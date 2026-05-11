@@ -1,0 +1,37 @@
+services:
+  sie:
+    # GPU compose uses the transformers5 bundle so we can serve LightOnOCR /
+    # GLM-OCR / Paddle (their adapters need transformers>=5). Florence-2 is
+    # in the catalog but its tokenizer relies on a transformers<5 API and is
+    # therefore unavailable on this image (sie-internal#828, #832). The CPU
+    # compose covers Florence-2.
+    image: ghcr.io/superlinked/sie-server:latest-cuda12-transformers5
+    command:
+      - serve
+      - --port
+      - "8080"
+      - --preload
+      - lightonai/LightOnOCR-2-1B,naver-clova-ix/donut-base-finetuned-cord-v2,urchade/gliner_multi-v2.1,zai-org/GLM-OCR,PaddlePaddle/PaddleOCR-VL-1.5
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 120
+      start_period: 360s
+    volumes:
+      - sie-cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  sie-cache:
+    name: sie-cache
+    external: false

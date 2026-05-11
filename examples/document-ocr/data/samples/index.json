@@ -1,0 +1,87 @@
+[
+  {
+    "id": "receipt",
+    "filename": "receipt.png",
+    "label": "Grocery receipt",
+    "description": "Printed receipt with line items, subtotal, tax, total. Donut on CORD reads this end-to-end.",
+    "labels": [
+      "merchant",
+      "date",
+      "line_item",
+      "subtotal",
+      "tax",
+      "total",
+      "payment_method"
+    ]
+  },
+  {
+    "id": "invoice",
+    "filename": "invoice.png",
+    "label": "Vendor invoice",
+    "description": "Multi-column invoice with billing party, line items, subtotal, tax, total.",
+    "labels": [
+      "vendor",
+      "invoice_number",
+      "date",
+      "due_date",
+      "billing_party",
+      "line_item",
+      "total"
+    ]
+  },
+  {
+    "id": "business-card",
+    "filename": "business-card.png",
+    "label": "Business card",
+    "description": "Tight layout, mixed text sizes, multiple contact fields. Good NER showcase.",
+    "labels": [
+      "company",
+      "person",
+      "role",
+      "email",
+      "phone",
+      "address",
+      "website"
+    ]
+  },
+  {
+    "id": "event-poster",
+    "filename": "event-poster.png",
+    "label": "Event poster",
+    "description": "Large-text poster with title, date, artists, ticket info. Florence-2 OCR's home turf.",
+    "labels": [
+      "event",
+      "date",
+      "venue",
+      "artist",
+      "price",
+      "organization"
+    ]
+  },
+  {
+    "id": "slide",
+    "filename": "slide.png",
+    "label": "Presentation slide",
+    "description": "Roadmap slide with title and three numbered items. Clean printed text on a single background.",
+    "labels": [
+      "initiative",
+      "person",
+      "date",
+      "quarter"
+    ]
+  },
+  {
+    "id": "letter",
+    "filename": "letter.png",
+    "label": "Business letter",
+    "description": "Short printed business letter with sender, date, recipient, body, and signature.",
+    "labels": [
+      "company",
+      "person",
+      "address",
+      "date",
+      "amount",
+      "phone"
+    ]
+  }
+]

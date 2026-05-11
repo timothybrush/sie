@@ -17,6 +17,7 @@ service keys.
 | [Private fine-tuned compliance RAG](./regulatory-rag) | Hot-loading a domain LoRA encoder and a custom token-pruning adapter on SIE | `encode`, `score`, `extract` | Custom SIE Docker image, GPU recommended | Advanced runnable example |
 | [Build a multimodal wine recommender with OCR](./wine-recommender) | Combining preference-based retrieval with OCR-driven label detection in one UI | `encode`, `score`, `extract` | Docker Compose app plus local SIE endpoint; API key optional for unauthenticated SIE | Runnable demo |
 | [Build a multi-modal product classifier with embeddings](./taxonomy-classification) | Evaluating text, image, NLI, and reranking approaches for hierarchical product taxonomy classification | `extract`, `encode`, `score` | SIE endpoint, Shopify dataset prep via `uv run` scripts, standalone `uv` project | Runnable evaluation example |
+| [Swap an OCR model with one identifier change](./document-ocr) | Driving recognition (VLM-OCR), structured extraction (Donut), and zero-shot NER (GLiNER) through the same `extract` call by swapping the model ID | `extract` | Docker Compose plus Node UI, no API key required, hosted version on [Hugging Face Spaces](https://huggingface.co/spaces/superlinked/document-ocr) | Runnable demo |
 
 For docs publishing, lead with the quickest runnable demos, then use the
 benchmark and evaluation examples for deeper technical users.

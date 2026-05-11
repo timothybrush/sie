@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>document-ocr</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <span class="logo">📄</span>
+        <h1>document-ocr</h1>
+        <span class="badge" id="badge">idle</span>
+      </div>
+      <div class="meta" id="models">SIE: <code>...</code></div>
+      <div class="meta" id="sie-state">checking SIE...</div>
+      <div class="cta-row">
+        <a class="cta" href="https://github.com/superlinked/brave-new-demos/tree/main/document-ocr" target="_blank" rel="noopener">
+          <span>↗</span> Source on GitHub
+        </a>
+        <a class="cta" href="https://github.com/superlinked/sie" target="_blank" rel="noopener">
+          <span>★</span> SIE repo
+        </a>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-text">
+        <p>
+          OCR is rarely a single-model problem. This demo runs three model
+          classes through <strong>one SIE server</strong>: a VLM-OCR recognizes
+          the document into Markdown, a fine-tuned Donut emits a JSON tree
+          directly, and a zero-shot NER (GLiNER) pulls typed fields out of
+          the recognition output. Pick a sample on the left, swap any of the
+          three models in the dropdowns, watch SIE hot-swap them with
+          <em>one identifier change</em>.
+        </p>
+      </div>
+      <div class="hero-diagram">
+        <div class="diagram">
+          <div class="diagram-input">image</div>
+          <div class="diagram-arrow">↓</div>
+          <div class="diagram-server">one SIE server · <code>client.extract(model_id, item)</code></div>
+          <div class="diagram-arrows">
+            <span>↓</span><span>↓</span><span>↓</span>
+          </div>
+          <div class="diagram-models">
+            <div class="diagram-box diagram-recognition">VLM-OCR<br><span>(LightOnOCR-2-1B, PaddleOCR-VL, GLM-OCR)</span></div>
+            <div class="diagram-box diagram-structured">Donut<br><span>(end-to-end JSON)</span></div>
+            <div class="diagram-box diagram-ner">GLiNER<br><span>(zero-shot NER)</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="why-sie">
+      <h3>Why SIE</h3>
+      <p>
+        Three different model architectures (a vision-language model, a
+        fine-tuned encoder-decoder, a span-based NER), one inference engine,
+        one HTTP API, one SDK call. Without SIE, this demo would be three
+        separate inference services with three SDKs, three auth flows, three
+        rate limits. With SIE, swap a string in <code>client.extract(...)</code>
+        and the underlying architecture changes.
+      </p>
+    </section>
+
+    <section class="tour">
+      <h3>Try these moments</h3>
+      <ol class="tour-list">
+        <li>
+          <strong>Click any sample on the left.</strong> All three models run
+          in one pipeline. The footer prints per-stage timings as each one
+          lands.
+        </li>
+        <li>
+          <strong>Open "See the SIE call"</strong> in any panel, then swap the
+          model dropdown above. The snippet updates with the one parameter
+          that changed. That is the swap-a-string pitch in action.
+        </li>
+        <li>
+          <strong>Click the receipt, then the multi-column page.</strong>
+          Donut (fine-tuned on receipts) dominates the first; recognition
+          dominates the second. Same pipeline, different model wins.
+        </li>
+        <li>
+          <strong>Switch NER from <code>gliner_multi</code> to
+          <code>gliner_large</code>.</strong> Same labels, same input text,
+          different confidence scores. Model quality is a single dropdown
+          away.
+        </li>
+      </ol>
+    </section>
+
+    <main>
+      <section class="panel" id="panel-events">
+        <header><h2>Sample documents</h2></header>
+        <div class="meta-row">
+          <label class="model-pick">
+            <span class="dropdown-label">Recognition</span>
+            <select id="select-recognition"></select>
+          </label>
+          <label class="model-pick">
+            <span class="dropdown-label">Structured</span>
+            <select id="select-structured"></select>
+          </label>
+          <label class="model-pick">
+            <span class="dropdown-label">NER</span>
+            <select id="select-ner"></select>
+          </label>
+        </div>
+        <div class="list" id="events">loading...</div>
+      </section>
+
+      <section class="panel" id="panel-recognition">
+        <header>
+          <h2>Recognition (Markdown)</h2>
+          <span class="hint" id="recognition-meta"></span>
+        </header>
+        <details class="sdk-snippet">
+          <summary>See the SIE call</summary>
+          <pre><code id="snippet-recognition">// pick a recognition model in the dropdown</code></pre>
+        </details>
+        <div class="markdown" id="recognition">
+          <p class="hint">Click a sample on the left.</p>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-extraction">
+        <header>
+          <h2>Extraction</h2>
+          <span class="hint" id="extraction-meta"></span>
+        </header>
+        <details class="sdk-snippet">
+          <summary>See the SIE calls</summary>
+          <pre><code id="snippet-structured">// structured (Donut)</code>
+
+<code id="snippet-ner">// NER (GLiNER)</code></pre>
+        </details>
+        <div class="extraction" id="extraction">
+          <p class="hint">Typed fields will appear here.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="footer">SIE on <code id="sie-url">http://localhost:8080</code></span>
+      <span id="timings"></span>
+    </footer>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

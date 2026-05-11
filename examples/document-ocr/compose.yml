@@ -1,0 +1,34 @@
+services:
+  sie:
+    # transformers5 bundle so LightOnOCR-2-1B (the recognition default) loads.
+    # Florence-2 family is incompatible with transformers>=5 (tokenizer API
+    # change), so the UI auto-disables those entries on this image
+    # (sie-internal#828 tracks unifying the bundles).
+    image: ghcr.io/superlinked/sie-server:latest-cpu-transformers5
+    # linux/amd64 is a no-op on x86_64 Linux hosts; on Apple Silicon it forces
+    # Rosetta translation (slower but works for local testing).
+    platform: linux/amd64
+    command:
+      - serve
+      - --port
+      - "8080"
+      - --preload
+      - lightonai/LightOnOCR-2-1B,naver-clova-ix/donut-base-finetuned-cord-v2,urchade/gliner_multi-v2.1
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 90
+      start_period: 240s
+    volumes:
+      # SIE's image sets HF_HOME=/app/.cache/huggingface; mount the volume
+      # there so the model weights survive `docker compose down/up`.
+      - sie-cache:/app/.cache/huggingface
+
+volumes:
+  sie-cache:
+    name: sie-cache
+    external: false
