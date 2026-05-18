@@ -14,10 +14,10 @@
 <p>85+ models. Three functions. From laptop to Kubernetes. All Apache 2.0.</p>
 
 <p>
-  <a href="https://sie.dev/docs/">Docs</a> ·
-  <a href="https://sie.dev/docs/quickstart/">Quickstart</a> ·
-  <a href="https://sie.dev/docs/reference/api/">API Reference</a> ·
-  <a href="https://sie.dev/docs/reference/models/">Models</a>
+  <a href="https://superlinked.com/docs/">Docs</a> ·
+  <a href="https://superlinked.com/docs/quickstart/">Quickstart</a> ·
+  <a href="https://superlinked.com/docs/reference/api/">API Reference</a> ·
+  <a href="https://superlinked.com/models">Models</a>
 </p>
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
@@ -42,13 +42,6 @@ SIE is an open-source inference engine that serves embeddings, reranking, and en
 Or try it in your browser, no install needed: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/superlinked/sie/blob/main/notebooks/quickstart.ipynb)
 
 **1. Start the server**
-
-```bash
-pip install sie-server
-sie-server serve            # auto-detects CUDA / Apple Silicon / CPU
-```
-
-Or with Docker:
 
 ```bash
 docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default                # CPU
@@ -94,9 +87,9 @@ print(result["entities"])
 #  {'text': 'Apple', 'label': 'organization', 'score': 0.91}]
 ```
 
-TypeScript: `pnpm add @sie/sdk` — [TypeScript docs ->](https://sie.dev/docs/reference/typescript-sdk/)
+TypeScript: `pnpm add @superlinked/sie-sdk` · [TypeScript docs ->](https://superlinked.com/docs/reference/typescript-sdk/)
 
-[Full quickstart guide ->](https://sie.dev/docs/quickstart/) · [SDK reference ->](https://sie.dev/docs/reference/sdk/)
+[Full quickstart guide ->](https://superlinked.com/docs/quickstart/) · [SDK reference ->](https://superlinked.com/docs/reference/sdk/)
 
 ---
 
@@ -112,7 +105,7 @@ helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster 
   -f deploy/helm/sie-cluster/values-{gke|aws}.yaml
 ```
 
-[Deployment guide ->](https://sie.dev/docs/deployment/)
+[Deployment guide ->](https://superlinked.com/docs/deployment/)
 
 > **Telemetry**: SIE collects anonymous usage data (version, OS, architecture, GPU type) to understand adoption. No IP addresses, hostnames, or request data are collected. Disable with `SIE_TELEMETRY_DISABLED=1` or `DO_NOT_TRACK=1`.
 
@@ -120,17 +113,17 @@ helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster 
 
 ### Explore
 
-[**85+ models**](https://sie.dev/docs/reference/models/) — `Stella v5` · `BGE-M3` · `SPLADE v3` · `SigLIP` · `ColQwen2.5` · `BGE-reranker` · `GLiNER` · `Florence-2` · [and more ->](https://sie.dev/docs/reference/models/)
+[**85+ models**](https://superlinked.com/models): `Stella v5` · `BGE-M3` · `SPLADE v3` · `SigLIP` · `ColQwen2.5` · `BGE-reranker` · `GLiNER` · `Florence-2` · [and more ->](https://superlinked.com/models)
 Dense, sparse, multi-vector, vision, rerankers, extractors. All pre-configured. All quality-verified against MTEB in CI.
 
-[**Integrations**](https://sie.dev/docs/integrations/) — LangChain · LlamaIndex · Haystack · DSPy · CrewAI · Chroma · Qdrant · Weaviate
+[**Integrations**](https://superlinked.com/docs/integrations/): LangChain · LlamaIndex · Haystack · DSPy · CrewAI · Chroma · Qdrant · Weaviate
 
-[**Notebooks**](notebooks/) — Quickstarts and walkthroughs
+[**Notebooks**](notebooks/): Quickstarts and walkthroughs
 
-[**Examples**](examples/) — End-to-end project gallery
+[**Examples**](examples/): End-to-end project gallery
 
 ---
 
 <p align="center">
-  <a href="https://sie.dev/docs/"><strong>sie.dev/docs</strong></a> · Apache 2.0
+  <a href="https://superlinked.com/docs"><strong>superlinked.com/docs</strong></a> · Apache 2.0
 </p>
