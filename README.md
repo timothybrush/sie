@@ -52,13 +52,14 @@ The first image pull is around 1 GB (CPU) or 9 GB (GPU). After the pull, the con
 
 See the [deployment guide](https://superlinked.com/docs/deployment/docker) for GPU pinning, read-only filesystems, and tuning.
 
-**2. Call it**
+**2. Use SIE from Python or TypeScript**
 
 ```bash
-pip install sie-sdk
+pip install sie-sdk           # Python
+pnpm add @superlinked/sie-sdk # TypeScript
 ```
 
-The SDK is a small HTTP client; it does not run any models locally. The entire API is three functions: `encode`, `score`, `extract`.
+The SDKs are small HTTP clients; they do not run any models locally. The entire API is three functions: `encode`, `score`, `extract`.
 
 ```python
 from sie_sdk import SIEClient
@@ -91,7 +92,7 @@ print(result["entities"])
 #  {'text': 'Apple', 'label': 'organization', 'score': 0.91}]
 ```
 
-TypeScript: `pnpm add @superlinked/sie-sdk`. See [TypeScript docs](https://superlinked.com/docs/reference/typescript-sdk/).
+For the equivalent TypeScript example, see the [TypeScript SDK docs](https://superlinked.com/docs/reference/typescript-sdk/).
 
 See the [full quickstart guide](https://superlinked.com/docs/quickstart/) and [SDK reference](https://superlinked.com/docs/reference/sdk/).
 
