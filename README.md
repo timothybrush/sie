@@ -30,7 +30,6 @@
 
 SIE is an open-source inference engine that serves embeddings, reranking, and entity extraction through a single unified API. It replaces the patchwork of separate model servers with one system that handles 85+ models across dense, sparse, multi-vector, vision, and cross-encoder architectures.
 
-- Three functions (`encode`, `score`, `extract`) cover the entire embedding, reranking, and extraction pipeline
 - 85+ pre-configured models, hot-swappable, all quality-verified against MTEB in CI
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
 - Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE/EKS
@@ -39,7 +38,7 @@ SIE is an open-source inference engine that serves embeddings, reranking, and en
 
 ## Quickstart
 
-SIE runs as a Docker container that your code calls over HTTP. Start the container first, then install the SDK in your app and run the example below against it. Docker is the recommended path for local work: it ships the model runtime, CUDA bits, and dependencies as one image, so you avoid Python and driver setup.
+SIE is a Docker container; your code calls it over HTTP. Start the container, install the SDK, run the example.
 
 **1. Run the engine**
 
@@ -52,6 +51,12 @@ docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlin
 
 # Linux, NVIDIA GPU
 docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-default
+```
+
+Confirm it is up:
+
+```bash
+curl http://localhost:8080/readyz   # expect: ok
 ```
 
 See the [deployment guide](https://superlinked.com/docs/deployment/docker) for GPU pinning, read-only filesystems, and tuning.
@@ -70,14 +75,16 @@ from sie_sdk import SIEClient
 from sie_sdk.types import Item
 
 client = SIEClient("http://localhost:8080")
+# First call to each model downloads weights from Hugging Face (seconds for
+# these tinies, longer for larger models). After that, calls are warm in ms.
 
-# Encode: dense embeddings, 400M-parameter model
-result = client.encode("NovaSearch/stella_en_400M_v5", Item(text="Hello world"))
-print(result["dense"].shape)  # (1024,)
+# Encode: dense embeddings (all-MiniLM-L6-v2, ~90 MB)
+result = client.encode("sentence-transformers/all-MiniLM-L6-v2", Item(text="Hello world"))
+print(result["dense"].shape)  # (384,)
 
-# Score: rerank documents by relevance
+# Score: rerank documents by relevance (ms-marco MiniLM, ~80 MB)
 scores = client.score(
-    "BAAI/bge-reranker-v2-m3",
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
     Item(text="What is machine learning?"),
     [Item(text="ML learns from data."), Item(text="The weather is sunny.")]
 )
@@ -96,8 +103,6 @@ print(result["entities"])
 #  {'text': 'Apple', 'label': 'organization', 'score': 0.91}]
 ```
 
-The first call to each model downloads weights from Hugging Face (30 seconds to a few minutes); after that, calls are warm in milliseconds.
-
 For the equivalent TypeScript example, see the [TypeScript SDK docs](https://superlinked.com/docs/reference/typescript-sdk/). For more, see the [full quickstart guide](https://superlinked.com/docs/quickstart/) and [SDK reference](https://superlinked.com/docs/reference/sdk/).
 
 ---
@@ -110,7 +115,7 @@ The same code works against a production cluster. SIE ships a load-balancing gat
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
   --set hfToken.create=true \
-  --set hfToken.value=<TOKEN> \
+  --set hfToken.value=YOUR_HF_TOKEN \
   -f deploy/helm/sie-cluster/values-{gke|aws}.yaml
 ```
 
@@ -124,6 +129,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 [**85+ models**](https://superlinked.com/models): `Stella v5`, `BGE-M3`, `SPLADE v3`, `SigLIP`, `ColQwen2.5`, `BGE-reranker`, `GLiNER`, `Florence-2`, and [more](https://superlinked.com/models).
 Dense, sparse, multi-vector, vision, rerankers, extractors. All pre-configured. All quality-verified against MTEB in CI.
+Pass the full Hugging Face model ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `NovaSearch/stella_en_400M_v5`); see the [catalog](https://superlinked.com/models) for the complete list.
 
 [**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
 
