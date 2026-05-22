@@ -1,0 +1,119 @@
+"""Build the per-tenant visual index.
+
+For every page PNG we ask SIE to encode the image with vidore/colqwen2.5-v0.2,
+which returns a [tokens, 128] multivector. Each page's multivector goes into a
+single .npz on disk, alongside a metadata.json that keeps the client name,
+page id, title, and source url for routing and filtering at query time.
+
+There is no vector database here. MaxSim at the scale of one team's wiki
+(hundreds to thousands of pages) is cheap and avoids the indexing step.
+For larger corpora swap the .npz for a multivector store (LanceDB, Vespa,
+Turbopuffer); the encode call is the same.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from sie_sdk import SIEClient
+from sie_sdk.types import Item
+
+
+def load_config():
+    return yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text())
+
+
+def load_pages():
+    pages_path = Path(__file__).resolve().parent.parent / "data" / "pages.json"
+    if not pages_path.exists():
+        raise FileNotFoundError(
+            "data/pages.json not found. Run `python data/fetch_dataset.py` "
+            "and `python data/render_pages.py` first."
+        )
+    return json.loads(pages_path.read_text())
+
+
+def encode_pages(client: SIEClient, model: str, pages: list[dict], gpu: str, timeout: float):
+    pages_dir = Path(__file__).resolve().parent.parent / "data" / "pages"
+    multivectors: list[np.ndarray] = []
+    metadata: list[dict] = []
+
+    for i, page in enumerate(pages, 1):
+        image_path = pages_dir / f"{page['page_id']}.png"
+        if not image_path.exists():
+            raise FileNotFoundError(f"Missing page image: {image_path}. Run data/render_pages.py.")
+
+        start = time.time()
+        result = client.encode(
+            model,
+            Item(id=page["page_id"], images=[str(image_path)]),
+            output_types=["multivector"],
+            gpu=gpu,
+            wait_for_capacity=True,
+            provision_timeout_s=timeout,
+        )
+        elapsed = time.time() - start
+        mv = result["multivector"].astype(np.float32)
+        multivectors.append(mv)
+        metadata.append(
+            {
+                "page_id": page["page_id"],
+                "client": page["client"],
+                "title": page["title"],
+                "space": page["space"],
+                "author": page["author"],
+                "web_url": page["web_url"],
+                "image_path": str(image_path.relative_to(image_path.parent.parent.parent)),
+                "num_tokens": int(mv.shape[0]),
+            }
+        )
+        print(f"  [{i}/{len(pages)}] {page['page_id']:10s} {page['client']:10s} {mv.shape} in {elapsed:.1f}s")
+
+    return multivectors, metadata
+
+
+def main():
+    config = load_config()
+    pages = load_pages()
+    print(f"Loaded {len(pages)} pages")
+
+    cluster_url = os.environ.get("SIE_CLUSTER_URL", config["cluster"]["url"])
+    api_key = os.environ.get("SIE_API_KEY", config["cluster"]["api_key"])
+    gpu = config["cluster"]["gpu"]
+    timeout = config["cluster"]["provision_timeout_s"]
+    model = config["models"]["retriever"]
+
+    print(f"\n--- Encoding pages with {model} ---")
+    with SIEClient(cluster_url, api_key=api_key) as client:
+        multivectors, metadata = encode_pages(client, model, pages, gpu, timeout)
+
+    data_dir = Path(__file__).resolve().parent.parent / "data"
+    # np.savez stores variable-length multivectors as one entry per array; we
+    # key them by page_id so the search side can reload without an extra index.
+    np.savez(
+        data_dir / "multivectors.npz",
+        **{m["page_id"]: mv for m, mv in zip(metadata, multivectors)},
+    )
+    (data_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    total_tokens = sum(m["num_tokens"] for m in metadata)
+    by_client: dict[str, int] = {}
+    for m in metadata:
+        by_client[m["client"]] = by_client.get(m["client"], 0) + 1
+
+    print(f"\n  Saved {len(metadata)} multivectors to data/multivectors.npz")
+    print(f"  Saved metadata to data/metadata.json")
+    print(f"  Total visual tokens: {total_tokens}")
+    print("  Pages per tenant:")
+    for client_name in sorted(by_client):
+        print(f"    {client_name}: {by_client[client_name]}")
+
+
+if __name__ == "__main__":
+    main()

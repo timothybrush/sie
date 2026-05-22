@@ -1,0 +1,43 @@
+# SIE server (defaults to local Docker: docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default).
+# Override with SIE_CLUSTER_URL / SIE_API_KEY env vars when targeting a managed cluster.
+cluster:
+  url: "http://localhost:8080"
+  api_key: ""
+  gpu: ""                       # only set for managed multi-GPU clusters (e.g. "l4-spot"); ignored locally
+  provision_timeout_s: 600
+
+# Models. The retrieval signal is vision end-to-end: ColQwen2.5 reads each page
+# as an image and we late-interact (MaxSim) against the same model's text-side
+# embedding of the query. No OCR is involved in ranking, so charts, screenshots,
+# tables, and any other layout cue that wouldn't survive an OCR round-trip
+# still contributes to the score.
+#
+# DocVQA produces a textual answer for the top page. The model takes the page
+# image + the user's question (passed via `instruction`) and returns the answer
+# as an entity in the response — no separate LLM call needed.
+models:
+  retriever: "vidore/colqwen2.5-v0.2"
+  docvqa: "mynkchaudhry/Florence-2-FT-DocVQA"
+  # Optional second-stage cross-encoder rerank. Visual model so we don't have to
+  # collapse the page through OCR before reranking. Disabled by default while
+  # we wait for the cluster-side adapter bug to land:
+  #   https://github.com/superlinked/sie-internal/issues/1026
+  # Re-enable with search.visual_rerank: true once that ships.
+  reranker: "Qwen/Qwen3-VL-Reranker-2B"
+
+# Page rendering (used by data/render_pages.py to turn the synthetic page
+# corpus into PNGs; replace with pdf2image, screenshots, or your own files
+# for a real deployment).
+render:
+  width: 1024
+  height: 1280
+  body_font_size: 20
+  title_font_size: 30
+
+# Retrieval
+search:
+  top_k_candidates: 5           # how many pages survive MaxSim
+  top_k_results: 3              # how many pages return after optional rerank
+  visual_rerank: false          # see models.reranker note above
+  answer: true                  # run DocVQA on the top page for a textual answer
+  ocr_snippet: true             # OCR the top page for a display-only snippet in the UI

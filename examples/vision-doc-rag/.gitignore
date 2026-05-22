@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+data/pages.json
+data/pages/
+data/multivectors.npz
+data/metadata.json
