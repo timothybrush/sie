@@ -25,14 +25,11 @@ models:
   # Re-enable with search.visual_rerank: true once that ships.
   reranker: "Qwen/Qwen3-VL-Reranker-2B"
 
-# Page rendering (used by data/render_pages.py to turn the synthetic page
-# corpus into PNGs; replace with pdf2image, screenshots, or your own files
-# for a real deployment).
+# Page rendering. `auto` tries pdf2image/Poppler first and falls back to
+# PyMuPDF when Poppler is not installed.
 render:
-  width: 1024
-  height: 1280
-  body_font_size: 20
-  title_font_size: 30
+  backend: "auto"                # auto | pdf2image | pymupdf
+  dpi: 160
 
 # Retrieval
 search:

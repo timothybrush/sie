@@ -120,7 +120,7 @@
     <main>
       <form id="searchForm">
         <select id="clientSel"><option value="">All clients</option></select>
-        <input id="q" type="text" placeholder="e.g. how do I sign in to the VPN?" autofocus />
+        <input id="q" type="text" placeholder="e.g. Raspberry Pi Pico pinout GP21" autofocus />
         <button type="submit">Search</button>
       </form>
       <div id="stats" class="stats"></div>
@@ -134,6 +134,14 @@
       const resultsEl = document.getElementById("results");
       const answerEl = document.getElementById("answer");
       const statsEl = document.getElementById("stats");
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
 
       async function loadStats() {
         const r = await fetch("/api/stats").then(r => r.json());
@@ -162,7 +170,7 @@
           answerEl.innerHTML = `
             <div class="answer-card">
               <div class="label">Answer (Florence-2-DocVQA)</div>
-              <div class="text">${res.answer.replace(/</g, "&lt;")}</div>
+              <div class="text">${escapeHtml(res.answer)}</div>
             </div>`;
         }
         if (!res.results.length) {
@@ -173,12 +181,13 @@
           const rerank = r.scores.rerank == null ? "—" : r.scores.rerank;
           return `
           <div class="result">
-            <a href="${r.page_image}" target="_blank"><img src="${r.page_image}" alt="${r.title}"/></a>
+            <a href="${escapeHtml(r.page_image)}" target="_blank"><img src="${escapeHtml(r.page_image)}" alt="${escapeHtml(r.title)}"/></a>
             <div>
-              <div class="title">${r.title}</div>
-              <div class="meta"><span class="tag">${r.client}</span> ${r.space} · ${r.author} · ${r.page_id}</div>
+              <div class="title">${escapeHtml(r.title)}</div>
+              <div class="meta"><span class="tag">${escapeHtml(r.client)}</span> ${escapeHtml(r.citation)} · ${escapeHtml(r.publisher)}</div>
+              <div class="meta">${escapeHtml(r.license)} · <a href="${escapeHtml(r.source_url)}" target="_blank" rel="noreferrer">source PDF</a></div>
               <div class="scores">maxsim=${r.scores.maxsim}   rerank=${rerank}</div>
-              ${r.ocr_snippet ? `<div class="snippet">${r.ocr_snippet.replace(/</g, "&lt;")}</div>` : ""}
+              ${r.ocr_snippet ? `<div class="snippet">${escapeHtml(r.ocr_snippet)}</div>` : ""}
             </div>
           </div>`;
         }).join("");
