@@ -236,11 +236,20 @@ def main():
     api_key = os.environ.get("SIE_API_KEY", config["cluster"]["api_key"])
 
     demo = [
+        # Visual signal — ranking is driven by the page image.
         ("Raspberry Pi Pico pinout GP21", "embedded-lab"),
         ("cloud native architecture diagram", "ops-eng"),
         ("solid rocket motor nozzle design figure", "aerospace"),
         # No tenant filter: shows the query routes across tenants.
         ("ATmega16U2 power tree diagram", None),
+        # Table / value lookup — DocVQA must return a specific value, not the title.
+        ("What is the operating voltage range of the Raspberry Pi Pico?", "embedded-lab"),
+        ("PostgreSQL default listening port", "ops-eng"),
+        # Disambiguation — two PDFs in one tenant; the right one must win.
+        ("solid propellant rocket nozzle cross-section", "aerospace"),
+        # Tenant-leak negative — the matching content lives in aerospace; scoping
+        # to ops-eng must return no aerospace pages.
+        ("regeneratively cooled nozzle", "ops-eng"),
     ]
     with SIEClient(cluster_url, api_key=api_key) as client:
         for query, tenant in demo:

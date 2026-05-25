@@ -93,13 +93,45 @@ explicit GPU class.
 
 ## Try these queries
 
-| Tenant | Query | Why it's interesting |
+Queries are grouped by what they exercise. Each row names the expected target
+page so you can spot regressions at a glance.
+
+### Visual signal — the ranking comes from the page image, not OCR
+
+| Tenant | Query | Expected target | Why it's interesting |
+|---|---|---|---|
+| `embedded-lab` | Raspberry Pi Pico pinout GP21 | Pi Pico datasheet pinout (pp 4-5) | Abbreviated visual label still drives retrieval. |
+| `embedded-lab` | where is the ATmega16U2 on the schematic? | Arduino UNO R3 schematic (pp 1-2) | Circuit schematic retrieval, not prose. |
+| `ops-eng` | cloud native architecture diagram | CNCF AI whitepaper or Kubernetes slides | Visual architecture page instead of OCR text. |
+| `aerospace` | solid rocket motor nozzle design figure | Solid rocket motor nozzles report | Engineering drawing in a figure-heavy report. |
+
+### Table / value lookups — the DocVQA answer is the point
+
+| Tenant | Query | Expected target | Expected answer |
+|---|---|---|---|
+| `embedded-lab` | What is the operating voltage range of the Raspberry Pi Pico? | Pi Pico datasheet electrical characteristics (pp 6-8) | A voltage range, e.g. 1.8-5.5 V |
+| `embedded-lab` | Which Arduino UNO pin is the built-in LED on? | UNO R3 datasheet pinout (pp 5-11) | D13 / PB5 |
+| `ops-eng` | PostgreSQL default listening port | PG 18 manual config section (pp 19-24) | 5432 |
+| `ops-eng` | What is the default value of max_connections in PostgreSQL? | PG 18 manual parameter table (pp 19-24) | 100 |
+| `aerospace` | What is the throat diameter shown in the nozzle drawing? | Nozzle design figure | A labeled dimension off the drawing |
+
+### Disambiguation — two PDFs in one tenant, the right one must win
+
+| Tenant | Query | Should pick | Should beat |
+|---|---|---|---|
+| `aerospace` | solid propellant rocket nozzle cross-section | `solid-rocket-motor-nozzles.pdf` | `liquid-rocket-engine-nozzles.pdf` |
+| `aerospace` | regeneratively cooled nozzle | `liquid-rocket-engine-nozzles.pdf` (regen cooling is liquid-specific) | `solid-rocket-motor-nozzles.pdf` |
+| `embedded-lab` | USB-to-serial interface chip on the schematic | `arduino-uno-r3-schematic.pdf` (ATmega16U2) | `raspberry-pi-pico-datasheet.pdf` |
+| `embedded-lab` | RP2040 GPIO function table | `raspberry-pi-pico-datasheet.pdf` | `arduino-uno-r3-datasheet.pdf` |
+
+### Tenant-leak negatives — the matching content lives in a different tenant
+
+| Scoped to | Query | Pass condition |
 |---|---|---|
-| `embedded-lab` | Raspberry Pi Pico pinout GP21 | Should land on a pinout/table page even when the visual label is abbreviated. |
-| `embedded-lab` | where is the ATmega16U2 on the schematic? | Circuit schematic retrieval, not prose retrieval. |
-| `ops-eng` | cloud native architecture diagram | Finds a visual architecture page or slide instead of relying on OCR text only. |
-| `aerospace` | solid rocket motor nozzle design figure | Targets an engineering drawing or figure-heavy report page. |
-| `ops-eng` | Raspberry Pi Pico pinout GP21 | Tenant filter: the query cannot leak embedded-lab pages when scoped to ops-eng. |
+| `ops-eng` | Raspberry Pi Pico pinout GP21 | No embedded-lab pages return. |
+| `ops-eng` | regeneratively cooled nozzle | No aerospace pages return. |
+| `aerospace` | cloud native architecture diagram | No ops-eng pages return. |
+| `embedded-lab` | PostgreSQL connection pool | No ops-eng pages return. |
 
 ## API
 
