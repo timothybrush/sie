@@ -73,18 +73,20 @@ override-dependencies = [
 
 # Use CUDA PyTorch on Linux only
 # explicit = true ensures only torch/torchvision use this index, not other packages
-# Using cu128 for PyTorch 2.9+ compatibility with xformers/flash-attn
+# Using cu129 — matches sglang's sgl-kernel cu129 wheels at
+# https://docs.sglang.ai/whl/cu129/ (the Modal validation image bakes
+# cuda-toolkit-12-9 to keep the runtime + JIT-compile path aligned).
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
 ]
 torchvision = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
 ]
 sie-server = { workspace = true }
 sie-sdk = { workspace = true }

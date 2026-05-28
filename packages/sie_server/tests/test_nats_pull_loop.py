@@ -40,6 +40,12 @@ def _make_work_item(**overrides) -> dict:
     return wi
 
 
+def _make_config(*, generate: bool = False) -> MagicMock:
+    config = MagicMock()
+    config.tasks.generate = object() if generate else None
+    return config
+
+
 def _make_loop(
     *,
     registry: MagicMock | None = None,
@@ -55,7 +61,7 @@ def _make_loop(
     if registry is None:
         registry = MagicMock()
         registry.model_names = ["test/model"]
-        registry.get_config.return_value = MagicMock()
+        registry.get_config.return_value = _make_config()
     return NatsPullLoop(
         nc=nc,
         js=js,
@@ -268,6 +274,198 @@ class TestPullLoopAdmission:
             pass
 
         loop._pool_sub.fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_waits_when_pool_subscription_is_temporarily_absent(self) -> None:
+        loop = _make_loop()
+        loop._pool_sub = None
+        loop._running = True
+        gate = AsyncMock()
+        gate.admitted = AsyncMock(return_value=True)
+        loop._admission_gate = gate
+
+        task = asyncio.create_task(loop._run())
+        await asyncio.sleep(0.01)
+        loop._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        gate.admitted.assert_awaited()
+
+
+class TestDirectDispatchIsolation:
+    @pytest.mark.asyncio
+    async def test_start_keeps_encode_pool_on_pool_only_subscription(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=False)
+
+        loop = _make_loop(registry=registry)
+        loop._migrate_per_model_streams = AsyncMock()
+        loop._ensure_pool_subscription = AsyncMock()
+        loop._ensure_per_worker_subscription = AsyncMock()
+        loop._ensure_cancel_subscription = AsyncMock()
+        loop._prewarm_grammars = AsyncMock()
+        loop._run = AsyncMock(return_value=None)
+        loop._run_worker_pull = AsyncMock(return_value=None)
+
+        await loop.start()
+        await asyncio.sleep(0)
+
+        loop._ensure_pool_subscription.assert_awaited_once()
+        loop._ensure_per_worker_subscription.assert_not_awaited()
+        loop._ensure_cancel_subscription.assert_not_awaited()
+        assert loop._worker_sub is None
+        assert loop._worker_pull_task is None
+
+        if loop._pull_task is not None:
+            await asyncio.gather(loop._pull_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_start_preserves_generation_direct_dispatch_subscription(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=True)
+
+        loop = _make_loop(registry=registry)
+        loop._migrate_per_model_streams = AsyncMock()
+        loop._ensure_pool_subscription = AsyncMock()
+
+        async def ensure_worker_subscription() -> None:
+            loop._worker_sub = AsyncMock()
+
+        loop._ensure_per_worker_subscription = AsyncMock(side_effect=ensure_worker_subscription)
+        loop._ensure_cancel_subscription = AsyncMock()
+        loop._prewarm_grammars = AsyncMock()
+        loop._run = AsyncMock(return_value=None)
+        loop._run_worker_pull = AsyncMock(return_value=None)
+
+        await loop.start()
+        await asyncio.sleep(0)
+
+        loop._ensure_pool_subscription.assert_awaited_once()
+        loop._ensure_per_worker_subscription.assert_awaited_once()
+        loop._ensure_cancel_subscription.assert_awaited_once()
+        assert loop._worker_sub is not None
+        assert loop._worker_pull_task is not None
+
+        await asyncio.gather(
+            *(task for task in (loop._pull_task, loop._worker_pull_task) if task is not None),
+            return_exceptions=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_encode_saturation_counts_queue_batches_not_generation_streams(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=False)
+
+        loop = _make_loop(registry=registry)
+        loop._streaming_processor.in_flight_count = MagicMock(return_value=7)
+        loop._effective_kv_budget = MagicMock(return_value=None)
+        loop.aggregate_max_batch_requests = MagicMock(return_value=4)
+        loop._saturation_gate.update = MagicMock(return_value=False)
+
+        task = asyncio.create_task(asyncio.sleep(60))
+        loop._in_flight_tasks.add(task)
+        try:
+            assert loop.in_flight_count() == 1
+            assert loop.update_saturation() is False
+            loop._saturation_gate.update.assert_called_once_with(in_flight=1, capacity=4)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def test_transport_class_probe_is_cached_for_status_updates(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=False)
+
+        loop = _make_loop(registry=registry)
+
+        assert loop._pool_hosts_generation_model() is False
+        get_config_calls = registry.get_config.call_count
+
+        assert loop.in_flight_count() == 0
+        assert loop.in_flight_count() == 0
+        assert registry.get_config.call_count == get_config_calls
+
+    def test_generation_saturation_still_uses_kv_budget(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=True)
+
+        loop = _make_loop(registry=registry)
+        loop._effective_kv_budget = MagicMock(return_value=100)
+        loop._streaming_processor.kv_reserved_tokens = MagicMock(return_value=44)
+        loop._saturation_gate.update = MagicMock(return_value=True)
+
+        assert loop.update_saturation() is True
+        loop._saturation_gate.update.assert_called_once_with(in_flight=44, capacity=100)
+
+    @pytest.mark.asyncio
+    async def test_add_model_enables_generation_direct_dispatch_after_hot_reload(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=True)
+
+        loop = _make_loop(registry=registry)
+        loop._running = True
+        loop._hosts_generation_model = False
+
+        async def ensure_worker_subscription() -> None:
+            loop._worker_sub = AsyncMock()
+
+        loop._ensure_per_worker_subscription = AsyncMock(side_effect=ensure_worker_subscription)
+        loop._rebind_pool_subscription = AsyncMock()
+        loop._ensure_cancel_subscription = AsyncMock()
+        loop._run_worker_pull = AsyncMock(return_value=None)
+
+        await loop.add_model("test/model")
+        await asyncio.sleep(0)
+
+        loop._ensure_per_worker_subscription.assert_awaited_once()
+        loop._rebind_pool_subscription.assert_awaited_once()
+        loop._ensure_cancel_subscription.assert_awaited_once()
+        assert loop._worker_pull_task is not None
+
+        await asyncio.gather(loop._worker_pull_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_add_model_rebinds_pool_fallback_when_direct_dispatch_setup_fails(self) -> None:
+        registry = MagicMock()
+        registry.model_names = ["test/model"]
+        registry.get_config.return_value = _make_config(generate=True)
+
+        loop = _make_loop(registry=registry)
+        loop._running = True
+        loop._hosts_generation_model = False
+        loop._ensure_per_worker_subscription = AsyncMock(side_effect=RuntimeError("nats unavailable"))
+        loop._rebind_pool_subscription = AsyncMock()
+        loop._ensure_cancel_subscription = AsyncMock()
+
+        await loop.add_model("test/model")
+
+        loop._ensure_per_worker_subscription.assert_awaited_once()
+        loop._rebind_pool_subscription.assert_awaited_once()
+        loop._ensure_cancel_subscription.assert_awaited_once()
+        assert loop._worker_pull_task is None
+
+    @pytest.mark.asyncio
+    async def test_rebind_pool_subscription_recreates_existing_pool_consumer(self) -> None:
+        loop = _make_loop()
+        pool_sub = AsyncMock()
+        loop._pool_sub = pool_sub
+        loop._ensure_pool_subscription = AsyncMock()
+
+        await loop._rebind_pool_subscription(reason="test")
+
+        pool_sub.unsubscribe.assert_awaited_once()
+        loop._ensure_pool_subscription.assert_awaited_once()
+        assert loop._pool_sub is None
 
 
 class TestProcessEncodeItem:

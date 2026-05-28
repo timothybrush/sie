@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.1
+
+- chore(main): release 0.4.1
+- fix(security): resolve 18 open CodeQL alerts
+- Revert "Fix pool queue batching coalescing"
+- Fix pool queue batching coalescing
+- refactor(release-docker): remove sie-deps prebake; build deps in-band
+- fix: refresh generation pool fallback on hot add
+- fix: isolate generation direct dispatch
+- feat(server): add Qwen3.6-27B model + migrate to CUDA 12.9
+
 ## v0.4.0
 
 - chore(main): release 0.4.0

@@ -32,7 +32,7 @@ def _find_free_port(start: int = 8400, end: int = 8500) -> int:
     for port in range(start, end):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("0.0.0.0", port))  # noqa: S104
+                s.bind(("127.0.0.1", port))
                 return port
         except OSError:
             continue

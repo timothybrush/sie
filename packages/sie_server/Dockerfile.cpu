@@ -6,7 +6,6 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 -f packages/sie_server/Dockerfile.cpu -t sie-server:cpu .
 
 ARG BUNDLE=default
-ARG SIE_DEPS_IMAGE=
 
 # =============================================================================
 # Stage 1: Dependencies (pyproject.toml only, cached across code changes)
@@ -108,9 +107,9 @@ RUN set -eux; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 3a: Bundle-deps - bundle-specific deps install (heavy)
+# Stage 3: Builder - bundle-specific deps
 # =============================================================================
-FROM base AS bundle_deps
+FROM base AS builder
 
 ARG BUNDLE
 
@@ -149,11 +148,6 @@ RUN set -eux; \
         find . -type f -name 'RECORD' -path '*dist-info*' -delete; \
     fi; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
-
-# =============================================================================
-# Stage 3b: Builder - optional trampoline to a prebuilt base image
-# =============================================================================
-FROM ${SIE_DEPS_IMAGE:-bundle_deps} AS builder
 
 # =============================================================================
 # Stage 4: Runtime

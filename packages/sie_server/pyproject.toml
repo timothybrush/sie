@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.4.0"
+version = "0.4.1"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -92,9 +92,10 @@ packages = ["src/sie_server"]
 "bundles" = "sie_server/bundles"
 
 [tool.uv.sources]
-# Prebuilt flash-attn wheel for torch 2.9 + cu128 (official wheels only go up to torch 2.8)
+# Prebuilt flash-attn wheel for torch 2.9 + cu129 (official wheels only go up to torch 2.8).
 # Platform-specific: Linux x86_64 only. Non-Linux users should not install the flash-attn extra.
-flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.7.4+cu128torch2.9-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux'" }
+# Source: mjun0812/flash-attention-prebuild-wheels v0.7.11 (first release with cu129torch2.9 cp312 manylinux).
+flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.7.4+cu129torch2.9-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux'" }
 
 [dependency-groups]
 dev = []

@@ -1,0 +1,196 @@
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+inputs:
+  # Qwen3.6-27B is a unified vision-language model (Gated DeltaNet + Gated
+  # Attention with an integrated vision encoder; same hybrid family as
+  # Qwen3.5-4B but scaled to 64 layers / hidden_size=5120). The wire
+  # surface accepts text+image via the OpenAI chat-completions schema
+  # (``image_url`` content parts); video is documented by Qwen but not
+  # yet wired through the SIE gateway.
+  text: true
+  image: true
+  audio: false
+  video: false
+tasks:
+  generate:
+    # Native context length is 262,144 tokens (YaRN extends to ~1M).
+    # Default to 8192 here — H100 80GB can fit larger windows after KV
+    # calibration but the conservative cap survives first boot before
+    # token_capacity is measured.
+    context_length: 8192
+    max_output_tokens: 4096
+    capabilities:
+      # Same constraint as Qwen3.5-4B: SGLang's outlines_backend does
+      # not implement ebnf. xgrammar smoke would pass all three; flip
+      # ``grammar_backend: xgrammar`` and re-add ``"ebnf"`` here if a
+      # consumer needs it.
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      tools: true
+    # Qwen3.6 emits ``<think>...</think>`` reasoning by default. We
+    # disable it for the OpenAI-compat path so visible output is the
+    # answer only. Operators wanting CoT can flip this profile-side.
+    chat_template_kwargs:
+      enable_thinking: false
+    prewarm_grammars:
+      # Bare pattern, NOT anchored — Outlines regexes are implicitly
+      # anchored and its FSM engine rejects ``^``/``$``. See the
+      # Qwen3.5-4B model card for the full back-story.
+      - name: yes_no
+        kind: regex
+        value: "(yes|no)"
+      - name: short_answer
+        kind: json_schema
+        value:
+          type: object
+          properties:
+            answer:
+              type: string
+          required: [answer]
+max_sequence_length: 8192
+# ── KV-cache math (placeholder, pending Modal calibration) ──
+#
+# Qwen3.6-27B layer breakdown (per model card / config.json):
+#   * 64 layers in a 16 × (3 × DeltaNet + 1 × GatedAttention) pattern
+#   * 16 KV-bearing Gated-Attention layers (4 KV heads × head_dim=256)
+#   * 48 recurrent Gated-DeltaNet layers — managed by SGLang's mamba
+#     scheduler under ``--mamba-scheduler-strategy extra_buffer``
+#
+# BF16 weights ≈ 27e9 × 2 B ≈ 54 GB before activations / KV.
+#   * L4 (22 GB)        → infeasible
+#   * A100-40GB (40 GB) → infeasible BF16; would need FP8 or TP2
+#   * H100-80GB         → primary target (single-GPU, BF16)
+#   * H100×2 (160 GB)   → for context >32k or large concurrencies
+#
+# ``kv_budget_tokens`` is a conservative analytical placeholder pending
+# the first /get_server_info dump from tools/smoke_qwen36_27b.py on
+# Modal. Re-calibrate from the empirical token_capacity before relying
+# on these numbers in production.
+profiles:
+  # L4 / A100-40GB profiles intentionally omitted — Qwen3.6-27B's BF16
+  # weights (~54 GB) do not fit. Add an FP8 or TP2 profile if those
+  # tiers become required.
+  default:
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Conservative H100-80GB placeholder pending the first
+    # /get_server_info dump from tools/smoke_qwen36_27b.py on Modal.
+    # Empirical reference point (2026-05-27 smoke, mem_fraction_static=0.93,
+    # context_length=4096, no-spec): SGLang reported
+    # ``weight=51.05 GB, kvcache=11.63 GB, token_capacity=190,543``.
+    # Sizing here at ~1/12 of that capacity to leave room for NEXTN
+    # draft KV + grammar/Outlines compile arena once spec is re-enabled.
+    # Re-calibrate after a smoke run on this profile's actual settings.
+    kv_budget_tokens: 16384
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        # MTP/NEXTN per the Qwen3.x model-card recipe. SGLang implements
+        # NEXTN under the EAGLE codepath internally; ``/server_info``
+        # reporting ``speculative_algorithm: EAGLE`` is expected.
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        # Required for NEXTN spec decoding to coexist with radix cache
+        # on the hybrid Gated-DeltaNet architecture. The adapter also
+        # sets SGLANG_ENABLE_SPEC_V2=1 when speculative.enabled — both
+        # are required as a pair.
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  h100:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Same H100-80GB target as ``default``; this profile widens
+    # ``max_batch_tokens`` for batch-heavy workloads once calibration
+    # confirms KV headroom.
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        # ``--disable-overlap-schedule`` is the required pair-flag for
+        # NEXTN + mamba-scheduler ``extra_buffer`` on the hybrid Gated-
+        # DeltaNet architecture (same constraint as Qwen3.5-4B).
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  # No-speculative baseline — for SIE-vs-raw-SGLang ablation cells so
+  # spec-decoding's contribution can be measured independently. Keeps
+  # the same ``extra_launch_args`` as ``default`` / ``h100`` so a config
+  # diff between them shows only the ``speculative`` block (the intent
+  # of the ablation), matching Qwen3.5-4B's convention.
+  no-spec:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"

@@ -6,29 +6,29 @@ deps:
   # SGLang 0.5.6+ includes all deps at base level (fixed from 0.4.x extras bug)
   # See: https://github.com/sgl-project/sglang/issues/4869
   #
-  # Qwen3.5-4B compatibility — M4 req2 Proj 5:
+  # Qwen3.5-4B + Qwen3.6-27B compatibility:
   #
-  # ``sglang==0.5.10`` is the canonical target for Qwen3.5-4B on the
-  # current L4 / A100-40GB / H100 fleet. Audited against
-  # ``python/pyproject.toml@v0.5.10`` upstream (see
-  # ``product/plans/qwen35-sglang-mtp-structured-outputs-findings.md``):
+  # ``sglang==0.5.10.post1`` is the canonical target for the Qwen3.x hybrid
+  # Gated-DeltaNet + Gated-Attention family on the current
+  # L4 / A100-40GB / H100 fleet. Qwen3.6-27B uses the same ``qwen3_5``
+  # model class shipped in 0.5.10 — the architecture (64 layers, hybrid
+  # Gated DeltaNet + Gated Attention, MTP/NEXTN) is identical, only the
+  # parameter count differs.
   #
-  #   * ships the ``qwen3_5`` model class (``models/qwen3_5.py``, 1724 LOC)
+  # SGLang 0.5.10 was evaluated against CUDA 12.9 + Qwen3.6-27B on Modal
+  # H100 (2026-05-27): server boots, loads weights, but the bundled
+  # ``sglang/jit_kernel/csrc/elementwise/activation.cuh`` has a C++
+  # template bug (``select_kernel<true>(type)`` is parsed as a class-
+  # template substitution, not a function-template call) that the
+  # stricter ``nvcc`` shipped with CUDA 12.9 rejects at first activation.
+  # 0.5.11 is also dev-only on the sglang docs wheel index — not on
+  # PyPI. Park the 0.5.11 bump until upstream cuts a stable release with
+  # the JIT header fixed; 0.5.10.post1 covers Qwen3.6-27B today.
+  #
   #   * grammar backends: ``xgrammar`` / ``outlines`` / ``llguidance`` / ``none``
-  #   * ``sglang-kernel==0.4.1`` wheel covers SM_80 / SM_89 / SM_90 / SM_100
-  #     via gencode (``CMakeLists.txt``: ``ENABLE_BELOW_SM90=ON`` default).
-  #     The runtime loader (``sgl_kernel/load_utils.py``) maps
-  #     compute_capability != 90 → ``sm100/`` subdir, which holds the
-  #     SM_80 / SM_89 / SM_100 build (precise math). H100 (CC=90) gets
-  #     the ``sm90/`` fast-math build.
-  #   * torch==2.9.1 (CUDA 12.8/12.9 wheels); ``cuda-python==12.9``.
-  #     **Not** CUDA 13 — that's an SGLang-main-only path which only
-  #     became relevant when looking at the dev branch.
-  #
-  # Compat note: 0.5.12 wheel observed shipping only ``sm100/`` (no SM_80
-  # cubin entry inside) — out of scope; we stay on 0.5.10 until upstream
-  # ships multi-arch binaries again.
-  sglang: '==0.5.10'
+  #   * ``sgl_kernel`` covers SM_80 / SM_89 / SM_90 / SM_100 via gencode.
+  #   * torch==2.9.1 (CUDA 12.9 wheels); ``cuda-python==12.9``.
+  sglang: '==0.5.10.post1'
   #
   # Grammar backend deps — pinned to exactly what SGLang 0.5.10 imports
   # internally to prevent silent pip resolution drift.
@@ -39,7 +39,7 @@ deps:
   # propagation (PR #20467). Kept available as the fallback backend.
   xgrammar: '==0.1.32'
   #
-  # ``outlines==0.1.11`` is a hard transitive dep of sglang==0.5.10. We
+  # ``outlines==0.1.11`` is a hard transitive dep of sglang==0.5.10.post1. We
   # declare it explicitly at bundle level so the surface is visible.
   # ``outlines-core`` (a separate package) is a transitive of outlines
   # and intentionally NOT pinned here — pinning ``outlines-core`` directly

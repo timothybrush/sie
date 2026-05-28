@@ -622,6 +622,8 @@ class NatsPullLoop:
         # ``None`` on direct-dispatch boot failures so the pool path keeps
         # working.
         self._worker_pull_task: asyncio.Task[None] | None = None
+        self._worker_sub: Any | None = None
+        self._hosts_generation_model: bool | None = None
         self._in_flight_tasks: set[asyncio.Task[None]] = set()
         # Outstanding generation streams, tracked separately from the
         # GPU-batch ``_in_flight_tasks``. Generation is decoupled from
@@ -752,6 +754,7 @@ class NatsPullLoop:
         # lazily in :meth:`start`; ``None`` until then so :meth:`stop`
         # tolerates an early shutdown.
         self._cancel_sub: Any | None = None
+        self._pool_sub: Any | None = None
 
     async def start(self) -> None:
         """Start the pull loop.
@@ -767,27 +770,32 @@ class NatsPullLoop:
         # pool stream if any per-model stream has an overlapping subject.
         await self._migrate_per_model_streams()
 
+        self._refresh_generation_pool_flag()
+
         # Create the single pool-level stream + consumer
         await self._ensure_pool_subscription()
 
-        # Per-worker direct-dispatch stream + consumer. The
-        # pool stream's wildcard ``sie.work.*.{pool}`` captures exactly
-        # 3 subject tokens after the prefix; the per-worker subject has
-        # 4 tokens (``…{pool}.{worker_id}``) so it cannot overlap. Both
-        # subscriptions feed the same ``_process_messages`` path.
-        # Failure here is non-fatal — workers without a per-worker
-        # subscription degrade to the pool-fallback path (the gateway
-        # already handles "no eligible worker" by publishing to the
-        # pool subject).
-        try:
-            await self._ensure_per_worker_subscription()
-        except Exception:
-            logger.exception("Failed to create per-worker subscription (continuing with pool-only delivery)")
+        if self._pool_hosts_generation_model():
+            # Per-worker direct-dispatch stream + consumer. The
+            # pool stream's wildcard ``sie.work.*.{pool}`` captures exactly
+            # 3 subject tokens after the prefix; the per-worker subject has
+            # 4 tokens (``…{pool}.{worker_id}``) so it cannot overlap. Both
+            # subscriptions feed the same ``_process_messages`` path.
+            # Failure here is non-fatal — workers without a per-worker
+            # subscription degrade to the pool-fallback path (the gateway
+            # already handles "no eligible worker" by publishing to the
+            # pool subject).
+            try:
+                await self._ensure_per_worker_subscription()
+            except Exception:
+                logger.exception("Failed to create per-worker subscription (continuing with pool-only delivery)")
 
-        # Subscribe (cluster-scope) to cancel.> on core NATS so
-        # the StreamingProcessor can react to client disconnect cancels.
-        # request_id uniqueness is the filter; router_id is informational.
-        await self._ensure_cancel_subscription()
+            # Subscribe (cluster-scope) to cancel.> on core NATS so
+            # the StreamingProcessor can react to client disconnect cancels.
+            # request_id uniqueness is the filter; router_id is informational.
+            await self._ensure_cancel_subscription()
+        else:
+            logger.info("Skipping generation direct-dispatch subscriptions for non-generation pool %s", self._pool_name)
 
         # Grammar prewarm. Compile each model's
         # ``tasks.generate.prewarm_grammars`` ahead of request traffic so
@@ -803,7 +811,7 @@ class NatsPullLoop:
         self._pull_task = asyncio.create_task(self._run())
         # Parallel pull task draining the per-worker stream.
         # Spawned only if the per-worker subscription was created.
-        if hasattr(self, "_worker_sub"):
+        if self._worker_sub is not None:
             self._worker_pull_task = asyncio.create_task(self._run_worker_pull())
         logger.info(
             "NatsPullLoop started (bundle=%s, pool=%s, models=%d, stream=%s)",
@@ -884,25 +892,28 @@ class NatsPullLoop:
                 logger.debug("Failed to unsubscribe during shutdown")
         self._subscriptions.clear()
 
-        if hasattr(self, "_pool_sub"):
+        if self._pool_sub is not None:
             try:
                 await self._pool_sub.unsubscribe()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to unsubscribe pool sub during shutdown")
+            self._pool_sub = None
         await self._admission_gate.close()
 
         # Tear down the per-worker subscription.
-        if hasattr(self, "_worker_sub"):
+        if self._worker_sub is not None:
             try:
                 await self._worker_sub.unsubscribe()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to unsubscribe per-worker sub during shutdown")
+            self._worker_sub = None
 
         if hasattr(self, "_cancel_sub") and self._cancel_sub is not None:
             try:
                 await self._cancel_sub.unsubscribe()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to unsubscribe cancel sub during shutdown")
+            self._cancel_sub = None
 
         logger.info("NatsPullLoop stopped")
 
@@ -921,47 +932,84 @@ class NatsPullLoop:
         self._subscriptions.clear()
 
         # Unsubscribe stale pool subscription (best-effort)
-        if hasattr(self, "_pool_sub"):
+        if self._pool_sub is not None:
             try:
                 await self._pool_sub.unsubscribe()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to unsubscribe old pool sub during reconnect")
+            self._pool_sub = None
+
+        if self._worker_pull_task is not None:
+            self._worker_pull_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_pull_task
+            self._worker_pull_task = None
 
         # Also drop the per-worker subscription so the next
         # `_ensure_per_worker_subscription` call re-binds against the
-        # new connection. The parallel pull task picks up the fresh
-        # subscription on its next fetch.
-        if hasattr(self, "_worker_sub"):
+        # new connection.
+        if self._worker_sub is not None:
             try:
                 await self._worker_sub.unsubscribe()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to unsubscribe old per-worker sub during reconnect")
-            try:
-                delattr(self, "_worker_sub")
-            except AttributeError:
-                pass
+            self._worker_sub = None
+
+        self._refresh_generation_pool_flag()
 
         # Re-create the pool subscription
         await self._ensure_pool_subscription()
-        # Re-create the per-worker subscription (best-effort).
-        try:
-            await self._ensure_per_worker_subscription()
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to re-create per-worker subscription on reconnect", exc_info=True)
+        if self._pool_hosts_generation_model():
+            # Re-create the per-worker subscription (best-effort).
+            try:
+                await self._ensure_per_worker_subscription()
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to re-create per-worker subscription on reconnect", exc_info=True)
+        else:
+            logger.info("Reconnect kept non-generation pool %s on pool-only delivery", self._pool_name)
+
         # Re-spawn the parallel pull task if needed.
         if (
             self._running
-            and hasattr(self, "_worker_sub")
+            and self._worker_sub is not None
             and (self._worker_pull_task is None or self._worker_pull_task.done())
         ):
             self._worker_pull_task = asyncio.create_task(self._run_worker_pull())
-        logger.info("NatsPullLoop reconnected — re-created pool and per-worker subscriptions")
+        logger.info("NatsPullLoop reconnected — re-created pool subscription")
 
     async def add_model(self, model_id: str) -> None:
-        """No-op in multiplexed mode — the pool subscription already covers all models.
+        """Refresh transport wiring after a model is hot-added.
 
-        Kept for API compatibility.
+        The pool subscription already covers all encode / score /
+        extract models. If the added model is the first generation
+        model in this worker pool, create the per-worker
+        direct-dispatch subscription now so hot reload preserves the
+        same generation path as cold start.
         """
+        if not self._running:
+            return
+
+        was_generation_pool = self._pool_hosts_generation_model()
+        if not self._refresh_generation_pool_flag():
+            return
+
+        if self._worker_sub is None:
+            try:
+                await self._ensure_per_worker_subscription()
+            except Exception:
+                logger.exception(
+                    "Failed to create per-worker subscription after adding model %s (continuing with pool-only delivery)",
+                    model_id,
+                )
+
+        if not was_generation_pool:
+            await self._rebind_pool_subscription(reason=f"first generation model added: {model_id}")
+
+        if self._cancel_sub is None:
+            await self._ensure_cancel_subscription()
+
+        if self._worker_sub is not None and (self._worker_pull_task is None or self._worker_pull_task.done()):
+            self._worker_pull_task = asyncio.create_task(self._run_worker_pull())
 
     # -- Pool-level multiplexed stream/consumer --------------------------------
 
@@ -1067,6 +1115,18 @@ class NatsPullLoop:
             filter_subject,
         )
 
+    async def _rebind_pool_subscription(self, *, reason: str) -> None:
+        """Recreate the pool consumer when generation settings change."""
+        if self._pool_sub is not None:
+            try:
+                await self._pool_sub.unsubscribe()
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to unsubscribe old pool sub during rebind")
+            self._pool_sub = None
+
+        await self._ensure_pool_subscription()
+        logger.info("Pool consumer re-bound (%s)", reason)
+
     async def _ensure_per_worker_subscription(self) -> None:
         """Create the per-worker direct-dispatch stream and pull consumer.
 
@@ -1149,12 +1209,27 @@ class NatsPullLoop:
             filter_subject,
         )
 
+    def _refresh_generation_pool_flag(self) -> bool:
+        self._hosts_generation_model = self._detect_pool_hosts_generation_model()
+        return self._hosts_generation_model
+
     def _pool_hosts_generation_model(self) -> bool:
+        """Return whether this pool hosts generation models.
+
+        The answer is cached because status heartbeats call the saturation
+        path frequently. Startup, reconnect, and hot-add refresh the flag
+        so normal status updates stay O(1) with respect to model count.
+        """
+        if self._hosts_generation_model is None:
+            return self._refresh_generation_pool_flag()
+        return self._hosts_generation_model
+
+    def _detect_pool_hosts_generation_model(self) -> bool:
         """Detect whether any model in this pool declares a generate task.
 
-        Used by :meth:`_ensure_pool_subscription` to pick an appropriate
-        JetStream ``ack_wait`` (§4.4: long generations would
-        exceed the default 30s window).
+        Used to pick the worker transport and the appropriate JetStream
+        ``ack_wait`` (§4.4: long generations would exceed the default 30s
+        window).
         """
         for model_id in self._registry.model_names:
             try:
@@ -1257,30 +1332,18 @@ class NatsPullLoop:
         return self._worker_id
 
     def in_flight_count(self) -> int:
-        """Current number of *generation requests* the worker is processing.
+        """Current in-flight count for the pool's transport class.
 
-        Routing-rollout fix (review finding M1): the previous implementation
-        returned ``len(self._in_flight_tasks)`` which counts fetched
-        *batches* — one task per ``_dispatch_batch`` invocation,
-        regardless of how many requests that batch contains. With
-        ``_MAX_CONCURRENT_BATCHES = 4`` and per-model batch budgets in
-        the tens to hundreds, the resulting saturation fraction
-        (``in_flight / max_batch_requests``) could never reach the
-        90% high-watermark, so the gate was effectively dead.
-
-        We now delegate to the streaming processor's
-        ``_in_flight_cancels`` map which tracks one entry per
-        generate request; that's the right denominator for the
-        saturation hysteresis on generate-heavy pools.
-
-        Admission-control rollout: :meth:`update_saturation` now prefers
-        ``kv_reserved / kv_budget_tokens`` when the streaming
-        processor has a budget configured (i.e. this worker hosts a
-        generation pool). For encode / extract / score pools the
-        budget is ``None`` and this method's per-request count keeps
-        driving the gate.
+        Generation pools count streaming requests; non-generation pools
+        count fetched queue batches. Keeping those signals separate is
+        important: the generation rollout added direct-dispatch state,
+        but encode / score / extract still rely on the shared pool queue
+        and must not report zero in-flight work just because no
+        generation stream is active.
         """
-        return self._streaming_processor.in_flight_count()
+        if self._pool_hosts_generation_model():
+            return self._streaming_processor.in_flight_count()
+        return len(self._in_flight_tasks)
 
     def aggregate_max_batch_requests(self) -> int:
         """Aggregate batch capacity across loaded models.
@@ -1476,8 +1539,14 @@ class NatsPullLoop:
                 await asyncio.sleep(self._admission_gate.pause_s)
                 continue
 
+            pool_sub = self._pool_sub
+            if pool_sub is None:
+                fetch_timeout = _MIN_FETCH_TIMEOUT_S
+                await asyncio.sleep(fetch_timeout)
+                continue
+
             try:
-                messages = await self._pool_sub.fetch(batch=_DEFAULT_BATCH_BUDGET, timeout=fetch_timeout)
+                messages = await pool_sub.fetch(batch=_DEFAULT_BATCH_BUDGET, timeout=fetch_timeout)
             except nats.errors.TimeoutError:
                 # No items — back off
                 fetch_timeout = min(fetch_timeout * _BACKOFF_GROWTH, _MAX_FETCH_TIMEOUT_S)
@@ -1575,10 +1644,15 @@ class NatsPullLoop:
         ``_batch_sem`` so the worker's GPU is the global concurrency
         limit, not "GPU × 2".
         """
+        worker_sub = self._worker_sub
+        if worker_sub is None:
+            logger.debug("Per-worker pull loop requested without a subscription; exiting")
+            return
+
         fetch_timeout = _MIN_FETCH_TIMEOUT_S
         while self._running:
             try:
-                messages = await self._worker_sub.fetch(batch=_DEFAULT_BATCH_BUDGET, timeout=fetch_timeout)
+                messages = await worker_sub.fetch(batch=_DEFAULT_BATCH_BUDGET, timeout=fetch_timeout)
             except nats.errors.TimeoutError:
                 fetch_timeout = min(fetch_timeout * _BACKOFF_GROWTH, _MAX_FETCH_TIMEOUT_S)
                 continue
