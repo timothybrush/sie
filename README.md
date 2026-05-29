@@ -14,10 +14,10 @@
 <p>85+ models. Three functions. From laptop to Kubernetes. All Apache 2.0.</p>
 
 <p>
-  <a href="https://sie.dev/docs/">Docs</a> ·
-  <a href="https://sie.dev/docs/quickstart/">Quickstart</a> ·
-  <a href="https://sie.dev/docs/reference/api/">API Reference</a> ·
-  <a href="https://sie.dev/docs/reference/models/">Models</a>
+  <a href="https://superlinked.com/docs/">Docs</a> |
+  <a href="https://superlinked.com/docs/quickstart/">Quickstart</a> |
+  <a href="https://superlinked.com/docs/reference/api/">API Reference</a> |
+  <a href="https://superlinked.com/models">Models</a>
 </p>
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
@@ -30,7 +30,6 @@
 
 SIE is an open-source inference engine that serves embeddings, reranking, and entity extraction through a single unified API. It replaces the patchwork of separate model servers with one system that handles 85+ models across dense, sparse, multi-vector, vision, and cross-encoder architectures.
 
-- Three functions (`encode`, `score`, `extract`) cover the entire embedding, reranking, and extraction pipeline
 - 85+ pre-configured models, hot-swappable, all quality-verified against MTEB in CI
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
 - Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE/EKS
@@ -39,26 +38,32 @@ SIE is an open-source inference engine that serves embeddings, reranking, and en
 
 ## Quickstart
 
-Or try it in your browser, no install needed: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/superlinked/sie/blob/main/notebooks/quickstart.ipynb)
+SIE is a Docker container; your code calls it over HTTP. Start the container, install the SDK, run the example.
 
-**1. Start the server**
+**1. Run the engine**
 
 ```bash
-pip install sie-server
-sie-server serve            # auto-detects CUDA / Apple Silicon / CPU
+# macOS (Apple Silicon)
+docker run --platform linux/amd64 -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
+
+# Linux, CPU
+docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
+
+# Linux, NVIDIA GPU
+docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-default
 ```
 
-Or with Docker:
+Confirm it is up:
 
 ```bash
-docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default                # CPU
-docker run --gpus all -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cuda12-default  # GPU
+curl http://localhost:8080/readyz   # expect: ok
 ```
 
-**2. Install the SDK and go**
+**2. Use SIE from Python or TypeScript**
 
 ```bash
-pip install sie-sdk
+pip install sie-sdk           # Python
+pnpm add @superlinked/sie-sdk # TypeScript
 ```
 
 The entire API is three functions: `encode`, `score`, `extract`.
@@ -68,20 +73,23 @@ from sie_sdk import SIEClient
 from sie_sdk.types import Item
 
 client = SIEClient("http://localhost:8080")
+# First call to each model downloads weights from Hugging Face (seconds for
+# these tinies, longer for larger models). After that, calls are warm in ms.
 
-# Encode: dense embeddings, 400M-parameter model
-result = client.encode("NovaSearch/stella_en_400M_v5", Item(text="Hello world"))
-print(result["dense"].shape)  # (1024,)
+# Encode: dense embeddings (all-MiniLM-L6-v2, ~90 MB)
+result = client.encode("sentence-transformers/all-MiniLM-L6-v2", Item(text="Hello world"))
+print(result["dense"].shape)  # (384,)
 
-# Score: rerank documents by relevance
+# Score: rerank documents by relevance (ms-marco MiniLM, ~80 MB)
 scores = client.score(
-    "BAAI/bge-reranker-v2-m3",
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
     Item(text="What is machine learning?"),
     [Item(text="ML learns from data."), Item(text="The weather is sunny.")]
 )
 print(scores["scores"])
-# [{'item_id': 'item-0', 'score': 0.998, 'rank': 0},
-#  {'item_id': 'item-1', 'score': 0.012, 'rank': 1}]
+# [{'item_id': 'item-0', 'score': -7.1,    'rank': 0},
+#  {'item_id': 'item-1', 'score': -11.048, 'rank': 1}]
+# (cross-encoder logits; relative order is what matters, not the absolute value)
 
 # Extract: zero-shot named entity recognition, no training data
 result = client.extract(
@@ -90,13 +98,11 @@ result = client.extract(
     labels=["person", "organization"]
 )
 print(result["entities"])
-# [{'text': 'Tim Cook', 'label': 'person', 'score': 0.96},
-#  {'text': 'Apple', 'label': 'organization', 'score': 0.91}]
+# [{'text': 'Tim Cook', 'label': 'person',       'score': 0.991},
+#  {'text': 'Apple',    'label': 'organization', 'score': 0.978}]
 ```
 
-TypeScript: `pnpm add @sie/sdk` — [TypeScript docs ->](https://sie.dev/docs/reference/typescript-sdk/)
-
-[Full quickstart guide ->](https://sie.dev/docs/quickstart/) · [SDK reference ->](https://sie.dev/docs/reference/sdk/)
+For the equivalent TypeScript example, see the [TypeScript SDK docs](https://superlinked.com/docs/reference/typescript-sdk/). For more, see the [full quickstart guide](https://superlinked.com/docs/quickstart/) and [SDK reference](https://superlinked.com/docs/reference/sdk/).
 
 ---
 
@@ -108,11 +114,11 @@ The same code works against a production cluster. SIE ships a load-balancing gat
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
   --set hfToken.create=true \
-  --set hfToken.value=<TOKEN> \
+  --set hfToken.value=YOUR_HF_TOKEN \
   -f deploy/helm/sie-cluster/values-{gke|aws}.yaml
 ```
 
-[Deployment guide ->](https://sie.dev/docs/deployment/)
+See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 > **Telemetry**: SIE collects anonymous usage data (version, OS, architecture, GPU type) to understand adoption. No IP addresses, hostnames, or request data are collected. Disable with `SIE_TELEMETRY_DISABLED=1` or `DO_NOT_TRACK=1`.
 
@@ -120,17 +126,20 @@ helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster 
 
 ### Explore
 
-[**85+ models**](https://sie.dev/docs/reference/models/) — `Stella v5` · `BGE-M3` · `SPLADE v3` · `SigLIP` · `ColQwen2.5` · `BGE-reranker` · `GLiNER` · `Florence-2` · [and more ->](https://sie.dev/docs/reference/models/)
+[**85+ models**](https://superlinked.com/models): `Stella v5`, `BGE-M3`, `SPLADE v3`, `SigLIP`, `ColQwen2.5`, `BGE-reranker`, `GLiNER`, `Florence-2`, and [more](https://superlinked.com/models).
 Dense, sparse, multi-vector, vision, rerankers, extractors. All pre-configured. All quality-verified against MTEB in CI.
+Pass the full Hugging Face model ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `NovaSearch/stella_en_400M_v5`); see the [catalog](https://superlinked.com/models) for the complete list.
 
-[**Integrations**](https://sie.dev/docs/integrations/) — LangChain · LlamaIndex · Haystack · DSPy · CrewAI · Chroma · Qdrant · Weaviate
+[**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
 
-[**Notebooks**](notebooks/) — Quickstarts and walkthroughs
+[**Notebooks**](notebooks/): Quickstarts and walkthroughs
 
-[**Examples**](examples/) — End-to-end project gallery
+[**Examples**](examples/): End-to-end project gallery
+
+[**Why we built SIE**](https://www.youtube.com/watch?v=qdh_x-uRs9g): The motivation, told at AI Engineer Europe 2026.
 
 ---
 
 <p align="center">
-  <a href="https://sie.dev/docs/"><strong>sie.dev/docs</strong></a> · Apache 2.0
+  <a href="https://superlinked.com/docs"><strong>superlinked.com/docs</strong></a> | Apache 2.0
 </p>
