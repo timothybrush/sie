@@ -1,15 +1,6 @@
-# Release-gate guard: the Qwen3.5 profiles' ``grammar_backend`` value must
-# match the backend-of-record declared in
-# ``product/research/generation-primitive-status.md`` (§4.2 Decision record).
-#
-# Closes finding H10. If you change either side, change both — this test is
-# *intended* to break when the YAML and the status doc drift apart.
-#
-# Context: production Qwen3.5 profiles ship with ``grammar_backend: outlines``
-# (dottxt partnership; the codebase default). The status doc historically
-# carried five contradictory passages claiming the profiles were pinned to
-# ``xgrammar`` "until the Outlines A100 smoke re-verification". The doc has
-# been reconciled with the code; this test guards the alignment.
+# Release-gate guard: production Qwen3.5 profiles ship with
+# ``grammar_backend: outlines`` (dottxt partnership; the codebase default).
+# This test keeps the YAML aligned with that backend-of-record.
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Unit tests for the mixed-pool fair-queue scheduler (roadmap §6.1).
+"""Unit tests for the mixed-pool fair-queue scheduler.
 
 Pure asyncio — no NATS. Covers config validation, the min_slots starvation
 floor, weighted-fair shares, slot release waking the most-owed waiter,

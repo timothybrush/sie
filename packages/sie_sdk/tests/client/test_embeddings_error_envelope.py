@@ -1,7 +1,7 @@
 """Regression: SIE SDK must parse the OpenAI ``{error:{…}}`` envelope.
 
-As of roadmap §3 item 1.4, ``/v1/embeddings`` returns the OpenAI-shaped
-error envelope (``{"error": {"message", "type", "param", "code"}}``) on
+``/v1/embeddings`` returns the OpenAI-shaped error envelope
+(``{"error": {"message", "type", "param", "code"}}``) on
 *every* error path, not the SIE-native ``{"detail": {"code", "message"}}``.
 A SIE SDK user hitting ``/v1/embeddings`` directly must still get a typed
 :class:`RequestError` / :class:`ServerError` with the parsed ``code`` and

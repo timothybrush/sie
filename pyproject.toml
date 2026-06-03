@@ -27,7 +27,7 @@ xformers = ["sie-server[xformers]"]
 [dependency-groups]
 dev = [
     # Testing
-    "pytest~=8.0",
+    "pytest>=9.0.3",
     "pytest-sugar",
     "pytest-asyncio",
     "pytest-cov",
@@ -129,6 +129,8 @@ markers = [
     "scaling: tests for autoscaling behavior (KEDA)",
     "gke: tests that require a real GKE cluster",
     "eks: tests that require a real EKS cluster",
+    "generation: tests that exercise generation endpoint contracts or a real generation worker",
+    "observability: tests that require optional local observability components",
     "model: Model regression tests (download real weights, slow)"
 ]
 
@@ -379,6 +381,31 @@ ignore = [
     "S311",    # Pseudo-random generator is fine for synthetic text generation
     "T201",    # Script output is intentional
 ]
+# Rust scheduler replay harness (dev tool, not production)
+"scripts/perf/replay-scheduler-trace.py" = [
+    "ANN",     # Annotations relaxed in dev scripts
+    "INP001",  # Standalone script, not a package
+    "PLC0415", # Lazy imports for optional dependencies
+    "PLR2004", # Magic numbers (truncation thresholds, etc.)
+    "S311",    # Pseudo-random fine for synthetic traces
+    "S404",    # subprocess import (we shell out to cargo)
+    "S603",    # subprocess.run with literal cargo argv (no shell)
+    "S607",    # Partial executable path "cargo" via PATH is intentional
+    "T201",    # Print output is intentional
+]
+# Tokeniser byte-identity fixture generator (dev tool, not production)
+"packages/sie_server/scripts/**/*" = [
+    "ANN",     # Annotations relaxed in dev scripts
+    "D301",    # Raw-string docstrings not enforced
+    "D415",    # Multi-paragraph docstrings without trailing punctuation
+    "EXE001",  # Shebang without +x permission - chmod is a deploy concern
+    "INP001",  # Standalone scripts, not packages
+    "PLC0415", # Lazy imports of huggingface_hub / transformers
+    "RUF001",  # Multilingual test data contains intentional non-ASCII
+    "S404",    # subprocess import
+    "S603",    # subprocess invocations with literal argv
+    "T201",    # Print output is intentional
+]
 # Mise task scripts - CLI scripts that use print, subprocess, etc.
 "tools/mise_tasks/**/*" = [
     "C901",    # Complexity acceptable for CLI command handlers
@@ -438,6 +465,10 @@ exclude = [
     "tools/benchview.py",
     # modal sandbox script
     "tools/modal_sandbox.py",
+    # Standalone dev scripts: import optional deps lazily, not part of the
+    # type-checked surface
+    "packages/sie_server/scripts/**",
+    "scripts/perf/**",
 ]
 
 [tool.ty.rules]

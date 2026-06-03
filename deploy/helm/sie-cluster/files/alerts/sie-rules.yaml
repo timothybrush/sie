@@ -1,9 +1,9 @@
 groups:
   # Worker health alerts
-  - name: sie-worker-health
+  - name: worker-sidecar-health
     rules:
       - alert: SIEWorkerDown
-        expr: up{job="sie-worker"} == 0
+        expr: up{namespace="__NAMESPACE__",endpoint="worker-metrics"} == 0
         for: 2m
         labels:
           severity: critical
@@ -12,7 +12,7 @@ groups:
           description: "Worker pod {{ $labels.pod }} has been unreachable for 2 minutes."
 
       - alert: SIENoHealthyWorkers
-        expr: sum(up{job="sie-worker"}) == 0
+        expr: sum(up{namespace="__NAMESPACE__",endpoint="worker-metrics"}) == 0
         for: 1m
         labels:
           severity: critical

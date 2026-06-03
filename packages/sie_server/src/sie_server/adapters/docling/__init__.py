@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.core.inference_output import ExtractOutput
-from sie_server.types.inputs import is_document_input
+from sie_server.types.inputs import is_document_input, is_image_input
 
 if TYPE_CHECKING:
     from sie_server.types.inputs import Item
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_ERR_REQUIRES_DOCUMENT = "Docling requires Item.document with raw bytes"
+_ERR_REQUIRES_DOCUMENT = "Docling requires Item.document or Item.images[0] with raw bytes"
 
 # Minimal one-page PDF used to warm Docling's layout/table model downloads
 # during load() so the first user request doesn't pay the download latency.
@@ -65,7 +65,7 @@ class DoclingAdapter(BaseAdapter):
     """
 
     spec: ClassVar[AdapterSpec] = AdapterSpec(
-        inputs=("document",),
+        inputs=("document", "image"),
         outputs=("json",),
         unload_fields=(),
     )
@@ -137,12 +137,23 @@ class DoclingAdapter(BaseAdapter):
         return [self._extract_one(item, ocr_enabled=ocr_enabled) for item in items]
 
     def _extract_one(self, item: Item, *, ocr_enabled: bool) -> dict[str, Any]:
+        # Prefer document when both are provided: PDF/DOCX/HTML carry layout
+        # that Docling's pipeline exploits; an image is the rasterized
+        # fallback for callers that only have a page render.
         document = item.document
-        if not is_document_input(document):
-            return {"error": _ERR_REQUIRES_DOCUMENT}
+        if is_document_input(document):
+            payload = document["data"]
+            format_hint = document.get("format")
+        else:
+            images = item.images or []
+            first_image = images[0] if images else None
+            if not is_image_input(first_image):
+                return {"error": _ERR_REQUIRES_DOCUMENT}
+            payload = first_image["data"]
+            format_hint = first_image.get("format") or "png"
         try:
             converter = self._get_converter(ocr_enabled=ocr_enabled)
-            return self._convert_bytes(converter, document["data"], format_hint=document.get("format"))
+            return self._convert_bytes(converter, payload, format_hint=format_hint)
         except Exception as e:  # noqa: BLE001 - per-item failure must not poison the batch
             logger.warning("Docling extract failed for item id=%s: %s", item.id, e)
             return {"error": str(e)}
@@ -184,7 +195,7 @@ class DoclingAdapter(BaseAdapter):
 
         from docling.datamodel.base_models import InputFormat  # ty: ignore[unresolved-import]
         from docling.datamodel.pipeline_options import PdfPipelineOptions  # ty: ignore[unresolved-import]
-        from docling.document_converter import PdfFormatOption  # ty: ignore[unresolved-import]
+        from docling.document_converter import ImageFormatOption, PdfFormatOption  # ty: ignore[unresolved-import]
 
         # Pass do_ocr explicitly on both paths. Docling's PdfPipelineOptions defaults
         # do_ocr=True, so an unset default would silently OCR every PDF and make the
@@ -193,7 +204,17 @@ class DoclingAdapter(BaseAdapter):
         if accelerator_options is not None:
             pdf_kwargs["accelerator_options"] = accelerator_options
         pdf_opts = PdfPipelineOptions(**pdf_kwargs)
-        return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)})
+        # Reuse the same PdfPipelineOptions for IMAGE input: Docling's image
+        # pipeline shares the layout/OCR model stack with the PDF pipeline,
+        # and re-using the option object keeps device/ocr settings in lock-step.
+        # ImageFormatOption attaches the ImageDocumentBackend so Docling doesn't
+        # auto-correct + deprecation-warn on every image request.
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
+                InputFormat.IMAGE: ImageFormatOption(pipeline_options=pdf_opts),
+            }
+        )
 
     def _build_accelerator_options(self) -> Any:
         """Translate self._device into a Docling AcceleratorOptions, or None."""

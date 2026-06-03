@@ -7,8 +7,6 @@ they output (head, relation, tail) triples with confidence scores.
 Reference models:
 - jackboyla/glirel-large-v0 (zero-shot relation extraction)
 - jackboyla/glirel_re_large-v0 (relation-focused variant)
-
-See DESIGN.md Section 7.6 for adapter specification.
 """
 
 from pathlib import Path
@@ -25,7 +23,6 @@ from sie_server.types.responses import Entity, Relation
 
 # Error messages
 _ERR_REQUIRES_LABELS = "GLiREL requires labels parameter for relation extraction"
-_ERR_REQUIRES_ENTITIES = "GLiREL requires entities in metadata for relation extraction"
 
 
 class GLiRELAdapter(BaseAdapter):

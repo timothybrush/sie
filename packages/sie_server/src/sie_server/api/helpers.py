@@ -170,7 +170,7 @@ class ContentNegotiator:
     def wants_msgpack(accept: str | None) -> bool:
         """Check if client prefers msgpack based on Accept header.
 
-        Default to msgpack if no preference specified (per DESIGN.md).
+        Default to msgpack if no preference is specified.
         """
         if not accept:
             return True  # Default to msgpack

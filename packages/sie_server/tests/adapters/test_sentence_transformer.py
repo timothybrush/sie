@@ -71,6 +71,52 @@ class TestSentenceTransformerDenseAdapter:
         assert adapter.dims.dense == 384
 
     @patch("sie_server.adapters.sentence_transformer.SentenceTransformer")
+    def test_load_gpu_preserves_sentence_transformers_defaults(
+        self,
+        mock_st_class: MagicMock,
+        mock_st_model: MagicMock,
+    ) -> None:
+        """GPU load path does not force dtype/attention globally."""
+        mock_st_class.return_value = mock_st_model
+        adapter = SentenceTransformerDenseAdapter(
+            "test-model",
+            compute_precision="float16",
+        )
+        adapter.load("cuda:0")
+
+        assert "model_kwargs" not in mock_st_class.call_args.kwargs
+
+    @patch("sie_server.adapters.sentence_transformer.SentenceTransformer")
+    def test_load_gpu_bf16_preserves_sentence_transformers_defaults(
+        self,
+        mock_st_class: MagicMock,
+        mock_st_model: MagicMock,
+    ) -> None:
+        """``bfloat16`` does not force a global dtype override."""
+        mock_st_class.return_value = mock_st_model
+        adapter = SentenceTransformerDenseAdapter(
+            "test-model",
+            compute_precision="bfloat16",
+        )
+        adapter.load("cuda:0")
+        assert "model_kwargs" not in mock_st_class.call_args.kwargs
+
+    @patch("sie_server.adapters.sentence_transformer.SentenceTransformer")
+    def test_load_gpu_fp32_leaves_dtype_unset(
+        self,
+        mock_st_class: MagicMock,
+        mock_st_model: MagicMock,
+    ) -> None:
+        """``float32`` deliberately doesn't override model defaults."""
+        mock_st_class.return_value = mock_st_model
+        adapter = SentenceTransformerDenseAdapter(
+            "test-model",
+            compute_precision="float32",
+        )
+        adapter.load("cuda:0")
+        assert "model_kwargs" not in mock_st_class.call_args.kwargs
+
+    @patch("sie_server.adapters.sentence_transformer.SentenceTransformer")
     def test_encode(
         self,
         mock_st_class: MagicMock,
@@ -197,6 +243,21 @@ class TestSentenceTransformerSparseAdapter:
         mock_sparse_class.assert_called_once()
         assert adapter.dims.sparse == 30522
         assert adapter.dims.dense is None
+
+    @patch("sie_server.adapters.sentence_transformer.SparseEncoder")
+    def test_load_gpu_preserves_sparse_encoder_defaults(
+        self,
+        mock_sparse_class: MagicMock,
+        mock_sparse_model: MagicMock,
+    ) -> None:
+        """GPU load path does not force dtype/attention globally."""
+        mock_sparse_class.return_value = mock_sparse_model
+        adapter = SentenceTransformerSparseAdapter(
+            "test-sparse-model",
+            compute_precision="float16",
+        )
+        adapter.load("cuda:0")
+        assert "model_kwargs" not in mock_sparse_class.call_args.kwargs
 
     @patch("sie_server.adapters.sentence_transformer.SparseEncoder")
     def test_encode_document(

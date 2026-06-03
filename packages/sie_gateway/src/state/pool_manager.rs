@@ -104,6 +104,9 @@ impl PoolManager {
         let mut pools = self.pools.write().await;
         let mut count = 0;
         for pool in k8s_pools {
+            if !Self::should_restore_pool_from_k8s(&pool) {
+                continue;
+            }
             if !pools.contains_key(&pool.spec.name) {
                 info!(pool = %pool.spec.name, "restored pool from K8s");
                 pools.insert(pool.spec.name.clone(), pool);
@@ -111,6 +114,10 @@ impl PoolManager {
             }
         }
         Ok(count)
+    }
+
+    fn should_restore_pool_from_k8s(pool: &Pool) -> bool {
+        pool.spec.name != DEFAULT_POOL_NAME
     }
 
     fn now_secs() -> f64 {
@@ -1323,6 +1330,28 @@ mod tests {
         // No K8s backend → returns Ok(0)
         let count = pm.restore_from_k8s().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_restore_from_k8s_skips_default_pool() {
+        let pool = Pool {
+            spec: PoolSpec {
+                name: DEFAULT_POOL_NAME.to_string(),
+                bundle: None,
+                gpus: HashMap::new(),
+                gpu_caps: HashMap::new(),
+                ttl_seconds: None,
+                minimum_worker_count: 0,
+            },
+            status: PoolStatus {
+                state: PoolState::Pending,
+                assigned_workers: Vec::new(),
+                created_at: 9999.0,
+                last_renewed: 9999.0,
+            },
+        };
+
+        assert!(!PoolManager::should_restore_pool_from_k8s(&pool));
     }
 
     #[tokio::test]

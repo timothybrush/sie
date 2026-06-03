@@ -16,6 +16,7 @@ use super::payload_store::PayloadStore;
 use super::streaming::{
     ChunkApplied, ChunkEnvelope, ChunkError, NakEnvelope, StreamCollector, StreamOutcome,
 };
+use crate::endpoint::InferenceEndpoint;
 use crate::metrics;
 
 const PAYLOAD_OFFLOAD_THRESHOLD: usize = 1_024 * 1_024; // 1 MB
@@ -262,6 +263,17 @@ pub struct GenerateParams {
     /// ``sampling_params["repetition_penalty"]``. Absent → sampler default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f64>,
+    /// SGLang ``sampling_params["min_new_tokens"]``: integer ``>= 0``,
+    /// gateway-validated. Minimum tokens the model must emit before
+    /// any stop condition can fire. Absent → sampler default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+    /// Per-request kwargs forwarded to the tokenizer's
+    /// ``apply_chat_template``. Worker merges them on top of the model
+    /// YAML defaults (YAML wins on conflict). Validated as a JSON
+    /// object by the gateway. Absent → only YAML defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
     /// Structured-output spec. Absent when the request omitted the
     /// ``grammar`` field (SIE-native) or ``response_format`` (OpenAI
     /// chat). Populated by :func:`handlers::grammar::parse_grammar`
@@ -363,6 +375,16 @@ pub struct WorkItem {
     pub model_id: String,
     #[serde(default)]
     pub profile_id: String,
+    /// Execution engine the bundle that resolved this request
+    /// declares. Today only ``"pytorch"`` is recognised (see
+    /// ``KNOWN_ENGINES`` in ``types::bundle``). Workers can use
+    /// this as a sanity check (``assert engine == self.engine``)
+    /// or as a soft dispatch hint when a single pool ever ends up
+    /// multiplexing engines. Older workers default to ``""`` and
+    /// ignore the field — back-compat is preserved by
+    /// ``#[serde(default)]``.
+    #[serde(default)]
+    pub engine: String,
     pub pool_name: String,
     pub machine_profile: String,
     /// Per-item payload. Carried as `rmpv::Value` so msgpack request
@@ -460,6 +482,7 @@ struct WorkItemRef<'a> {
     pub operation: &'a str,
     pub model_id: &'a str,
     pub profile_id: &'a str,
+    pub engine: &'a str,
     pub pool_name: &'a str,
     pub machine_profile: &'a str,
     pub item: Option<&'a rmpv::Value>,
@@ -502,6 +525,7 @@ struct WorkItemShared<'a> {
     model: &'a str,
     pool: &'a str,
     gpu: &'a str,
+    engine: &'a str,
     bundle_config_hash: &'a str,
     router_id: &'a str,
     reply_subject: &'a str,
@@ -557,6 +581,7 @@ pub struct WorkPublisher {
     payload_store: Arc<dyn PayloadStore>,
     result_timeout: Duration,
     max_stream_pending: u64,
+    stream_max_age: Duration,
     /// Pools we've already `get_or_create_stream`'d for, keyed by pool
     /// name so we skip the admin-API round trip on subsequent
     /// requests. The value is the pre-computed JetStream stream name
@@ -1045,6 +1070,7 @@ impl WorkPublisher {
         payload_store: Arc<dyn PayloadStore>,
         result_timeout: Duration,
         max_stream_pending: u64,
+        stream_max_age: Duration,
     ) -> Self {
         Self {
             jetstream,
@@ -1052,6 +1078,7 @@ impl WorkPublisher {
             payload_store,
             result_timeout,
             max_stream_pending,
+            stream_max_age,
             ensured_streams: DashMap::new(),
             stream_info_cache: DashMap::new(),
             pending_results: DashMap::new(),
@@ -1095,6 +1122,25 @@ impl WorkPublisher {
         &self.router_id
     }
 
+    /// Number of JetStream consumers registered on the pool's
+    /// ``WORK_POOL_<pool>`` stream — refreshed by the stream-info
+    /// monitor. ``None`` when the pool hasn't been observed yet
+    /// (cold cache); ``Some(0)`` is possible briefly during worker
+    /// roll-over.
+    ///
+    /// Callers use this to gate the H9 first-chunk-fallback path: in
+    /// single-consumer pools the republish targets the same worker
+    /// that's already handling the original request, which produces
+    /// a self-induced cancel-tombstone race
+    /// (``cancel arrived before this worker registered;
+    /// pool-republished attempt is authoritative``). Skipping the
+    /// fallback in that shape preserves the legitimate overall_timeout
+    /// fallback for genuinely slow workers without trading it for a
+    /// guaranteed 503.
+    pub fn pool_consumer_count(&self, pool: &str) -> Option<usize> {
+        self.stream_info_cache.get(pool).map(|v| v.num_consumers)
+    }
+
     /// Ensure the stream exists for the given pool (cached — admin call happens once per pool).
     ///
     /// Returns the cached JetStream stream name as an `Arc<str>` so
@@ -1115,7 +1161,7 @@ impl WorkPublisher {
                 subjects,
                 retention: jetstream::stream::RetentionPolicy::WorkQueue,
                 storage: jetstream::stream::StorageType::Memory,
-                max_age: Duration::from_secs(60),
+                max_age: self.stream_max_age,
                 max_messages: 100_000,
                 ..Default::default()
             })
@@ -1246,6 +1292,7 @@ impl WorkPublisher {
         endpoint: &str,
         model: &str,
         _bundle: &str,
+        engine: &str,
         gpu: &str,
         bundle_config_hash: &str,
         items: Vec<rmpv::Value>,
@@ -1294,12 +1341,10 @@ impl WorkPublisher {
             .unwrap_or_default()
             .as_secs_f64();
 
-        // M5: capture the W3C Trace Context for envelope injection.
-        // Done once per request so the propagator runs O(1) regardless
-        // of fan-out width. Both fields are `None` when no gateway
-        // span is recording — the envelope omits the keys in that
-        // case (see `WorkItemRef.serde(skip_serializing_if)`).
-        let (traceparent, tracestate) = crate::observability::propagation::inject_current_context();
+        // Generation queue fallback carries trace context. Encode /
+        // score / extract intentionally keep the pre-generation queue
+        // hot path and wire shape: no OTel lookup, no envelope fields.
+        let (traceparent, tracestate) = Self::trace_context_for_endpoint(endpoint);
 
         // Every work item in a request shares the same pool / model /
         // params block. `WorkItemRef` borrows these values so we don't
@@ -1311,6 +1356,7 @@ impl WorkPublisher {
             model,
             pool,
             gpu,
+            engine,
             bundle_config_hash,
             router_id: &self.router_id,
             reply_subject: &reply_subject,
@@ -1325,8 +1371,7 @@ impl WorkPublisher {
         // so on any error we have to unwind the collector entry
         // and whatever payloads the successful siblings already
         // wrote to the offload store, otherwise both leak until
-        // the result-timeout sweep kicks in (review feedback on
-        // PR #716).
+        // the result-timeout sweep kicks in.
         let publish_outcome = if endpoint == "score" {
             self.publish_score(&shared, items, &subject)
                 .await
@@ -1396,6 +1441,18 @@ impl WorkPublisher {
         Ok((request_id, rx))
     }
 
+    fn trace_context_for_endpoint(endpoint: &str) -> (Option<String>, Option<String>) {
+        if Self::should_propagate_queue_trace(endpoint) {
+            crate::observability::propagation::inject_current_context()
+        } else {
+            (None, None)
+        }
+    }
+
+    fn should_propagate_queue_trace(endpoint: &str) -> bool {
+        InferenceEndpoint::from_label(endpoint).injects_queue_trace_context()
+    }
+
     /// Publish the single work item for a score request.
     ///
     /// The score endpoint collapses the whole request into one work
@@ -1423,6 +1480,7 @@ impl WorkPublisher {
             operation: shared.endpoint,
             model_id: shared.model,
             profile_id: "default",
+            engine: shared.engine,
             pool_name: shared.pool,
             machine_profile: shared.gpu,
             item: None,
@@ -1503,6 +1561,7 @@ impl WorkPublisher {
         &self,
         target: PublishTarget,
         _bundle: &str,
+        engine: &str,
         gpu: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
@@ -1555,6 +1614,7 @@ impl WorkPublisher {
             model: &model,
             pool: &pool,
             gpu,
+            engine,
             bundle_config_hash,
             router_id: &self.router_id,
             reply_subject: &reply_subject,
@@ -1612,6 +1672,7 @@ impl WorkPublisher {
         &self,
         target: PublishTarget,
         _bundle: &str,
+        engine: &str,
         gpu: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
@@ -1659,6 +1720,7 @@ impl WorkPublisher {
             model: &model,
             pool: &pool,
             gpu,
+            engine,
             bundle_config_hash,
             router_id: &self.router_id,
             reply_subject: &reply_subject,
@@ -1806,6 +1868,7 @@ impl WorkPublisher {
             operation: shared.endpoint,
             model_id: shared.model,
             profile_id: "default",
+            engine: shared.engine,
             pool_name: shared.pool,
             machine_profile: shared.gpu,
             item: None,
@@ -1844,7 +1907,7 @@ impl WorkPublisher {
             .jetstream
             .send_publish(
                 subject.to_string(),
-                jetstream::context::Publish::build()
+                jetstream::message::PublishMessage::build()
                     .message_id(shared.request_id)
                     .payload(encoded.clone().into()),
             )
@@ -1985,7 +2048,7 @@ impl WorkPublisher {
             .jetstream
             .send_publish(
                 subject.clone(),
-                jetstream::context::Publish::build()
+                jetstream::message::PublishMessage::build()
                     .message_id(&msg_id)
                     .payload(payload.into()),
             )
@@ -2047,6 +2110,7 @@ impl WorkPublisher {
             operation: shared.endpoint,
             model_id: shared.model,
             profile_id: "default",
+            engine: shared.engine,
             pool_name: shared.pool,
             machine_profile: shared.gpu,
             item: Some(&item_value),
@@ -2678,6 +2742,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "BAAI/bge-m3".to_string(),
             profile_id: String::new(),
+            engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
@@ -2728,6 +2793,25 @@ mod tests {
         assert_eq!(decoded.bundle_config_hash, "abc123");
         assert_eq!(decoded.router_id, "router-1");
         assert_eq!(decoded.reply_subject, "_INBOX.r1.req-1");
+        assert_eq!(decoded.engine, "pytorch");
+    }
+
+    #[test]
+    fn test_work_item_engine_back_compat() {
+        let mut without_engine = serde_json::Map::new();
+        without_engine.insert("work_item_id".into(), "req-1.0".into());
+        without_engine.insert("request_id".into(), "req-1".into());
+        without_engine.insert("item_index".into(), 0.into());
+        without_engine.insert("total_items".into(), 1.into());
+        without_engine.insert("operation".into(), "encode".into());
+        without_engine.insert("model_id".into(), "m".into());
+        without_engine.insert("pool_name".into(), "default".into());
+        without_engine.insert("machine_profile".into(), "".into());
+        without_engine.insert("reply_subject".into(), "_INBOX.x.y".into());
+        let encoded = rmp_serde::to_vec_named(&without_engine).unwrap();
+        let decoded: WorkItem = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.engine, "");
+        assert_eq!(decoded.operation, "encode");
     }
 
     /// Regression: `WorkItemRef` is the borrowed view we use on the
@@ -2745,6 +2829,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "BAAI/bge-m3".to_string(),
             profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
@@ -2786,6 +2871,7 @@ mod tests {
             operation: &owned.operation,
             model_id: &owned.model_id,
             profile_id: &owned.profile_id,
+            engine: &owned.engine,
             pool_name: &owned.pool_name,
             machine_profile: &owned.machine_profile,
             item: Some(&item_value),
@@ -2862,6 +2948,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "model".to_string(),
             profile_id: String::new(),
+            engine: String::new(),
             pool_name: "default".to_string(),
             machine_profile: String::new(),
             item: None,
@@ -3199,6 +3286,7 @@ mod tests {
             operation: "generate".to_string(),
             model_id: "m".to_string(),
             profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
             machine_profile: "g".to_string(),
             item: None,
@@ -3346,6 +3434,7 @@ mod tests {
             operation: "generate".to_string(),
             model_id: "m".to_string(),
             profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
             machine_profile: "g".to_string(),
             item: None,
@@ -3388,6 +3477,7 @@ mod tests {
             operation: "generate".to_string(),
             model_id: "m".to_string(),
             profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
             machine_profile: "g".to_string(),
             item: None,
@@ -3458,6 +3548,61 @@ mod tests {
         assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
         assert_eq!(parts[1].len(), 32, "trace_id is 32 hex chars");
         assert_eq!(parts[2].len(), 16, "span_id is 16 hex chars");
+    }
+
+    #[test]
+    fn test_queue_trace_context_stays_off_for_non_generation() {
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry::Context;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::TracerProvider;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = TracerProvider::builder().build();
+        let tracer = provider.tracer("gateway-test");
+        let span = tracer.start("gateway.proxy_request");
+        let cx = Context::current().with_span(span);
+        let _guard = cx.attach();
+
+        for endpoint in InferenceEndpoint::NON_GENERATION_QUEUE_LABELS {
+            assert!(
+                !WorkPublisher::should_propagate_queue_trace(endpoint),
+                "{endpoint} must keep the pre-generation queue hot path"
+            );
+            let (tp, ts) = WorkPublisher::trace_context_for_endpoint(endpoint);
+            assert!(tp.is_none(), "{endpoint} unexpectedly injected traceparent");
+            assert!(ts.is_none(), "{endpoint} unexpectedly injected tracestate");
+        }
+        let (tp, ts) = WorkPublisher::trace_context_for_endpoint("unknown");
+        assert!(
+            tp.is_none(),
+            "unknown endpoint unexpectedly injected traceparent"
+        );
+        assert!(
+            ts.is_none(),
+            "unknown endpoint unexpectedly injected tracestate"
+        );
+    }
+
+    #[test]
+    fn test_queue_trace_context_is_generation_only() {
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry::Context;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::TracerProvider;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = TracerProvider::builder().build();
+        let tracer = provider.tracer("gateway-test");
+        let span = tracer.start("gateway.proxy_generate");
+        let cx = Context::current().with_span(span);
+        let _guard = cx.attach();
+
+        assert!(WorkPublisher::should_propagate_queue_trace("generate"));
+        let (tp, _ts) = WorkPublisher::trace_context_for_endpoint("generate");
+        let tp = tp.expect("generate queue fallback should propagate traceparent");
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
     }
 
     // ----- H9 — first-chunk-fallback rate limit ---------------------

@@ -923,7 +923,7 @@ def test_chunk_translator_tolerates_2tuple_shape() -> None:
     assert chunk.logprobs[0]["token"] == ""
 
 
-# ── H4 / M4 multi-candidate logprobs ─────────────────────────────────────
+# ── Multi-candidate logprobs ─────────────────────────────────────
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -990,7 +990,7 @@ def test_generate_streaming_n_gt_one_attaches_per_candidate_logprobs(mock_async_
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
 def test_generate_n_gt_one_non_streaming_emits_per_candidate_logprobs(mock_async_client: MagicMock, adapter) -> None:
-    """M4: non-streaming ``n>1`` with ``logprobs=True`` populates each
+    """Non-streaming ``n>1`` with ``logprobs=True`` populates each
     candidate's ``logprobs`` field from SGLang's
     ``meta_info.output_token_logprobs`` (was ``None`` pre-fix).
     """

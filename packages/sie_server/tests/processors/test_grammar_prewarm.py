@@ -97,8 +97,6 @@ def _patch_compile(
     When ``grammar.label`` is in ``raise_on`` the stub raises a
     :class:`RuntimeError` so we can exercise the per-entry failure path.
     """
-    import sie_server.processors.streaming as streaming_mod
-
     calls: list[tuple[Any, Any]] = []
 
     def _stub_compile(tok: Any, grammar: Any) -> Any:
@@ -108,13 +106,13 @@ def _patch_compile(
             raise RuntimeError(msg)
         return True
 
-    monkeypatch.setattr(streaming_mod, "compile_outlines", _stub_compile)
+    monkeypatch.setattr("sie_server.processors.streaming.compile_outlines", _stub_compile)
 
     async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
         return object()
 
     monkeypatch.setattr(
-        streaming_mod.StreamingProcessor,
+        StreamingProcessor,
         "_get_tokenizer",
         _fake_get_tokenizer,
     )

@@ -146,22 +146,6 @@ def mock_sie_client() -> MagicMock:
         item_dicts = [{"text": _get_text(i)} for i in items]
         return _create_mock_extract_result(item_dicts, labels=labels)
 
-    def mock_extract_classify(
-        _model: str,
-        items: Any,
-        *,
-        labels: list[str] | None = None,
-        **kwargs: Any,
-    ) -> list[dict] | dict:
-        if not isinstance(items, list):
-            items = [items]
-            item_dicts = [{"text": _get_text(items[0])}]
-            results = _create_mock_classify_result(item_dicts, labels=labels)
-            return results[0]
-
-        item_dicts = [{"text": _get_text(i)} for i in items]
-        return _create_mock_classify_result(item_dicts, labels=labels)
-
     client.encode = MagicMock(side_effect=mock_encode)
     # Default extract returns entities; tests that need classification
     # swap the side_effect on the second call.

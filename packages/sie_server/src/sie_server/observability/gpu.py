@@ -5,8 +5,6 @@ Gracefully handles missing pynvml or no GPU.
 
 Note: the ``pynvml`` module is supplied at runtime by the ``nvidia-ml-py``
 package (the legacy ``pynvml`` PyPI package is deprecated).
-
-See DESIGN.md Section 5.6.
 """
 
 from __future__ import annotations

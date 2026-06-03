@@ -169,8 +169,8 @@ class InvalidMediaError(ValueError):
 
     - HTTP / in-process: the endpoints' ``except ValueError`` routes it through
       ``InferenceErrorHandler.handle_value_error`` (see ``api/encode.py``).
-    - Queue / NATS: ``_classify_inference_exception`` maps it to
-      ``ErrorCode.INVALID_INPUT`` (see ``nats_pull_loop.py``).
+    - Queue / sidecar: ``queue_executor._inference_exception_outcome`` maps it
+      to ``ErrorCode.INVALID_INPUT`` before the sidecar publishes the result.
 
     Without this, an un-decoded base64 ``str`` slipping past the wire boundary
     raised ``TypeError: a bytes-like object is required, not 'str'`` deep inside

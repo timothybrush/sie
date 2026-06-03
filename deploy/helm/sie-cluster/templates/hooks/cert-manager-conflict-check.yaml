@@ -3,8 +3,9 @@
        (b) Bundle off + cert-manager-dependent mode (self-signed, trust-manager, trustBundle):
            fail if cert-manager is NOT present (presence check).
        Both cases share the label-based detection logic and the same RBAC. */ -}}
-{{- $tlsMode := .Values.ingress.tls.mode }}
-{{- $needsCm := or .Values.certManagerBundle.trustManager.install .Values.certManagerBundle.trustBundle.enabled (and .Values.ingress.tls.enabled (or (eq $tlsMode "self-signed") (eq $tlsMode "cert-manager"))) }}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- $tlsMode := default "byo" $tls.mode }}
+{{- $needsCm := or .Values.certManagerBundle.trustManager.install .Values.certManagerBundle.trustBundle.enabled (and $tls.enabled (or (eq $tlsMode "self-signed") (eq $tlsMode "cert-manager"))) }}
 {{- $bundleOn := .Values.certManagerBundle.certManager.install }}
 {{- if or $bundleOn $needsCm }}
 {{- $fullname := include "sie-cluster.fullname" . }}
@@ -116,7 +117,7 @@ spec:
               Refusing to install bundled cert-manager because two controllers reconciling
               the same CRDs will corrupt issuance state.
               Remediation:
-                (a) set certManagerBundle.certManager.install=false and use ingress.tls.mode=cert-manager
+                (a) set certManagerBundle.certManager.install=false and use ingress.tlsConfig.mode=cert-manager
                     against the existing install, OR
                 (b) uninstall the existing cert-manager first, OR
                 (c) set certManagerBundle.allowExistingCRDs=true (DANGEROUS).

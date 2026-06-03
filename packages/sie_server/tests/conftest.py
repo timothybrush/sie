@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -36,6 +36,7 @@ def device() -> str:
         if torch.cuda.is_available():
             return "cuda:0"
     except ImportError:
+        # torch not installed — caller will fall back to CPU.
         pass
     return "cpu"
 
@@ -53,10 +54,17 @@ def _find_free_port(start: int = 8090, end: int = 8200) -> int:
     raise RuntimeError(msg)
 
 
-def _wait_for_health(url: str, timeout_s: float = 120.0, poll_interval_s: float = 1.0) -> bool:
+def _wait_for_health(
+    url: str,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 1.0,
+    proc: subprocess.Popen | None = None,
+) -> bool:
     """Wait for server health endpoint to respond 200."""
     start = time.monotonic()
     while time.monotonic() - start < timeout_s:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             response = httpx.get(f"{url}/healthz", timeout=5.0)
             if response.status_code == 200:
@@ -84,10 +92,6 @@ def sie_server(device: str) -> Generator[str]:
             client = SIEClient(sie_server)
             # ... test code ...
     """
-    mise_path = shutil.which("mise")
-    if mise_path is None:
-        pytest.skip("mise not found in PATH - required for integration tests")
-
     models_dir = _project_root / "packages" / "sie_server" / "models"
     port = _find_free_port(8090, 8200)
 
@@ -97,10 +101,10 @@ def sie_server(device: str) -> Generator[str]:
     models = "BAAI/bge-m3:bge_m3_flag,NeuML/gliner-bert-tiny"
 
     cmd = [
-        mise_path,
-        "run",
+        sys.executable,
+        "-m",
+        "sie_server.cli",
         "serve",
-        "--",
         "-p",
         str(port),
         "-d",
@@ -123,10 +127,13 @@ def sie_server(device: str) -> Generator[str]:
 
     try:
         health_timeout = float(os.environ.get("SIE_TEST_SERVER_TIMEOUT", "120"))
-        if not _wait_for_health(url, timeout_s=health_timeout):
-            proc.terminate()
-            proc.wait(timeout=10)
-            pytest.fail(f"Server failed to start within {health_timeout:.0f}s — check server output above")
+        if not _wait_for_health(url, timeout_s=health_timeout, proc=proc):
+            returncode = proc.poll()
+            if returncode is None:
+                proc.terminate()
+                proc.wait(timeout=10)
+                pytest.fail(f"Server failed to start within {health_timeout:.0f}s — check server output above")
+            pytest.fail(f"Server process exited before health check passed (exit code {returncode})")
 
         logger.info("Integration test server ready at %s", url)
         yield url
@@ -172,6 +179,8 @@ def _get_docker_client() -> Any:
         pytest.skip("docker package not installed")
     except Exception as e:  # noqa: BLE001 — Docker API errors are varied
         pytest.skip(f"Docker not available: {e}")
+    # Unreachable: both except branches call pytest.skip (NoReturn).
+    raise RuntimeError("unreachable")
 
 
 def _build_docker_image(
@@ -349,8 +358,13 @@ def sie_docker_server() -> Generator[str]:
 
 
 @pytest.fixture(scope="session")
-def docker_client(sie_docker_server: str) -> SIEClient:
-    """Create an SIEClient connected to the Docker test server."""
+def sie_docker_client(sie_docker_server: str) -> SIEClient:
+    """Create an SIEClient connected to the Docker test server.
+
+    Named ``sie_docker_client`` (not ``docker_client``) to avoid clashing with the
+    local ``docker_client`` variable inside fixtures that hold the actual Docker
+    SDK client.
+    """
     return SIEClient(sie_docker_server, timeout_s=180.0)
 
 

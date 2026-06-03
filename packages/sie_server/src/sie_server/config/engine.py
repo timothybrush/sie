@@ -2,8 +2,6 @@
 
 Defines the EngineConfig Pydantic model that controls server-wide settings
 like batching, memory management, and performance tuning.
-
-See DESIGN.md Section 10.1 for full specification.
 """
 
 import os
@@ -68,8 +66,18 @@ class AdaptiveBatchingConfig(BaseModel):
     ] = 500.0
     min_wait_ms: Annotated[
         float,
-        Field(ge=0.1, description="Minimum batch wait time in milliseconds"),
-    ] = 1.0
+        Field(
+            ge=0.1,
+            description=(
+                "Floor for the adaptive first-request timeout. Not a "
+                "mandatory wait — under load the batcher yields on "
+                "full/coalesce far earlier, so raising this has no "
+                "steady-state latency cost. Keeping it well above zero "
+                "prevents GPU-batch shredding when the PI controller "
+                "briefly wants to flush on every submit."
+            ),
+        ),
+    ] = 15.0
     max_wait_ms: Annotated[
         float,
         Field(ge=1, description="Maximum batch wait time in milliseconds"),
@@ -94,6 +102,36 @@ class AdaptiveBatchingConfig(BaseModel):
         int,
         Field(ge=1, description="Batches between controller updates"),
     ] = 10
+
+    # -- Starvation detector / deadlock recovery ---------------------------
+    # See ``AdaptiveBatchingParams`` in core/worker/types.py for the full
+    # rationale. TL;DR: the PI loop can get stuck in a "batch-of-1"
+    # attractor when both knobs bottom out; these fields arm an escape.
+    starvation_recovery_enabled: Annotated[
+        bool,
+        Field(description="Enable self-heal when both knobs sit at their floors."),
+    ] = True
+    starvation_window: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Consecutive tiny batches at the floor before declaring "
+                "deadlock. Should be long enough to absorb genuine idle "
+                "tails, short enough to recover within a few seconds."
+            ),
+        ),
+    ] = 20
+    starvation_batch_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Batch sizes at or below this count toward the starvation "
+                "streak. 1 = only single-item GPU forwards are pathological."
+            ),
+        ),
+    ] = 1
 
     @model_validator(mode="after")
     def validate_invariants(self) -> "AdaptiveBatchingConfig":
@@ -223,8 +261,43 @@ class EngineConfig(BaseSettings):
     ] = 64
     max_batch_wait_ms: Annotated[
         float,
-        Field(description="Maximum milliseconds to wait for batch to fill"),
-    ] = 10.0
+        Field(
+            description=(
+                "Initial value for the adaptive first-request timeout. "
+                "The PI controller moves this between "
+                "adaptive_batching.min_wait_ms and max_wait_ms at runtime, "
+                "so the practical effect of this knob is bounded by those."
+            ),
+        ),
+    ] = 15.0
+    coalesce_ms: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            description=(
+                "Ceiling for the idle-coalesce window. When items stop "
+                "arriving for this long, the batcher yields whatever it "
+                "has accumulated. Tune to the typical inter-arrival "
+                "jitter of upstream IPC bursts so a full sidecar batch "
+                "lands in one GPU forward instead of being shredded. "
+                "Effective window is capped by ``coalesce_ratio * "
+                "max_batch_wait_ms``."
+            ),
+        ),
+    ] = 15.0
+    coalesce_ratio: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Coalesce window as a fraction of the current "
+                "max_batch_wait_ms. Keeps the coalesce window "
+                "proportional as the PI controller moves the wait "
+                "timeout."
+            ),
+        ),
+    ] = 0.5
     max_concurrent_requests: Annotated[
         int,
         Field(description="Maximum concurrent requests (queue size)"),

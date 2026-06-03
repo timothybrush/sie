@@ -15,9 +15,6 @@ from sie_server.adapters.colqwen3 import ColQwen3Adapter
 from sie_server.adapters.nemo_colembed import NemoColEmbedAdapter
 from sie_server.types.inputs import Item
 
-# Create a random generator for tests
-_RNG = np.random.default_rng(42)
-
 
 class TestColPaliAdapter:
     """Tests for ColPaliAdapter with mocked model."""
@@ -379,6 +376,24 @@ class TestVLMCudaCacheClearing:
         source = inspect.getsource(ColPaliAdapter._encode_prepared_batch)
         assert "torch.cuda.empty_cache()" in source, (
             "ColPali._encode_prepared_batch must call torch.cuda.empty_cache() to prevent OOM"
+        )
+
+    def test_colpali_encode_images_has_empty_cache(self) -> None:
+        """ColPali _encode_images (single-item fallback) source contains empty_cache call."""
+        import inspect
+
+        source = inspect.getsource(ColPaliAdapter._encode_images)
+        assert "torch.cuda.empty_cache()" in source, (
+            "ColPali._encode_images must call torch.cuda.empty_cache() to prevent OOM"
+        )
+
+    def test_colqwen2_encode_images_batched_has_empty_cache(self) -> None:
+        """ColQwen2 _encode_images_batched (document-path) source contains empty_cache call."""
+        import inspect
+
+        source = inspect.getsource(ColQwen2Adapter._encode_images_batched)
+        assert "torch.cuda.empty_cache()" in source, (
+            "ColQwen2._encode_images_batched must call torch.cuda.empty_cache() to prevent OOM"
         )
 
     def test_nemo_colembed_encode_images_has_empty_cache(self) -> None:

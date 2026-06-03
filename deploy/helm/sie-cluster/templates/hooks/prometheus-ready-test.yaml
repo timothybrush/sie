@@ -1,7 +1,7 @@
 {{- if and .Values.healthGates.enabled .Values.autoscaling.enabled }}
 {{- /*
   When kube-prometheus-stack is installed as a sub-chart, Prometheus runs in the release
-  namespace — not the hardcoded "monitoring" namespace. Auto-derive both the namespace
+  namespace; not the hardcoded "monitoring" namespace. Auto-derive both the namespace
   and address so the health gate Job can reach Prometheus without manual overrides.
 */ -}}
 {{- $promNs := .Values.healthGates.monitoringNamespace }}

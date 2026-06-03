@@ -186,6 +186,14 @@ class ModelRegistry:
                 integral_gain=ab.integral_gain,
                 window_size=ab.window_size,
                 update_interval=ab.update_interval,
+                # Starvation detector lives on the runtime params struct so
+                # it is configurable per-deployment without touching code.
+                # Engine-level defaults (see AdaptiveBatchingConfig) are
+                # tuned for production; tests override via direct
+                # AdaptiveBatchingParams construction.
+                starvation_recovery_enabled=ab.starvation_recovery_enabled,
+                starvation_window=ab.starvation_window,
+                starvation_batch_size=ab.starvation_batch_size,
             )
 
         # Build OOM recovery config from the engine config (if present).
@@ -201,6 +209,8 @@ class ModelRegistry:
             attention_backend=engine_config.attention_backend if engine_config else "auto",
             max_batch_requests=engine_config.max_batch_requests if engine_config else None,
             max_batch_wait_ms=engine_config.max_batch_wait_ms if engine_config else None,
+            coalesce_ms=engine_config.coalesce_ms if engine_config else None,
+            coalesce_ratio=engine_config.coalesce_ratio if engine_config else None,
             max_queue_size=engine_config.max_concurrent_requests if engine_config else None,
             instrumentation=engine_config.instrumentation if engine_config else False,
             max_loras_per_model=engine_config.max_loras_per_model if engine_config else DEFAULT_MAX_LORAS,
@@ -1599,8 +1609,6 @@ class ModelRegistry:
             model: Model name.
             lora: LoRA adapter name/path.
         """
-        import asyncio
-
         loop = asyncio.get_running_loop()
 
         try:
@@ -1648,8 +1656,6 @@ class ModelRegistry:
             model: Model name.
             lora: LoRA adapter name/path.
         """
-        import asyncio
-
         loop = asyncio.get_running_loop()
 
         try:

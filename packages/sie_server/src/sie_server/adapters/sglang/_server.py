@@ -170,6 +170,7 @@ def wait_for_server(
             if response.status_code == 200:
                 return True
         except requests.RequestException:
+            # Health endpoint not up yet — keep polling until timeout.
             pass
 
         time.sleep(HEALTH_CHECK_INTERVAL_S)

@@ -319,14 +319,14 @@ mod tests {
         // family and look up the matching series.
         let families = metrics::REGISTRY.gather();
         for mf in &families {
-            if mf.get_name() != "sie_gateway_request_latency_seconds" {
+            if mf.name() != "sie_gateway_request_latency_seconds" {
                 continue;
             }
             for m in mf.get_metric() {
                 let labels: std::collections::HashMap<&str, &str> = m
                     .get_label()
                     .iter()
-                    .map(|l| (l.get_name(), l.get_value()))
+                    .map(|l| (l.name(), l.value()))
                     .collect();
                 if labels.get("endpoint").copied() == Some(endpoint)
                     && labels.get("machine_profile").copied() == Some(machine_profile)
@@ -424,9 +424,9 @@ mod tests {
             let families = metrics::REGISTRY.gather();
             families
                 .iter()
-                .filter(|mf| mf.get_name() == "sie_gateway_requests_total")
+                .filter(|mf| mf.name() == "sie_gateway_requests_total")
                 .flat_map(|mf| mf.get_metric().iter())
-                .map(|m| m.get_counter().get_value())
+                .map(|m| m.counter.value())
                 .sum()
         };
 
@@ -439,9 +439,9 @@ mod tests {
             let families = metrics::REGISTRY.gather();
             families
                 .iter()
-                .filter(|mf| mf.get_name() == "sie_gateway_requests_total")
+                .filter(|mf| mf.name() == "sie_gateway_requests_total")
                 .flat_map(|mf| mf.get_metric().iter())
-                .map(|m| m.get_counter().get_value())
+                .map(|m| m.counter.value())
                 .sum()
         };
 

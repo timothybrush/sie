@@ -290,9 +290,7 @@ class TestGenerateEndpoint:
 
     def test_oversized_prompt_returns_413(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         # Shrink the cap so the test doesn't have to build a 4 MiB string.
-        import sie_server.api.generate as generate_mod
-
-        monkeypatch.setattr(generate_mod, "_MAX_PROMPT_BYTES", 16)
+        monkeypatch.setattr("sie_server.api.generate._MAX_PROMPT_BYTES", 16)
         response = client.post(
             "/v1/generate/Qwen__Qwen3-4B-Instruct",
             json={"prompt": "x" * 64, "max_new_tokens": 8},
@@ -376,9 +374,7 @@ class TestGenerateEndpoint:
 
     def test_prompt_at_cap_is_accepted(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         # A prompt exactly at the byte cap is allowed (boundary check).
-        import sie_server.api.generate as generate_mod
-
-        monkeypatch.setattr(generate_mod, "_MAX_PROMPT_BYTES", 16)
+        monkeypatch.setattr("sie_server.api.generate._MAX_PROMPT_BYTES", 16)
         response = client.post(
             "/v1/generate/Qwen__Qwen3-4B-Instruct",
             json={"prompt": "x" * 16, "max_new_tokens": 8},

@@ -1038,14 +1038,14 @@ pub fn clear_fulfilled_demand(
     // Gather current demand label pairs from the metric
     let metric_families = REGISTRY.gather();
     for mf in &metric_families {
-        if mf.get_name() != "sie_gateway_pending_demand" {
+        if mf.name() != "sie_gateway_pending_demand" {
             continue;
         }
         for m in mf.get_metric() {
             let labels: std::collections::HashMap<&str, &str> = m
                 .get_label()
                 .iter()
-                .map(|l| (l.get_name(), l.get_value()))
+                .map(|l| (l.name(), l.value()))
                 .collect();
             if let Some(&gpu) = labels.get("machine_profile") {
                 let bundle = labels.get("bundle").copied().unwrap_or("default");
@@ -1216,19 +1216,19 @@ mod tests {
         let families = REGISTRY.gather();
         let lease = families
             .iter()
-            .find(|mf| mf.get_name() == "sie_gateway_active_lease_gpus")
+            .find(|mf| mf.name() == "sie_gateway_active_lease_gpus")
             .expect("sie_gateway_active_lease_gpus should still be present after reset");
         let stale_present = lease.get_metric().iter().any(|m| {
             m.get_label().iter().any(|l| {
-                (l.get_name() == "machine_profile" && l.get_value() == "stale-gpu")
-                    || (l.get_name() == "bundle" && l.get_value() == "stale-bundle")
+                (l.name() == "machine_profile" && l.value() == "stale-gpu")
+                    || (l.name() == "bundle" && l.value() == "stale-bundle")
             })
         });
         assert!(!stale_present, "stale label combination survived reset");
         let sentinel_present = lease
             .get_metric()
             .iter()
-            .any(|m| m.get_label().iter().all(|l| l.get_value().is_empty()));
+            .any(|m| m.get_label().iter().all(|l| l.value().is_empty()));
         assert!(
             sentinel_present,
             "empty-label sentinel missing after update_pool_metrics(&[])"
@@ -1338,12 +1338,12 @@ mod tests {
         let families = REGISTRY.gather();
         let stale_present = families
             .iter()
-            .filter(|mf| mf.get_name() == "sie_gateway_worker_queue_depth")
+            .filter(|mf| mf.name() == "sie_gateway_worker_queue_depth")
             .flat_map(|mf| mf.get_metric().iter())
             .any(|m| {
                 m.get_label()
                     .iter()
-                    .any(|l| l.get_name() == "worker" && l.get_value() == "ghost-worker")
+                    .any(|l| l.name() == "worker" && l.value() == "ghost-worker")
             });
         assert!(
             !stale_present,
@@ -1372,12 +1372,12 @@ mod tests {
         let families = REGISTRY.gather();
         let stale_present = families
             .iter()
-            .filter(|mf| mf.get_name() == "sie_gateway_model_workers")
+            .filter(|mf| mf.name() == "sie_gateway_model_workers")
             .flat_map(|mf| mf.get_metric().iter())
             .any(|m| {
                 m.get_label()
                     .iter()
-                    .any(|l| l.get_name() == "model" && l.get_value() == "org/ghost-model")
+                    .any(|l| l.name() == "model" && l.value() == "org/ghost-model")
             });
         assert!(
             !stale_present,
@@ -1688,14 +1688,14 @@ mod tests {
         let families = REGISTRY.gather();
         let ttft_series = families
             .iter()
-            .find(|mf| mf.get_name() == "sie_gateway_generation_ttft_seconds")
+            .find(|mf| mf.name() == "sie_gateway_generation_ttft_seconds")
             .expect("ttft family present")
             .get_metric()
             .iter()
             .filter(|m| {
                 m.get_label()
                     .iter()
-                    .any(|l| l.get_name() == "model" && l.get_value() == "card/model")
+                    .any(|l| l.name() == "model" && l.value() == "card/model")
             })
             .count();
         assert_eq!(
@@ -1705,14 +1705,14 @@ mod tests {
 
         let token_series = families
             .iter()
-            .find(|mf| mf.get_name() == "sie_gateway_generation_total_tokens")
+            .find(|mf| mf.name() == "sie_gateway_generation_total_tokens")
             .expect("total_tokens family present")
             .get_metric()
             .iter()
             .filter(|m| {
                 m.get_label()
                     .iter()
-                    .any(|l| l.get_name() == "model" && l.get_value() == "card/model")
+                    .any(|l| l.name() == "model" && l.value() == "card/model")
             })
             .count();
         assert_eq!(
@@ -1777,17 +1777,17 @@ mod tests {
         let families = REGISTRY.gather();
         let mut model_values: std::collections::HashSet<String> = std::collections::HashSet::new();
         for mf in &families {
-            if mf.get_name() != "sie_gateway_generation_ttft_seconds" {
+            if mf.name() != "sie_gateway_generation_ttft_seconds" {
                 continue;
             }
             for m in mf.get_metric() {
                 let labels = m.get_label();
                 let is_atk_pool = labels
                     .iter()
-                    .any(|l| l.get_name() == "pool" && l.get_value() == "atk-pool");
+                    .any(|l| l.name() == "pool" && l.value() == "atk-pool");
                 if is_atk_pool {
-                    if let Some(model_label) = labels.iter().find(|l| l.get_name() == "model") {
-                        model_values.insert(model_label.get_value().to_string());
+                    if let Some(model_label) = labels.iter().find(|l| l.name() == "model") {
+                        model_values.insert(model_label.value().to_string());
                     }
                 }
             }
@@ -1868,7 +1868,7 @@ mod tests {
             "sie_gateway_provisioning_responses_total",
         ] {
             assert!(
-                !pre.iter().any(|mf| mf.get_name() == needle),
+                !pre.iter().any(|mf| mf.name() == needle),
                 "precondition violated: {needle} still in gather() after reset"
             );
         }
@@ -1892,7 +1892,7 @@ mod tests {
         ] {
             let found = post
                 .iter()
-                .find(|mf| mf.get_name() == needle)
+                .find(|mf| mf.name() == needle)
                 .unwrap_or_else(|| panic!("{needle} missing after init + scrape path"));
             assert!(
                 !found.get_metric().is_empty(),
@@ -1948,7 +1948,7 @@ mod tests {
         let families: std::collections::HashSet<String> = REGISTRY
             .gather()
             .iter()
-            .map(|mf| mf.get_name().to_string())
+            .map(|mf| mf.name().to_string())
             .collect();
         for expected in [
             "sie_gateway_generation_ttft_seconds",

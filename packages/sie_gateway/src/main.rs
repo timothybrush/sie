@@ -1,5 +1,6 @@
 mod config;
 mod discovery;
+mod endpoint;
 mod error;
 mod handlers;
 mod health_mode;
@@ -307,9 +308,9 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Set up health manager based on mode. WebSocket health is the supported
-    // product path; NATS health is an internal/experimental consumer until
-    // workers publish `sie.health.>` by default.
+    // Set up health manager based on mode. Helm selects NATS health for the
+    // worker-sidecar queue path so the registry receives queue pool names and
+    // bundle config hashes from `sie.health.>` heartbeats.
     //
     // Core NATS subscriptions are resumed by the client on reconnect; do not spawn
     // duplicate `NatsHealthManager::start` loops on `reconnect_notify` (see PR review).
@@ -343,10 +344,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 "unsupported gateway health mode requested; falling back to WS"
             );
         }
-        HealthModeDisposition::TryNatsExperimental => {
-            tracing::warn!(
-                "NATS health mode is experimental/internal and requires workers to publish sie.health.>; if no publisher exists, the worker registry can remain empty"
-            );
+        HealthModeDisposition::TryNats => {
             if let Some(client) = nats_manager.get_client().await {
                 info!("using NATS health mode (shared connection)");
                 let nats_mgr = Arc::new(NatsHealthManager::new(Arc::clone(&registry)));
@@ -506,6 +504,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                         payload_store,
                         Duration::from_secs_f64(config.request_timeout),
                         config.max_stream_pending,
+                        Duration::from_secs(config.stream_max_age_s),
                     ));
 
                     if let Err(e) = publisher.start_inbox_subscription(&client).await {

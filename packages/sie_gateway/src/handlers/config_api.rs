@@ -453,6 +453,7 @@ mod tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
+            stream_max_age_s: 120,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),

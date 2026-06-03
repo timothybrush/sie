@@ -394,14 +394,28 @@ impl WorkerRegistry {
         unhealthy
     }
 
+    /// Resolve the NATS pool name for queue mode routing.
+    /// Finds a healthy worker matching the bundle (and optionally GPU) that has
+    /// a pool_name set and reports the expected bundle config hash.
+    #[cfg(test)]
+    pub async fn resolve_queue_pool(
+        &self,
+        bundle: &str,
+        gpu: &str,
+        bundle_config_hash: &str,
+    ) -> Option<String> {
+        self.resolve_queue_pool_matching(bundle, gpu, None, bundle_config_hash)
+    }
+
     /// Resolve the NATS pool name, constrained to a specific logical pool.
     pub async fn resolve_queue_pool_in_pool(
         &self,
         bundle: &str,
         gpu: &str,
         pool_name: &str,
+        bundle_config_hash: &str,
     ) -> Option<String> {
-        self.resolve_queue_pool_matching(bundle, gpu, Some(pool_name))
+        self.resolve_queue_pool_matching(bundle, gpu, Some(pool_name), bundle_config_hash)
     }
 
     fn resolve_queue_pool_matching(
@@ -409,13 +423,14 @@ impl WorkerRegistry {
         bundle: &str,
         gpu: &str,
         pool_name: Option<&str>,
+        bundle_config_hash: &str,
     ) -> Option<String> {
         let snap = self.snapshot.load();
 
         // `by_bundle` is keyed with `w.bundle.to_lowercase()` in
         // `RegistrySnapshot::build`, so the lookup has to use the
         // same Unicode-aware lowercase to keep non-ASCII bundle
-        // ids reachable (review feedback on PR #716). We only
+        // ids reachable. We only
         // allocate once per request on this branch, so the cost
         // is negligible compared to the per-candidate
         // `to_lowercase()` that `eq_ignore_ascii_case` replaced
@@ -436,6 +451,9 @@ impl WorkerRegistry {
                 }
             }
             if !gpu.is_empty() && !w.machine_profile.eq_ignore_ascii_case(gpu) {
+                continue;
+            }
+            if !bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash) {
                 continue;
             }
             return Some(w.pool_name.clone());
@@ -567,6 +585,10 @@ impl WorkerRegistry {
             models,
         }
     }
+}
+
+fn bundle_config_hash_matches(worker_hash: &str, expected_hash: &str) -> bool {
+    expected_hash.is_empty() || worker_hash == expected_hash
 }
 
 #[cfg(test)]
@@ -1168,7 +1190,7 @@ mod tests {
         msg.machine_profile = "l4-spot".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool_matching("default", "l4-spot", None);
+        let pool = reg.resolve_queue_pool("default", "l4-spot", "").await;
         assert_eq!(pool, Some("pool-a".to_string()));
     }
 
@@ -1190,12 +1212,12 @@ mod tests {
         reg.update_worker("http://w2:8080", isolated_msg).await;
 
         let pool = reg
-            .resolve_queue_pool_in_pool("default", "l4-spot", "eval-l4")
+            .resolve_queue_pool_in_pool("default", "l4-spot", "eval-l4", "")
             .await;
         assert_eq!(pool, Some("eval-l4".to_string()));
 
         let missing = reg
-            .resolve_queue_pool_in_pool("default", "l4-spot", "missing")
+            .resolve_queue_pool_in_pool("default", "l4-spot", "missing", "")
             .await;
         assert!(missing.is_none());
     }
@@ -1209,7 +1231,7 @@ mod tests {
         reg.update_worker("http://w1:8080", msg).await;
 
         // No GPU filter
-        let pool = reg.resolve_queue_pool_matching("premium", "", None);
+        let pool = reg.resolve_queue_pool("premium", "", "").await;
         assert_eq!(pool, Some("pool-b".to_string()));
     }
 
@@ -1221,7 +1243,7 @@ mod tests {
         msg.bundle = "default".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool_matching("premium", "", None);
+        let pool = reg.resolve_queue_pool("premium", "", "").await;
         assert!(pool.is_none());
     }
 
@@ -1233,7 +1255,7 @@ mod tests {
         msg.bundle = "default".into();
         reg.update_worker("http://w1:8080", msg).await;
 
-        let pool = reg.resolve_queue_pool_matching("default", "", None);
+        let pool = reg.resolve_queue_pool("default", "", "").await;
         assert!(pool.is_none());
     }
 
@@ -1246,8 +1268,45 @@ mod tests {
         reg.update_worker("http://w1:8080", msg).await;
         reg.mark_unhealthy("http://w1:8080").await;
 
-        let pool = reg.resolve_queue_pool_matching("default", "", None);
+        let pool = reg.resolve_queue_pool("default", "", "").await;
         assert!(pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_queue_pool_requires_matching_config_hash_when_expected() {
+        let reg = registry();
+        let mut stale = make_msg(true);
+        stale.name = "stale".into();
+        stale.pool_name = "old-pool".into();
+        stale.bundle = "default".into();
+        stale.bundle_config_hash = "old".into();
+        reg.update_worker("http://w1:8080", stale).await;
+
+        let mut current = make_msg(true);
+        current.name = "current".into();
+        current.pool_name = "current-pool".into();
+        current.bundle = "default".into();
+        current.bundle_config_hash = "new".into();
+        reg.update_worker("http://w2:8080", current).await;
+
+        let pool = reg.resolve_queue_pool("default", "", "new").await;
+        assert_eq!(pool, Some("current-pool".to_string()));
+
+        let missing = reg.resolve_queue_pool("default", "", "missing").await;
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_queue_pool_empty_expected_hash_keeps_legacy_match() {
+        let reg = registry();
+        let mut msg = make_msg(true);
+        msg.pool_name = "pool-a".into();
+        msg.bundle = "default".into();
+        msg.bundle_config_hash = String::new();
+        reg.update_worker("http://w1:8080", msg).await;
+
+        let pool = reg.resolve_queue_pool("default", "", "").await;
+        assert_eq!(pool, Some("pool-a".to_string()));
     }
 
     // ── dispatch_workers_for / ring_snapshot_for ───────────────────

@@ -1,7 +1,4 @@
-"""Base model adapter interface.
-
-See DESIGN.md Section 7.3 for specification.
-"""
+"""Base model adapter interface."""
 
 import logging
 from abc import ABC, abstractmethod
@@ -46,7 +43,7 @@ class ModelAdapter(ABC):
     Each model adapter wraps a specific model architecture and provides
     a consistent interface for loading, inference, and unloading.
 
-    Adapters are resolved in this order (see DESIGN.md Section 7.2):
+    Adapters are resolved in this order:
     1. base_model: inherit adapter from another model's config
     2. adapter: adapter.py:ClassName (file in model directory)
     3. adapter: sie_server.adapters.module:ClassName (built-in adapter)

@@ -2,7 +2,7 @@ sie_id: docling
 package_backed: true
 inputs:
   text: false
-  image: false
+  image: true
   audio: false
   video: false
   document: true

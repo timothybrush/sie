@@ -222,12 +222,12 @@ def test_metrics_export_contains_no_routing_or_prompt_identifiers() -> None:
         assert needle not in body, f"forbidden label/value {needle!r} leaked into /metrics body"
 
 
-def test_m5_observability_metrics_module_still_excludes_opentelemetry() -> None:
-    """M5+: the metrics surface module is still pure Prometheus.
+def test_observability_metrics_module_still_excludes_opentelemetry() -> None:
+    """The metrics surface module is still pure Prometheus.
 
     The metrics rollout originally banned OpenTelemetry mentions from this
     *specific module* because trace propagation was out of scope for
-    that work. M5 introduces trace context propagation, but the
+    that work. Trace context propagation exists, but the
     *worker observability metrics module itself* still has no need
     to import OpenTelemetry — the propagation surface lives in
     :mod:`sie_server.processors.streaming` and the FastAPI tracing
@@ -243,7 +243,7 @@ def test_m5_observability_metrics_module_still_excludes_opentelemetry() -> None:
 
     metrics_path = pathlib.Path(obs_metrics.__file__)
     source = metrics_path.read_text(encoding="utf-8").lower()
-    # `traceparent` is fine to mention in M5 docs/comments anywhere
+    # `traceparent` is fine to mention in docs/comments anywhere
     # else, but should still not bleed into the metrics-text rendering
     # module. We still ban it here to keep that module focused.
     for forbidden in ("traceparent", "opentelemetry"):

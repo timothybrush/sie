@@ -1,6 +1,6 @@
 """Request timing utilities.
 
-Tracks latency breakdown for encode requests per DESIGN.md Section 5.7.
+Tracks latency breakdown for encode requests.
 
 Timing headers:
 - X-Queue-Time: Time waiting in queue (ms)

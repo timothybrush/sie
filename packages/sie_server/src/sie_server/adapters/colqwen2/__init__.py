@@ -302,10 +302,8 @@ class ColQwen2Adapter(BaseAdapter):
             return self._encode_text(item.text)
         if has_images:
             return self._encode_images(self._load_images(item))
-        if has_text:
-            return self._encode_text(item.text)
-
-        raise ValueError(_ERR_NO_INPUT)
+        # The top guard guarantees has_text once we get here.
+        return self._encode_text(item.text)
 
     # ------------------------------------------------------------------
     # Image encoding
@@ -393,7 +391,11 @@ class ColQwen2Adapter(BaseAdapter):
 
         results = [embeddings[i].float().cpu().numpy() for i in range(len(images))]
 
+        # Free GPU memory from intermediate tensors to prevent OOM on
+        # subsequent encode calls (L4 22GB GPUs are tight for VLM models).
         del embeddings, batch
+        if self._device and self._device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
         return results
 

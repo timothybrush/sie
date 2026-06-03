@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import torch
-import yaml
 from fastapi import FastAPI
 
 from sie_server.api.encode import router as encode_router
@@ -23,34 +22,24 @@ from sie_server.api.ws import init_server_start_time
 from sie_server.api.ws import router as ws_router
 from sie_server.app.app_state_config import AppStateConfig
 from sie_server.config.engine import EngineConfig
-from sie_server.config.model import ModelConfig, ProfileConfig, Tasks
 from sie_server.core.memory import MemoryConfig
-from sie_server.core.readiness import mark_not_ready, mark_ready
+from sie_server.core.readiness import mark_not_ready, mark_ready, register_liveness_probe
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.shutdown import ShutdownMiddleware, ShutdownState, setup_signal_handlers
-from sie_server.nats_pull_loop import NatsPullLoop
-from sie_server.nats_subscriber import NatsSubscriber
+from sie_server.ipc_server import IpcServer
 from sie_server.observability.gpu import _init_nvml, shutdown_nvml
 from sie_server.observability.telemetry import telemetry_sender
 from sie_server.observability.tracing import setup_tracing
+from sie_server.queue_executor import QueueExecutor
 
 logger = logging.getLogger(__name__)
 
 
-def _resolved_pool_name() -> str | None:
-    """Resolve the worker's pool identity from the environment.
-
-    Returns the ``SIE_POOL`` value (with ``"_default"`` fallback) when
-    cluster-queue routing is active, else ``None`` for the local
-    single-process serving path which has no pool semantics.
-
-    Shared by :meth:`AppFactory._registry_lifecycle` (registry
-    pool-isolation validator) and :meth:`AppFactory._nats_pull_loop`
-    (NATS pull loop) so the two cannot drift.
-    """
-    if os.environ.get("SIE_CLUSTER_ROUTING") != "queue":
-        return None
-    return os.environ.get("SIE_POOL", "_default")
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 @asynccontextmanager
@@ -90,16 +79,28 @@ class AppFactory:
         # Setup OpenTelemetry tracing (no-op if SIE_TRACING_ENABLED is not set)
         setup_tracing(app)
 
-        # Register routers
+        # Queue is the only supported routing mode: the worker-sidecar
+        # drives NATS and talks to Python over UDS IPC. We still mount
+        # the HTTP routers for /healthz, /readyz, /metrics (K8s probes
+        # and Prometheus), the landing page, and /ws/status — which is
+        # the gateway's worker-registration channel: the gateway dials
+        # `ws://<pod>/ws/status` to learn pool_name, bundle,
+        # machine_profile, and readiness. The inference endpoints
+        # (/encode, /score, /extract, /generate, /models, /v1/embeddings) are
+        # historically reachable on the pod's HTTP port but are not a
+        # production ingress — the Rust gateway is queue-only and
+        # publishes to JetStream, not HTTP. They stay mounted so local
+        # SIEClient-based checks and the existing test surface keep
+        # working; no traffic reaches them in a real cluster.
         app.include_router(root_router)
         app.include_router(health_router)
+        app.include_router(metrics_router)
+        app.include_router(ws_router)
         app.include_router(encode_router)
         app.include_router(extract_router)
         app.include_router(generate_router)
         app.include_router(score_router)
         app.include_router(models_router)
-        app.include_router(metrics_router)
-        app.include_router(ws_router)
         app.include_router(openai_router)  # OpenAI-compatible /v1/embeddings
         setup_custom_openapi_schema(app)
 
@@ -126,23 +127,12 @@ class AppFactory:
                 _timed_stage("nvml", cls._nvml()),
                 _timed_stage("telemetry", telemetry_sender()),
                 _timed_stage("model_registry", cls._model_registry(config)) as registry,
-                _timed_stage("nats_subscriber", cls._nats_subscriber(registry)) as nats_sub,
-                _timed_stage("nats_pull_loop", cls._nats_pull_loop(registry, nats_sub)) as pull_loop,
-                # Optional NATS health publisher. Off by default; flip
-                # SIE_HEALTH_NATS=1 to surface `saturated` (and the rest of the
-                # WorkerStatusMessage) over `sie.health.{worker_id}` in addition
-                # to the WS path. Started *after* the pull loop because it
-                # snapshots `pull_loop.update_saturation()` on every tick.
-                _timed_stage(
-                    "nats_health_publisher",
-                    cls._nats_health_publisher(registry, nats_sub, pull_loop),
-                ),
+                _timed_stage("ipc_server", cls._ipc_server(registry)) as ipc_server,
                 _timed_stage("graceful_shutdown", cls._graceful_shutdown(shutdown_state)),
                 _timed_stage("readiness", cls._readiness_handling()),
             ):
                 app.state.registry = registry
-                app.state.nats_subscriber = nats_sub
-                app.state.nats_pull_loop = pull_loop
+                app.state.ipc_server = ipc_server
                 yield
 
         return lifespan
@@ -162,18 +152,12 @@ class AppFactory:
 
         models_dir = config.models_dir or str(engine_config.models_dir)
 
-        # Pass the worker's pool identity into the registry so
-        # the pool-isolation validator can reject mixed gen/non-gen pools
-        # at config-load time. Only set when SIE_CLUSTER_ROUTING=queue so
-        # local single-process serving (which has no pool semantics) keeps
-        # working without the check.
         registry = ModelRegistry(
             models_dir=models_dir,
             model_filter=config.model_filter,
             memory_config=memory_config,
             device=config.device,
             engine_config=engine_config,
-            pool_name=_resolved_pool_name(),
         )
         try:
             # Start background services (memory monitor, idle evictor, hot reload).
@@ -197,177 +181,41 @@ class AppFactory:
 
     @classmethod
     @asynccontextmanager
-    async def _nats_subscriber(cls, registry: ModelRegistry) -> AsyncGenerator[NatsSubscriber | None, None]:
-        """For optional NATS subscriber lifecycle.
+    async def _ipc_server(cls, registry: ModelRegistry) -> AsyncGenerator[IpcServer, None]:
+        """IPC server lifecycle for the sidecar path.
 
-        Only starts if SIE_NATS_URL is set. Connection failures are non-fatal —
-        the server starts normally without NATS.
+        The worker-sidecar drives NATS and talks to Python over a
+        UDS msgpack RPC. This context manager binds the socket, exposes
+        the :class:`QueueExecutor`, and can wire the sidecar heartbeat into
+        ``/readyz`` so a dead sidecar flips the pod unready.
+
+        The IPC server starts unconditionally so the same image can serve
+        direct HTTP and sidecar-driven queue deployments. Readiness only
+        depends on the Rust heartbeat when ``SIE_IPC_REQUIRE_HEARTBEAT`` is
+        truthy; Helm sets that env var when the worker-sidecar is present.
         """
-        nats_url = os.environ.get("SIE_NATS_URL")
-        if not nats_url:
-            yield None
-            return
+        socket_path = os.environ.get("SIE_IPC_SOCKET_PATH", "/tmp/sie-ipc.sock")  # noqa: S108
+        stale_after_ms = float(os.environ.get("SIE_IPC_STALE_AFTER_MS", "10000"))
+        worker_id = os.environ.get("SIE_WORKER_ID") or os.environ.get("HOSTNAME", "worker-unknown")
+        require_heartbeat = _env_flag("SIE_IPC_REQUIRE_HEARTBEAT")
 
-        async def on_model_config(model_id: str, config_yaml: str) -> None:
-            try:
-                raw = yaml.safe_load(config_yaml)
-                if not isinstance(raw, dict):
-                    logger.warning("NATS config for '%s' is not a dict, ignoring", model_id)
-                    return
-
-                # Try full ModelConfig parsing (works for complete configs with tasks, hf_id, etc.)
-                try:
-                    model_config = ModelConfig(**raw)
-                    registry.add_config(model_config)
-                    logger.info("Added full model config from NATS: %s", model_config.sie_id)
-                    return
-                except Exception:  # noqa: BLE001 — fallback to lightweight path
-                    logger.debug("Full ModelConfig parse failed for '%s', trying minimal path", model_id)
-
-                # Fallback: minimal config from Config API (sie_id + profiles only).
-                # Create a stub ModelConfig with required fields filled in from the profile.
-                sie_id = raw.get("sie_id", model_id)
-                profiles_raw = raw.get("profiles", {})
-                if not profiles_raw:
-                    logger.warning("NATS config for '%s' has no profiles, ignoring", model_id)
-                    return
-
-                # Fallback to sie_id as hf_id (satisfies ModelConfig validator)
-
-                # Build a minimal valid ModelConfig
-                profiles = {}
-                for pname, pdata in profiles_raw.items():
-                    profiles[pname] = ProfileConfig(
-                        adapter_path=pdata.get("adapter_path"),
-                        max_batch_tokens=pdata.get("max_batch_tokens"),
-                        extends=pdata.get("extends"),
-                    )
-
-                # Build a stub ModelConfig for profile/hash tracking.
-                # This config may not be loadable — it's used to register the model
-                # in the registry so the config hash updates and routing can reference it.
-                # Actual model loading will use the full config pushed by the adapter.
-                model_config = ModelConfig(
-                    sie_id=sie_id,
-                    hf_id=raw.get("hf_id", sie_id),
-                    tasks=Tasks(),
-                    profiles=profiles,
-                )
-                registry.add_config(model_config)
-                logger.info("Added minimal model config from NATS: %s", sie_id)
-
-            except Exception:
-                logger.exception("Failed to apply NATS config for model '%s'", model_id)
-
-        subscriber = NatsSubscriber(nats_url=nats_url, on_model_config=on_model_config)
-        await subscriber.start()
-        try:
-            yield subscriber
-        finally:
-            await subscriber.stop()
-
-    @classmethod
-    @asynccontextmanager
-    async def _nats_pull_loop(
-        cls, registry: ModelRegistry, nats_subscriber: NatsSubscriber | None
-    ) -> AsyncGenerator[NatsPullLoop | None, None]:
-        """For optional NATS pull loop lifecycle.
-
-        Only starts when SIE_CLUSTER_ROUTING=queue and a NATS connection exists.
-        """
-        if os.environ.get("SIE_CLUSTER_ROUTING") != "queue":
-            yield None
-            return
-
-        if nats_subscriber is None:
-            raise RuntimeError("SIE_CLUSTER_ROUTING=queue but no NATS subscriber available — cannot start pull loop")
-
-        nc = nats_subscriber.nc
-        if nc is None:
-            raise RuntimeError("SIE_CLUSTER_ROUTING=queue but NATS connection is None — cannot start pull loop")
-        js = nc.jetstream()
-        bundle_id = os.environ.get("SIE_BUNDLE", "default")
-        # Share resolution with the registry's pool isolation
-        # validator. ``_resolved_pool_name`` returns ``None`` outside
-        # ``SIE_CLUSTER_ROUTING=queue``, but we still need a pool string
-        # for the pull-loop subject naming inside this branch (we already
-        # know cluster routing is queue — this lifecycle only fires then).
-        pool_name = _resolved_pool_name() or os.environ.get("SIE_POOL", "_default")
-        payload_store_url = os.environ.get("SIE_PAYLOAD_STORE_URL")
-
-        pull_loop = NatsPullLoop(
-            nc=nc,
-            js=js,
-            registry=registry,
-            bundle_id=bundle_id,
-            pool_name=pool_name,
-            payload_store_url=payload_store_url,
+        executor = QueueExecutor(registry)
+        server = IpcServer(
+            socket_path,
+            executor,
+            worker_id=worker_id,
+            stale_after_ms=stale_after_ms,
         )
-        await pull_loop.start()
-
-        # Register pull loop reconnect handler via NatsSubscriber's public API.
-        # This is invoked by the NATS client's reconnected_cb chain, ensuring
-        # pull subscriptions are re-created after NATS reconnect.
-        nats_subscriber.add_reconnect_handler(pull_loop.handle_reconnect)
-
+        await server.start()
+        if require_heartbeat:
+            register_liveness_probe(server.is_heartbeat_fresh)
+        else:
+            register_liveness_probe(None)
         try:
-            yield pull_loop
+            yield server
         finally:
-            await pull_loop.stop()
-
-    @classmethod
-    @asynccontextmanager
-    async def _nats_health_publisher(
-        cls,
-        registry: ModelRegistry,
-        nats_subscriber: NatsSubscriber | None,
-        pull_loop: NatsPullLoop | None,
-    ) -> AsyncGenerator[object | None, None]:
-        """Optional periodic ``sie.health.{worker_id}`` publisher.
-
-        Opt-in via ``SIE_HEALTH_NATS=1``. Disabled by default because
-        the WebSocket ``/ws/status`` path is still the canonical
-        transport; the NATS path is parallel and runs at the same
-        cadence so the gateway sees consistent state from either
-        side. Requires the NATS connection from the subscriber and
-        the pull loop (for saturation). Gracefully no-ops if either
-        is missing.
-        """
-        from sie_server.health.nats_publisher import NatsHealthPublisher, is_enabled  # noqa: PLC0415
-
-        if not is_enabled():
-            yield None
-            return
-        nats_url = os.environ.get("SIE_NATS_URL")
-        if not nats_url or nats_subscriber is None or pull_loop is None:
-            logger.info(
-                "SIE_HEALTH_NATS=1 but prerequisites missing (url=%s, subscriber=%s, pull_loop=%s); "
-                "skipping NATS health publisher",
-                bool(nats_url),
-                nats_subscriber is not None,
-                pull_loop is not None,
-            )
-            yield None
-            return
-
-        # Build a closure that the publisher polls once per interval.
-        # We pull `pull_loop` directly so the `saturated` field is in
-        # lockstep with the gate state machine.
-        from sie_server.api.ws import build_status_message  # noqa: PLC0415
-
-        async def _snapshot() -> Any:
-            return await build_status_message(registry, pull_loop=pull_loop)
-
-        publisher = NatsHealthPublisher(
-            nats_url=nats_url,
-            worker_id=pull_loop.worker_id,
-            build_status=_snapshot,
-        )
-        await publisher.start()
-        try:
-            yield publisher
-        finally:
-            await publisher.stop()
+            register_liveness_probe(None)
+            await server.stop()
 
     @classmethod
     @asynccontextmanager

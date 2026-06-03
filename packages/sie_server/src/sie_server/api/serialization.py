@@ -3,7 +3,7 @@
 Provides msgpack serialization with native numpy support for efficient wire format.
 Falls back to JSON for debugging when Accept header requests it.
 
-Per DESIGN.md Section 5.9:
+Serialization behavior:
 - Use msgpack with msgpack-numpy for arrays (not list comprehensions)
 - Single call serialization, no Python loops
 """

@@ -20,7 +20,7 @@
 //! ``$ref`` rejection note: the spec wording is "external ``$ref``";
 //! v1 rejects **all** ``$ref`` (including internal ``#/...``) for
 //! implementation simplicity. The error message and the OpenAPI spec
-//! both call this out; M5+ can refine if customer pressure justifies
+//! both call this out; this can be refined if customer pressure justifies
 //! the JSON-pointer resolver.
 
 use axum::http::StatusCode;
@@ -339,7 +339,7 @@ fn walk_schema_inner(
                     let message = if kw == "$ref" {
                         // Grammar v1 blanket-rejects all ``$ref``,
                         // including internal ``#/...``. The spec
-                        // wording is "external ``$ref``"; M5+ may
+                        // wording is "external ``$ref``"; later revisions may
                         // refine. Documented in OpenAPI.
                         "'$ref' is not supported (the grammar surface rejects all $ref including internal)"
                             .to_string()

@@ -8,7 +8,7 @@ class out of the box:
 
     embeddings = OpenAIEmbeddings(base_url="http://localhost:8080/v1")
 
-Per roadmap Project 11.0: OpenAI-Compatible API.
+This module implements the OpenAI-compatible embeddings API surface.
 """
 
 from __future__ import annotations

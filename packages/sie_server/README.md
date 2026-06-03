@@ -66,7 +66,7 @@ auto-retries; see `packages/sie_sdk/README.md` for client-side controls.
 
 | Env var | Default | Effect |
 |--|--|--|
-| `SIE_GRAMMAR_PREFLIGHT_DEBUG` | unset (off) | Enables the legacy worker-side Outlines preflight compile before each structured-output request. Off by default per ADR-0002 — SGLang is the production grammar authority. Use for diagnosing schema-rejection problems or slow compiles in a controlled environment; not recommended for production traffic. |
+| `SIE_GRAMMAR_PREFLIGHT_DEBUG` | unset (off) | Enables the legacy worker-side Outlines preflight compile before each structured-output request. Off by default because SGLang is the production grammar authority. Use for diagnosing schema-rejection problems or slow compiles in a controlled environment; not recommended for production traffic. |
 
 For nested settings (any field with `__`), the env-var format is
 `SIE_<TOP>__<NESTED>=value`. The complete schema is in

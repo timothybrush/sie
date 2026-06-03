@@ -8,10 +8,8 @@ cancellation, and partial-state semantics are not a method bolt-on. The
 - async-iterator ``generate(prompt, ...)`` yielding :class:`GenerationChunk`
 - worker dispatch on ``isinstance(adapter, GenerationAdapter)``
 
-The streaming contract replaces the walking-skeleton's blocking shape: concrete adapters yield chunks
-as the upstream engine produces them, with the terminal chunk carrying
-``finish_reason`` and ``usage``. See
-``product/research/generation-primitive-status.md`` (§2 deliverables, §3 measurements).
+Concrete adapters yield chunks as the upstream engine produces them, with the
+terminal chunk carrying ``finish_reason`` and ``usage``.
 """
 
 from __future__ import annotations

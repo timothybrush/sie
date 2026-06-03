@@ -3,9 +3,9 @@
 This adapter provides support for SigLIP (Sigmoid Loss for Language Image Pre-training)
 models that produce aligned embeddings for both images and text in a shared vector space.
 
-Per roadmap Project 10.4, uses transformers SiglipModel with SiglipProcessor
-for Phase 1. SigLIP differs from CLIP in using sigmoid loss instead of softmax
-and not having a separate projection_dim - it uses hidden_size directly.
+Uses transformers SiglipModel with SiglipProcessor. SigLIP differs from CLIP in
+using sigmoid loss instead of softmax and not having a separate projection_dim -
+it uses hidden_size directly.
 
 Supports two backends:
 

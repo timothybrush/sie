@@ -78,6 +78,7 @@ pub struct SseParams<'a> {
     pub work_publisher: Arc<WorkPublisher>,
     pub model: String,
     pub bundle: String,
+    pub engine: String,
     pub gpu: String,
     pub pool: String,
     pub bundle_config_hash: String,
@@ -101,6 +102,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
         work_publisher,
         model,
         bundle,
+        engine,
         gpu,
         pool,
         bundle_config_hash,
@@ -168,7 +170,14 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
 
     let (request_id, outcome_rx, chunk_rx) = match work_publisher
-        .publish_generate_streaming_sse(target, &bundle, &gpu, &bundle_config_hash, &work_params)
+        .publish_generate_streaming_sse(
+            target,
+            &bundle,
+            &engine,
+            &gpu,
+            &bundle_config_hash,
+            &work_params,
+        )
         .await
     {
         Ok(triple) => triple,

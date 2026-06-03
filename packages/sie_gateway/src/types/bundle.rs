@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Recognised execution engines for the ``engine`` bundle field.
+///
+/// We only ship one engine today (the Python ``sie_server`` adapter
+/// image). The plumbing — ``X-SIE-Engine`` header,
+/// ``resolve_bundle_with_engine``, ``WorkItem.engine`` — is kept
+/// alive as the contract for re-introducing a second engine later;
+/// for now there is exactly one valid value here.
+///
+/// Mirrors ``sie_config.model_registry.KNOWN_ENGINES`` on the Python
+/// side. Drift is a quiet mis-routing footgun, so both ends are kept
+/// in lock-step.
+pub const KNOWN_ENGINES: &[&str] = &["pytorch"];
+
+/// Default engine when a bundle YAML omits the field. Same as the
+/// only entry in ``KNOWN_ENGINES`` today; kept as a separate
+/// constant so the asymmetric "default vs known" contract still
+/// reads cleanly when a second engine lands.
+pub const DEFAULT_ENGINE: &str = "pytorch";
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct BundleConfig {
@@ -10,6 +29,12 @@ pub struct BundleConfig {
     pub adapters: Vec<String>,
     #[serde(default)]
     pub default: bool,
+    /// Execution engine the bundle's worker image speaks. Today
+    /// only ``"pytorch"`` (the Python adapter image) is recognised;
+    /// see ``KNOWN_ENGINES`` for the load-time check. Defaults to
+    /// ``"pytorch"`` for back-compat with pre-engine bundle YAMLs.
+    #[serde(default = "default_engine")]
+    pub engine: String,
     #[serde(default)]
     pub machine_profiles: Vec<BundleMachineProfile>,
     #[serde(default)]
@@ -21,6 +46,11 @@ pub struct BundleConfig {
 #[allow(dead_code)]
 fn default_priority() -> i32 {
     100
+}
+
+#[allow(dead_code)]
+fn default_engine() -> String {
+    DEFAULT_ENGINE.to_string()
 }
 
 #[allow(dead_code)]
@@ -42,6 +72,31 @@ pub struct BundleInfo {
     pub name: String,
     pub priority: i32,
     pub adapters: Vec<String>,
+    /// See [`BundleConfig::engine`] — surfaced in routing logs,
+    /// metrics, and the published ``WorkItem.engine`` so workers
+    /// can verify they speak the right engine. Today only
+    /// ``"pytorch"`` is recognised (see ``KNOWN_ENGINES``).
+    #[allow(dead_code)]
+    pub engine: String,
+}
+
+/// Adapter-module prefixes considered legal for each engine.
+///
+/// The gateway's matcher intersects ``bundle.adapters`` with each
+/// model's ``adapter_path`` modules — so a bundle that accidentally
+/// lists an adapter outside this engine's namespace is caught at
+/// config-load time rather than producing ``UnsupportedModel`` IPC
+/// NAKs at runtime.
+///
+/// Returns an empty slice for unknown engines (caller decides what
+/// to do — typically the load already rejected the bundle, so this
+/// path is unreachable).
+#[allow(dead_code)]
+pub fn engine_adapter_prefixes(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "pytorch" => &["sie_server.adapters."],
+        _ => &[],
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +128,27 @@ default: true
         assert!(config.adapters.is_empty());
         assert!(!config.default);
         assert!(config.machine_profiles.is_empty());
+        assert_eq!(config.engine, DEFAULT_ENGINE);
+    }
+
+    #[test]
+    fn test_engine_adapter_prefixes() {
+        assert_eq!(
+            engine_adapter_prefixes("pytorch"),
+            &["sie_server.adapters."]
+        );
+        // Unknown engine → empty slice. Caller is expected to have
+        // already rejected the bundle by checking ``KNOWN_ENGINES``.
+        assert!(engine_adapter_prefixes("candle").is_empty());
+        assert!(engine_adapter_prefixes("unknown").is_empty());
+    }
+
+    #[test]
+    fn test_known_engines_only_pytorch() {
+        // Lock-step parity with sie_config.model_registry.KNOWN_ENGINES.
+        // Today there's exactly one engine; this assertion catches
+        // drift at PR review time when a second engine is added.
+        assert_eq!(KNOWN_ENGINES, &["pytorch"]);
     }
 
     #[test]

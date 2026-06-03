@@ -27,7 +27,9 @@ class TestEngineConfig:
         config = EngineConfig()
         # Note: max_batch_tokens is per-model (in ModelConfig), not engine-level
         assert config.max_batch_requests == 64
-        assert config.max_batch_wait_ms == 10
+        assert config.max_batch_wait_ms == 15
+        assert config.coalesce_ms == 15.0
+        assert config.coalesce_ratio == 0.5
         assert config.max_concurrent_requests == 512
         assert config.memory_pressure_threshold_percent == 85
         assert config.max_loras_per_model == 10
@@ -36,6 +38,11 @@ class TestEngineConfig:
         assert config.default_compute_precision == "float16"
         assert config.instrumentation is False
         assert config.models_dir == Path("./models")
+        assert config.adaptive_batching.min_wait_ms == 15.0
+        assert config.adaptive_batching.max_wait_ms == 50.0
+        assert config.adaptive_batching.starvation_recovery_enabled is True
+        assert config.adaptive_batching.starvation_window == 20
+        assert config.adaptive_batching.starvation_batch_size == 1
 
     def test_custom_values(self) -> None:
         """EngineConfig accepts custom values."""
@@ -419,7 +426,7 @@ class TestModelConfig:
             )
 
     def test_generate_capabilities_accepts_ebnf(self) -> None:
-        """``ebnf`` was added to the accepted grammar list when M4 req2's
+        """``ebnf`` was added to the accepted grammar list when
         Outlines / XGrammar EBNF support landed. Prior to that this test
         asserted rejection; it's flipped to acceptance as the regression
         guard so a future refactor doesn't silently drop EBNF support.

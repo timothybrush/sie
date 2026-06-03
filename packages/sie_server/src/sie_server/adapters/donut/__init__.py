@@ -285,8 +285,6 @@ class DonutAdapter(BaseAdapter):
         Returns:
             ExtractOutput with entities.
         """
-        import re
-
         from sie_server.core.prepared import DonutPayload, PreparedItem
 
         all_entities = []

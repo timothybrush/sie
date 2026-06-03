@@ -4,7 +4,8 @@ This module manages preprocessors for all loaded models and provides
 async preprocessing that runs in a thread pool to avoid blocking
 the event loop.
 
-See roadmap.md Project 10.4 Phase 2 for design details.
+Adapters provide preprocessors at model-load time; this registry dispatches
+items to the registered modality implementation.
 """
 
 from __future__ import annotations

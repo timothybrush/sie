@@ -8,7 +8,7 @@
 ARG BUNDLE=default
 
 # =============================================================================
-# Stage 1: Dependencies (pyproject.toml only, cached across code changes)
+# Dependency image: pyproject-only cache seed
 # =============================================================================
 FROM python:3.12-slim-bookworm AS deps
 
@@ -57,9 +57,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -e ".[gpu-metrics]"
 
 # =============================================================================
-# Stage 2: Base - source install + shared-venv finalization (no BUNDLE)
+# Shared runtime base: source install and venv finalization
 # =============================================================================
-# Bundle-agnostic: all base-stage layers are shared across bundles of this
+# Bundle-agnostic: all base image layers are shared across bundles of this
 # platform in local BuildKit cache and in content-addressed registry layers.
 FROM deps AS base
 
@@ -107,7 +107,7 @@ RUN set -eux; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 3: Builder - bundle-specific deps
+# Bundle dependency builder: bundle-specific deps
 # =============================================================================
 FROM base AS builder
 
@@ -150,7 +150,7 @@ RUN set -eux; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 4: Runtime
+# Runtime image
 # =============================================================================
 FROM python:3.12-slim-bookworm AS runtime
 

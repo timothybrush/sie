@@ -9,7 +9,7 @@
 #   docker run -p 8080:8080 sie-config:latest
 
 # =============================================================================
-# Stage 1: Builder - install dependencies with pip
+# Dependency builder: install service dependencies
 # =============================================================================
 FROM python:3.12-slim AS builder
 
@@ -37,9 +37,9 @@ RUN find .venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
     && find .venv -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 2: Runtime - minimal image
+# Runtime image: minimal config service
 # =============================================================================
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash sie

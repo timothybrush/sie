@@ -10,8 +10,7 @@ Run via ``mise run test -- -i`` after starting a local gateway with::
     target/release/sie-gateway --nats-url ... &
     mise run serve -- -m Qwen/Qwen3-4B-Instruct-2507
 
-Acceptance criteria from
-``product/plans/m4-req2-generate-issues/03-chat-completions-openai-compat.md``:
+Acceptance criteria:
 
 * official OpenAI Python SDK round-trip
 * unsupported field rejection with OpenAI envelope (``frequency_penalty``,
@@ -69,7 +68,7 @@ def test_frequency_penalty_nonzero_accepted(gateway_url: str) -> None:
     """Penalties in OpenAI's ``[-2.0, 2.0]`` range are validated by the
     gateway and forwarded to the SGLang sampler (``ChatRequestParams``
     plumbing in ``packages/sie_gateway/src/handlers/proxy.rs``). Prior
-    to M4-req2 the gateway 400-rejected non-zero values; the regression
+    the gateway used to 400-reject non-zero values; the regression
     guard here flips to "request must succeed" so we don't silently
     re-introduce the reject.
     """

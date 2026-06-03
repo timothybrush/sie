@@ -10,7 +10,6 @@ Configuration via standard OTel environment variables:
 - OTEL_TRACES_SAMPLER: Sampling strategy
 - OTEL_TRACES_SAMPLER_ARG: Sampling rate
 
-See DESIGN.md Section 5.6 for observability design.
 See https://opentelemetry.io/docs/concepts/sdk-configuration/ for OTel config.
 """
 

@@ -1,0 +1,78 @@
+[package]
+name = "sie-server-sidecar"
+version = "0.4.2"
+edition = "2021"
+description = "SIE worker sidecar: NATS JetStream consumer, scheduler, IPC client, and GPU-independent prep for sie-server pods."
+
+[lib]
+name = "sie_server_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sie-server-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-nats = "0.38"
+futures-util = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` switches serde_json to its IEEE-754 correctly-rounded
+# f64 parser. Required for bit-exact parity with the Python adaptive
+# controller in `scripts/perf/replay-scheduler-trace.py` — without it,
+# serde_json's default "fast" parser can be 1 ULP off for some decimals
+# (e.g. "14.394267984578837" parses 1 bit low), which breaks the
+# shadow-trace ULP diff. Do not drop this feature.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_bytes = "0.11"
+rmp-serde = "1"
+# Low-level msgpack writer. Used to emit byte-for-byte compatible
+# `msgpack_numpy` sentinels on the result path so the Python SDK's
+# `msgpack_numpy.patch()` decoder sees the same wire shape it gets
+# from the Python adapters.
+rmp = "0.8"
+
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+async-trait = "0.1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Metrics server (matches gateway)
+prometheus = { version = "0.13", features = ["process"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# Cloud payload store backends (opt-in, same shape as gateway)
+object_store = { version = "0.11", optional = true, features = ["aws", "gcp"] }
+url = { version = "2", optional = true }
+
+# HF fast-tokenizers. Used by `src/tokenize/` to verify the
+# adapter-provided `tokenizer.json` materialised at the path
+# `ModelDescriptor.tokenizer_path` and to tokenize inbound batches
+# inside the sidecar. Blake3 hashes the canonical bytes
+# for the `tokenizer_id` drift check the adapter populates on
+# `EnsureModelReady`.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+blake3 = "1"
+
+# NOTE: This crate has no GPU-side dependencies. The sidecar talks to
+# its inference backend strictly over IPC; in-process native backends
+# (if reintroduced later) would land as a sibling crate, not here.
+
+[features]
+default = []
+cloud-storage = ["dep:object_store", "dep:url"]
+
+[dev-dependencies]
+tempfile = "3"
+# Dynamically typed msgpack values for tests that need to walk
+# hand-rolled wire envelopes (e.g. dense-encode numpy sentinel).
+rmpv = "1"

@@ -13,7 +13,7 @@
   hook Job. This avoids the chicken-and-egg problem where Helm validates ScaledObject CRDs
   before the KEDA sub-chart has installed them.
 */ -}}
-# ── RBAC for the apply Job (weight 1 — must exist before the Job at weight 2) ─
+# RBAC for the apply Job (weight 1; must exist before the Job at weight 2)
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -62,7 +62,7 @@ subjects:
     name: {{ include "sie-cluster.keda.apply.serviceAccountName" . }}
     namespace: {{ include "sie-cluster.namespace" . }}
 ---
-# ── ConfigMap containing rendered ScaledObject manifests (weight 1 — mounted by Job at weight 2) ─
+# ConfigMap containing rendered ScaledObject manifests (weight 1; mounted by Job at weight 2)
 # Each key is a separate YAML file applied by the hook Job via kubectl apply -f /config/
 apiVersion: v1
 kind: ConfigMap
@@ -152,10 +152,10 @@ data:
             serverAddress: {{ $promAddr }}
             metricName: sie_gateway_rejected_rate_{{ $poolName }}
             # Filter out reasons the SDK already retries against the same
-            # worker pool — they are per-request transient signals, not
+            # worker pool; they are per-request transient signals, not
             # "we need more workers" signals:
             #   - resource_exhausted: worker hit GPU OOM after recovery
-            #     (cache_clear → evict_lru → split_batch). The SDK retries
+            #     (cache_clear -> evict_lru -> split_batch). The SDK retries
             #     with bounded exponential backoff; scaling up here would
             #     cold-start a new GPU pod for what is a transient memory
             #     pressure event on an otherwise-healthy worker.
@@ -175,8 +175,8 @@ data:
             # trigger.
             #
             # Note on regex anchoring: PromQL ``=~`` / ``!~`` are RE2 with
-            # implicit ``^…$`` full-string anchors. The list below matches
-            # exact reason values only — a future suffixed reason like
+            # implicit full-string anchors. The list below matches
+            # exact reason values only; a future suffixed reason like
             # ``resource_exhausted_extended`` would NOT be excluded and
             # would drive scale-up. If new retryable reasons are added in
             # ``proxy.rs::record_rejected_request``, append them here.
@@ -210,7 +210,7 @@ data:
             query: sum(rate(sie_gateway_requests_total[1m])) or vector(0)
             threshold: "100"
 ---
-# ── Hook Job: wait for KEDA CRDs then apply ScaledObjects ───────────────────
+# Hook Job: wait for KEDA CRDs then apply ScaledObjects
 apiVersion: batch/v1
 kind: Job
 metadata:

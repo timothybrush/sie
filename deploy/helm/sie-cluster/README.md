@@ -6,8 +6,6 @@ Deploy SIE (Search Inference Engine) to Kubernetes with autoscaling and observab
 
 ```bash
 helm install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
-   --namespace sie \
-   --create-namespace
   --namespace sie \
   --create-namespace
 ```
@@ -35,7 +33,7 @@ helm install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
 
 When scaling from zero, expect the following latencies:
 
-| Phase | Duration | Notes |
+| Step | Duration | Notes |
 |-------|----------|-------|
 | **Node provisioning** | 2-5 min | GKE/EKS spins up GPU node (spot may be slower) |
 | **Container startup** | 20-40s | Pull image, start process, health checks |
@@ -109,6 +107,24 @@ even when there are 0 workers (and thus no worker metrics).
 | `sie_request_queue_depth` | Workers | Scale up on load |
 | `sie_active_requests` | Workers | Scale up on concurrent requests |
 
+### Worker-sidecar Metrics
+
+When `workers.common.workerSidecar.enabled=true`, each worker Pod includes a
+`worker-sidecar` container. The sidecar image is
+`ghcr.io/superlinked/sie-server-sidecar`, the Rust binary is
+`sie-server-sidecar`, and Prometheus families use the `sie_worker_*` prefix
+because they describe worker-side runtime behavior.
+
+The chart wires sidecar scraping as:
+
+- `worker-sidecar` container port `metrics` on `SIE_WORKER_METRICS_PORT`
+  (default `9095`)
+- worker Service port `worker-metrics`
+- worker ServiceMonitor endpoint `worker-metrics`
+
+Alert rules that need the sidecar scrape target match
+`endpoint="worker-metrics"` rather than an old `job="sie-worker"` label.
+
 ## Configuration
 
 See `values.yaml` for all options. Key settings:
@@ -154,12 +170,12 @@ ingress:
 
 The singular `ingress.host` is the backward-compatible single-host shorthand; it is
 ignored whenever `ingress.hosts` is non-empty. With neither set the chart renders a
-host-less catch-all Ingress. All hosts share the single `ingress.tls.secretName`
+host-less catch-all Ingress. All hosts share the single `ingress.tlsConfig.secretName`
 (one multi-SAN certificate).
 
 ## TLS / HTTPS
 
-The chart supports four TLS modes for the Ingress (set via `ingress.tls.mode`):
+The chart supports four TLS modes for the Ingress (set via `ingress.tlsConfig.mode`):
 
 - `byo` — bring your own `kubernetes.io/tls` Secret (default, backward compatible).
 - `cert-manager` — chart annotates the Ingress; [cert-manager](https://cert-manager.io/) provisions and renews the certificate. Default flavour is ACME (HTTP-01 challenge to Let's Encrypt); you can also point at an existing internal Issuer/ClusterIssuer.
@@ -183,7 +199,7 @@ ingress:
   enabled: true
   className: nginx
   host: sie.example.com
-  tls:
+  tlsConfig:
     enabled: true
     mode: byo            # default
     secretName: sie-tls  # default
@@ -203,6 +219,15 @@ helm install cert-manager jetstack/cert-manager \
   --set crds.enabled=true -n cert-manager --create-namespace
 ```
 
+For single-tenant clusters where SIE is the only workload, the chart can also
+install cert-manager as an opt-in subchart:
+
+```yaml
+certManagerBundle:
+  certManager:
+    install: true
+```
+
 Then enable cert-manager mode in your SIE values:
 
 ```yaml
@@ -210,7 +235,7 @@ ingress:
   enabled: true
   className: nginx
   host: sie.example.com
-  tls:
+  tlsConfig:
     enabled: true
     mode: cert-manager
     certManager:
@@ -221,7 +246,7 @@ ingress:
       create: true         # chart renders the Issuer/ClusterIssuer
 ```
 
-The chart renders a `{kind}` named `{release-fullname}-letsencrypt-prod` (release-scoped to avoid collisions when multiple SIE releases share a cluster) and adds the appropriate `cert-manager.io/cluster-issuer` (or `/issuer`) annotation to the main Ingress. cert-manager populates `ingress.tls.secretName` (default `sie-tls`); the same Secret is referenced by the oauth2-proxy Ingress when auth is enabled.
+The chart renders a `{kind}` named `{release-fullname}-letsencrypt-prod` (release-scoped to avoid collisions when multiple SIE releases share a cluster) and adds the appropriate `cert-manager.io/cluster-issuer` (or `/issuer`) annotation to the main Ingress. cert-manager populates `ingress.tlsConfig.secretName` (default `sie-tls`); the same Secret is referenced by the oauth2-proxy Ingress when auth is enabled.
 
 Note: Helm's standard `fullname` collapses when the release name already contains the chart name, so `helm install sie-cluster …` produces `sie-cluster-letsencrypt-prod` (not `sie-cluster-sie-cluster-letsencrypt-prod`). If you override `certManager.name`, set the full intended name explicitly rather than expecting a particular default.
 
@@ -234,7 +259,7 @@ Issuer kind tradeoff:
 
 ```yaml
 ingress:
-  tls:
+  tlsConfig:
     enabled: true
     mode: cert-manager
     certManager:
@@ -290,7 +315,7 @@ kubectl -n sie get secret sie-root-ca-key-pair \
 
 > **Root CA namespace constraint.** Two independent namespace-scoped lookups apply:
 >
-> 1. **cert-manager** only resolves Secrets referenced by a `ClusterIssuer` inside its `--cluster-resource-namespace` (defaults to its own Deployment's namespace). The chart writes the root CA to `ingress.tls.selfSigned.rootCA.namespace` (defaults to the release namespace, which is correct for the **bundled** subchart since cert-manager also runs in the release namespace).
+> 1. **cert-manager** only resolves Secrets referenced by a `ClusterIssuer` inside its `--cluster-resource-namespace` (defaults to its own Deployment's namespace). The chart writes the root CA to `ingress.tlsConfig.selfSigned.rootCA.namespace` (defaults to the release namespace, which is correct for the **bundled** subchart since cert-manager also runs in the release namespace).
 > 2. **trust-manager** only resolves source Secrets for `Bundle` resources inside its `--trust-namespace` (defaults to `cert-manager`, regardless of where trust-manager itself runs).
 >
 > If you also enable `certManagerBundle.trustBundle.enabled: true` with the bundled trust-manager, override the trust namespace at install time so it matches where the root CA lives:
@@ -299,7 +324,7 @@ kubectl -n sie get secret sie-root-ca-key-pair \
 > helm install ... --set "trust-manager.app.trust.namespace=<release-namespace>"
 > ```
 >
-> Otherwise the Bundle stays `Synced=False` with `SourceNotFound`. For external cert-manager (typically in `cert-manager` namespace), set `ingress.tls.selfSigned.rootCA.namespace: cert-manager` so the CA `ClusterIssuer` can find its Secret; the default trust-namespace then already matches.
+> Otherwise the Bundle stays `Synced=False` with `SourceNotFound`. For external cert-manager (typically in `cert-manager` namespace), set `ingress.tlsConfig.selfSigned.rootCA.namespace: cert-manager` so the CA `ClusterIssuer` can find its Secret; the default trust-namespace then already matches.
 
 **When to use this**: air-gapped / on-prem clusters where you can distribute the root CA to client machines (e.g. via MDM, internal trust store, or workload mount), and you want a single `helm install` to land a working HTTPS path.
 

@@ -7,8 +7,9 @@ import json
 import logging
 import os
 import time
+import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sie_sdk.types import (
@@ -28,7 +29,14 @@ from sie_server.observability.prometheus import collect_prometheus_metrics
 
 if TYPE_CHECKING:
     from sie_server.core.registry import ModelRegistry
-    from sie_server.nats_pull_loop import NatsPullLoop
+
+
+class StatusPullLoop(Protocol):
+    worker_id: str
+
+    def update_saturation(self) -> bool:
+        raise NotImplementedError
+
 
 logger = logging.getLogger(__name__)
 
@@ -171,8 +179,8 @@ def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
 
     # Deterministic serialization matching gateway's compute_bundle_config_hash:
     # both sides hash [{"sie_id": name, "profiles": [{name, config}]}]
-    # where config contains routable fields (adapter_path, max_batch_tokens, etc.).
-    _hash_fields = ("adapter_path", "max_batch_tokens", "compute_precision", "adapter_options")
+    # where config contains routable fields: adapter_path, max_batch_tokens,
+    # compute_precision, adapter_options.
     items = []
     for config in sorted(configs.values(), key=lambda c: c.sie_id):
         profiles_for_hash = []
@@ -203,8 +211,12 @@ def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
 
 
 # Cache of bundle config hashes. Populated by _compute_bundle_config_hash
-# and invalidated when the registry is mutated.
-_bundle_config_hash_cache: dict[str, tuple[int, str]] = {}
+# and invalidated when the corresponding registry is mutated. The cache is
+# scoped per registry so test/sidecar registry instances with the same version
+# cannot reuse each other's bundle hash.
+_bundle_config_hash_cache: weakref.WeakKeyDictionary[ModelRegistry, dict[str, tuple[int, str]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def compute_bundle_config_hash_cached(registry: ModelRegistry, bundle_id: str) -> str:
@@ -213,17 +225,21 @@ def compute_bundle_config_hash_cached(registry: ModelRegistry, bundle_id: str) -
     Uses the registry's config version (mutation counter) to detect staleness.
     """
     version = getattr(registry, "_config_version", 0)
-    cached = _bundle_config_hash_cache.get(bundle_id)
+    registry_cache = _bundle_config_hash_cache.get(registry)
+    if registry_cache is None:
+        registry_cache = {}
+        _bundle_config_hash_cache[registry] = registry_cache
+    cached = registry_cache.get(bundle_id)
     if cached is not None and cached[0] == version:
         return cached[1]
     result = _compute_bundle_config_hash(registry, bundle_id)
-    _bundle_config_hash_cache[bundle_id] = (version, result)
+    registry_cache[bundle_id] = (version, result)
     return result
 
 
 async def build_status_message(
     registry: ModelRegistry,
-    pull_loop: NatsPullLoop | None = None,
+    pull_loop: StatusPullLoop | None = None,
 ) -> WorkerStatusMessage:
     """Build the complete status message.
 

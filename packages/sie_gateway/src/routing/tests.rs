@@ -228,7 +228,7 @@ fn raw_for_debug_field_absent_without_feature() {
     assert!(r.hash.is_some());
 }
 
-// ── Cache-aware (prefix-hash) routing (roadmap §6.3) ───────────────
+// ── Cache-aware (prefix-hash) routing ───────────────
 
 const LONG_PREFIX: &str =
     "You are a meticulous assistant. Always answer concisely and cite sources \

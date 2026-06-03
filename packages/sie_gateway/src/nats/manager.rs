@@ -11,6 +11,7 @@
 //! `sie-config`'s `/v1/configs/epoch` and triggers a full
 //! `GET /v1/configs/export` re-fetch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -331,6 +332,13 @@ impl NatsManager {
 
         match self.model_registry.add_model_config(config) {
             Ok(_) => {
+                if !notification.bundle_config_hash.is_empty() {
+                    self.model_registry
+                        .install_bundle_config_hashes(HashMap::from([(
+                            notification.bundle_id.clone(),
+                            notification.bundle_config_hash.clone(),
+                        )]));
+                }
                 self.config_epoch.set_max(notification.epoch);
                 metrics::CONFIG_DELTAS
                     .with_label_values(&[kind, "applied"])
@@ -682,6 +690,7 @@ profiles:
         let mut profiles = registry.get_model_profile_names("test/model");
         profiles.sort();
         assert_eq!(profiles, vec!["default".to_string(), "fast".to_string()]);
+        assert_eq!(registry.compute_bundle_config_hash("default"), "hash3");
     }
 
     #[tokio::test]

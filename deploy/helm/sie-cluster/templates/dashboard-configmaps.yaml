@@ -79,4 +79,20 @@ metadata:
 data:
   sie-generation.json: |-
 {{ .Files.Get "files/dashboards/generation.json" | indent 4 }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sie-cluster.fullname" . }}-dashboard-perf-tuning
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: SIE
+data:
+  sie-perf-tuning.json: |-
+{{ .Files.Get "files/dashboards/perf-tuning.json" | indent 4 }}
 {{- end }}

@@ -2,8 +2,7 @@
 #
 # If this ever fails again we get a clear CI error instead of a silent
 # "Adapter(s) not in any known bundle" warning at gateway bootstrap time
-# and a stuck sie-config epoch. See PR #702 (and the Qwen3-VL bundle
-# omission surfaced during the 2025-04 eu-central-1 deployment) for context.
+# and a stuck sie-config epoch.
 
 from __future__ import annotations
 
@@ -136,7 +135,5 @@ def test_bundle_yaml_has_required_fields(bundle_yaml: Path) -> None:
 # the same adapter is intentionally available in multiple dependency
 # stacks (e.g. a CPU bundle and a CUDA bundle that both ship the same
 # sentence-transformer adapter). If equal-priority resolution ever
-# needs to be fully deterministic in sie-config too (the Rust gateway
-# already tie-breaks by bundle name per PR #702, but the Python side
-# only sorts by priority), the fix is a registry-level secondary sort
-# key, not a CI lint on bundle contents.
+# needs to be fully deterministic in sie-config too, the fix is a
+# registry-level secondary sort key, not a CI lint on bundle contents.

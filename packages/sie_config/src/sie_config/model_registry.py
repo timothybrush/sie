@@ -43,14 +43,71 @@ class BundleConflictError(Exception):
         )
 
 
+class ProfileConflictError(ValueError):
+    """Existing profile cannot be changed through the append-only Config API."""
+
+    def __init__(self, model: str, profiles: list[str]) -> None:
+        self.model = model
+        self.profiles = profiles
+        super().__init__(
+            f"Profile(s) {profiles} on model '{model}' already exist with different content. Config API is append-only."
+        )
+
+
+# Set of recognised execution engines for the ``engine`` bundle field.
+# Locks in the disjoint-bundles convention discussed in the IPC/UDS audit
+# (2026-04-26): a model that's served by two different engines declares
+# two profiles, each pointing at the namespaced adapter, and the gateway
+# routes to the bundle whose ``engine`` matches the worker image at hand.
+#
+# Add new engines here only when there's a real worker image speaking that
+# backend — every value must round-trip through the gateway's bundle
+# resolution and the worker's IPC contract. Drift is the easiest way to
+# silently mis-route traffic, so we surface unknown values as a config
+# load error rather than tolerating them.
+KNOWN_ENGINES: frozenset[str] = frozenset({"pytorch"})
+DEFAULT_ENGINE: str = "pytorch"
+
+# Adapter-module prefix expected for each engine. The gateway's matcher
+# is engine-agnostic (it intersects ``bundle.adapters`` with the model's
+# ``adapter_path`` modules), so this constraint is enforced at config-
+# load time rather than at the matcher level — a mismatch is a deploy
+# bug, not a runtime fall-through. Today we ship one engine; extend in
+# lock-step with KNOWN_ENGINES (mirroring
+# ``sie_gateway::types::bundle::engine_adapter_prefixes``).
+_ENGINE_ADAPTER_PREFIXES: dict[str, tuple[str, ...]] = {
+    "pytorch": ("sie_server.adapters.",),
+}
+
+
 @dataclass
 class BundleInfo:
-    """Information about a bundle."""
+    """Information about a bundle.
+
+    Attributes:
+        name: Bundle identifier (matches the YAML filename stem unless
+            overridden by an explicit ``name:`` field).
+        priority: Lower wins. The gateway's ``resolve_bundle`` returns
+            the lowest-priority compatible bundle by default.
+        adapters: Python module paths (e.g.
+            ``sie_server.adapters.<family>``) that this bundle's
+            worker image can serve.
+        default: Whether this is the operator-blessed fallback bundle
+            in the event of an ambiguous resolution. Surfaced as
+            metadata; the priority field is what actually decides ties.
+        engine: Execution engine the bundle's worker image speaks
+            (today the only recognised value is ``"pytorch"`` for the
+            Python adapter image; see ``KNOWN_ENGINES``). Defaults to
+            ``"pytorch"`` for back-compat with bundle YAMLs written
+            before this field existed. The gateway uses ``engine`` to
+            disambiguate when a model resolves to multiple bundles.
+    """
 
     name: str
     priority: int
     adapters: list[str] = field(default_factory=list)
     default: bool = False
+    engine: str = DEFAULT_ENGINE
 
 
 @dataclass
@@ -156,14 +213,62 @@ class ModelRegistry:
                     priority = data.get("priority", 100)
                     adapters = data.get("adapters", [])
                     default = data.get("default", False)
+                    # ``engine`` defaults to ``DEFAULT_ENGINE`` (== "pytorch")
+                    # so existing bundle YAMLs keep working without edits.
+                    # Unknown values are a hard error — silently coercing
+                    # to "pytorch" would let a typo'd ``engine: pytroch``
+                    # mis-route traffic and push diagnosis to the
+                    # symptom side.
+                    engine = data.get("engine", DEFAULT_ENGINE)
+                    if engine not in KNOWN_ENGINES:
+                        logger.error(
+                            "Bundle %r at %s declares engine=%r which is not in "
+                            "KNOWN_ENGINES=%s — skipping load. Update the bundle "
+                            "YAML or add the engine to sie_config.model_registry.",
+                            name,
+                            bundle_path,
+                            engine,
+                            sorted(KNOWN_ENGINES),
+                        )
+                        continue
+
+                    # Adapter-namespace consistency check. The gateway's
+                    # matcher intersects ``bundle.adapters`` with each
+                    # model's ``adapter_path`` modules, so a bundle
+                    # that accidentally lists adapters outside this
+                    # engine's namespace would produce
+                    # ``UnsupportedModel`` errors at runtime. Catching
+                    # this at config-load time makes the failure mode
+                    # an obvious deploy-rejection rather than a stream
+                    # of cryptic IPC NAKs.
+                    expected_prefixes = _ENGINE_ADAPTER_PREFIXES.get(engine, ())
+                    if expected_prefixes:
+                        bad_adapters = [a for a in adapters if not any(a.startswith(p) for p in expected_prefixes)]
+                        if bad_adapters:
+                            logger.warning(
+                                "Bundle %r (engine=%r) lists adapter(s) outside the "
+                                "expected namespace(s) %s: %s — these will not be "
+                                "servable by a worker speaking this engine.",
+                                name,
+                                engine,
+                                expected_prefixes,
+                                bad_adapters,
+                            )
 
                     new_bundles[name] = BundleInfo(
                         name=name,
                         priority=priority,
                         adapters=adapters,
                         default=default,
+                        engine=engine,
                     )
-                    logger.debug("Loaded bundle '%s': priority=%d, adapters=%d", name, priority, len(adapters))
+                    logger.debug(
+                        "Loaded bundle '%s': priority=%d, engine=%s, adapters=%d",
+                        name,
+                        priority,
+                        engine,
+                        len(adapters),
+                    )
 
                 except Exception:
                     logger.exception("Failed to load bundle: %s", bundle_path)
@@ -233,8 +338,8 @@ class ModelRegistry:
         # Not fatal: routable profiles keep serving traffic, the log below
         # surfaces the bad profiles in sie-config logs without waiting for
         # every sie-gateway to hit "Adapter(s) not in any known bundle"
-        # during bootstrap, and PR #704's test_bundle_coverage regression
-        # test catches this pre-merge in CI.
+        # during bootstrap. The bundle-coverage regression test catches
+        # this pre-merge in CI.
         all_bundle_adapters: set[str] = set()
         for bundle in new_bundles.values():
             all_bundle_adapters.update(bundle.adapters)
@@ -393,6 +498,7 @@ class ModelRegistry:
                 "name": b.name,
                 "priority": b.priority,
                 "adapters": sorted(b.adapters),
+                "engine": b.engine,
             }
             for b in sorted(bundles, key=lambda x: x.name)
         ]
@@ -507,18 +613,24 @@ class ModelRegistry:
         skipped_profiles: list[str] = []
 
         if existing:
+            existing_full_profiles = self._model_full_configs.get(sie_id, {}).get("profiles", {})
+            conflicting_profiles: list[str] = []
             for profile_name, profile in profiles.items():
                 if profile_name in self.get_model_profile_names(sie_id):
+                    stored_full = existing_full_profiles.get(profile_name)
+                    if stored_full is not None and stored_full != profile:
+                        conflicting_profiles.append(profile_name)
+                        continue
                     stored = self._model_profile_configs.get(sie_id, {}).get(profile_name)
                     incoming = _canonical_profile_dict(profile)
                     if stored is not None and stored != incoming:
-                        raise ValueError(
-                            f"Profile '{profile_name}' on model '{sie_id}' already exists "
-                            f"with different config (append-only -- cannot modify)"
-                        )
+                        conflicting_profiles.append(profile_name)
+                        continue
                     skipped_profiles.append(profile_name)
                 else:
                     created_profiles.append(profile_name)
+            if conflicting_profiles:
+                raise ProfileConflictError(sie_id, conflicting_profiles)
         else:
             created_profiles = list(profiles.keys())  # type: ignore
 

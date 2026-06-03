@@ -13,8 +13,7 @@ into one forward pass. Two distinct adapter shapes feed this:
    output side, so the batcher over-packs and the GPU stalls or
    OOMs. This is the bug behind issue #33.
 
-The fix (M4 req2 Proj 2 / coordination contract — "same fix is
-referenced by #33"): callers operating on decoder-OCR adapters pass
+The fix: callers operating on decoder-OCR adapters pass
 ``decoder_max_output_tokens`` so the cost reflects the worst-case
 KV growth during decode. Encoder-only callers pass nothing — default
 zero preserves the existing behaviour exactly.

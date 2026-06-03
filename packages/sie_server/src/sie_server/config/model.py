@@ -266,6 +266,7 @@ _DEFAULT_GPU_MEMORY_GB = 24.0
 # fallback comes from).
 _GPU_MEMORY_GB_BY_PROFILE_HINT: tuple[tuple[str, float], ...] = (
     ("h200", 141.0),
+    ("rtx-pro-6000", 96.0),  # RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7)
     ("h100", 80.0),
     ("a100-80", 80.0),
     ("a100-40", 40.0),
@@ -355,8 +356,7 @@ def _maybe_warn_oversubscribed_budget(
             f"kv_bytes_per_token≈{kv_bytes_per_token}, "
             f"assumed_gpu_memory_gb={gpu_memory_gb}). "
             "Operators can override — this is a warning, not an error. "
-            "See product/plans/m4-req2-generate-issues/"
-            "10-validation-and-calibration.md for calibrated values."
+            "Use measured workload and GPU data to calibrate this value."
         )
         warnings.warn(msg, UserWarning, stacklevel=2)
         logger.warning(
@@ -476,18 +476,14 @@ class ModelConfig(BaseModel):
                     msg = (
                         f"Profile '{name}' on a generation model "
                         f"('{self.sie_id}') is missing 'kv_budget_tokens'. "
-                        "This is the per-worker KV-cache admission budget; "
-                        "see product/plans/m4-req2-generate-issues/"
-                        "10-validation-and-calibration.md for the calibrated value."
+                        "This is the per-worker KV-cache admission budget."
                     )
                     raise ValueError(msg)
                 if not isinstance(effective_budget, int) or effective_budget <= 0:
                     msg = (
                         f"Profile '{name}' on a generation model "
                         f"('{self.sie_id}'): 'kv_budget_tokens' must be a "
-                        f"positive int, got {effective_budget!r}. "
-                        "See product/plans/m4-req2-generate-issues/"
-                        "10-validation-and-calibration.md for calibration guidance."
+                        f"positive int, got {effective_budget!r}."
                     )
                     raise ValueError(msg)
 

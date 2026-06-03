@@ -282,6 +282,26 @@ def serve(
             typer.echo(f"Available models: {', '.join(sorted(all_configs.keys())[:10])}...", err=True)
             raise typer.Exit(1)
 
+    # Augment the filter with explicitly-allowed extra model ids (opt-in via
+    # ``SIE_EXTRA_MODELS``). A bundle's filter is built by scanning model YAML
+    # files, so it only contains *base* ids — it can't see profile-variant ids
+    # like ``Qwen/Qwen3.6-27B:rtx-pro-6000`` that the loader expands at runtime.
+    # A worker that serves a base model's adapter can also serve that model's
+    # profile variants (same adapter, same weights, different launch flags), so
+    # allow naming them here. Validated against the variant-expanded config set.
+    # The advertised bundle (``SIE_BUNDLE`` below) is unchanged, so gateway
+    # routing by adapter→bundle still resolves these variants to this worker.
+    extra_models_env = os.environ.get("SIE_EXTRA_MODELS")
+    if extra_models_env and model_filter is not None:
+        extras = [m.strip() for m in extra_models_env.split(",") if m.strip()]
+        all_configs = load_model_configs(models_dir_resolved)
+        unknown_extra = [m for m in extras if m not in all_configs]
+        if unknown_extra:
+            typer.echo(f"Error: SIE_EXTRA_MODELS unknown model(s): {', '.join(unknown_extra)}", err=True)
+            raise typer.Exit(1)
+        model_filter = sorted(set(model_filter) | set(extras))
+        typer.echo(f"Extra models added to filter: {', '.join(extras)}")
+
     os.environ["SIE_INSTRUMENTATION"] = "true" if instrumentation else "false"
     if bundle:
         os.environ["SIE_BUNDLE"] = bundle

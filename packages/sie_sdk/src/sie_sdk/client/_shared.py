@@ -177,6 +177,7 @@ def check_version_skew(sdk_version: str, server_version: str) -> str | None:
                 f"server {server_version}. Consider upgrading."
             )
     except (ValueError, IndexError):
+        # Best-effort version compare; non-semver inputs silently skip the warning.
         pass
     return None
 
@@ -428,6 +429,7 @@ def get_error_detail(response: _HttpResponse) -> dict[str, Any] | None:
             if isinstance(detail, dict):
                 return detail
     except (ValueError, KeyError, TypeError):
+        # Malformed error body — caller treats as "no detail" and falls back.
         pass
     return None
 

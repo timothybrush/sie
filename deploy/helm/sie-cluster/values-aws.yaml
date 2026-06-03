@@ -58,7 +58,7 @@ ingress:
   #   1) cert-manager + Let's Encrypt (external cert-manager install):
   #      hosts:
   #        - sie.example.com
-  #      tls:
+  #      tlsConfig:
   #        enabled: true
   #        mode: cert-manager
   #        certManager:
@@ -67,7 +67,7 @@ ingress:
   #   2) self-signed (air-gapped / on-prem; bundles cert-manager — single-tenant clusters only):
   #      hosts:
   #        - sie.example.com
-  #      tls:
+  #      tlsConfig:
   #        enabled: true
   #        mode: self-signed
   #      # And at the top level:
@@ -76,7 +76,7 @@ ingress:
   #      #     install: true
   #
   #   3) disabled (TLS terminated upstream of the Ingress):
-  #      tls:
+  #      tlsConfig:
   #        enabled: false
   #        mode: disabled
 

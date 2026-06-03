@@ -314,7 +314,7 @@ class TestRegistryIntegration:
         )
 
     async def test_sglang_startup_timeout_classifies_as_timeout(self) -> None:
-        """M3 regression: ``_load_main_thread`` rewraps SGLang's
+        """Regression: ``_load_main_thread`` rewraps SGLang's
         ``RuntimeError('SGLang server failed to start within timeout')``
         into ``ModelLoadTimeoutError`` so the classifier buckets it as
         ``LoadErrorClass.TIMEOUT`` (30 s cooldown) instead of UNKNOWN

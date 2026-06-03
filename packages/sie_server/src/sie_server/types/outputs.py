@@ -3,7 +3,7 @@
 These types define the structure of embedding outputs: dense vectors, sparse vectors,
 and multi-vectors (for late-interaction models like ColBERT).
 
-Per DESIGN.md Section 5.9, numpy arrays are preserved for msgpack serialization.
+Numpy arrays are preserved for msgpack serialization.
 For JSON fallback, arrays are converted to lists on serialization.
 
 Using TypedDict for zero runtime overhead.

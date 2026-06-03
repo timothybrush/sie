@@ -12,8 +12,6 @@ Target models:
 
 Implementation: Uses SGLang's HTTP server mode (subprocess) rather than the
 Engine API to avoid event loop conflicts with uvicorn/uvloop.
-
-See DESIGN.md Section 6.2 for backend selection rationale.
 """
 
 from __future__ import annotations
@@ -204,7 +202,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         if self._pooling_method:
             cmd.extend(["--pooling-method", self._pooling_method])
 
-        # LoRA configuration (see DESIGN.md Section 3.7)
+        # LoRA configuration for the SGLang server.
         if self._lora_paths:
             cmd.append("--enable-lora")
             lora_path_str = ",".join(f"{name}={path}" for name, path in self._lora_paths.items())

@@ -13,7 +13,7 @@ The validator runs at config-load and at
 is a hard invariant. Encode/score/extract models continue to use the
 scalar ``lora_id`` form and are accepted.
 
-See ``product/research/generation-primitive-status.md`` §5 / §6.2.
+This test locks the generation-specific config-load rejection.
 """
 
 from __future__ import annotations

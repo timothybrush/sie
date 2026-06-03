@@ -764,7 +764,7 @@ tasks:
 
     #[test]
     fn test_model_info_extras_generate_task_surfaces_tokens_output() {
-        // Walking-skeleton (M4 Req 2): a generate task surfaces ``["tokens"]`` so
+        // A generate task surfaces ``["tokens"]`` so
         // ``GET /v1/models`` advertises the capability accurately. Without
         // this, generate-only models report ``outputs=[]`` and downstream
         // clients can't tell what the model produces.

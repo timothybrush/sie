@@ -14,7 +14,6 @@ Key features:
 
 License: NVIDIA Non-Commercial (note in model config)
 
-Per roadmap Project 10.5 Phase 1c:
 - Full conformance with SIE preprocessor infrastructure
 - Uses NemoColEmbedPreprocessor for image preprocessing
 - Calls model.forward() directly instead of forward_passages()
@@ -174,6 +173,23 @@ class NemoColEmbedAdapter(BaseAdapter):
         if isinstance(embedding_dim, int) and embedding_dim > 0:
             self._multivector_dim = embedding_dim
 
+        # FIX[#1055]: ensure the requested attention impl actually reaches the
+        # inner Qwen3-VL backbone (v2). On the sdpa fallback Qwen3-VL's vision
+        # attention runs a per-image Python loop over torch.split that
+        # serializes the batch (see ColQwen3). Safe no-op when flash already
+        # propagated, or for the v1 SigLIP+Llama path.
+        if attn_impl is not None and attn_impl != "sdpa" and hasattr(self._model, "set_attn_implementation"):
+            try:
+                self._model.set_attn_implementation(attn_impl)
+            except Exception:  # noqa: BLE001 - best-effort, keep loaded default on failure
+                logger.warning("NemoColEmbed: could not set attn=%s; keeping default", attn_impl, exc_info=True)
+
+        # FIX[#1055]: replace the Qwen3-VL vision Conv3d patch-embed with its
+        # matmul equivalent (same weights). The non-overlapping Conv3d hits a
+        # pathologically slow cuDNN path on this GPU; for the sibling ColQwen3 it
+        # was ~99.7% of the vision-tower forward. No-op for the v1 SigLIP path.
+        self._patch_vision_patch_embed()
+
         # Create preprocessor only when the model exposes v1-style attrs (image_size,
         # num_image_token). v2 (Qwen3-VL) does not, and the SigLIP+Llama-keyed
         # NemoColEmbedPreprocessor does not apply.
@@ -181,6 +197,38 @@ class NemoColEmbedAdapter(BaseAdapter):
             self._create_processor()
         else:
             logger.info("Skipping NemoColEmbedPreprocessor — model lacks v1 attrs (likely v2 backbone).")
+
+    def _patch_vision_patch_embed(self) -> None:
+        """Rebind the Qwen3-VL vision Conv3d patch-embed to its matmul equivalent.
+
+        The non-overlapping Conv3d patch projection (kernel == stride) hits a
+        pathologically slow cuDNN path on this GPU; for the sibling ColQwen3 it
+        was ~99.7% of the vision-tower forward. Reshaping to ``F.linear`` with the
+        same weights is numerically identical but runs as a fast matmul. Locates
+        the vision tower under the v2 (Qwen3-VL) backbone; no-op for the v1 path.
+        """
+        from torch.nn import functional
+
+        try:
+            visual = getattr(getattr(self._model, "model", None), "visual", None)
+            patch_embed = getattr(visual, "patch_embed", None)
+            proj = getattr(patch_embed, "proj", None)
+            if not isinstance(proj, torch.nn.Conv3d):
+                return
+            embed_dim = proj.out_channels
+            in_features = proj.in_channels * proj.kernel_size[0] * proj.kernel_size[1] * proj.kernel_size[2]
+
+            def fast_patch_embed_forward(
+                hidden_states: torch.Tensor, _pe: Any = patch_embed, _embed: int = embed_dim, _in: int = in_features
+            ) -> torch.Tensor:
+                weight = _pe.proj.weight
+                hs = hidden_states.to(weight.dtype).reshape(-1, _in)
+                return functional.linear(hs, weight.reshape(_embed, _in), _pe.proj.bias)
+
+            patch_embed.forward = fast_patch_embed_forward  # ty: ignore[invalid-assignment]
+            logger.info("NemoColEmbed: replaced vision Conv3d patch-embed with matmul equivalent")
+        except Exception:  # noqa: BLE001 - best-effort, keep the original Conv3d on failure
+            logger.warning("NemoColEmbed: could not rebind vision patch-embed; keeping Conv3d", exc_info=True)
 
     def _load_v1_dynamic(self, device: str, dtype: torch.dtype) -> Any:
         """Load v1 (SigLIP+Llama) via the explicit dynamic-module path.

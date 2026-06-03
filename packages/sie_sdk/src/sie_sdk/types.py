@@ -3,7 +3,7 @@
 These types are lightweight TypedDicts for type hints. No validation is performed
 client-side - the server validates all inputs.
 
-Per DESIGN.md Section 4.1 and 8.2, these types support flexible Python inputs
+These types support flexible Python inputs
 (file paths, PIL images, numpy arrays, bytes) which the client converts for transport.
 """
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
     from PIL import Image
 
-# Output dtype options (per DESIGN.md Section 4.4)
+# Output dtype options.
 DType = Literal["float32", "float16", "bfloat16", "int8", "uint8", "binary", "ubinary"]
 
 # Output dtypes we support for casting
@@ -91,7 +91,7 @@ class DocumentInput(TypedDict, total=False):
 class Item(TypedDict, total=False):
     """A single item to encode, score, or extract from.
 
-    Per DESIGN.md Section 4.1, items can contain text, images, audio, or video.
+    Items can contain text, images, audio, or video.
     Most models operate on text only, but multimodal models can process images.
 
     For simple text encoding, just use {"text": "your text here"}.
@@ -126,10 +126,7 @@ class Item(TypedDict, total=False):
 
 
 class SparseResult(TypedDict):
-    """Sparse vector result with non-zero indices and values.
-
-    Per DESIGN.md Section 8.2.
-    """
+    """Sparse vector result with non-zero indices and values."""
 
     indices: NDArray[np.int32]
     values: NDArray[np.float32]
@@ -147,7 +144,7 @@ class TimingInfo(TypedDict, total=False):
 class EncodeResult(TypedDict, total=False):
     """Result of encoding a single item.
 
-    Per DESIGN.md Section 8.2. Contains the item ID (if provided) and one or more
+    Contains the item ID (if provided) and one or more
     output representations depending on what was requested.
 
     Attributes:

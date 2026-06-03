@@ -17,7 +17,13 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from sie_config import metrics as sie_metrics
 from sie_config.config_store import ConfigStore
-from sie_config.model_registry import BundleConflictError, ModelNotFoundError, ModelRegistry, parse_model_spec
+from sie_config.model_registry import (
+    BundleConflictError,
+    ModelNotFoundError,
+    ModelRegistry,
+    ProfileConflictError,
+    parse_model_spec,
+)
 from sie_config.nats_publisher import NatsPublisher, PartialPublishError
 from sie_config.types import AuditEntry
 
@@ -488,11 +494,44 @@ async def add_model(request: Request) -> Response:
             #    never leaves the registry inconsistent with disk.
             try:
                 created_profiles, skipped_profiles, affected_bundles = model_registry.validate_model_config(config)
+            except ProfileConflictError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "content_conflict",
+                        "model_id": e.model,
+                        "conflicting_profiles": e.profiles,
+                        "message": str(e),
+                    },
+                ) from e
             except ValueError as e:
                 raise HTTPException(
                     status_code=422,
                     detail={"error": "validation_error", "details": [{"message": str(e)}]},
                 ) from e
+
+            existing_config = model_registry.get_full_config(model_id)
+            if existing_config:
+                conflicting_fields = []
+                for key, new_value in config.items():
+                    if key == "profiles":
+                        continue
+                    if key in existing_config and existing_config[key] != new_value:
+                        conflicting_fields.append(key)
+                if conflicting_fields:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "content_conflict",
+                            "model_id": model_id,
+                            "conflicting_fields": sorted(conflicting_fields),
+                            "message": (
+                                f"Top-level field(s) {sorted(conflicting_fields)} already "
+                                "exist with different values. Config API is append-only; "
+                                "mutating existing metadata is not supported via this endpoint."
+                            ),
+                        },
+                    )
 
             # 2. 409 conflict detection against what's already on disk.
             #    Only runs for pure-replay writes (no new profiles would be
@@ -979,10 +1018,16 @@ async def export_snapshot(request: Request) -> Response:
                 }
             )
 
+        bundle_config_hashes = {
+            bundle_id: model_registry.compute_bundle_config_hash(bundle_id)
+            for bundle_id in model_registry.list_bundles()
+        }
+
     snapshot = {
         "snapshot_version": 1,
         "epoch": epoch,
         "generated_at": datetime.now(UTC).isoformat(),
+        "bundle_config_hashes": bundle_config_hashes,
         "models": models,
     }
     return Response(content=orjson.dumps(snapshot), media_type="application/json")

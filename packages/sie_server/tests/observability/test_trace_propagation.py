@@ -1,4 +1,4 @@
-"""W3C Trace Context propagation through the worker streaming processor (M5).
+"""W3C Trace Context propagation through the worker streaming processor.
 
 These tests pin the contract that
 :meth:`sie_server.processors.streaming.StreamingProcessor.process`
@@ -156,7 +156,7 @@ async def test_worker_span_is_child_of_envelope_traceparent(
 ) -> None:
     """The worker span's trace_id must match the inbound traceparent.
 
-    This is the load-bearing assertion of the whole M5 wire — if
+    This is the load-bearing assertion of the trace propagation wire — if
     the worker did not extract the parent context the span would
     root a *new* trace tree and the assertion fails. The
     `parent_span_id` check additionally proves it's a child of the
@@ -232,7 +232,7 @@ async def test_worker_span_is_root_when_envelope_omits_traceparent(
 ) -> None:
     """Backward-compat: envelopes without `traceparent` still emit a span.
 
-    Pre-M5 gateways do not populate the trace fields, and we must
+    Gateways without trace propagation do not populate the trace fields, and we must
     not crash or skip the worker span just because the envelope
     omits them. The worker emits a root span instead — the trace
     just won't link back to a gateway parent.

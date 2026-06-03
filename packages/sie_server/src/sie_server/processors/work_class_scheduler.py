@@ -7,11 +7,10 @@ worker's slots between work classes when the operator opts in via
 consumable by another class, so neither starves) and competes for the
 remaining shared slots by weight via a virtual-time deficit counter.
 
-This module is the algorithmic core (roadmap §6.1, plan step 1): pure
-:mod:`asyncio`, no NATS. The pull-loop integration (acquire-before-dispatch,
-release-at-chunk-boundary), the ``SaturationGate`` snapshot wiring, and the
-A100 loadtest are the deferred follow-up; this component is unit-tested in
-isolation first.
+This module is the algorithmic core: pure :mod:`asyncio`, no NATS. The
+pull-loop integration (acquire-before-dispatch, release-at-chunk-boundary),
+the ``SaturationGate`` snapshot wiring, and load tests are separate layers;
+this component is unit-tested in isolation first.
 
 Slots are released at **completion** (chunk boundary for generation, batch
 completion for embedding) — never mid-decode — so KV-cache locality is

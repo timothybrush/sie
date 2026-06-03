@@ -23,6 +23,22 @@ pub trait PayloadStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), String>;
 }
 
+/// Disabled payload store. Used when `SIE_PAYLOAD_STORE_URL` is unset so
+/// queue mode does not silently offload to gateway-local disk that worker
+/// pods cannot read.
+pub struct DisabledPayloadStore;
+
+#[async_trait]
+impl PayloadStore for DisabledPayloadStore {
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<String, String> {
+        Err("payload store not configured".to_string())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Local filesystem payload store (default).
 pub struct LocalPayloadStore {
     base_dir: PathBuf,
@@ -158,6 +174,10 @@ impl PayloadStore for ObjectStorePayloadStore {
 
 /// Factory function to create the appropriate payload store based on URL prefix.
 pub async fn create_payload_store(url: &str) -> Arc<dyn PayloadStore> {
+    if url.trim().is_empty() {
+        return Arc::new(DisabledPayloadStore);
+    }
+
     #[cfg(feature = "cloud-storage")]
     {
         if let Some(rest) = url.strip_prefix("s3://") {
@@ -238,6 +258,13 @@ mod tests {
     async fn test_create_payload_store_local() {
         let dir = tempfile::TempDir::new().unwrap();
         let _store = create_payload_store(dir.path().to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_payload_store_empty_disables_offload() {
+        let store = create_payload_store("").await;
+        assert!(store.put("test.bin", b"data").await.is_err());
+        assert!(store.delete("test.bin").await.is_ok());
     }
 
     #[tokio::test]

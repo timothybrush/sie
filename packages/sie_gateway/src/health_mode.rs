@@ -5,8 +5,8 @@
 pub enum HealthModeDisposition {
     /// Default supported path: WebSocket worker health.
     WebSocketDefault,
-    /// Experimental path: subscribe to `sie.health.>` when URL + client exist.
-    TryNatsExperimental,
+    /// Subscribe to `sie.health.>` when URL + client exist.
+    TryNats,
     /// `nats` requested but `SIE_NATS_URL` is unset or empty.
     FallbackWebSocketMissingNatsUrl,
     /// `nats` requested but no usable NATS client is available yet.
@@ -26,7 +26,7 @@ pub fn health_mode_disposition(
         "ws" => HealthModeDisposition::WebSocketDefault,
         "nats" if !nats_url_nonempty => HealthModeDisposition::FallbackWebSocketMissingNatsUrl,
         "nats" if !nats_client_available => HealthModeDisposition::FallbackWebSocketNoNatsClient,
-        "nats" => HealthModeDisposition::TryNatsExperimental,
+        "nats" => HealthModeDisposition::TryNats,
         _ => HealthModeDisposition::FallbackWebSocketUnsupported,
     }
 }
@@ -64,10 +64,10 @@ mod tests {
     }
 
     #[test]
-    fn nats_with_url_and_client_is_experimental_path() {
+    fn nats_with_url_and_client_is_ready() {
         assert_eq!(
             health_mode_disposition("nats", true, true),
-            HealthModeDisposition::TryNatsExperimental
+            HealthModeDisposition::TryNats
         );
     }
 

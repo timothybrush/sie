@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from sie_sdk.bundle_utils import find_bundle_for_models, match_bundle_models
+from sie_sdk.bundle_utils import match_bundle_models
 
 logger = logging.getLogger(__name__)
 
@@ -185,46 +184,3 @@ def collect_bundle_deps(
         conflicts=[],
         models=model_names,
     )
-
-
-def resolve_bundle_deps_cli(
-    bundle_name: str | None,
-    model_names: list[str] | None,
-    bundles_dir: Path,
-    models_dir: Path,
-) -> int:
-    """CLI entry point for resolving bundle dependencies.
-
-    Prints requirements to stdout (one per line) or errors to stderr.
-
-    Args:
-        bundle_name: Name of the bundle to resolve.
-        model_names: Alternative: explicit list of model names (finds matching bundle).
-        bundles_dir: Path to the bundles directory.
-        models_dir: Path to the models directory.
-
-    Returns:
-        Exit code (0 for success, 1 for conflicts/errors).
-    """
-    if bundle_name:
-        result = collect_bundle_deps(bundle_name, bundles_dir, models_dir)
-    elif model_names:
-        # Find the best matching bundle for these models
-        matched = find_bundle_for_models(model_names, bundles_dir, models_dir)
-        if not matched:
-            print(f"No bundle found covering models: {', '.join(model_names)}", file=sys.stderr)
-            return 1
-        result = collect_bundle_deps(matched, bundles_dir, models_dir)
-    else:
-        return 1
-
-    if result.conflicts:
-        for conflict in result.conflicts:
-            print(conflict, file=sys.stderr)
-        return 1
-
-    # Print requirements to stdout for shell scripts to consume
-    for req in result.requirements:
-        print(req)
-
-    return 0

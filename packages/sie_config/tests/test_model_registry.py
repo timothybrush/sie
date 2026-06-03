@@ -4,7 +4,10 @@ import threading
 from pathlib import Path
 
 import pytest
+from sie_config import model_registry
 from sie_config.model_registry import (
+    DEFAULT_ENGINE,
+    KNOWN_ENGINES,
     BundleConflictError,
     BundleInfo,
     ModelInfo,
@@ -53,6 +56,11 @@ class TestBundleInfo:
         assert info.priority == 10
         assert info.adapters == []
         assert info.default is False
+        assert info.engine == DEFAULT_ENGINE
+
+    def test_bundle_info_engine_explicit(self) -> None:
+        info = BundleInfo(name="example", priority=5, engine="pytorch")
+        assert info.engine == "pytorch"
 
 
 class TestModelInfo:
@@ -282,11 +290,10 @@ class TestModelRegistryAdapterMatching:
 
         We deliberately do not fail reload() on this: the baked-in
         inconsistency is caught pre-merge by
-        ``packages/sie_server/tests/config/test_bundle_coverage.py`` (added
-        in PR #704), and failing here would take down the entire control
-        plane for a two-model config bug. Callers (e.g. readiness probes,
-        alerts) are expected to treat ``unrouteable_models`` as a
-        soft-error surface instead.
+        ``packages/sie_server/tests/config/test_bundle_coverage.py``, and
+        failing here would take down the entire control plane for a two-model
+        config bug. Callers (e.g. readiness probes, alerts) are expected to
+        treat ``unrouteable_models`` as a soft-error surface instead.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
@@ -424,6 +431,29 @@ class TestModelRegistryThreadSafety:
         registry.reload()
         assert registry.compute_bundles_hash() != before
 
+    def test_compute_bundles_hash_changes_on_engine_edit(
+        self, temp_config_dirs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Engine controls gateway routing, so engine-only bundle edits must
+        # trigger bundle drift reconciliation even when adapters are unchanged.
+        bundles_dir, models_dir = temp_config_dirs
+        registry = ModelRegistry(bundles_dir, models_dir)
+        before = registry.compute_bundles_hash()
+
+        monkeypatch.setattr(model_registry, "KNOWN_ENGINES", frozenset({"pytorch", "future-engine"}))
+        (bundles_dir / "default.yaml").write_text(
+            "name: default\n"
+            "priority: 10\n"
+            "default: true\n"
+            "engine: future-engine\n"
+            "adapters:\n"
+            "  - sie_server.adapters.bge_m3\n"
+            "  - sie_server.adapters.sentence_transformer\n"
+            "  - sie_server.adapters.cross_encoder\n"
+        )
+        registry.reload()
+        assert registry.compute_bundles_hash() != before
+
     def test_compute_bundles_hash_independent_of_adapter_list_order(self, temp_config_dirs) -> None:
         # Two YAMLs that list the same adapters in different order describe
         # the same bundle semantically. The hash MUST NOT change — otherwise
@@ -493,7 +523,7 @@ class TestUnrouteableModelsSurface:
     bundle declares) is reported via :pyattr:`ModelRegistry.unrouteable_models`
     and a single aggregated ERROR log at reload time, but never fatal.
 
-    The rationale is that PR #704's regression test
+    The rationale is that the bundle-coverage regression test
     (``packages/sie_server/tests/config/test_bundle_coverage.py``) already
     catches this in CI before it ships, so the runtime guard is
     defense-in-depth only. Failing reload() would take down the whole
@@ -624,7 +654,7 @@ class TestUnrouteableModelsSurface:
         when ``ModelInfo.bundles == []``, but bundles is the union across
         profiles, so a single good profile would hide every bad sibling.
 
-        Regression test for the cursor[bot] blocking comment on PR #705:
+        Regression test for baked-in/runtime parity:
         ``add_model_config`` already rejects the same shape at write time
         via ``new_adapter_modules - all_bundle_adapters``; ``reload()``
         now mirrors that so baked-in drift is surfaced identically.
@@ -668,8 +698,8 @@ class TestUnrouteableModelsSurface:
         otherwise ``unrouteable_models`` lies to readiness probes until
         the next disk-reload.
 
-        (Regression test for the coderabbitai PR #705 comment about
-        ``_unrouteable_models`` being stale after runtime writes.)
+        Regression test for ``_unrouteable_models`` being stale after
+        runtime writes.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
@@ -711,3 +741,83 @@ class TestUnrouteableModelsSurface:
                 }
             )
             assert registry.unrouteable_models == {}
+
+
+# --------------------------------------------------------------------
+# engine field — locks in the disjoint-bundles convention from the
+# 2026-04-26 IPC/UDS audit. A model that's served by two different
+# engines declares two profiles, each pointing at the namespaced
+# adapter, and the gateway routes to the bundle whose ``engine``
+# matches the worker image at hand. These tests pin the wire shape
+# and validation contract.
+# --------------------------------------------------------------------
+
+
+class TestEngineField:
+    @staticmethod
+    def _mk_dirs(tmppath: Path) -> tuple[Path, Path]:
+        bundles_dir = tmppath / "bundles"
+        models_dir = tmppath / "models"
+        bundles_dir.mkdir()
+        models_dir.mkdir()
+        return bundles_dir, models_dir
+
+    def test_engine_defaults_to_pytorch_when_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundles_dir, models_dir = self._mk_dirs(Path(tmpdir))
+            (bundles_dir / "default.yaml").write_text(
+                "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.bge_m3\n"
+            )
+
+            registry = ModelRegistry(bundles_dir, models_dir)
+            info = registry.get_bundle_info("default")
+            assert info is not None
+            assert info.engine == DEFAULT_ENGINE
+            assert info.engine == "pytorch"
+
+    def test_engine_unknown_value_skips_bundle(self, caplog: pytest.LogCaptureFixture) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundles_dir, models_dir = self._mk_dirs(Path(tmpdir))
+            (bundles_dir / "good.yaml").write_text(
+                "name: good\npriority: 10\nadapters:\n  - sie_server.adapters.bge_m3\n"
+            )
+            (bundles_dir / "typo.yaml").write_text(
+                "name: typo\nengine: pytroch\npriority: 10\nadapters:\n  - sie_server.adapters.foo\n"
+            )
+
+            with caplog.at_level(logging.ERROR, logger="sie_config.model_registry"):
+                registry = ModelRegistry(bundles_dir, models_dir)
+
+            bundles = registry.list_bundles()
+            assert "good" in bundles
+            assert "typo" not in bundles
+            assert any(
+                rec.levelname == "ERROR" and "engine" in rec.getMessage() and "pytroch" in rec.getMessage()
+                for rec in caplog.records
+            )
+
+    def test_engine_namespace_mismatch_is_warned_but_loads(self, caplog: pytest.LogCaptureFixture) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundles_dir, models_dir = self._mk_dirs(Path(tmpdir))
+            (bundles_dir / "mixed.yaml").write_text(
+                "name: mixed\n"
+                "engine: pytorch\n"
+                "priority: 10\n"
+                "adapters:\n"
+                "  - sie_server.adapters.bert_flash\n"
+                "  - some_unrelated.module\n"
+            )
+
+            with caplog.at_level(logging.WARNING, logger="sie_config.model_registry"):
+                registry = ModelRegistry(bundles_dir, models_dir)
+
+            info = registry.get_bundle_info("mixed")
+            assert info is not None
+            assert info.engine == "pytorch"
+            assert len(info.adapters) == 2
+            assert any(
+                rec.levelname == "WARNING" and "some_unrelated.module" in rec.getMessage() for rec in caplog.records
+            )
+
+    def test_known_engines_only_pytorch(self) -> None:
+        assert frozenset({"pytorch"}) == KNOWN_ENGINES

@@ -6,6 +6,10 @@ import pytest
 from sie_sdk.exceptions import GatedModelError
 
 
+def _raise_gated(model_id: str = "org/model", original: Exception | None = None) -> None:
+    raise GatedModelError(model_id, original or ValueError("test"))
+
+
 class TestGatedModelError:
     """Tests for GatedModelError exception class."""
 
@@ -67,14 +71,14 @@ class TestGatedModelError:
     def test_can_be_caught_as_exception(self) -> None:
         """GatedModelError can be caught as Exception."""
         with pytest.raises(Exception, match="Access denied") as exc_info:
-            raise GatedModelError("org/model", ValueError("test"))
+            _raise_gated()
 
         assert isinstance(exc_info.value, GatedModelError)
 
     def test_can_be_caught_specifically(self) -> None:
         """GatedModelError can be caught by its specific type."""
         with pytest.raises(GatedModelError) as exc_info:
-            raise GatedModelError("org/model", ValueError("test"))
+            _raise_gated()
 
         assert exc_info.value.model_id == "org/model"
 
@@ -102,7 +106,7 @@ class TestGatedModelError:
         original = ValueError("HF Hub error")
 
         with pytest.raises(GatedModelError) as exc_info:
-            raise GatedModelError("org/model", original)
+            _raise_gated(original=original)
 
         # The original error should be accessible
         assert exc_info.value.original_error is original

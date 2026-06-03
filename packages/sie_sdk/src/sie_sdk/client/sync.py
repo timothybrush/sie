@@ -2,8 +2,7 @@
 
 Provides a Python client for the Search Inference Engine server.
 
-Per DESIGN.md Section 8.1:
-- Synchronous encode() method (async variants in M5)
+- Synchronous encode() method
 - Accepts Item or list[Item], returns matching shape
 - Uses msgpack for efficient serialization with native numpy support
 - Returns numpy arrays directly
@@ -25,7 +24,7 @@ GPU Selection and Auto-Retry:
     ...     provision_timeout_s=900,  # Wait up to 15 min
     ... )
 
-Resource Pools (per DESIGN.md Section 10.3):
+Resource Pools:
     >>> # Create pool for isolated capacity
     >>> client = SIEClient("http://gateway:8080")
     >>> client.create_pool("eval-bench", {"l4": 2})  # 2 L4 GPUs
@@ -268,8 +267,6 @@ def _handle_oom_retry(
 
 class SIEClient:
     """Client for the Search Inference Engine.
-
-    Per DESIGN.md Section 8.1 and 9.6.
 
     Args:
         base_url: Base URL of the SIE server (e.g., "http://localhost:8080").
@@ -928,8 +925,6 @@ class SIEClient:
     ) -> EncodeResult | list[EncodeResult]:
         """Encode items into vector representations.
 
-        Per DESIGN.md Section 8.1.
-
         Args:
             model: Model name to use for encoding (e.g., "bge-m3").
             items: Single Item or list of Items to encode.
@@ -1040,7 +1035,7 @@ class SIEClient:
         single_item = not isinstance(items, list)
         items_list = [items] if single_item else items
 
-        # Convert images to JPEG bytes for transport (per design.md Section 4.3)
+        # Convert images to JPEG bytes for transport.
         # Only copy items that have images — text-only items are passed through directly
         items_for_wire = [
             convert_item_images({**item}) if "images" in item else item  # ty: ignore[invalid-argument-type]
@@ -1437,7 +1432,6 @@ class SIEClient:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
-        last_error: Exception | None = None
         for path in paths:
             ws_url = self._ws_url(path)
             try:
@@ -1451,7 +1445,6 @@ class SIEClient:
                         yield data
                 return
             except InvalidStatus as e:
-                last_error = e
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(e, "status", None)
@@ -1459,14 +1452,9 @@ class SIEClient:
                 )
                 raise RequestError(f"WebSocket connection failed: {status}") from e
             except WebSocketException as e:
-                last_error = e
                 raise SIEConnectionError(f"WebSocket error: {e}") from e
             except (OSError, json.JSONDecodeError) as e:
-                last_error = e
                 raise SIEConnectionError(f"WebSocket error: {e}") from e
-
-        if last_error:
-            raise SIEConnectionError(f"WebSocket connection failed: {last_error}") from last_error
 
     def get_capacity(self, *, gpu: str | None = None) -> CapacityInfo:
         """Get current cluster capacity information.

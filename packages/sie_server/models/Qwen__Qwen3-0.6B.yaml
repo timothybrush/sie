@@ -6,40 +6,39 @@ inputs:
   audio: false
   video: false
 tasks:
-  # Tiny generation model used for fast e2e iteration on Modal L4 (walking-skeleton
-  # viability bench + validation-harness SIE-only smoke). Loads in ~30s. Quality is
-  # bad — this is a transport benchmark target, not a production model.
+  # Small, fast generation model — a viable PROD pick for simple/short-prompt
+  # tasks (cheap + high throughput; weaker on long-context reasoning). Loads in
+  # ~30s. Also doubles as the transport/walking-skeleton benchmark target.
   #
-  # Context / batch sizes are deliberately small (1024 vs the headroom an
-  # L4 could nominally support) so the validation harness can co-resident
-  # the worker's SGLang with a second SGLang for the baseline phase on
-  # a single 22 GiB card without OOMing. Raise these if you ever run 0.6B
-  # alone on a card it doesn't have to share.
+  # ``context_length`` is the standalone PROD serving value (4096): big enough
+  # to fit the full generation benchmark pack (casehold prompts reach ~1.8k
+  # tokens, gpqa ~1.3k) so the model is comparable to the rest of the fleet on
+  # every task, while KV stays trivial at this size (112 KB/token → 4096 ≈
+  # 0.46 GB). The validation/co-residency harness, which packs two SGLang
+  # instances onto a single 22 GiB L4, does NOT depend on this default — it
+  # passes an explicit ``--max-seq-length``/``--context-length`` (see
+  # tools/bench_generation_matrix.py + run_generation_smoke.py) and caps itself
+  # to 1024 for that case.
   #
-  # Note on the three 1024s below: `context_length`, `max_sequence_length`,
-  # and `max_batch_tokens` are NOT redundant — they're three independent
-  # knobs (per-request context, SGLang --context-length, batcher cost
-  # budget) that just happen to collide here because the model is tiny.
-  # See sibling Qwen__Qwen3-4B-Instruct-2507.yaml for the canonical
-  # non-collapsed shape.
+  # ``context_length``, ``max_sequence_length``, and ``max_batch_tokens`` are
+  # three independent knobs (per-request context, SGLang --context-length,
+  # batcher cost budget); see sibling Qwen__Qwen3-4B-Instruct-2507.yaml.
   generate:
-    context_length: 1024
+    context_length: 4096
     max_output_tokens: 1024
     capabilities:
       grammar: []
       streaming: true
       tools: false
-max_sequence_length: 1024
+max_sequence_length: 4096
 # KV-cache memory math (Qwen3-0.6B, bf16):
 #   layers=28, kv_heads=8, head_dim=128, bytes_per_elem=2
 #   kv_bytes_per_token = 2 × 28 × 8 × 128 × 2 = 114,688 B ≈ 112 KB
-# The 0.6B is a transport benchmark target — context_length is held at
-# 1024 deliberately (see header comment) so the validation harness can
-# co-resident two SGLang instances on an L4. KV budgets per profile
-# scale with the deployment scenario rather than the GPU ceiling.
+# At ctx=4096 a single request's KV is ~0.46 GB — negligible. The co-residency
+# harness still caps context explicitly when it has to share a card.
 profiles:
   default:
-    max_batch_tokens: 1024
+    max_batch_tokens: 4096
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
     kv_budget_tokens: 8192

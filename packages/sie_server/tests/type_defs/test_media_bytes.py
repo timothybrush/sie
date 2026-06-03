@@ -73,20 +73,47 @@ class TestMediaBytesRejects:
 
 
 class TestWorkerErrorClassification:
-    """The queue/NATS path maps InvalidMediaError to INVALID_INPUT, not inference_error."""
+    """The queue/sidecar path maps InvalidMediaError to INVALID_INPUT, not inference_error."""
 
     def test_invalid_media_maps_to_invalid_input(self) -> None:
-        from sie_server.nats_pull_loop import NatsPullLoop
+        from sie_server.ipc_types import EncodeBatchItem
+        from sie_server.queue_executor import _inference_exception_outcome
         from sie_server.types.responses import ErrorCode
 
-        code, msg = NatsPullLoop._classify_inference_exception(InvalidMediaError("image data must be bytes, got str"))
+        outcome = _inference_exception_outcome(
+            EncodeBatchItem(
+                work_item_id="wi-1",
+                request_id="req-1",
+                item_index=0,
+                total_items=1,
+                timestamp=0.0,
+                item={},
+                output_types=["dense"],
+            ),
+            InvalidMediaError("image data must be bytes, got str"),
+        )
 
-        assert code == ErrorCode.INVALID_INPUT.value
-        assert "must be bytes" in msg
+        assert outcome.disposition == "publish_error_and_ack"
+        assert outcome.error_code == ErrorCode.INVALID_INPUT.value
+        assert outcome.error is not None
+        assert "must be bytes" in outcome.error
 
     def test_generic_error_still_maps_to_inference_error(self) -> None:
-        from sie_server.nats_pull_loop import NatsPullLoop
+        from sie_server.ipc_types import EncodeBatchItem
+        from sie_server.queue_executor import _inference_exception_outcome
 
-        code, _ = NatsPullLoop._classify_inference_exception(RuntimeError("boom"))
+        outcome = _inference_exception_outcome(
+            EncodeBatchItem(
+                work_item_id="wi-1",
+                request_id="req-1",
+                item_index=0,
+                total_items=1,
+                timestamp=0.0,
+                item={},
+                output_types=["dense"],
+            ),
+            RuntimeError("boom"),
+        )
 
-        assert code == "inference_error"
+        assert outcome.disposition == "publish_error_and_ack"
+        assert outcome.error_code == "inference_error"

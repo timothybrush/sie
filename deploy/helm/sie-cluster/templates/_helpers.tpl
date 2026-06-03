@@ -285,7 +285,23 @@ Consume with: include "sie-cluster.ingress.hosts" . | fromJsonArray
 Validation: TLS / cert-manager / trust-manager configuration consistency.
 Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or no) Issuer template renders.
 */}}
+{{- define "sie-cluster.ingressTlsConfig" -}}
+{{- $tls := deepCopy (default (dict) .Values.ingress.tlsConfig) -}}
+{{- if and (hasKey .Values.ingress "tls") (kindIs "map" .Values.ingress.tls) -}}
+{{- $legacy := .Values.ingress.tls -}}
+{{- $legacyActive := or (default false $legacy.enabled) (and (hasKey $legacy "mode") (ne (default "byo" $legacy.mode) "byo")) -}}
+{{- if and (not (default false $tls.enabled)) $legacyActive -}}
+{{- $tls = mergeOverwrite $tls $legacy -}}
+{{- else -}}
+{{- $tls = mergeOverwrite (deepCopy $legacy) $tls -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $tls -}}
+{{- end }}
+
 {{- define "sie-cluster.validateTls" -}}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- $hosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
 {{- /* CRD existence is no longer a reliable "is cert-manager installed" signal — we vendor the
        cert-manager and trust-manager CRDs under crds/, so the CRD lands on every install regardless
        of whether a cert-manager Deployment exists. Helm's lookup() can't filter by label, so we
@@ -310,7 +326,7 @@ Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or
 {{- $tmInstall := .Values.certManagerBundle.trustManager.install }}
 {{- if $cmInstall }}
 {{- if and $cmDeploy (not .Values.certManagerBundle.allowExistingCRDs) }}
-{{- fail "Refusing to install bundled cert-manager: a cert-manager Deployment already exists in the cluster. Two cert-manager controllers reconciling the same CRDs will corrupt issuance state. Remediation: (a) set certManagerBundle.certManager.install=false and use ingress.tls.mode=cert-manager against the existing install, OR (b) uninstall the existing cert-manager first, OR (c) set certManagerBundle.allowExistingCRDs=true (DANGEROUS — only if you understand the consequences)." }}
+{{- fail "Refusing to install bundled cert-manager: a cert-manager Deployment already exists in the cluster. Two cert-manager controllers reconciling the same CRDs will corrupt issuance state. Remediation: (a) set certManagerBundle.certManager.install=false and use ingress.tlsConfig.mode=cert-manager against the existing install, OR (b) uninstall the existing cert-manager first, OR (c) set certManagerBundle.allowExistingCRDs=true (DANGEROUS — only if you understand the consequences)." }}
 {{- end }}
 {{- end }}
 {{- /* Note: we deliberately do NOT fail here when (mode=self-signed | trustManager.install=true |
@@ -320,39 +336,41 @@ Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or
        Job hook is the authoritative apply-time check; if cert-manager truly isn't present at apply
        time, the cert-manager.io / trust.cert-manager.io resources will fail to reconcile and
        surface in `kubectl get certificate`. */ -}}
-{{- if .Values.ingress.tls.enabled }}
-{{- $mode := .Values.ingress.tls.mode }}
+{{- if $tls.enabled }}
+{{- $mode := default "byo" $tls.mode }}
 {{- if not (or (eq $mode "byo") (eq $mode "cert-manager") (eq $mode "self-signed") (eq $mode "disabled")) }}
-{{- fail (printf "Invalid configuration: ingress.tls.mode=%q. Must be one of: \"byo\", \"cert-manager\", \"self-signed\", \"disabled\"." $mode) }}
+{{- fail (printf "Invalid configuration: ingress.tlsConfig.mode=%q. Must be one of: \"byo\", \"cert-manager\", \"self-signed\", \"disabled\"." $mode) }}
 {{- end }}
 {{- if eq $mode "cert-manager" }}
-{{- if not (include "sie-cluster.ingress.hosts" . | fromJsonArray) }}
-{{- fail "Invalid configuration: ingress.tls.mode=cert-manager requires ingress.host or ingress.hosts to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
+{{- if not $hosts }}
+{{- fail "Invalid configuration: ingress.tlsConfig.mode=cert-manager requires ingress.host or ingress.hosts to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
 {{- end }}
-{{- $kind := .Values.ingress.tls.certManager.kind }}
+{{- $certManager := default (dict) $tls.certManager }}
+{{- $kind := default "" $certManager.kind }}
 {{- if not (or (eq $kind "ClusterIssuer") (eq $kind "Issuer")) }}
-{{- fail (printf "Invalid configuration: ingress.tls.certManager.kind=%q. Must be either \"ClusterIssuer\" or \"Issuer\" (case-sensitive)." $kind) }}
+{{- fail (printf "Invalid configuration: ingress.tlsConfig.certManager.kind=%q. Must be either \"ClusterIssuer\" or \"Issuer\" (case-sensitive)." $kind) }}
 {{- end }}
-{{- if .Values.ingress.tls.certManager.create }}
-{{- if not .Values.ingress.tls.certManager.server }}
-{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.server to be set (ACME directory URL is required)." }}
+{{- if $certManager.create }}
+{{- if not $certManager.server }}
+{{- fail "Invalid configuration: ingress.tlsConfig.certManager.create=true requires ingress.tlsConfig.certManager.server to be set (ACME directory URL is required)." }}
 {{- end }}
-{{- if not .Values.ingress.tls.certManager.privateKeySecretRef }}
-{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.privateKeySecretRef to be set (ACME account key Secret name is required)." }}
+{{- if not $certManager.privateKeySecretRef }}
+{{- fail "Invalid configuration: ingress.tlsConfig.certManager.create=true requires ingress.tlsConfig.certManager.privateKeySecretRef to be set (ACME account key Secret name is required)." }}
 {{- end }}
-{{- if not .Values.ingress.tls.certManager.email }}
-{{- fail "Invalid configuration: ingress.tls.certManager.create=true requires ingress.tls.certManager.email to be set (ACME account registration needs an email)." }}
+{{- if not $certManager.email }}
+{{- fail "Invalid configuration: ingress.tlsConfig.certManager.create=true requires ingress.tlsConfig.certManager.email to be set (ACME account registration needs an email)." }}
 {{- end }}
 {{- else }}
-{{- if not .Values.ingress.tls.certManager.name }}
-{{- fail "Invalid configuration: ingress.tls.certManager.create=false requires ingress.tls.certManager.name to be set (without a name there is no existing Issuer/ClusterIssuer to annotate against)." }}
+{{- if not $certManager.name }}
+{{- fail "Invalid configuration: ingress.tlsConfig.certManager.create=false requires ingress.tlsConfig.certManager.name to be set (without a name there is no existing Issuer/ClusterIssuer to annotate against)." }}
 {{- end }}
 {{- end }}
 {{- end }}
 {{- if eq $mode "self-signed" }}
-{{- $hosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
-{{- if and (empty $hosts) (empty .Values.ingress.tls.selfSigned.leaf.dnsNames) (empty .Values.ingress.tls.selfSigned.leaf.ipAddresses) }}
-{{- fail "Invalid configuration: ingress.tls.mode=self-signed requires at least one of ingress.hosts (or ingress.host), ingress.tls.selfSigned.leaf.dnsNames, or ingress.tls.selfSigned.leaf.ipAddresses to be set (the leaf certificate needs at least one SAN)." }}
+{{- $selfSigned := default (dict) $tls.selfSigned }}
+{{- $leaf := default (dict) $selfSigned.leaf }}
+{{- if and (empty $hosts) (empty $leaf.dnsNames) (empty $leaf.ipAddresses) }}
+{{- fail "Invalid configuration: ingress.tlsConfig.mode=self-signed requires at least one of ingress.hosts (or ingress.host), ingress.tlsConfig.selfSigned.leaf.dnsNames, or ingress.tlsConfig.selfSigned.leaf.ipAddresses to be set (the leaf certificate needs at least one SAN)." }}
 {{- end }}
 {{- end }}
 {{- end }}

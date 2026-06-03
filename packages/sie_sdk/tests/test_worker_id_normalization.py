@@ -15,7 +15,7 @@ will silently miss every worker whose raw id contains a newly-changed
 character — the pool fallback will eventually catch the work item but the
 HRW routing decision is wasted.
 
-Workstream G-M5.
+This locks the cross-language normalization contract.
 """
 
 from __future__ import annotations

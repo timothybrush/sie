@@ -1,7 +1,8 @@
-{{- if and .Values.ingress.tls.enabled (eq .Values.ingress.tls.mode "self-signed") }}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- if and $tls.enabled (eq (default "byo" $tls.mode) "self-signed") }}
 {{- $fullname := include "sie-cluster.fullname" . }}
 {{- $ns := include "sie-cluster.namespace" . }}
-{{- $self := .Values.ingress.tls.selfSigned }}
+{{- $self := $tls.selfSigned }}
 {{- /* Root CA lives in cert-manager's --cluster-resource-namespace so the CA ClusterIssuer can find its Secret. */ -}}
 {{- $rootCaNs := default $ns $self.rootCA.namespace }}
 apiVersion: cert-manager.io/v1
@@ -55,7 +56,7 @@ metadata:
   labels:
     {{- include "sie-cluster.labels" . | nindent 4 }}
 spec:
-  secretName: {{ .Values.ingress.tls.secretName | quote }}
+  secretName: {{ $tls.secretName | quote }}
   duration: {{ $self.leaf.duration | quote }}
   renewBefore: {{ $self.leaf.renewBefore | quote }}
   privateKey:

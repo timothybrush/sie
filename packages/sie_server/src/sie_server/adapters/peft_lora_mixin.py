@@ -10,8 +10,6 @@ Usage:
             self._model = AutoModel.from_pretrained(...)
             # Store base model reference for LoRA wrapping
             self._base_model = self._model
-
-See DESIGN.md Section 7.3 for the LoRA architecture specification.
 """
 
 from __future__ import annotations

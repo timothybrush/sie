@@ -8,8 +8,6 @@ Metrics follow Prometheus naming conventions:
 - _total suffix for counters
 - _seconds suffix for duration histograms
 - _bytes suffix for memory metrics
-
-See DESIGN.md Section 5.6 for observability design.
 """
 
 from __future__ import annotations
@@ -198,11 +196,11 @@ GRAMMAR_PREWARM_TOTAL = Counter(
 )
 
 # -----------------------------------------------------------------------------
-# ADR-0002 metrics — SGLang owns request-time grammar compilation
+# Structured-output grammar metrics
 # -----------------------------------------------------------------------------
 #
-# Per ADR-0002 the worker-side Outlines preflight is no longer on the
-# request hot path; SGLang's server-side grammar backend (Outlines,
+# The worker-side Outlines preflight is no longer on the request hot
+# path; SGLang's server-side grammar backend (Outlines,
 # xgrammar, or llguidance) is the single authority. These metrics give
 # operators visibility into structured-output behaviour from the
 # worker's side without re-introducing the duplicate preflight.
@@ -221,29 +219,27 @@ GRAMMAR_PREWARM_TOTAL = Counter(
 # output TTFT histogram is the proxy for SGLang's own internal compile
 # cost — when SGLang has to construct an FSM for a unique schema, the
 # first-token latency for that request inflates accordingly.
-GRAMMAR_COMPILE_SECONDS_ADR0002 = Histogram(
+GRAMMAR_COMPILE_SECONDS_STRUCTURED_OUTPUT = Histogram(
     "sie_grammar_compile_seconds",
-    "Worker-side preflight grammar-compile duration (only emitted when "
-    "SIE_GRAMMAR_PREFLIGHT_DEBUG=1; off by default per ADR-0002)",
+    "Worker-side preflight grammar-compile duration (only emitted when SIE_GRAMMAR_PREFLIGHT_DEBUG=1; off by default)",
     ["backend", "mode"],
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
 )
 
 STRUCTURED_OUTPUT_TTFT_SECONDS = Histogram(
     "sie_structured_output_ttft_seconds",
-    "Time-to-first-token for structured-output requests, proxy for "
-    "SGLang's server-side grammar-construction cost (ADR-0002)",
+    "Time-to-first-token for structured-output requests, proxy for SGLang's server-side grammar-construction cost",
     ["backend", "mode"],
     buckets=TTFT_TPOT_BUCKETS,
 )
 
-GRAMMAR_CACHE_HITS_ADR0002 = Counter(
+GRAMMAR_CACHE_HITS_STRUCTURED_OUTPUT = Counter(
     "sie_grammar_cache_hits_total",
     "Worker-side grammar-cache hits (preflight cache; only fires when SIE_GRAMMAR_PREFLIGHT_DEBUG=1)",
     ["backend"],
 )
 
-GRAMMAR_CACHE_MISSES_ADR0002 = Counter(
+GRAMMAR_CACHE_MISSES_STRUCTURED_OUTPUT = Counter(
     "sie_grammar_cache_misses_total",
     "Worker-side grammar-cache misses (preflight cache; only fires when SIE_GRAMMAR_PREFLIGHT_DEBUG=1)",
     ["backend"],
@@ -364,6 +360,32 @@ QUEUE_DEPTH = Gauge(
     ["model"],
 )
 
+# IPC batch shape metrics expose how one sidecar batch fragments into
+# Python/GPU forward passes. Bucket sizes match `sie_gpu_batch_items`
+# so dashboards can compare IPC and GPU batch shapes directly.
+_IPC_BATCH_SIZE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+IPC_BATCH_ITEMS = Histogram(
+    "sie_ipc_batch_items",
+    "Number of items in a single IPC batch received from the worker-sidecar",
+    ["model", "endpoint"],
+    buckets=_IPC_BATCH_SIZE_BUCKETS,
+)
+
+IPC_BATCH_SUB_GROUPS = Histogram(
+    "sie_ipc_batch_sub_groups",
+    "Number of sub-groups (separate GPU forward passes) from one IPC batch",
+    ["model", "endpoint"],
+    buckets=_IPC_BATCH_SIZE_BUCKETS,
+)
+
+IPC_BATCH_SUB_GROUP_ITEMS = Histogram(
+    "sie_ipc_batch_sub_group_items",
+    "Items per sub-group after IPC-batch splitting",
+    ["model", "endpoint"],
+    buckets=_IPC_BATCH_SIZE_BUCKETS,
+)
+
 
 # -----------------------------------------------------------------------------
 # Model Metrics
@@ -384,7 +406,7 @@ MODEL_MEMORY_BYTES = Gauge(
 MODEL_LOAD_TIMEOUTS = Counter(
     "sie_model_load_timeouts_total",
     "Number of post-download model-load timeouts, broken down by stage. "
-    "Stage is one of: ``instantiate`` (adapter object construction) or "
+    "The stage label is one of: ``instantiate`` (adapter object construction) or "
     "``load`` (adapter.load + warmup). Download is bounded separately by "
     "HF_HUB_DOWNLOAD_TIMEOUT and does NOT increment this counter.",
     ["model", "stage"],
@@ -563,6 +585,24 @@ def set_queue_depth(model: str, depth: int) -> None:
         depth: Current queue depth.
     """
     QUEUE_DEPTH.labels(model=model).set(depth)
+
+
+def record_ipc_batch_shape(
+    model: str,
+    endpoint: str,
+    total_items: int,
+    sub_group_sizes: list[int],
+) -> None:
+    """Record the IPC batch shape before Python dispatches GPU work."""
+    if total_items <= 0:
+        return
+    IPC_BATCH_ITEMS.labels(model=model, endpoint=endpoint).observe(total_items)
+    IPC_BATCH_SUB_GROUPS.labels(model=model, endpoint=endpoint).observe(len(sub_group_sizes))
+    for size in sub_group_sizes:
+        # Zero-size entries are invalid; skip them rather than recording
+        # misleading 0-bucket samples.
+        if size > 0:
+            IPC_BATCH_SUB_GROUP_ITEMS.labels(model=model, endpoint=endpoint).observe(size)
 
 
 def set_model_loaded(model: str, device: str, loaded: bool) -> None:

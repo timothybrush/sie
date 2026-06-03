@@ -2,7 +2,7 @@
 
 Provides an async Python client for the Search Inference Engine server.
 
-Per DESIGN.md Section 8.1 and 9.6 - Async variants for all methods.
+Async variants for all client methods.
 
 Example:
     >>> async with SIEAsyncClient("http://localhost:8080") as client:
@@ -309,7 +309,7 @@ class _AioResponse:
 class SIEAsyncClient:
     """Async client for the Search Inference Engine.
 
-    Per DESIGN.md Section 8.1 and 9.6 - Async variants for all methods.
+    Async variants for all client methods.
 
     Args:
         base_url: Base URL of the SIE server (e.g., "http://localhost:8080").
@@ -1083,7 +1083,7 @@ class SIEAsyncClient:
         single_item = not isinstance(items, list)
         items_list = [items] if single_item else items
 
-        # Convert images to JPEG bytes for transport (per design.md Section 4.3)
+        # Convert images to JPEG bytes for transport.
         # Only copy items that have images — text-only items are passed through directly
         items_for_wire = [
             convert_item_images({**item}) if "images" in item else item  # ty: ignore[invalid-argument-type]
@@ -1435,7 +1435,6 @@ class SIEAsyncClient:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
-        last_error: Exception | None = None
         for path in paths:
             ws_url = self._ws_url(path)
             try:
@@ -1449,14 +1448,9 @@ class SIEAsyncClient:
                         yield data
                 return
             except websockets.exceptions.InvalidStatus as e:
-                last_error = e
                 raise RequestError(f"WebSocket connection failed: {e.response.status_code}") from e
             except (websockets.WebSocketException, OSError, json.JSONDecodeError) as e:
-                last_error = e
                 raise SIEConnectionError(f"WebSocket error: {e}") from e
-
-        if last_error:
-            raise SIEConnectionError(f"WebSocket connection failed: {last_error}") from last_error
 
     async def get_capacity(self, *, gpu: str | None = None) -> CapacityInfo:
         """Async version of get_capacity(). See SIEClient.get_capacity() for details."""

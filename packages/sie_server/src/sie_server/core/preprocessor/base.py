@@ -3,7 +3,7 @@
 This module defines the Preprocessor protocol that all modality-specific
 preprocessors must implement, plus shared infrastructure for image processing.
 
-See roadmap.md Project 10.4 Phase 2 for design details.
+Preprocessors convert request items into payloads ready for batching.
 """
 
 from __future__ import annotations

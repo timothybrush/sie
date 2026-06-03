@@ -11,7 +11,7 @@ spec:
   {{- /*
     sie-config is intentionally hardcoded to a single replica.
 
-    State it owns (see packages/sie_gateway/docs/architecture-guide.md §3, §11):
+    State it owns (see packages/sie_gateway/docs/architecture-guide.md sections 3 and 11):
       - epoch counter on disk (RMW increment)
       - per-process asyncio.Lock serializing writes
       - per-process Idempotency-Key LRU cache

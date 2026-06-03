@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ERR_CUDA_REQUIRED = "BertFlashCrossEncoder requires CUDA for Flash Attention."
-
 
 class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
     """Cross-encoder adapter with Flash Attention 2 varlen.

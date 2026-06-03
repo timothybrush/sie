@@ -2,7 +2,7 @@
 
 Runtime gateway for elastic GPU inference deployments. It routes the four SIE primitives: `encode`, `score`, and `extract` over NATS JetStream (queue transport, at-least-once delivery), plus OpenAI-compatible and SIE-native **generation** endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/generate/{model}`) over direct-dispatch per-worker streams with cache-aware prefix routing. The gateway also owns pool coordination and worker health. Config writes live in `sie-config`; the gateway is a pure consumer of config state, bootstrapping from `GET /v1/configs/export` and subscribing to NATS deltas.
 
-Generation is treated as a supported fourth primitive (see [`docs/adr/0001-generation-is-a-supported-primitive.md`](../../docs/adr/0001-generation-is-a-supported-primitive.md) and `product/design.md` Section 5.10–5.14 for the contract — defer to those documents for the full surface).
+Generation is treated as a supported fourth primitive.
 
 See [`docs/architecture-guide.md`](docs/architecture-guide.md) for the authoritative code-audited architecture document (covers both this service and `sie-config`).
 
@@ -49,7 +49,8 @@ SIE_NATS_URL=nats://localhost:4222 \
 
 Notes:
 
-- `encode` / `score` / `extract` are queue-only: if no usable NATS client is available, these requests return `503`. Generation endpoints use direct-dispatch and do not depend on JetStream for their hot path (NATS Core is still used for worker health and config distribution).
+- `encode` / `score` / `extract` are queue-only: if no usable NATS client is available, these requests return `503`.
+- Generation endpoints use direct-dispatch and do not depend on JetStream for their hot path (NATS Core is still used for worker health and config distribution). There is no direct worker HTTP fallback mode and no `SIE_CLUSTER_ROUTING` toggle.
 
 ## CLI
 
@@ -87,7 +88,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_GATEWAY_K8S_NAMESPACE` | `default` | K8s namespace |
 | `SIE_GATEWAY_K8S_SERVICE` | `sie-worker` | K8s service name |
 | `SIE_GATEWAY_K8S_PORT` | `8080` | K8s worker port |
-| `SIE_GATEWAY_HEALTH_MODE` | `ws` | Worker health transport. Supported value: `ws`. `nats` is experimental/internal and requires a worker-side `sie.health.>` publisher, which is not wired by default |
+| `SIE_GATEWAY_HEALTH_MODE` | `ws` | Health mode: `ws` or `nats` |
 | `SIE_NATS_URL` | | NATS server URL. The process can start without it, but inference requests will return `503` until a usable client exists |
 | `SIE_AUTH_MODE` | `none` | Auth mode for inbound requests: `none` disables, `token` (alias `static`) enforces. Unknown values fail-open-to-bypass; `main` logs a startup error naming the bad value |
 | `SIE_AUTH_TOKENS` | | CSV of valid bearer tokens for inference and pool/config read endpoints. If unset, the singular `SIE_AUTH_TOKEN` is used as a fallback. When auth is enabled and this list is empty, non-probe requests return `500` |
@@ -110,7 +111,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_GATEWAY_GPU_ALIASES` | | JSON map of request aliases to canonical machine profiles |
 | `SIE_BUNDLES_DIR` | `bundles` | Optional bundle filesystem seed. Unset in default Helm deploys: the gateway pulls bundles from `sie-config` via `GET /v1/configs/bundles{,/{id}}` at startup and the registry's filesystem reload is a no-op. Only set by the `gateway.embeddedConfigs` / `gateway.configMap` overlays which mount a ConfigMap at `/configs/bundles`. |
 | `SIE_MODELS_DIR` | `models` | Optional model filesystem seed. Same semantics as `SIE_BUNDLES_DIR`: unset in default deploys, runtime model writes always go to `sie-config` and the gateway replays them via `GET /v1/configs/export`. |
-| `SIE_PAYLOAD_STORE_URL` | `payload_store` | Payload offload store path; `s3://` and `gs://` require the `cloud-storage` feature |
+| `SIE_PAYLOAD_STORE_URL` | unset | Shared payload offload store path. When unset, large-payload offload is disabled. Queue deployments should use `s3://` or `gs://`; local filesystem paths only work when gateway and workers share the same path |
 
 ## API Endpoints
 
@@ -137,7 +138,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 
 ### Generation (direct-dispatch per-worker streams)
 
-Generation is a supported fourth primitive. The contract is defined in `product/design.md` Section 5.10–5.14; this README only lists the routes. Strict allow-list parsing on the OpenAI-compatible endpoints — unknown fields reject with `400 unsupported_field`.
+Generation is a supported fourth primitive. Strict allow-list parsing on the OpenAI-compatible endpoints means unknown fields reject with `400 unsupported_field`.
 
 | Method | Path | Description |
 |--------|------|-------------|

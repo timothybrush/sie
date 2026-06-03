@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.4.1"
+version = "0.4.2"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -39,7 +39,7 @@ dependencies = [
     # SigLIP (Marqo/marqo-ecommerce-embeddings-B native open_clip loader)
     "open-clip-torch>=2.24",
     # Image processing
-    "pillow>=11,<12",
+    "pillow>=12.2.0",
     "numpy>=2,<3",
     "torchvision>=0.18,<1", # Required by some HF models (e.g., nvidia/llama-nemoretriever)
     # Config
@@ -50,8 +50,6 @@ dependencies = [
     "packaging>=24,<25",
     # Hot-reload
     "watchdog>=6,<7",
-    # NATS pub/sub for config notifications
-    "nats-py>=2.9,<3",
     # Observability
     "opentelemetry-api>=1.28,<2",
     "opentelemetry-sdk>=1.28,<2",
@@ -66,6 +64,11 @@ dependencies = [
     "msgspec>=0.20.0",
     # Async HTTP client (telemetry sender)
     "httpx>=0.28.1",
+    # BLAKE3 used to cross-check the worker-sidecar's `PreparedTokens`
+    # tokenizer_id. Tiny (<200KB, pure-Rust via PyO3), mandatory for
+    # the encode / score fast-path consumer — see
+    # `sie_server.core.preprocessor.text.TextPreprocessor`.
+    "blake3>=0.4,<1",
 ]
 
 [project.optional-dependencies]

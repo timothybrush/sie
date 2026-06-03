@@ -232,10 +232,7 @@ async def test_cancel_event_emits_cancelled_terminal() -> None:
         GenerationChunk(text_delta=" more"),  # will never be yielded — held
         GenerationChunk(text_delta="", done=True, finish_reason="stop"),
     ]
-    adapter = _FakeGenAdapter(script, hold_event=hold)
-    # First chunk yields immediately (hold unset for the first iteration?).
-    # We need the first chunk to come through; then we hold subsequent yields.
-    # Easiest: don't use hold for the first; set it after first.
+    # First chunk yields immediately; subsequent yields wait on `hold`.
     # Workaround: tweak the adapter to not hold on the first yield.
 
     class _AdapterFirstFree(_FakeGenAdapter):
@@ -709,8 +706,6 @@ def _patch_compile(monkeypatch: pytest.MonkeyPatch, fn: Any) -> list[int]:
     exercise the legacy worker-side preflight (now off by default per
     ADR-0002) still run the preflight code path.
     """
-    import sie_server.processors.streaming as streaming_mod
-
     # ADR-0002: the worker-side preflight is off by default. Tests that
     # use this helper are explicitly exercising the preflight path, so
     # enable the debug flag for their scope.
@@ -722,7 +717,7 @@ def _patch_compile(monkeypatch: pytest.MonkeyPatch, fn: Any) -> list[int]:
         calls.append(1)
         return fn(tok, grammar)
 
-    monkeypatch.setattr(streaming_mod, "compile_outlines", _wrapped)
+    monkeypatch.setattr("sie_server.processors.streaming.compile_outlines", _wrapped)
 
     # Stub the per-model tokenizer fetch so tests don't need an
     # ``hf_id``-shaped fixture. ``_ensure_grammar_ready`` only needs an
@@ -732,7 +727,7 @@ def _patch_compile(monkeypatch: pytest.MonkeyPatch, fn: Any) -> list[int]:
         return object()
 
     monkeypatch.setattr(
-        streaming_mod.StreamingProcessor,
+        StreamingProcessor,
         "_get_tokenizer",
         _fake_get_tokenizer,
     )
@@ -814,9 +809,7 @@ async def test_grammar_compile_timeout_surfaces_grammar_compile_failed(
     # ``streaming._wait_for`` so the override is scoped to this
     # module — patching ``asyncio.wait_for`` directly would affect
     # every concurrent coroutine.
-    import sie_server.processors.streaming as streaming_mod
-
-    real_wait_for = streaming_mod._wait_for
+    from sie_server.processors.streaming import _wait_for as real_wait_for
 
     # The ``timeout`` kw mirrors :func:`asyncio.wait_for`'s signature
     # — required because the shim replaces it 1:1. The lint rule
@@ -826,7 +819,7 @@ async def test_grammar_compile_timeout_surfaces_grammar_compile_failed(
         _ = timeout
         return await real_wait_for(coro, timeout=0.05)
 
-    monkeypatch.setattr(streaming_mod, "_wait_for", _short_wait)
+    monkeypatch.setattr("sie_server.processors.streaming._wait_for", _short_wait)
 
     def _slow_compile(_tok: Any, _g: Any) -> Any:
         import time as _time
@@ -1301,15 +1294,14 @@ async def test_ebnf_on_outlines_backend_not_rejected_at_preflight(
         registry=_make_registry(adapter),
         worker_id="w1",
     )
+
     # The real ``compile_outlines`` is exercised — but with the fix it
     # short-circuits for EBNF before resolving any Outlines factory, so we
     # don't need to stub it. Stub only the tokenizer fetch.
-    import sie_server.processors.streaming as streaming_mod
-
     async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
         return object()
 
-    monkeypatch.setattr(streaming_mod.StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
 
     grammar_payload = {"kind": "ebnf", "value": 'root ::= "yes" | "no"'}
     msg = _make_msg(_make_work_item(generate={"prompt": "Hi", "max_new_tokens": 8, "grammar": grammar_payload}))
@@ -1342,12 +1334,10 @@ async def test_cancel_during_grammar_compile_window_is_honored(
     registry = _make_registry(_FakeGenAdapter(script))
     proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
 
-    import sie_server.processors.streaming as streaming_mod
-
     async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
         return object()
 
-    monkeypatch.setattr(streaming_mod.StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
 
     compile_started = asyncio.Event()
     compile_release = threading.Event()
@@ -1707,22 +1697,20 @@ async def test_grammar_preflight_default_does_not_call_compile_outlines(
     # other test fixture could have set it).
     monkeypatch.delenv("SIE_GRAMMAR_PREFLIGHT_DEBUG", raising=False)
 
-    import sie_server.processors.streaming as streaming_mod
-
     calls: list[int] = []
 
     def _spy(_tok: Any, _g: Any) -> Any:
         calls.append(1)
         return True
 
-    monkeypatch.setattr(streaming_mod, "compile_outlines", _spy)
+    monkeypatch.setattr("sie_server.processors.streaming.compile_outlines", _spy)
 
     # Stub the tokenizer fetch in case the env flag is accidentally on
     # somewhere — we still don't want the test crashing on a missing HF id.
     async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
         return object()
 
-    monkeypatch.setattr(streaming_mod.StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
 
     nc = AsyncMock()
     script = [
@@ -1824,12 +1812,12 @@ def test_adr0002_metrics_register_without_error() -> None:
     """
     from sie_server.observability import metrics as obs_metrics
 
-    obs_metrics.GRAMMAR_COMPILE_SECONDS_ADR0002.labels(backend="outlines", mode="json_schema").observe(0.01)
-    obs_metrics.GRAMMAR_COMPILE_SECONDS_ADR0002.labels(backend="xgrammar", mode="regex").observe(0.02)
+    obs_metrics.GRAMMAR_COMPILE_SECONDS_STRUCTURED_OUTPUT.labels(backend="outlines", mode="json_schema").observe(0.01)
+    obs_metrics.GRAMMAR_COMPILE_SECONDS_STRUCTURED_OUTPUT.labels(backend="xgrammar", mode="regex").observe(0.02)
     obs_metrics.STRUCTURED_OUTPUT_TTFT_SECONDS.labels(backend="outlines", mode="json_schema").observe(0.1)
     obs_metrics.STRUCTURED_OUTPUT_TTFT_SECONDS.labels(backend="llguidance", mode="ebnf").observe(0.2)
-    obs_metrics.GRAMMAR_CACHE_HITS_ADR0002.labels(backend="outlines").inc()
-    obs_metrics.GRAMMAR_CACHE_MISSES_ADR0002.labels(backend="outlines").inc()
+    obs_metrics.GRAMMAR_CACHE_HITS_STRUCTURED_OUTPUT.labels(backend="outlines").inc()
+    obs_metrics.GRAMMAR_CACHE_MISSES_STRUCTURED_OUTPUT.labels(backend="outlines").inc()
     obs_metrics.GRAMMAR_UNIQUE_SCHEMA_TOTAL.labels(backend="outlines", mode="json_schema").inc()
     obs_metrics.GRAMMAR_UNIQUE_SCHEMA_TOTAL.labels(backend="unknown", mode="ebnf").inc()
 

@@ -8,7 +8,7 @@ Supports:
 - Encoder-based models (when using CLS or mean pooling)
 - Configurable attention: SDPA (default) or Flash Attention 2
 
-Performance notes (see DESIGN.md Section 6.3):
+Performance notes:
 - SDPA is 20-25% faster for sequences <512 tokens
 - FA2 is faster for sequences >512 tokens
 - Default is SDPA since standard retrieval workloads have short texts
@@ -97,6 +97,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         default_instruction: str | None = None,
         forward_kwargs: dict[str, Any] | None = None,
         uses_legacy_transformers_cache: bool = False,
+        dense_dim: int | None = None,
     ) -> None:
         r"""Initialize the adapter.
 
@@ -131,6 +132,8 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             uses_legacy_transformers_cache: If True, disable the KV cache after
                 loading by setting model.config.use_cache = False. Required for
                 models that use the legacy transformers cache API (pre-4.54).
+            dense_dim: Catalog-declared dense embedding dimension. If provided,
+                validated against the loaded model's hidden size.
         """
         self._model_name_or_path = str(model_name_or_path)
         self._pooling = pooling
@@ -145,11 +148,12 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._default_instruction = default_instruction
         self._forward_kwargs = forward_kwargs or {}
         self._uses_legacy_transformers_cache = uses_legacy_transformers_cache
+        self._configured_dense_dim = dense_dim
 
         self._model: PreTrainedModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
         self._device: str | None = None
-        self._dense_dim: int | None = None
+        self._dense_dim: int | None = dense_dim
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -204,8 +208,17 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._model.to(device)
         self._model.eval()
 
-        # Get embedding dimension from model config
-        self._dense_dim = self._model.config.hidden_size
+        self._dense_dim = self._validate_or_set_dense_dim(self._model.config.hidden_size)
+
+    def _validate_or_set_dense_dim(self, observed_dim: int) -> int:
+        """Validate observed model width against configured dense_dim."""
+        if self._configured_dense_dim is not None and observed_dim != self._configured_dense_dim:
+            msg = (
+                "PyTorch embedding dimension mismatch: "
+                f"configured dense_dim={self._configured_dense_dim}, model hidden_size={observed_dim}"
+            )
+            raise ValueError(msg)
+        return observed_dim
 
     def _resolve_dtype_and_attn(self, device: str) -> tuple[torch.dtype, str]:
         """Resolve dtype and attention implementation based on device and config.

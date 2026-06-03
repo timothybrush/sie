@@ -1838,14 +1838,17 @@ export class SIEClient {
       : undefined;
 
     try {
-      if (headers) {
-        return new (
-          WebSocket as unknown as {
-            new (u: string, p?: string[], o?: { headers: Record<string, string> }): WebSocket;
-          }
-        )(url, [], { headers });
+      if (!headers) {
+        return new WebSocket(url);
       }
-      return new WebSocket(url);
+      // In Node, `WebSocket` resolves to the `ws` package which accepts
+      // a third `{ headers }` options argument. In browsers, the native
+      // WebSocket only takes `(url, protocols)` and the third arg is
+      // silently dropped. Use `Reflect.construct` with a runtime args
+      // array so the call site doesn't statically appear to pass
+      // superfluous trailing arguments to the lib.dom WebSocket type.
+      const args: unknown[] = [url, [], { headers }];
+      return Reflect.construct(WebSocket, args) as WebSocket;
     } catch (error) {
       if (headers) {
         throw new SIEConnectionError(

@@ -35,7 +35,7 @@ def patch_ensure_model_cached():
 
 
 class TestAsyncLoading:
-    """Tests for async model loading (DESIGN.md Section 5.4)."""
+    """Tests for async model loading."""
 
     @pytest.fixture
     def mock_adapter(self) -> MagicMock:

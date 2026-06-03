@@ -1,6 +1,6 @@
 """Inference optimization utilities.
 
-Handles compute precision and attention backend configuration per DESIGN.md Section 6.3-6.4.
+Handles compute precision and attention backend configuration.
 
 Compute precision pipeline:
 - Weights on disk (FP32/BF16) → Load/Cast to GPU → Compute (FP16/BF16/FP32) → Output
@@ -164,7 +164,7 @@ def resolve_attention_backend(
 
     Handles "auto" selection and validates compatibility with precision and device.
 
-    Per DESIGN.md: Flash Attention 2 requires FP16 or BF16 and CUDA device.
+    Flash Attention 2 requires FP16 or BF16 and a CUDA device.
 
     Args:
         requested: Requested backend from config.

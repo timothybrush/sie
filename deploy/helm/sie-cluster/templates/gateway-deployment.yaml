@@ -1,7 +1,7 @@
 {{- /* Validate: at most one static overlay may be active. Zero overlays is the
-     default — the gateway fetches bundles+models from sie-config at startup
+     default; the gateway fetches bundles+models from sie-config at startup
      and has NO baked-in filesystem seed (see
-     packages/sie_gateway/docs/architecture-guide.md §4). */}}
+     packages/sie_gateway/docs/architecture-guide.md section 4). */}}
 {{- $modesEnabled := list }}
 {{- if .Values.gateway.embeddedConfigs.enabled }}{{- $modesEnabled = append $modesEnabled "embeddedConfigs" }}{{- end }}
 {{- if .Values.gateway.configMap.enabled }}{{- $modesEnabled = append $modesEnabled "configMap" }}{{- end }}
@@ -11,17 +11,18 @@
 {{- /* Validate: gateway needs SOME source of bundles/models. Since the image
      no longer bakes a seed, disabling sie-config without also enabling a
      static overlay would leave the gateway permanently empty and 404 every
-     model request — an obvious deployment-time bug that's worth catching
+     model request; an obvious deployment-time bug that's worth catching
      before the cluster runs. */}}
 {{- if and (not .Values.config.enabled) (eq (len $modesEnabled) 0) }}
-  {{- fail "gateway: config.enabled=false requires one of gateway.embeddedConfigs.enabled or gateway.configMap.enabled — the gateway image no longer bakes bundles/models, so something must provide them. See packages/sie_gateway/docs/architecture-guide.md §11 caveat 7." }}
+  {{- fail "gateway: config.enabled=false requires one of gateway.embeddedConfigs.enabled or gateway.configMap.enabled; the gateway image no longer bakes bundles/models, so something must provide them. See packages/sie_gateway/docs/architecture-guide.md section 11 caveat 7." }}
 {{- end }}
 {{- /* Validate: `clusterRouting` is queue-only today. The Rust gateway has
-     no direct-mode code path — the legacy "direct" value was a Python-gateway
-     artifact and is now a footgun (operators requesting direct would silently
+     no direct-mode code path; "direct" belongs to Python-gateway deployments
+     and is now a footgun (operators requesting direct would silently
      get queue behavior). Workers still honor SIE_CLUSTER_ROUTING=queue for
      pull-loop gating; see packages/sie_server/src/sie_server/app/app_factory.py.
-     Queue mode requires NATS+JetStream and an object-store payload store. */}}
+     Queue mode requires NATS+JetStream; large-payload offload additionally
+     requires a shared object-store payload store. */}}
 {{- $routing := default "queue" .Values.clusterRouting }}
 {{- if ne $routing "queue" }}
   {{- fail (printf "clusterRouting=%q is not supported; the gateway is queue-only. Set clusterRouting: queue or leave unset." $routing) }}
@@ -129,6 +130,13 @@ spec:
               value: {{ include "sie-cluster.worker.serviceName" . }}
             - name: SIE_MULTI_ROUTER
               value: {{ gt (int .Values.gateway.replicas) 1 | quote }}
+            {{- $defaultHealthMode := ternary "nats" "" (and .Values.nats.enabled .Values.workers.common.workerSidecar.enabled) }}
+            {{- $explicitHealthMode := default "" .Values.gateway.healthMode }}
+            {{- $healthMode := default $defaultHealthMode $explicitHealthMode }}
+            {{- if $healthMode }}
+            - name: SIE_GATEWAY_HEALTH_MODE
+              value: {{ $healthMode | quote }}
+            {{- end }}
             # Available GPU types (from Helm values, survives scale-to-zero)
             - name: SIE_GATEWAY_CONFIGURED_GPUS
               valueFrom:
@@ -180,11 +188,15 @@ spec:
               value: {{ include "sie-cluster.config.serviceName" . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.queueRouting }}
+            - name: SIE_STREAM_MAX_AGE_S
+              value: {{ .streamMaxAgeSec | default 120 | quote }}
+            {{- end }}
             {{- if .Values.config.enabled }}
             # URL of the sie-config control plane. The gateway uses it for
             # the cold-start GET /v1/configs/export bootstrap and the 30-s
             # GET /v1/configs/epoch drift poll. See
-            # packages/sie_gateway/docs/architecture-guide.md §4.
+            # packages/sie_gateway/docs/architecture-guide.md section 4.
             - name: SIE_CONFIG_SERVICE_URL
               value: {{ include "sie-cluster.config.internalUrl" . | quote }}
             {{- if .Values.config.auth.adminTokenSecretName }}
@@ -208,7 +220,7 @@ spec:
             # Optional ConfigMap overlay: when enabled, the gateway reads its
             # bundle/model seed from /configs at startup. By default neither
             # overlay is on and the gateway fetches everything from sie-config
-            # via /v1/configs/bundles + /v1/configs/export — see
+            # via /v1/configs/bundles + /v1/configs/export; see
             # packages/sie_gateway/src/state/config_bootstrap.rs.
             - name: SIE_BUNDLES_DIR
               value: /configs/bundles

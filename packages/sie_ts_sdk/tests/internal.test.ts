@@ -313,8 +313,8 @@ describe("handleError (gateway / FastAPI bodies)", () => {
     });
   });
 
-  // roadmap §3 item 1.4: /v1/embeddings returns the OpenAI {error:{message,
-  // type,param,code}} envelope on every error path. A SIE SDK user hitting
+  // /v1/embeddings returns the OpenAI {error:{message,type,param,code}}
+  // envelope on every error path. A SIE SDK user hitting
   // it directly must still get a typed error with the parsed `code`.
   it("reads OpenAI {error:{type,param,code}} envelope (embeddings 4xx)", async () => {
     const res = new Response(

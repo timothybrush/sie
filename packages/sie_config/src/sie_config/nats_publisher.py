@@ -138,11 +138,12 @@ class NatsPublisher:
         For each affected bundle, builds one canonical ``ConfigNotification``
         payload and publishes it to two subjects:
 
-        1. ``sie.config.models.{bundle}`` -- consumed by workers
+        1. ``sie.config.models.{bundle}`` -- reserved for worker-side apply
         2. ``sie.config.models._all`` -- consumed by Rust gateways
 
-        The same payload shape goes to both subjects so every subscriber sees
-        the full set of fields that ``sie_gateway`` expects
+        worker-sidecar containers consume the bundle-scoped subject. The same
+        payload shape goes to both subjects so every subscriber sees the full
+        set of fields that ``sie_gateway`` expects
         (``router_id``, ``bundle_id``, ``epoch``, ``bundle_config_hash``,
         ``model_id``, ``profiles_added``, ``model_config``, ``affected_bundles``).
         See ``packages/sie_gateway/src/nats/manager.rs::ConfigNotification``.

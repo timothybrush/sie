@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::endpoint::InferenceEndpoint;
 use crate::http_error::{
     code as err_code, embeddings_error, json_detail, json_detail_merge, json_openai_error,
     openai_code as oai_code, openai_type as oai_type,
@@ -137,6 +138,55 @@ static SDK_VERSION_CACHE: std::sync::LazyLock<DashMap<Arc<str>, Option<u32>>> =
     std::sync::LazyLock::new(DashMap::new);
 const SDK_VERSION_CACHE_CAP: usize = 1024;
 
+#[allow(dead_code)]
+static HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
+
+#[allow(dead_code)]
+fn is_hop_by_hop(name: &str) -> bool {
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnginePinParse {
+    None,
+    Some(String),
+    Unknown(String),
+    InvalidUtf8,
+}
+
+fn parse_engine_pin(headers: &HeaderMap) -> EnginePinParse {
+    let Some(raw) = headers.get("x-sie-engine") else {
+        return EnginePinParse::None;
+    };
+    let s = match raw.to_str() {
+        Ok(s) => s,
+        Err(_) => return EnginePinParse::InvalidUtf8,
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return EnginePinParse::None;
+    }
+    use crate::types::bundle::KNOWN_ENGINES;
+    let normalised = trimmed.to_ascii_lowercase();
+    if KNOWN_ENGINES.contains(&normalised.as_str()) {
+        EnginePinParse::Some(normalised)
+    } else {
+        EnginePinParse::Unknown(trimmed.to_string())
+    }
+}
+
 /// Outcome of resolving the JetStream pool to publish work for a request.
 #[derive(Debug, PartialEq, Eq)]
 enum PoolResolution {
@@ -194,13 +244,14 @@ fn is_valid_pool_name(pool: &str) -> bool {
 /// Kept as a free function so it can be unit-tested without standing up
 /// an `AppState` / `WorkPublisher`.
 ///
-/// Rules (see `product/design.md` §10 and
-/// `packages/sie_gateway/docs/architecture-guide.md` §2):
+/// Rules:
 /// - If the caller pinned a pool via `X-SIE-Pool`, trust them and publish
 ///   there unconditionally. This preserves the "power user" path where
 ///   the client knows exactly which pool it wants (including cold ones
-///   that are expected to scale up on demand).
+///   that are expected to scale up on demand). The worker-side hash guard
+///   still rejects deliveries whose expected hash is unknown locally.
 /// - Otherwise look up a healthy default-pool worker for `(bundle, gpu)`.
+///   The worker must also report the gateway's expected bundle config hash.
 ///   If GPU was specified and the exact tuple has no worker, fall back to
 ///   any default-pool worker on `bundle` (covers single-GPU clusters where
 ///   the profile-level distinction is cosmetic).
@@ -214,6 +265,7 @@ async fn resolve_effective_pool(
     bundle: &str,
     gpu: &str,
     pool_name: &str,
+    bundle_config_hash: &str,
 ) -> PoolLookup {
     if !pool_name.is_empty() {
         // Caller pinned a pool. We still try one registry probe inside
@@ -225,7 +277,7 @@ async fn resolve_effective_pool(
             false
         } else {
             registry
-                .resolve_queue_pool_in_pool(bundle, gpu, pool_name)
+                .resolve_queue_pool_in_pool(bundle, gpu, pool_name, bundle_config_hash)
                 .await
                 .is_some()
         };
@@ -238,7 +290,7 @@ async fn resolve_effective_pool(
     // Primary lookup. Folds the "was the exact tuple routable?"
     // question into the same registry load we use to pick a pool.
     let primary = registry
-        .resolve_queue_pool_in_pool(bundle, gpu, DEFAULT_POOL_NAME)
+        .resolve_queue_pool_in_pool(bundle, gpu, DEFAULT_POOL_NAME, bundle_config_hash)
         .await;
     let exact_gpu_match = !gpu.is_empty() && primary.is_some();
 
@@ -250,7 +302,7 @@ async fn resolve_effective_pool(
         Some(p) => Some(p),
         None if !gpu.is_empty() => {
             registry
-                .resolve_queue_pool_in_pool(bundle, "", DEFAULT_POOL_NAME)
+                .resolve_queue_pool_in_pool(bundle, "", DEFAULT_POOL_NAME, bundle_config_hash)
                 .await
         }
         None => None,
@@ -322,6 +374,7 @@ fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::EncodeRequest,
@@ -352,6 +405,7 @@ pub async fn proxy_encode(state: State<Arc<AppState>>, req: Request) -> impl Int
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::ScoreRequest,
@@ -382,6 +436,7 @@ pub async fn proxy_score(state: State<Arc<AppState>>, req: Request) -> impl Into
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::ExtractRequest,
@@ -489,30 +544,29 @@ async fn proxy_request(
     // SDK version skew detection
     check_sdk_version(req.headers());
 
-    // M5: same trace-context plumbing as `proxy_chat`. Extract the
-    // inbound W3C parent, open a gateway span, attach it as current
-    // so downstream `publish_*` calls inject the gateway span ID
-    // into the work envelope. No envelope shape change when the
-    // inbound request omits `traceparent` — the gateway just opens
-    // a new trace root.
-    let parent_cx = crate::observability::propagation::extract_context_from_headers(req.headers());
-    let span_name = if endpoint == "generate" {
-        "gateway.proxy_generate"
+    // Keep the pre-generation queue hot path untouched for encode /
+    // score / extract. Native `/v1/generate/{model}` is the only route
+    // through this helper that needs gateway-side trace propagation;
+    // OpenAI generation routes have their own tracing blocks.
+    let proxy_span = if should_trace_proxy_request(endpoint) {
+        let parent_cx =
+            crate::observability::propagation::extract_context_from_headers(req.headers());
+        let proxy_span = tracing::info_span!(
+            "gateway.proxy",
+            otel.name = "gateway.proxy_generate",
+            sie.endpoint = endpoint,
+            sie.request_id = tracing::field::Empty,
+            sie.model = tracing::field::Empty,
+        );
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            proxy_span.set_parent(parent_cx);
+        }
+        Some(proxy_span)
     } else {
-        "gateway.proxy_request"
+        None
     };
-    let proxy_span = tracing::info_span!(
-        "gateway.proxy",
-        otel.name = span_name,
-        sie.endpoint = endpoint,
-        sie.request_id = tracing::field::Empty,
-        sie.model = tracing::field::Empty,
-    );
-    {
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
-        proxy_span.set_parent(parent_cx);
-    }
-    let _proxy_span_guard = proxy_span.enter();
+    let _proxy_span_guard = proxy_span.as_ref().map(|span| span.enter());
 
     // Extract model from path: /v1/{endpoint}/{model...}
     let prefix = format!("/v1/{}/", endpoint);
@@ -561,6 +615,39 @@ async fn proxy_request(
         Some(bundle_override.as_str())
     };
 
+    // Optional ``X-SIE-Engine`` header lets the caller pin engine
+    // selection when a model resolves to multiple bundles across
+    // engines. Today only ``"pytorch"`` is recognised, so the header
+    // is effectively a no-op (or a 400 if the caller types something
+    // else); the plumbing is preserved for the day a second engine
+    // lands. Lowercase normalisation + UTF-8 validation lives in
+    // ``parse_engine_pin`` (unit-tested below).
+    let engine_pin = match parse_engine_pin(req.headers()) {
+        EnginePinParse::None => None,
+        EnginePinParse::Some(eng) => Some(eng),
+        EnginePinParse::Unknown(raw) => {
+            use crate::types::bundle::KNOWN_ENGINES;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    format!("X-SIE-Engine value {:?} is not in {:?}", raw, KNOWN_ENGINES),
+                )),
+            )
+                .into_response();
+        }
+        EnginePinParse::InvalidUtf8 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_detail(
+                    err_code::INVALID_REQUEST,
+                    "X-SIE-Engine header must be valid UTF-8 (got non-printable bytes)",
+                )),
+            )
+                .into_response();
+        }
+    };
+
     // Try model registry resolution. Three cases:
     //   1. Model is known        → resolve bundle (404 on BundleConflict, etc.)
     //   2. Model unknown, registry populated → 404 (fail fast; avoids queueing
@@ -569,10 +656,11 @@ async fn proxy_request(
     //      override or "default". This is the pre-bootstrap / no-config
     //      deployment path; workers may still match on bundle+gpu alone.
     let bundle = if state.model_registry.model_exists(&model_name) {
-        match state
-            .model_registry
-            .resolve_bundle(&model_name, bundle_override_ref)
-        {
+        match state.model_registry.resolve_bundle_with_engine(
+            &model_name,
+            bundle_override_ref,
+            engine_pin.as_deref(),
+        ) {
             Ok(b) => b,
             Err(ResolveError::ModelNotFound(e)) => {
                 return endpoint_error_response(
@@ -621,6 +709,13 @@ async fn proxy_request(
     } else {
         bundle_override.clone()
     };
+
+    let engine = state
+        .model_registry
+        .get_bundle_info(&bundle)
+        .map(|info| info.engine)
+        .or_else(|| engine_pin.clone())
+        .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
 
     // Parse GPU from X-SIE-MACHINE-PROFILE header
     let mut gpu = req
@@ -741,6 +836,8 @@ async fn proxy_request(
         );
     };
 
+    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(&bundle);
+
     // Resolve the effective pool in one shot. `resolve_effective_pool`
     // folds the demand-tracking probe ("was there an exact (bundle,
     // gpu) match?") into the same registry load it uses to pick a
@@ -750,7 +847,14 @@ async fn proxy_request(
     // preference but no exact-tuple worker was registered, regardless
     // of whether we still serve this request via bundle-fallback or a
     // pinned pool (see `test_scaling.py::test_pending_demand_*`).
-    let lookup = resolve_effective_pool(&state.registry, &bundle, &gpu, &pool_name).await;
+    let lookup = resolve_effective_pool(
+        &state.registry,
+        &bundle,
+        &gpu,
+        &pool_name,
+        &bundle_config_hash,
+    )
+    .await;
     if !gpu.is_empty() && !lookup.exact_gpu_match {
         state.demand_tracker.record(&gpu, &bundle);
     }
@@ -758,6 +862,16 @@ async fn proxy_request(
     let effective_pool = match lookup.resolution {
         PoolResolution::Pool(p) => p,
         PoolResolution::Provisioning => {
+            let gpu_label = if gpu.is_empty() { "any" } else { gpu.as_str() };
+            info!(
+                gpu = %gpu_label,
+                bundle = %bundle,
+                engine = %engine,
+                "no queue worker available, returning 202",
+            );
+            metrics::PROVISIONING_RESPONSES
+                .with_label_values(&[gpu_label])
+                .inc();
             // Note: if the caller expressed a GPU preference, demand
             // was already recorded above via `exact_gpu_match = false`.
             // We still record here (idempotent — see
@@ -890,6 +1004,7 @@ async fn proxy_request(
         endpoint,
         &model_name,
         &bundle,
+        &engine,
         &gpu,
         &effective_pool,
         &body_bytes,
@@ -898,8 +1013,13 @@ async fn proxy_request(
         &token_id,
         content_length,
         Instant::now(),
+        &bundle_config_hash,
     )
     .await
+}
+
+fn should_trace_proxy_request(endpoint: &str) -> bool {
+    InferenceEndpoint::from_label(endpoint).uses_generation_gateway_tracing()
 }
 
 /// Route request through the queue-only JetStream path.
@@ -919,6 +1039,7 @@ async fn queue_mode_proxy(
     endpoint: &str,
     model: &str,
     bundle: &str,
+    engine: &str,
     gpu: &str,
     pool: &str,
     body_bytes: &[u8],
@@ -927,6 +1048,7 @@ async fn queue_mode_proxy(
     token_id: &str,
     content_length: i64,
     start: Instant,
+    bundle_config_hash: &str,
 ) -> Response {
     // Parse body once, extract items + params (avoids double parse)
     let (items, params) = match parse_queue_request(body_bytes, is_msgpack_in, endpoint) {
@@ -1056,9 +1178,6 @@ async fn queue_mode_proxy(
         }
     }
 
-    // Compute bundle config hash for worker config-skew detection
-    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(bundle);
-
     // Generate has its own publish + result-collection path
     // (streaming chunk aggregation instead of one-shot WorkResult fan-in).
     if endpoint == "generate" {
@@ -1094,9 +1213,10 @@ async fn queue_mode_proxy(
                     work_publisher: work_publisher_arc,
                     model: model.to_string(),
                     bundle: bundle.to_string(),
+                    engine: engine.to_string(),
                     gpu: gpu.to_string(),
                     pool: pool.to_string(),
-                    bundle_config_hash: bundle_config_hash.clone(),
+                    bundle_config_hash: bundle_config_hash.to_string(),
                     work_params: params,
                     endpoint: super::sse::SseEndpoint::Generate,
                 })
@@ -1110,9 +1230,10 @@ async fn queue_mode_proxy(
             work_publisher_arc,
             model,
             bundle,
+            engine,
             gpu,
             pool,
-            &bundle_config_hash,
+            bundle_config_hash,
             &params,
             use_msgpack_out,
             token_id,
@@ -1129,8 +1250,9 @@ async fn queue_mode_proxy(
             endpoint,
             model,
             bundle,
+            engine,
             gpu,
-            &bundle_config_hash,
+            bundle_config_hash,
             items,
             &params,
         )
@@ -1543,6 +1665,7 @@ pub(crate) async fn run_streaming_generate(
     work_publisher: Arc<publisher::WorkPublisher>,
     model: &str,
     bundle: &str,
+    engine: &str,
     gpu: &str,
     pool: &str,
     bundle_config_hash: &str,
@@ -1635,7 +1758,7 @@ pub(crate) async fn run_streaming_generate(
     // Capture this before the move into `publish_generate_streaming`.
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
     let (request_id, rx, activity) = match work_publisher
-        .publish_generate_streaming(target, bundle, gpu, bundle_config_hash, params)
+        .publish_generate_streaming(target, bundle, engine, gpu, bundle_config_hash, params)
         .await
     {
         Ok(r) => r,
@@ -1708,6 +1831,20 @@ pub(crate) async fn run_streaming_generate(
     // `republished` field on `StreamCollector`) so the two paths
     // cannot double-publish.
     let mut republished_for_first_chunk = false;
+    // Capture the pool's consumer count at dispatch time so the H9
+    // single-worker suppression below uses the topology we actually
+    // dispatched against. Re-reading at timeout could see a count of 1
+    // after a 2-worker pool lost its chosen worker mid-flight, and
+    // suppress a republish that could have failed over to the
+    // remaining worker. (We accept the inverse hazard — a worker
+    // joining mid-flight in a single-worker pool keeps the suppression
+    // active — because the cancel-tombstone race that motivates this
+    // guard cannot fire on a worker that wasn't registered at
+    // dispatch.)
+    let single_consumer_pool_at_dispatch = was_direct_dispatched
+        && work_publisher
+            .pool_consumer_count(pool)
+            .is_some_and(|n| n <= 1);
 
     // Drive the wait loop. We hold a single pinned receiver across
     // iterations and re-arm the inter-chunk timer on every chunk
@@ -1736,7 +1873,24 @@ pub(crate) async fn run_streaming_generate(
             // is true), in which case waiting another full
             // first_chunk_timeout would double the user-visible latency
             // for no benefit (no new work was published).
-            if was_direct_dispatched && !republished_for_first_chunk {
+            //
+            // Single-consumer-pool guard: in pools with exactly one
+            // worker the H9 republish lands on the same worker that's
+            // already running the original attempt, and the
+            // ``publish_cancel`` we'd fire first arrives as a cancel-
+            // tombstone on the pool-republished message — the worker
+            // then refuses to decode with ``request cancelled before
+            // this worker registered; pool-republished attempt is
+            // authoritative``. There is no alternative worker to
+            // failover *to*, so the fallback can only ever harm
+            // throughput here. Extend the deadline to ``overall`` so
+            // the original attempt gets the legitimate end-to-end
+            // budget; if the worker really is dead the
+            // overall_timeout path will surface that.
+            if was_direct_dispatched
+                && !republished_for_first_chunk
+                && !single_consumer_pool_at_dispatch
+            {
                 republished_for_first_chunk = true;
                 // At-least-once-execution hazard: the original
                 // direct-dispatched worker may simply be SLOW (cold
@@ -1777,6 +1931,27 @@ pub(crate) async fn run_streaming_generate(
                         break Err("first_chunk");
                     }
                 }
+            }
+            if single_consumer_pool_at_dispatch
+                && was_direct_dispatched
+                && !republished_for_first_chunk
+            {
+                // Single-worker fallback skip: don't surface
+                // first_chunk_timeout to the client — the only worker
+                // is the one we're already waiting on, and the
+                // overall_timeout path will catch a genuinely dead
+                // worker. Mark republished so this branch doesn't
+                // re-trigger on subsequent ticks, and push the
+                // first_chunk_deadline to the overall_deadline so
+                // tokio's select arm at line ~1824 stops firing.
+                republished_for_first_chunk = true;
+                first_chunk_deadline = overall_deadline;
+                tracing::debug!(
+                    request_id = %request_id,
+                    pool = %pool,
+                    "first_chunk_timeout — single-worker pool, suppressing republish; continuing on overall_timeout"
+                );
+                continue;
             }
             break Err("first_chunk");
         }
@@ -2076,6 +2251,7 @@ async fn queue_mode_streaming_generate(
     work_publisher: Arc<publisher::WorkPublisher>,
     model: &str,
     bundle: &str,
+    engine: &str,
     gpu: &str,
     pool: &str,
     bundle_config_hash: &str,
@@ -2090,6 +2266,7 @@ async fn queue_mode_streaming_generate(
         work_publisher,
         model,
         bundle,
+        engine,
         gpu,
         pool,
         bundle_config_hash,
@@ -2206,6 +2383,17 @@ struct ChatRequestParams {
     /// penalty); forwarded to SGLang's ``repetition_penalty``. Absent →
     /// sampler default.
     repetition_penalty: Option<f64>,
+    /// SGLang ``sampling_params.min_new_tokens``: minimum tokens to emit
+    /// before any stop condition can end the response. Integer ``>= 0``;
+    /// absent → no minimum. See the field doc on ``ChatCompletionRequest``
+    /// in :mod:`openapi.rs` for the canonical use case (anti-stop-first
+    /// fix on Qwen3.6 greedy decoding).
+    min_tokens: Option<u32>,
+    /// Per-request chat-template kwargs (e.g. ``{"enable_thinking":
+    /// false}``); forwarded verbatim to the worker which merges them on
+    /// top of the model YAML's defaults at template-render time. Absent
+    /// → only the model YAML's defaults apply.
+    chat_template_kwargs: Option<serde_json::Value>,
     /// Routing hints plumbed through to the work envelope.
     routing_key: Option<String>,
     prompt_cache_key: Option<String>,
@@ -2855,6 +3043,46 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
             }
         }
     }
+    // -- min_tokens: SGLang ``sampling_params.min_new_tokens``. Integer
+    //    >= 0; values >= u32::MAX or negative reject. Absent → no
+    //    minimum. Workaround for stop-first artefacts (e.g. Qwen3.6
+    //    greedy decoding occasionally emits the stop token first).
+    let mut min_tokens: Option<u32> = None;
+    if let Some(val) = obj.get("min_tokens") {
+        if !val.is_null() {
+            match val.as_i64() {
+                Some(k) if (0..=u32::MAX as i64).contains(&k) => {
+                    min_tokens = Some(k as u32);
+                }
+                _ => {
+                    return bad(
+                        "'min_tokens' must be an integer >= 0",
+                        Some("min_tokens"),
+                        oai_code::INVALID_REQUEST,
+                    );
+                }
+            }
+        }
+    }
+    // -- chat_template_kwargs: opaque map of kwargs for the tokenizer's
+    //    ``apply_chat_template``. Validated only as an object (or null);
+    //    the worker merges it onto the model YAML defaults at render
+    //    time. Reject non-object values so a bad client doesn't smuggle
+    //    a string/array past the schema and then crash render in the
+    //    worker.
+    let mut chat_template_kwargs: Option<serde_json::Value> = None;
+    if let Some(val) = obj.get("chat_template_kwargs") {
+        if !val.is_null() {
+            if !val.is_object() {
+                return bad(
+                    "'chat_template_kwargs' must be an object",
+                    Some("chat_template_kwargs"),
+                    oai_code::INVALID_REQUEST,
+                );
+            }
+            chat_template_kwargs = Some(val.clone());
+        }
+    }
 
     // -- n: parsed and surfaced on :class:`ChatRequestParams.n` so the
     //    wire envelope (``GenerateParams.n``) drives the worker's
@@ -3231,6 +3459,8 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
         "presence_penalty",
         "top_k",
         "repetition_penalty",
+        "min_tokens",
+        "chat_template_kwargs",
         "n",
         "best_of",
         "lora_adapter",
@@ -3288,6 +3518,8 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
         presence_penalty,
         top_k,
         repetition_penalty,
+        min_tokens,
+        chat_template_kwargs,
         routing_key,
         prompt_cache_key,
         grammar,
@@ -3898,6 +4130,7 @@ fn resolve_model_and_bundle(
 /// publisher, plus audit fields. Produced by [`resolve_generation_route`].
 struct ResolvedRoute {
     gpu: String,
+    engine: String,
     effective_pool: String,
     bundle_config_hash: String,
     work_publisher: Arc<publisher::WorkPublisher>,
@@ -3985,7 +4218,20 @@ async fn resolve_generation_route(
             .into_response());
     };
 
-    let lookup = resolve_effective_pool(&state.registry, bundle, &gpu, &pool_name).await;
+    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(bundle);
+    let engine = state
+        .model_registry
+        .get_bundle_info(bundle)
+        .map(|info| info.engine)
+        .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
+    let lookup = resolve_effective_pool(
+        &state.registry,
+        bundle,
+        &gpu,
+        &pool_name,
+        &bundle_config_hash,
+    )
+    .await;
     if !gpu.is_empty() && !lookup.exact_gpu_match {
         state.demand_tracker.record(&gpu, bundle);
     }
@@ -4017,7 +4263,6 @@ async fn resolve_generation_route(
         }
     };
 
-    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(bundle);
     let token_id = extract_bearer_token(hdr)
         .map(|t| mask_token(&t))
         .unwrap_or_default();
@@ -4029,6 +4274,7 @@ async fn resolve_generation_route(
 
     Ok(ResolvedRoute {
         gpu,
+        engine,
         effective_pool,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
@@ -4276,6 +4522,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     //    Shared with /v1/completions via resolve_generation_route.
     let ResolvedRoute {
         gpu,
+        engine,
         effective_pool,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
@@ -4305,6 +4552,8 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             presence_penalty: params.presence_penalty,
             top_k: params.top_k,
             repetition_penalty: params.repetition_penalty,
+            min_tokens: params.min_tokens,
+            chat_template_kwargs: params.chat_template_kwargs,
             grammar: params.grammar,
             routing_key: params.routing_key.clone(),
             prompt_cache_key: params.prompt_cache_key.clone(),
@@ -4339,6 +4588,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             work_publisher: work_publisher_arc,
             model: model_name.clone(),
             bundle: bundle.clone(),
+            engine: engine.clone(),
             gpu: gpu.clone(),
             pool: effective_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
@@ -4355,6 +4605,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         work_publisher_arc,
         &model_name,
         &bundle,
+        &engine,
         &gpu,
         &effective_pool,
         &bundle_config_hash,
@@ -4870,6 +5121,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
 
     let ResolvedRoute {
         gpu,
+        engine,
         effective_pool,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
@@ -4906,6 +5158,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
             work_publisher: work_publisher_arc,
             model: model_name.clone(),
             bundle: bundle.clone(),
+            engine: engine.clone(),
             gpu: gpu.clone(),
             pool: effective_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
@@ -4920,6 +5173,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         work_publisher_arc,
         &model_name,
         &bundle,
+        &engine,
         &gpu,
         &effective_pool,
         &bundle_config_hash,
@@ -5431,6 +5685,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
     };
     let ResolvedRoute {
         gpu,
+        engine,
         effective_pool,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
@@ -5459,6 +5714,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         work_publisher_arc,
         &model_name,
         &bundle,
+        &engine,
         &gpu,
         &effective_pool,
         &bundle_config_hash,
@@ -7328,10 +7584,13 @@ fn generate_params_from_json(
         stop,
         frequency_penalty,
         presence_penalty,
-        // top_k / repetition_penalty are exposed only via the chat route
-        // today; SIE-native /v1/generate stays a thin prompt wrapper.
+        // top_k / repetition_penalty / min_tokens / chat_template_kwargs
+        // are exposed only via the chat route today; SIE-native
+        // /v1/generate stays a thin prompt wrapper and ignores them.
         top_k: None,
         repetition_penalty: None,
+        min_tokens: None,
+        chat_template_kwargs: None,
         grammar,
         routing_key,
         prompt_cache_key,
@@ -7674,10 +7933,13 @@ fn generate_params_from_rmpv(
         stop,
         frequency_penalty,
         presence_penalty,
-        // top_k / repetition_penalty are exposed only via the chat route
-        // today; SIE-native /v1/generate stays a thin prompt wrapper.
+        // top_k / repetition_penalty / min_tokens / chat_template_kwargs
+        // are exposed only via the chat route today; SIE-native
+        // /v1/generate stays a thin prompt wrapper and ignores them.
         top_k: None,
         repetition_penalty: None,
+        min_tokens: None,
+        chat_template_kwargs: None,
         grammar,
         routing_key,
         prompt_cache_key,
@@ -7847,38 +8109,23 @@ fn try_decode_rmpv_numpy(entries: &[(rmpv::Value, rmpv::Value)]) -> Option<serde
         .unwrap_or_default();
 
     let flat_values = decode_dtype_values(dtype, data)?;
-
-    // The `shape` is worker-supplied and otherwise unbounded. Validate
-    // that it actually describes `flat_values` before reshaping:
-    // `product(shape)` must equal the decoded element count. This both
-    // rejects a corrupt/mismatched shape (clear `None` instead of a
-    // truncated tensor) and, crucially, prevents a malformed dimension
-    // (e.g. `shape = [1, 4_000_000_000]` against a 4-element buffer) from
-    // driving a multi-GB `Vec::with_capacity` in `reshape_recursive`.
-    // `checked_mul` guards the product computation itself against
-    // overflow. An empty/1-D shape is passed through to `reshape_array`,
-    // which treats it as a flat array.
-    if !shape.is_empty() {
-        let mut product: usize = 1;
-        for &dim in &shape {
-            product = match product.checked_mul(dim) {
-                Some(p) => p,
-                None => {
-                    warn!("numpy shape product overflows usize; rejecting");
-                    return None;
-                }
-            };
-        }
-        if product != flat_values.len() {
-            warn!(
-                shape_product = product,
-                flat_len = flat_values.len(),
-                "numpy shape does not match decoded element count; rejecting"
-            );
-            return None;
-        }
+    let expected_len = if shape.is_empty() {
+        flat_values.len()
+    } else {
+        shape
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))?
+    };
+    if expected_len != flat_values.len() {
+        warn!(
+            dtype = %dtype,
+            expected_len,
+            actual_len = flat_values.len(),
+            shape = ?shape,
+            "numpy sentinel shape does not match decoded data length"
+        );
+        return None;
     }
-
     Some(reshape_array(&flat_values, &shape))
 }
 
@@ -8265,6 +8512,7 @@ fn openai_embedding_items_to_data(
     params(
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
+        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     responses(
@@ -8390,6 +8638,7 @@ pub async fn proxy_openai_embeddings(State(state): State<Arc<AppState>>, req: Re
         if n.eq_ignore_ascii_case("authorization")
             || n.eq_ignore_ascii_case("x-sie-machine-profile")
             || n.eq_ignore_ascii_case("x-sie-pool")
+            || n.eq_ignore_ascii_case("x-sie-engine")
             || n.eq_ignore_ascii_case("x-sie-sdk-version")
         {
             inner_headers.insert(name.clone(), val.clone());
@@ -8628,6 +8877,21 @@ mod tests {
         assert_eq!(resolve_path_model_id("Org/Model", &registry), "Org/Model");
         // `__`-encoded case variant also folds via the slash rewrite.
         assert_eq!(resolve_path_model_id("org__model", &registry), "Org/Model");
+    }
+
+    #[test]
+    fn test_proxy_request_tracing_is_generation_only() {
+        assert!(should_trace_proxy_request("generate"));
+        for endpoint in crate::endpoint::InferenceEndpoint::NON_GENERATION_QUEUE_LABELS {
+            assert!(
+                !should_trace_proxy_request(endpoint),
+                "{endpoint} must keep the pre-generation proxy hot path"
+            );
+        }
+        assert!(
+            !should_trace_proxy_request("unknown"),
+            "unknown endpoints must fail closed to the non-generation hot path"
+        );
     }
 
     // ── is_valid_pool_name (pool subject-injection guard) ──────────
@@ -10088,6 +10352,101 @@ mod tests {
         assert_eq!(resolve_machine_profile("h100", &m), "h100");
     }
 
+    // ── is_hop_by_hop ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_hop_by_hop_true() {
+        assert!(is_hop_by_hop("connection"));
+        assert!(is_hop_by_hop("Connection"));
+        assert!(is_hop_by_hop("Transfer-Encoding"));
+        assert!(is_hop_by_hop("host"));
+        assert!(is_hop_by_hop("keep-alive"));
+    }
+
+    #[test]
+    fn test_is_hop_by_hop_false() {
+        assert!(!is_hop_by_hop("content-type"));
+        assert!(!is_hop_by_hop("authorization"));
+        assert!(!is_hop_by_hop("x-custom-header"));
+    }
+
+    // ── parse_engine_pin ───────────────────────────────────────────
+
+    fn hdr(raw: &[u8]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(
+            HeaderName::from_static("x-sie-engine"),
+            HeaderValue::from_bytes(raw).expect("test value should be valid"),
+        );
+        m
+    }
+
+    #[test]
+    fn test_parse_engine_pin_absent() {
+        let m = HeaderMap::new();
+        assert_eq!(parse_engine_pin(&m), EnginePinParse::None);
+    }
+
+    #[test]
+    fn test_parse_engine_pin_empty_or_whitespace_is_none() {
+        assert_eq!(parse_engine_pin(&hdr(b"")), EnginePinParse::None);
+        assert_eq!(parse_engine_pin(&hdr(b"   ")), EnginePinParse::None);
+        assert_eq!(parse_engine_pin(&hdr(b"\t")), EnginePinParse::None);
+    }
+
+    #[test]
+    fn test_parse_engine_pin_lowercase_known_passes_through() {
+        assert_eq!(
+            parse_engine_pin(&hdr(b"pytorch")),
+            EnginePinParse::Some("pytorch".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_engine_pin_normalises_case_and_whitespace() {
+        // Mixed/upper case must round-trip to the lowercase canonical
+        // form so downstream registry lookups don't miss-match.
+        assert_eq!(
+            parse_engine_pin(&hdr(b"PyTorch")),
+            EnginePinParse::Some("pytorch".to_string()),
+        );
+        assert_eq!(
+            parse_engine_pin(&hdr(b"  PYTORCH  ")),
+            EnginePinParse::Some("pytorch".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_engine_pin_unknown_token_is_unknown() {
+        // ``candle`` was the only other engine we used to ship; it's
+        // gone now, so it joins ``jax`` in the unknown bucket.
+        assert_eq!(
+            parse_engine_pin(&hdr(b"candle")),
+            EnginePinParse::Unknown("candle".to_string()),
+        );
+        assert_eq!(
+            parse_engine_pin(&hdr(b"jax")),
+            EnginePinParse::Unknown("jax".to_string()),
+        );
+        // Whitespace stripped before reporting the raw token, so the
+        // 400 message stays readable.
+        assert_eq!(
+            parse_engine_pin(&hdr(b"  jax  ")),
+            EnginePinParse::Unknown("jax".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_engine_pin_invalid_utf8_is_invalid() {
+        // 0xFF is an invalid UTF-8 lead byte.
+        let mut m = HeaderMap::new();
+        m.insert(
+            HeaderName::from_static("x-sie-engine"),
+            HeaderValue::from_bytes(&[0xFFu8]).expect("bytes always valid"),
+        );
+        assert_eq!(parse_engine_pin(&m), EnginePinParse::InvalidUtf8);
+    }
+
     #[test]
     fn test_parse_queue_request_reads_nested_params() {
         let body = serde_json::to_vec(&json!({
@@ -10240,8 +10599,7 @@ mod tests {
     /// top-level array / scalar is almost always a mis-encoded
     /// client request; silently accepting it as a single item
     /// used to let the request fail later in worker-specific
-    /// ways instead of at ingress (see review feedback on
-    /// PR #716).
+    /// ways instead of at ingress.
     #[test]
     fn test_parse_queue_request_msgpack_rejects_non_map_top_level() {
         let array_body = rmp_serde::to_vec(&rmpv::Value::Array(vec![
@@ -10318,7 +10676,7 @@ mod tests {
     // ── msgpack_numpy conversion tests ──────────────────────────
     //
     // These exercise the fused `rmpv_to_response_json` path. All
-    // fixtures use the exact rmpv shape that Python workers emit
+    // fixtures use the exact rmpv shape that Python adapter processes emit
     // via `msgpack_numpy` — a `Map` whose `data` key holds a
     // `Binary` blob — so the tests double as a wire-format guard:
     // if Python-side encoding ever changes, these flip first.
@@ -10410,6 +10768,23 @@ mod tests {
         assert!((row0[2].as_f64().unwrap() - 3.0).abs() < 1e-6);
         let row1 = outer[1].as_array().unwrap();
         assert!((row1[0].as_f64().unwrap() - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rmpv_to_response_json_rejects_mismatched_numpy_shape() {
+        let bytes: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let value = numpy_sentinel("<f4", &[2, 3], bytes);
+        if let rmpv::Value::Map(entries) = value {
+            assert!(
+                try_decode_rmpv_numpy(&entries).is_none(),
+                "mismatched shape must not silently truncate decoded values"
+            );
+        } else {
+            panic!("numpy_sentinel helper must return a map");
+        }
     }
 
     #[test]
@@ -10555,7 +10930,7 @@ mod tests {
     }
 
     /// End-to-end guard: build a msgpack payload the way a real
-    /// Python worker would (sentinel map with `data` as `Binary`),
+    /// Python adapter process would (sentinel map with `data` as `Binary`),
     /// decode via `rmp_serde::from_slice` → `rmpv_to_response_json`,
     /// and check that bin data is decoded inline without byte-array
     /// inflation. Non-numpy fields (`text`) must survive untouched.
@@ -10590,7 +10965,7 @@ mod tests {
     }
 
     /// The hot path fuses msgpack_numpy decode into the rmpv walk.
-    /// This test builds the exact shape Python workers produce — a
+    /// This test builds the exact shape Python adapter processes produce — a
     /// map whose `data` field is an `rmpv::Value::Binary` blob —
     /// and confirms the fused function decodes the dtype directly
     /// from the byte slice, without ever materialising a
@@ -10756,7 +11131,7 @@ mod tests {
         // `Provisioning` so the caller returns `202 + Retry-After` and
         // records pending demand for KEDA.
         let reg = pool_registry();
-        let out = resolve_effective_pool(&reg, "default", "", "").await;
+        let out = resolve_effective_pool(&reg, "default", "", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         // No GPU expressed → exact_gpu_match is definitionally false.
         assert!(!out.exact_gpu_match);
@@ -10769,7 +11144,7 @@ mod tests {
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "premium", "l4", "").await;
+        let out = resolve_effective_pool(&reg, "premium", "l4", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
     }
@@ -10786,7 +11161,7 @@ mod tests {
         )
         .await;
 
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "").await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
     }
@@ -10799,7 +11174,7 @@ mod tests {
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "default"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4", "").await;
+        let out = resolve_effective_pool(&reg, "default", "l4", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         // Exact tuple (default, l4) had no worker — even though we
         // still routed via the bundle-only fallback, the caller must
@@ -10817,7 +11192,7 @@ mod tests {
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "", "").await;
+        let out = resolve_effective_pool(&reg, "default", "", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         // No GPU preference → no demand tracking applicable.
         assert!(!out.exact_gpu_match);
@@ -10833,7 +11208,7 @@ mod tests {
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "").await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
         assert!(out.exact_gpu_match);
     }
@@ -10844,7 +11219,7 @@ mod tests {
         // empty registry must route there so a known cold pool can be
         // targeted (worker will scale up independently).
         let reg = pool_registry();
-        let out = resolve_effective_pool(&reg, "default", "", "my-bench").await;
+        let out = resolve_effective_pool(&reg, "default", "", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
         assert!(!out.exact_gpu_match);
     }
@@ -10858,7 +11233,7 @@ mod tests {
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "l4-spot", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench").await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
         assert!(!out.exact_gpu_match);
     }
@@ -10871,7 +11246,7 @@ mod tests {
             worker_msg("default", "l4-spot", "my-bench"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench").await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
         assert!(out.exact_gpu_match);
     }
@@ -10885,7 +11260,33 @@ mod tests {
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4", "my-bench").await;
+        let out = resolve_effective_pool(&reg, "default", "l4", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        assert!(!out.exact_gpu_match);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_provisions_when_hash_is_stale() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "default"),
+        )
+        .await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "new-hash").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert!(!out.exact_gpu_match);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_pinned_pool_still_overrides_stale_hash() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "default"),
+        )
+        .await;
+        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "new-hash").await;
         assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
         assert!(!out.exact_gpu_match);
     }
@@ -11303,6 +11704,49 @@ mod tests {
         let v = _expect_chat_err(body).await;
         assert_eq!(v["error"]["code"], "invalid_request");
         assert_eq!(v["error"]["param"], "top_k");
+    }
+
+    /// ``min_tokens`` non-negative integer parses through.
+    #[test]
+    fn test_chat_params_from_json_accepts_min_tokens() {
+        let mut body = _chat_body_min("m");
+        body["min_tokens"] = serde_json::json!(10);
+        let p = _expect_chat_ok(body);
+        assert_eq!(p.min_tokens, Some(10));
+    }
+
+    /// ``min_tokens`` negative rejects with param attribution.
+    #[tokio::test]
+    async fn test_chat_params_from_json_rejects_negative_min_tokens() {
+        let mut body = _chat_body_min("m");
+        body["min_tokens"] = serde_json::json!(-1);
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert_eq!(v["error"]["param"], "min_tokens");
+    }
+
+    /// ``chat_template_kwargs`` as an object parses and round-trips.
+    #[test]
+    fn test_chat_params_from_json_accepts_chat_template_kwargs_object() {
+        let mut body = _chat_body_min("m");
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        let p = _expect_chat_ok(body);
+        assert_eq!(
+            p.chat_template_kwargs
+                .as_ref()
+                .and_then(|v| v.get("enable_thinking")),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    /// ``chat_template_kwargs`` non-object rejects.
+    #[tokio::test]
+    async fn test_chat_params_from_json_rejects_non_object_chat_template_kwargs() {
+        let mut body = _chat_body_min("m");
+        body["chat_template_kwargs"] = serde_json::json!("oops");
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert_eq!(v["error"]["param"], "chat_template_kwargs");
     }
 
     /// ``repetition_penalty`` outside ``(0.0, 2.0]`` rejects (both ends).

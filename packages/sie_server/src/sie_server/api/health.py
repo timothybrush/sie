@@ -4,8 +4,6 @@ Provides Kubernetes-compatible probes:
 - /healthz: Startup/liveness probe - is the process alive? (CPU only, cheap)
 - /livez:   GPU-aware liveness probe - can the device still run kernels?
 - /readyz:  Readiness probe - is the server ready to accept traffic right now?
-
-See DESIGN.md Section 3.1 for specification.
 """
 
 from fastapi import APIRouter, Response

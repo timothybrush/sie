@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
-use crate::types::bundle::BundleInfo;
+use crate::types::bundle::{engine_adapter_prefixes, BundleInfo, DEFAULT_ENGINE, KNOWN_ENGINES};
 use crate::types::model::{
     CanonicalProfile, ModelConfig, ModelEntry, ModelInfoExtras, ProfileConfig,
 };
@@ -259,7 +259,7 @@ impl ModelRegistry {
 
         let priority = data.get("priority").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
 
-        let adapters = data
+        let adapters: Vec<String> = data
             .get("adapters")
             .and_then(|v| v.as_sequence())
             .map(|seq| {
@@ -269,10 +269,57 @@ impl ModelRegistry {
             })
             .unwrap_or_default();
 
+        // Engine: defaults to "pytorch" for back-compat with bundle
+        // YAMLs written before this field existed. Unknown values
+        // are a hard error — silently coercing to the default would
+        // let a typo'd ``engine: pytroch`` mis-route traffic and
+        // push diagnosis to the symptom side. Mirrors the
+        // equivalent check in ``sie_config/model_registry.py::reload``.
+        let engine = data
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_ENGINE)
+            .to_string();
+        if !KNOWN_ENGINES.contains(&engine.as_str()) {
+            return Err(format!(
+                "bundle {:?} declares engine={:?} which is not in KNOWN_ENGINES={:?}; \
+                 update the bundle YAML or add the engine to types::bundle::KNOWN_ENGINES",
+                name, engine, KNOWN_ENGINES,
+            )
+            .into());
+        }
+
+        // Adapter-namespace consistency check. The matcher
+        // (``resolve_bundle`` and ``compute_bundle_config_hash``)
+        // intersects ``bundle.adapters`` with each model's
+        // ``adapter_path`` modules — so a bundle that accidentally
+        // lists adapters outside this engine's namespace would
+        // produce ``UnsupportedModel`` IPC NAKs at runtime.
+        // Catching this at config-load time turns it into a
+        // deploy-time signal.
+        let expected_prefixes = engine_adapter_prefixes(&engine);
+        if !expected_prefixes.is_empty() {
+            let bad: Vec<&String> = adapters
+                .iter()
+                .filter(|a| !expected_prefixes.iter().any(|p| a.starts_with(p)))
+                .collect();
+            if !bad.is_empty() {
+                warn!(
+                    bundle = %name,
+                    engine = %engine,
+                    expected = ?expected_prefixes,
+                    bad_adapters = ?bad,
+                    "bundle lists adapter(s) outside the expected namespace(s); \
+                     these will not be servable by a worker speaking this engine"
+                );
+            }
+        }
+
         Ok(BundleInfo {
             name,
             priority,
             adapters,
+            engine,
         })
     }
 
@@ -681,6 +728,28 @@ impl ModelRegistry {
         model: &str,
         bundle_override: Option<&str>,
     ) -> Result<String, ResolveError> {
+        self.resolve_bundle_with_engine(model, bundle_override, None)
+    }
+
+    /// Engine-aware variant of [`Self::resolve_bundle`].
+    ///
+    /// When `engine_filter` is `Some(engine)`, the candidate bundle
+    /// list for `model` is intersected with bundles whose
+    /// `BundleInfo.engine` matches before applying the existing
+    /// `(priority, name)` sort. This is what implements the
+    /// `X-SIE-Engine` header at the proxy layer; today only
+    /// `"pytorch"` is recognised so the filter is effectively a
+    /// no-op, but the plumbing is preserved for the day a second
+    /// engine lands.
+    ///
+    /// `engine_filter = None` is the back-compat path used by callers
+    /// that don't care about engine selection.
+    pub fn resolve_bundle_with_engine(
+        &self,
+        model: &str,
+        bundle_override: Option<&str>,
+        engine_filter: Option<&str>,
+    ) -> Result<String, ResolveError> {
         let snap = self.snapshot.load();
 
         // Case-insensitive lookup
@@ -704,18 +773,36 @@ impl ModelRegistry {
             }
         };
 
+        let filtered: Vec<String> = match engine_filter {
+            Some(eng) => model_entry
+                .bundles
+                .iter()
+                .filter(|b| snap.bundles.get(*b).is_some_and(|info| info.engine == eng))
+                .cloned()
+                .collect(),
+            None => model_entry.bundles.clone(),
+        };
+
+        if filtered.is_empty() {
+            return Err(ResolveError::BundleConflict(BundleConflictError {
+                model: model.to_string(),
+                bundle: engine_filter.unwrap_or("").to_string(),
+                compatible_bundles: model_entry.bundles.clone(),
+            }));
+        }
+
         if let Some(override_bundle) = bundle_override {
-            if model_entry.bundles.contains(&override_bundle.to_string()) {
+            if filtered.contains(&override_bundle.to_string()) {
                 return Ok(override_bundle.to_string());
             }
             return Err(ResolveError::BundleConflict(BundleConflictError {
                 model: model.to_string(),
                 bundle: override_bundle.to_string(),
-                compatible_bundles: model_entry.bundles.clone(),
+                compatible_bundles: filtered,
             }));
         }
 
-        Ok(model_entry.bundles[0].clone())
+        Ok(filtered[0].clone())
     }
 
     pub fn model_exists(&self, model: &str) -> bool {
@@ -881,6 +968,26 @@ impl ModelRegistry {
             .unwrap_or_default()
     }
 
+    pub fn install_bundle_config_hashes(&self, hashes: HashMap<String, String>) {
+        if hashes.is_empty() {
+            return;
+        }
+
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (**self.snapshot.load()).clone();
+        for (bundle_name, hash) in hashes {
+            if !snap.bundles.contains_key(&bundle_name) {
+                continue;
+            }
+            if hash.is_empty() {
+                snap.bundle_config_hashes.remove(&bundle_name);
+            } else {
+                snap.bundle_config_hashes.insert(bundle_name, hash);
+            }
+        }
+        self.snapshot.store(Arc::new(snap));
+    }
+
     /// Compute the config hash for a bundle (expensive: sort + JSON + SHA-256).
     /// Called during reload() and add_model_config() to pre-populate the cache.
     fn hash_bundle_config(
@@ -902,6 +1009,10 @@ impl ModelRegistry {
         model_names.sort();
 
         for model_name in model_names {
+            if Self::is_synthetic_profile_variant(model_name, models) {
+                continue;
+            }
+
             let model_entry = &models[model_name];
             if !model_entry.bundles.contains(&bundle_id.to_string()) {
                 continue;
@@ -914,7 +1025,7 @@ impl ModelRegistry {
                 continue;
             }
 
-            let mut profiles_for_hash: Vec<serde_json::Value> = Vec::new();
+            let mut profiles_for_hash: Vec<BTreeMap<&str, serde_json::Value>> = Vec::new();
             let mut profile_names: Vec<&String> = model_entry.profile_names.iter().collect();
             profile_names.sort();
 
@@ -927,24 +1038,39 @@ impl ModelRegistry {
                         }
                     }
 
-                    let config = serde_json::json!({
-                        "adapter_path": p_cfg.adapter_path,
-                        "max_batch_tokens": p_cfg.max_batch_tokens,
-                        "compute_precision": p_cfg.compute_precision,
-                        "adapter_options": p_cfg.adapter_options,
-                    });
+                    let mut config = BTreeMap::new();
+                    config.insert(
+                        "adapter_options",
+                        serde_json::to_value(&p_cfg.adapter_options)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    config.insert(
+                        "adapter_path",
+                        serde_json::to_value(&p_cfg.adapter_path)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    config.insert(
+                        "compute_precision",
+                        serde_json::to_value(&p_cfg.compute_precision)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    config.insert(
+                        "max_batch_tokens",
+                        serde_json::to_value(p_cfg.max_batch_tokens)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
 
-                    profiles_for_hash.push(serde_json::json!({
-                        "name": pname,
-                        "config": config,
-                    }));
+                    let mut profile = BTreeMap::new();
+                    profile.insert("config", serde_json::to_value(config).unwrap());
+                    profile.insert("name", serde_json::Value::String(pname.clone()));
+                    profiles_for_hash.push(profile);
                 }
             }
 
-            items.push(serde_json::json!({
-                "sie_id": model_name,
-                "profiles": profiles_for_hash,
-            }));
+            let mut item = BTreeMap::new();
+            item.insert("profiles", serde_json::to_value(profiles_for_hash).unwrap());
+            item.insert("sie_id", serde_json::Value::String(model_name.clone()));
+            items.push(serde_json::to_value(item).unwrap());
         }
 
         if items.is_empty() {
@@ -955,6 +1081,17 @@ impl ModelRegistry {
         let mut hasher = Sha256::new();
         hasher.update(serialized.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    fn is_synthetic_profile_variant(
+        model_name: &str,
+        models: &HashMap<String, ModelEntry>,
+    ) -> bool {
+        model_name
+            .rsplit_once(':')
+            .is_some_and(|(base_model_name, profile_name)| {
+                !profile_name.is_empty() && models.contains_key(base_model_name)
+            })
     }
 
     pub fn add_model_config(&self, config: ModelConfig) -> Result<AddModelConfigOutcome, String> {
@@ -2132,8 +2269,8 @@ adapters:
     /// cold-start and on epoch-poller catch-up. It treats the export as
     /// the source of truth and overrides any divergent stored profile
     /// config (with a warn log) instead of failing the entire bootstrap.
-    /// Reproduces the v0.3.2 -> v0.3.3 `nemotron-8b` adapter swap that
-    /// wedged sie-test until a manual `kubectl rollout restart`.
+    /// Reproduces the `nemotron-8b` adapter swap that wedged sie-test
+    /// until a manual gateway restart.
     #[test]
     fn test_add_model_config_authoritative_overrides_conflicting_profile() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
@@ -2482,6 +2619,93 @@ profiles:
     }
 
     #[test]
+    fn test_compute_bundle_config_hash_ignores_profile_variant_aliases() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            models_dir.join("example.yaml"),
+            r#"
+name: example/model
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+    max_batch_tokens: 4096
+  small:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+    max_batch_tokens: 2048
+    compute_precision: fp16
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        assert!(registry.model_exists("example/model:small"));
+
+        assert_eq!(
+            registry.compute_bundle_config_hash("default"),
+            "a4ce038148c529799f88014dde9360175c9e9536f353162cf3bc312c09f4cd23"
+        );
+    }
+
+    #[test]
+    fn test_install_bundle_config_hashes_overrides_local_hash() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            models_dir.join("bge-m3.yaml"),
+            r#"
+name: BAAI/bge-m3
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+    max_batch_tokens: 4096
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        assert_ne!(
+            registry.compute_bundle_config_hash("default"),
+            "authority-hash"
+        );
+
+        registry.install_bundle_config_hashes(HashMap::from([(
+            "default".to_string(),
+            "authority-hash".to_string(),
+        )]));
+        assert_eq!(
+            registry.compute_bundle_config_hash("default"),
+            "authority-hash"
+        );
+
+        registry
+            .install_bundle_config_hashes(HashMap::from([("default".to_string(), String::new())]));
+        assert_eq!(registry.compute_bundle_config_hash("default"), "");
+    }
+
+    #[test]
     fn test_concurrent_add_model_config_preserves_all_writes() {
         // Fix #4 regression: without `write_lock`, two threads that call
         // `add_model_config` in parallel can both `snapshot.load()` the
@@ -2584,5 +2808,112 @@ profiles:
         registry.reload();
         assert_eq!(registry.list_models().len(), 1);
         assert_eq!(registry.list_bundles().len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // engine field. These tests pin the wire shape and validation
+    // contract so a future refactor can't quietly drop the field.
+    // Today only ``"pytorch"`` is recognised — see ``KNOWN_ENGINES``.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_engine_defaults_to_pytorch_when_omitted() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let info = registry.get_bundle_info("default").unwrap();
+        assert_eq!(info.engine, DEFAULT_ENGINE);
+        assert_eq!(info.engine, "pytorch");
+    }
+
+    #[test]
+    fn test_engine_unknown_value_skips_bundle() {
+        // Unknown engine values are a hard error — silently coercing
+        // would let a typo'd ``engine: pytroch`` mis-route traffic.
+        // We surface this as "bundle skipped";
+        // the registry still loads, but the bad bundle is absent.
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("good.yaml"),
+            "name: good\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        fs::write(
+            bundles_dir.join("typo.yaml"),
+            "name: typo\nengine: pytroch\npriority: 10\nadapters:\n  - sie_server.adapters.foo\n",
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let bundles = registry.list_bundles();
+        assert!(bundles.contains(&"good".to_string()));
+        assert!(
+            !bundles.contains(&"typo".to_string()),
+            "bundle with unknown engine must be rejected at load time, not silently coerced"
+        );
+    }
+
+    #[test]
+    fn test_resolve_bundle_with_engine_filter_passes_through_for_only_engine() {
+        // Today there's exactly one engine in ``KNOWN_ENGINES``
+        // (``"pytorch"``), so the engine-filter codepath must be a
+        // no-op for any pytorch-backed bundle: with or without the
+        // filter, the same bundle resolves. Re-introduce a
+        // multi-engine version of this test when a second engine
+        // lands.
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.bert_flash
+"#,
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("bert.yaml"),
+            r#"
+name: example/bert
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.bert_flash:Adapter"
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let plain = registry.resolve_bundle("example/bert", None).unwrap();
+        assert_eq!(plain, "default");
+
+        let filtered = registry
+            .resolve_bundle_with_engine("example/bert", None, Some("pytorch"))
+            .unwrap();
+        assert_eq!(filtered, "default");
+    }
+
+    #[test]
+    fn test_engine_known_engines_lockstep_with_bundle_module() {
+        // Belt-and-braces: prove the registry's KNOWN_ENGINES import
+        // resolves to the exact constant exported by the bundle types
+        // module, so a future move/rename trips compile-time rather
+        // than runtime. Also enforces the invariant that every known
+        // engine has a non-empty adapter-prefix list — without it the
+        // namespace check is a no-op.
+        for engine in KNOWN_ENGINES {
+            assert!(
+                !engine_adapter_prefixes(engine).is_empty(),
+                "every engine in KNOWN_ENGINES must have a non-empty \
+                 adapter-prefix list (engine={engine}); add it to \
+                 engine_adapter_prefixes() in types/bundle.rs"
+            );
+        }
     }
 }

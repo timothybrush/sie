@@ -1,0 +1,24 @@
+sie_id: opendatalab/MinerU2.5-Pro-2604-1.2B
+hf_id: opendatalab/MinerU2.5-Pro-2604-1.2B
+hf_revision: d3f5e08d073c21466bbabe21c71bb1e9c2e595da
+inputs:
+  text: false
+  image: true
+  audio: false
+  video: false
+tasks:
+  encode: null
+  score: null
+  extract: {}
+profiles:
+  default:
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.mineru_vl:MinerUVLAdapter
+    adapter_options:
+      loadtime:
+        default_task: "[default]"
+      runtime:
+        task: "[default]"
+        max_new_tokens: 4096
+        num_beams: 1

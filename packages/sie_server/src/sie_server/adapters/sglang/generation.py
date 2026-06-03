@@ -173,8 +173,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # ``--tool-call-parser`` (e.g. ``qwen3_coder`` for Qwen3.5).
         # Set ``None`` to omit the flag.
         self._tool_call_parser = tool_call_parser
-        # M4 req2 Proj 5 — generic speculative-decoding surface.
-        # Accepts ``{enabled, algorithm, num_steps?, eagle_topk?,
+        # Generic speculative-decoding surface accepts
+        # ``{enabled, algorithm, num_steps?, eagle_topk?,
         # num_draft_tokens?, draft_model?}``; translated by
         # ``_speculative_launch_args`` into SGLang CLI flags. Default-on
         # for Qwen3.5-4B (NEXTN/MTP trained in); intentionally off for
@@ -196,8 +196,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # ``unload()``. A single shared client lets concurrent requests
         # multiplex over a connection pool instead of paying per-request
         # TCP setup. Measured impact at c=16 on A100: ~20% TTFT improvement
-        # vs the previous "new AsyncClient per request" implementation
-        # (see ``product/research/generation-primitive-status.md`` §3.4).
+        # vs the previous "new AsyncClient per request" implementation.
         self._http_client: httpx.AsyncClient | None = None
         # Two locks for the lazy ``_http_client``:
         #
@@ -732,6 +731,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         presence_penalty: float | None = None,
         top_k: int | None = None,
         repetition_penalty: float | None = None,
+        min_new_tokens: int | None = None,
         grammar: GrammarSpec | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
@@ -756,6 +756,12 @@ class SGLangGenerationAdapter(GenerationAdapter):
             sampling_params["top_k"] = top_k
         if repetition_penalty is not None:
             sampling_params["repetition_penalty"] = repetition_penalty
+        # SGLang ``sampling_params["min_new_tokens"]`` — minimum tokens
+        # before stop. Plumbed end-to-end from the gateway's chat
+        # ``min_tokens`` knob (workaround for Qwen3.6's first-token-EOS
+        # bug under greedy decode).
+        if min_new_tokens is not None:
+            sampling_params["min_new_tokens"] = min_new_tokens
         # SGLang accepts both penalty knobs natively under
         # ``sampling_params`` with the same names OpenAI uses. Pass them
         # through only when the gateway provided a value so model
@@ -992,7 +998,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                     prompt_tokens = meta["prompt_tokens"]
                 if isinstance(meta.get("completion_tokens"), int):
                     total_completion += meta["completion_tokens"]
-                # Per-candidate logprobs (M4): only emit when the request
+                # Per-candidate logprobs: only emit when the request
                 # asked for them. ``return_logprob`` is also set for
                 # ``best_of`` ranking; do NOT surface the ranking-only
                 # logprobs to the client — that would make ``logprobs:

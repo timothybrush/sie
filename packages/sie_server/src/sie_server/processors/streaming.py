@@ -20,9 +20,7 @@ The streaming rollout (this revision) drives the adapter as an async iterator:
   request queue cap >64 unsent), publish a final ``{error,
   code: "transport_failure", done: true}`` chunk and ACK
 
-The chunk envelope is *not* the walking-skeleton ``WorkResult`` shape — see
-``product/plans/m4-req2-generate-issues/02-streaming-async-iterator.md``
-§2.2 of the plan for the discriminated wire shape:
+The chunk envelope uses a discriminated streaming wire shape:
 
     { kind: "chunk", request_id, attempt_id, seq, text_delta,
       is_first?, done, finish_reason?, usage?, ttft_ms?, error? }
@@ -34,6 +32,7 @@ import asyncio
 import collections
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -41,7 +40,7 @@ from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 import msgpack
 from opentelemetry import propagate
@@ -91,7 +90,7 @@ _GRAMMAR_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gramma
 # until ack_wait (which would trigger a JetStream redelivery storm).
 _GRAMMAR_FOLLOWER_TIMEOUT_S = 30.0
 
-# ADR-0002 — SGLang owns request-time grammar compilation.
+# SGLang owns request-time grammar compilation.
 #
 # By default the worker forwards the raw schema/regex/EBNF straight to
 # SGLang's server-side grammar backend (the single grammar authority
@@ -155,12 +154,17 @@ _CANCEL_TOMBSTONE_TTL_S = 120.0
 _CANCEL_TOMBSTONE_MAX = 1024
 
 if TYPE_CHECKING:
-    from nats.aio.client import Client as NATSClient
     from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
     from sie_server.core.registry import ModelRegistry
 
     TokenizerLike = PreTrainedTokenizer | PreTrainedTokenizerFast
+
+
+class NatsPublisher(Protocol):
+    async def publish(self, reply_subject: str, payload: bytes) -> None:
+        raise NotImplementedError
+
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +211,7 @@ _PUBLISH_FAIL_WINDOW_S = 1.0
 # Heartbeat cadence for JetStream ``in_progress()`` calls. The pool
 # consumer's ``ack_wait`` is 5 min for generation pools (per the streaming §4.4 spec);
 # beat well below that so a slow decode doesn't lose the slot.
-_INPROGRESS_INTERVAL_S = 60.0
+_INPROGRESS_INTERVAL_S = float(os.environ.get("SIE_GENERATION_INPROGRESS_INTERVAL_S", "10.0"))
 
 # Input-size caps applied BEFORE the CPU-bound, input-sized tokenizer
 # calls (``apply_chat_template`` / ``tok.encode``). These run on the
@@ -304,6 +308,14 @@ class _GenerateRequestParams:
     # validated; ``None`` → model/sampler default.
     top_k: int | None = None
     repetition_penalty: float | None = None
+    # SGLang ``sampling_params["min_new_tokens"]`` (int >= 0). Anti-
+    # stop-first knob; ``None`` → no minimum.
+    min_tokens: int | None = None
+    # Per-request kwargs for ``apply_chat_template`` (e.g.
+    # ``{"enable_thinking": False}``). Merged on top of the model YAML's
+    # ``chat_template_kwargs`` at render time. ``None`` → only YAML
+    # defaults apply.
+    chat_template_kwargs: dict[str, Any] | None = None
     grammar: GrammarSpec | None = None
     # OpenAI tools / tool_choice. The gateway has already shape-validated
     # the schemas; the worker uses ``tools is not None`` as the flag that
@@ -354,7 +366,7 @@ class StreamingProcessor:
 
     def __init__(
         self,
-        nc: NATSClient,
+        nc: NatsPublisher,
         registry: ModelRegistry,
         worker_id: str,
         *,
@@ -669,7 +681,7 @@ class StreamingProcessor:
 
     @staticmethod
     def _resolve_grammar_backend_label(adapter: GenerationAdapter) -> str:
-        """Bounded-cardinality backend label for the ADR-0002 metrics.
+        """Bounded-cardinality backend label for structured-output metrics.
 
         Reads the adapter's ``_grammar_backend`` (the same field used to
         drive the SGLang ``--grammar-backend`` flag). Anything that
@@ -686,7 +698,7 @@ class StreamingProcessor:
         adapter: GenerationAdapter,
         grammar: GrammarSpec,
     ) -> None:
-        """Record per-request grammar observability signal (ADR-0002).
+        """Record per-request grammar observability signal.
 
         Runs on every structured-output request, regardless of whether
         the legacy preflight is enabled. Cheap — one counter increment
@@ -974,7 +986,7 @@ class StreamingProcessor:
         # attempt_id it observes and drops chunks from any other.
         attempt_id = uuid.uuid4().hex
 
-        # M5: W3C Trace Context propagation. If the gateway populated
+        # W3C Trace Context propagation. If the gateway populated
         # the ``traceparent`` (and optionally ``tracestate``) fields on
         # the envelope, extract a parent ``opentelemetry.Context`` and
         # open the worker-side processing span as its child. The span
@@ -1169,8 +1181,8 @@ class StreamingProcessor:
 
         # Routing-key plumbing: inert at this layer. Read so the values land
         # in a single place, but do not act on them.
-        _routing_key = wi.get("routing_key")  # routing-affinity hint
-        _prompt_cache_key = wi.get("prompt_cache_key")  # prompt-cache hint
+        _ = wi.get("routing_key")  # routing-affinity hint
+        _ = wi.get("prompt_cache_key")  # prompt-cache hint
 
         validation = self._validate_generate_params(wi)
         if isinstance(validation, _ValidationError):
@@ -1203,7 +1215,12 @@ class StreamingProcessor:
         # the underlying adapter. ``Prompt`` shape goes straight through.
         prompt_str: str
         if isinstance(params.input, _MessagesInput):
-            rendered = await self._render_chat_template(model_id, params.input.messages, effective_tools)
+            rendered = await self._render_chat_template(
+                model_id,
+                params.input.messages,
+                effective_tools,
+                request_kwargs=params.chat_template_kwargs,
+            )
             if isinstance(rendered, _ValidationError):
                 await self._terminal_error_then_settle(
                     reply_subject,
@@ -1287,7 +1304,7 @@ class StreamingProcessor:
         # gateway rejects the combo before the request reaches here).
         effective_grammar = forcing_grammar if forcing_grammar is not None else params.grammar
 
-        # ADR-0002 — SGLang owns request-time grammar compilation.
+        # SGLang owns request-time grammar compilation.
         #
         # The default path forwards the raw schema/regex/EBNF straight to
         # SGLang's server-side grammar backend (the single grammar
@@ -1390,6 +1407,8 @@ class StreamingProcessor:
                 presence_penalty=params.presence_penalty,
                 top_k=params.top_k,
                 repetition_penalty=params.repetition_penalty,
+                min_tokens=params.min_tokens,
+                chat_template_kwargs=params.chat_template_kwargs,
                 grammar=effective_grammar,
                 tools=effective_tools,
                 enable_tool_parser=enable_tool_parser,
@@ -1435,6 +1454,12 @@ class StreamingProcessor:
         presence_penalty: float | None = None,
         top_k: int | None = None,
         repetition_penalty: float | None = None,
+        min_tokens: int | None = None,
+        # ``chat_template_kwargs`` is consumed upstream in
+        # :meth:`_render_chat_template`; accepted here only so the
+        # caller can forward the whole ``params`` block without sniffing
+        # which fields belong to which stage.
+        chat_template_kwargs: dict[str, Any] | None = None,
         grammar: GrammarSpec | None = None,
         tools: tuple[dict[str, Any], ...] | None = None,
         enable_tool_parser: bool | None = None,
@@ -1481,9 +1506,17 @@ class StreamingProcessor:
             gen_kwargs["top_k"] = top_k
         if repetition_penalty is not None:
             gen_kwargs["repetition_penalty"] = repetition_penalty
+        if min_tokens is not None:
+            # SGLang names the knob ``min_new_tokens`` server-side; the
+            # OpenAI-compat surface (mirroring vLLM / Together) takes it
+            # as ``min_tokens``. Translate at this edge.
+            gen_kwargs["min_new_tokens"] = min_tokens
+        # ``chat_template_kwargs`` is consumed in _render_chat_template
+        # upstream; nothing to forward from here.
+        _ = chat_template_kwargs
         if grammar is not None:
             gen_kwargs["grammar"] = grammar
-        # Slice M5: seed / logit_bias / logprobs / top_logprobs. Only
+        # Optional sampler controls: seed / logit_bias / logprobs / top_logprobs. Only
         # forward when set so older adapters that don't accept the
         # kwargs still work for the (common) no-extra-sampler path.
         if seed is not None:
@@ -1753,7 +1786,7 @@ class StreamingProcessor:
                 # Record first-text timing for TTFT.
                 if chunk.text_delta and first_text_at is None:
                     first_text_at = time.monotonic()
-                    # ADR-0002 — structured-output TTFT is the proxy for
+                    # Structured-output TTFT is the proxy for
                     # SGLang's server-side grammar-construction cost. Only
                     # observe when this request actually carries a
                     # grammar; non-structured requests already feed the
@@ -2289,7 +2322,7 @@ class StreamingProcessor:
                     raw,
                 )
                 return None
-            if v != v or v < -2.0 or v > 2.0:  # noqa: PLR0124, PLR2004 — explicit NaN check, OpenAI penalty range is the spec value
+            if math.isnan(v) or v < -2.0 or v > 2.0:  # noqa: PLR2004 — OpenAI penalty range is the spec value
                 logger.debug(
                     "generate request: %s %r out of [-2.0, 2.0] — dropping",
                     name,
@@ -2332,11 +2365,36 @@ class StreamingProcessor:
                 )
                 repetition_penalty = None
             else:
-                # Range (0, 2] is the documented gateway contract; the
-                # ``v == v`` guard rejects NaN.
+                # Range (0, 2] is the documented gateway contract;
+                # NaN is rejected via ``math.isnan``.
                 repetition_penalty = (
-                    rep_pen_val if (rep_pen_val == rep_pen_val and 0.0 < rep_pen_val <= 2.0) else None  # noqa: PLR0124, PLR2004
+                    rep_pen_val if (not math.isnan(rep_pen_val) and 0.0 < rep_pen_val <= 2.0) else None  # noqa: PLR2004
                 )
+
+        # SGLang ``sampling_params["min_new_tokens"]``. Gateway validates
+        # as ``>= 0``; defensive coerce here.
+        min_tokens_raw = params.get("min_tokens")
+        min_tokens: int | None
+        if min_tokens_raw is None or isinstance(min_tokens_raw, bool):
+            min_tokens = None
+        else:
+            try:
+                min_tokens_val = int(min_tokens_raw)
+            except (TypeError, ValueError):
+                logger.debug("generate request: non-integer min_tokens %r — dropping", min_tokens_raw)
+                min_tokens = None
+            else:
+                min_tokens = min_tokens_val if min_tokens_val >= 0 else None
+
+        # Per-request chat-template kwargs. Gateway has already validated
+        # this is an object (or absent); store as-is and merge with the
+        # model YAML defaults in ``_render_chat_template`` below.
+        chat_template_kwargs_raw = params.get("chat_template_kwargs")
+        chat_template_kwargs: dict[str, Any] | None
+        if isinstance(chat_template_kwargs_raw, dict):
+            chat_template_kwargs = dict(chat_template_kwargs_raw)
+        else:
+            chat_template_kwargs = None
 
         # OpenAI ``seed`` / ``logit_bias`` / ``logprobs`` / ``top_logprobs``
         # round-trips. Gateway is the authority for shape validation
@@ -2457,6 +2515,8 @@ class StreamingProcessor:
             presence_penalty=presence_penalty,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            min_tokens=min_tokens,
+            chat_template_kwargs=chat_template_kwargs,
             grammar=grammar,
             tools=tools,
             tool_choice=tool_choice,
@@ -2531,6 +2591,7 @@ class StreamingProcessor:
         model_id: str,
         messages: tuple[_ChatMessage, ...],
         tools: tuple[dict[str, Any], ...] | None = None,
+        request_kwargs: dict[str, Any] | None = None,
     ) -> str | _ValidationError:
         """Render a chat-message list into a prompt string via the tokenizer's
         chat template. Returns the rendered string or a validation error
@@ -2540,6 +2601,16 @@ class StreamingProcessor:
         the tool definitions are rendered into the prompt — without this the
         model never sees the available tools and never emits ``<tool_call>``
         blocks, so native tool calling silently degrades to prose.
+
+        ``request_kwargs`` are per-request overrides for the tokenizer's
+        template kwargs (sourced from the client's
+        ``chat_template_kwargs`` body field). Merged on top of the model
+        YAML's ``chat_template_kwargs`` so the YAML stays the default
+        while clients can flip individual switches per request (e.g.
+        ``{"enable_thinking": False}`` to suppress Qwen3's ``<think>``
+        reasoning on a one-off basis). The YAML wins on conflict —
+        operator config is authoritative; per-request overrides only
+        fill in keys the YAML didn't set.
         """
         try:
             tok = await self._get_tokenizer(model_id)
@@ -2555,7 +2626,14 @@ class StreamingProcessor:
             )
 
         # Tokenizer-extension kwargs (e.g. Qwen3's ``enable_thinking``).
+        # Start from any per-request overrides, then layer the model
+        # YAML on top — YAML defaults win on conflict so an operator
+        # can fence off a kwarg the client shouldn't be flipping just
+        # by setting it in the YAML. Empty/missing client kwargs are
+        # a no-op.
         kwargs: dict[str, Any] = {}
+        if request_kwargs:
+            kwargs.update(request_kwargs)
         try:
             config = self._registry.get_config(model_id)
         except KeyError:
@@ -2563,7 +2641,7 @@ class StreamingProcessor:
         if config is not None and config.tasks.generate is not None:
             raw_kwargs = config.tasks.generate.chat_template_kwargs
             if isinstance(raw_kwargs, dict):
-                kwargs = dict(raw_kwargs)
+                kwargs.update(raw_kwargs)
 
         # Reject pathologically large message lists before the CPU-bound
         # render: ``apply_chat_template`` is input-sized and runs on the
@@ -2786,9 +2864,9 @@ class StreamingProcessor:
         if cached is not None:
             _metrics.GRAMMAR_CACHE_HITS.labels(model=model_id).inc()
             try:
-                _metrics.GRAMMAR_CACHE_HITS_ADR0002.labels(backend="outlines").inc()
+                _metrics.GRAMMAR_CACHE_HITS_STRUCTURED_OUTPUT.labels(backend="outlines").inc()
             except Exception:  # noqa: BLE001
-                logger.debug("ADR-0002 grammar cache-hit metric failed", exc_info=True)
+                logger.debug("structured-output grammar cache-hit metric failed", exc_info=True)
             return True
 
         # Single-flight: if another coroutine is already compiling this
@@ -2832,9 +2910,9 @@ class StreamingProcessor:
                 return False
             _metrics.GRAMMAR_CACHE_HITS.labels(model=model_id).inc()
             try:
-                _metrics.GRAMMAR_CACHE_HITS_ADR0002.labels(backend="outlines").inc()
+                _metrics.GRAMMAR_CACHE_HITS_STRUCTURED_OUTPUT.labels(backend="outlines").inc()
             except Exception:  # noqa: BLE001
-                logger.debug("ADR-0002 grammar cache-hit metric failed", exc_info=True)
+                logger.debug("structured-output grammar cache-hit metric failed", exc_info=True)
             return True
 
         # Leader path: load tokenizer + run the bounded-pool compile.
@@ -2962,14 +3040,16 @@ class StreamingProcessor:
         elapsed = time.monotonic() - t0
         _metrics.GRAMMAR_COMPILE_SECONDS.labels(model=model_id, kind=grammar.kind).observe(elapsed)
         _metrics.GRAMMAR_CACHE_MISSES.labels(model=model_id).inc()
-        # ADR-0002 metrics — the preflight only runs when
+        # Structured-output grammar metrics: the preflight only runs when
         # ``SIE_GRAMMAR_PREFLIGHT_DEBUG=1``, so these observations are
         # diagnostic-only by construction.
         try:
-            _metrics.GRAMMAR_COMPILE_SECONDS_ADR0002.labels(backend="outlines", mode=grammar.kind).observe(elapsed)
-            _metrics.GRAMMAR_CACHE_MISSES_ADR0002.labels(backend="outlines").inc()
+            _metrics.GRAMMAR_COMPILE_SECONDS_STRUCTURED_OUTPUT.labels(backend="outlines", mode=grammar.kind).observe(
+                elapsed
+            )
+            _metrics.GRAMMAR_CACHE_MISSES_STRUCTURED_OUTPUT.labels(backend="outlines").inc()
         except Exception:  # noqa: BLE001
-            logger.debug("ADR-0002 grammar compile/miss metric failed", exc_info=True)
+            logger.debug("structured-output grammar compile/miss metric failed", exc_info=True)
         self._grammar_cache.put(key, compiled)
         future_to_await.set_result(compiled)
         return True

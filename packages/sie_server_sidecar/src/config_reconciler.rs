@@ -1,0 +1,790 @@
+//! Periodic worker-side reconciliation against `sie-config`.
+//!
+//! Core NATS gives the sidecar a fast live path for
+//! `sie.config.models.<bundle>`, but it does not replay messages that were
+//! published while a worker was disconnected. This module closes that gap by
+//! polling `GET /v1/configs/epoch` and fetching `GET /v1/configs/export` when
+//! the control plane is ahead. A slower full-export pass also covers
+//! no-config-store deployments where `sie-config` keeps epoch at `0`.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio::time::interval;
+use tracing::{debug, info, warn};
+
+use crate::config_subscriber::{
+    apply_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
+};
+use crate::ipc_client::{IpcClient, IpcError};
+use crate::ipc_types::{ApplyModelConfigRequest, ApplyModelConfigResponse};
+use crate::metrics::MetricsRegistry;
+use crate::shutdown::Shutdown;
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+pub const DEFAULT_FULL_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone)]
+pub struct ReconcilerConfig {
+    pub base_url: String,
+    pub admin_token: Option<String>,
+    pub bundle: String,
+    pub poll_interval: Duration,
+    pub full_export_interval: Option<Duration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EpochResponse {
+    #[serde(default)]
+    epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportSnapshot {
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    bundle_config_hashes: HashMap<String, String>,
+    #[serde(default)]
+    models: Vec<ExportedModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportedModel {
+    #[serde(default)]
+    model_id: String,
+    #[serde(default)]
+    raw_yaml: Option<String>,
+    #[serde(default)]
+    model_config: Option<serde_json::Value>,
+    #[serde(default)]
+    affected_bundles: Vec<String>,
+}
+
+impl ExportedModel {
+    fn targets_bundle(&self, bundle: &str) -> bool {
+        self.affected_bundles.iter().any(|b| b == bundle)
+    }
+
+    fn config_body(&self) -> Result<Option<String>, serde_json::Error> {
+        if let Some(raw) = self.raw_yaml.as_deref() {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+        match &self.model_config {
+            Some(value) if !value.is_null() => serde_json::to_string(value).map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReconcileError {
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("unexpected status {status} from {url}: {body}")]
+    BadStatus {
+        status: u16,
+        url: String,
+        body: String,
+    },
+}
+
+#[derive(Debug)]
+struct ExportOutcome {
+    epoch: u64,
+    applied: usize,
+    failed: usize,
+    skipped: usize,
+    shutdown: bool,
+    state_updated: bool,
+}
+
+struct ReconcileClient {
+    base_url: String,
+    admin_token: Option<String>,
+    http: reqwest::Client,
+}
+
+struct ReconcileRuntime<'a> {
+    client: &'a ReconcileClient,
+    bundle: &'a str,
+    ipc: Arc<IpcClient>,
+    state: Arc<ConfigApplyState>,
+    metrics: Arc<MetricsRegistry>,
+    shutdown: Arc<Shutdown>,
+}
+
+impl ReconcileClient {
+    fn new(base_url: String, admin_token: Option<String>) -> Result<Self, reqwest::Error> {
+        let http = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
+        Ok(Self {
+            base_url,
+            admin_token,
+            http,
+        })
+    }
+
+    async fn fetch_epoch(&self) -> Result<u64, ReconcileError> {
+        let url = format!("{}/v1/configs/epoch", self.base_url.trim_end_matches('/'));
+        let mut req = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ReconcileError::BadStatus {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        let payload: EpochResponse = resp.json().await?;
+        Ok(payload.epoch)
+    }
+
+    async fn fetch_export(&self) -> Result<ExportSnapshot, ReconcileError> {
+        let url = format!("{}/v1/configs/export", self.base_url.trim_end_matches('/'));
+        let mut req = self.http.get(&url);
+        if let Some(token) = &self.admin_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ReconcileError::BadStatus {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+}
+
+fn record_reconcile(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .config_deltas_total
+        .with_label_values(&["export", result])
+        .inc();
+}
+
+/// Spawn the optional export reconciler.
+///
+/// The task is disabled when `config.base_url` is empty. The caller owns the
+/// returned handle and aborts it on shutdown, matching the config subscriber
+/// and health publisher lifecycle.
+pub fn spawn(
+    config: Option<ReconcilerConfig>,
+    ipc: Arc<IpcClient>,
+    state: Arc<ConfigApplyState>,
+    metrics: Arc<MetricsRegistry>,
+    shutdown: Arc<Shutdown>,
+    generation_reconcile: Option<Arc<Notify>>,
+) -> Option<JoinHandle<()>> {
+    let config = config?;
+    if config.base_url.trim().is_empty() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let client = match ReconcileClient::new(config.base_url.clone(), config.admin_token) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "worker-config: failed to build export reconciler client");
+                record_reconcile(&metrics, "client_error");
+                return;
+            }
+        };
+
+        info!(
+            base_url = %config.base_url,
+            bundle = %config.bundle,
+            poll_interval_ms = config.poll_interval.as_millis() as u64,
+            full_export_interval_ms = config.full_export_interval.map(|d| d.as_millis() as u64),
+            "worker-config: export reconciler started"
+        );
+
+        let runtime = ReconcileRuntime {
+            client: &client,
+            bundle: &config.bundle,
+            ipc: Arc::clone(&ipc),
+            state: Arc::clone(&state),
+            metrics: Arc::clone(&metrics),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let mut last_successful_export: Option<Instant> = None;
+        match reconcile_export(&runtime, false, "startup").await {
+            Ok(outcome) if outcome.shutdown => return,
+            Ok(outcome) if outcome.failed == 0 => {
+                last_successful_export = Some(Instant::now());
+                if outcome.applied > 0 {
+                    if let Some(notify) = generation_reconcile.as_ref() {
+                        notify.notify_one();
+                    }
+                }
+                info!(
+                    epoch = outcome.epoch,
+                    applied = outcome.applied,
+                    skipped = outcome.skipped,
+                    state_updated = outcome.state_updated,
+                    "worker-config: startup export reconcile complete"
+                );
+            }
+            Ok(outcome) => {
+                warn!(
+                    epoch = outcome.epoch,
+                    applied = outcome.applied,
+                    failed = outcome.failed,
+                    skipped = outcome.skipped,
+                    "worker-config: startup export reconcile partial; will retry"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "worker-config: startup export reconcile failed; will retry");
+                record_reconcile(&metrics, "fetch_error");
+            }
+        }
+
+        let mut ticker = interval(config.poll_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => return,
+                _ = ticker.tick() => {
+                    let local_epoch = state.epoch();
+                    let remote_epoch = match client.fetch_epoch().await {
+                        Ok(epoch) => epoch,
+                        Err(e) => {
+                            warn!(error = %e, "worker-config: epoch poll failed");
+                            record_reconcile(&metrics, "epoch_error");
+                            continue;
+                        }
+                    };
+
+                    let full_export_due = config.full_export_interval.is_some_and(|interval| {
+                        last_successful_export
+                            .map(|last| last.elapsed() >= interval)
+                            .unwrap_or(true)
+                    });
+                    let needs_export =
+                        remote_epoch != local_epoch || (remote_epoch == 0 && full_export_due);
+
+                    if !needs_export {
+                        debug!(
+                            local_epoch,
+                            remote_epoch,
+                            "worker-config: epoch poll in sync"
+                        );
+                        continue;
+                    }
+
+                    let force_epoch = remote_epoch < local_epoch;
+                    let reason = if remote_epoch > local_epoch {
+                        "epoch_ahead"
+                    } else if remote_epoch < local_epoch {
+                        "epoch_rewind"
+                    } else {
+                        "periodic_export"
+                    };
+                    if force_epoch {
+                        warn!(
+                            local_epoch,
+                            remote_epoch,
+                            "worker-config: local epoch ahead of sie-config; export reconcile will force epoch after successful apply"
+                        );
+                    } else {
+                        info!(
+                            local_epoch,
+                            remote_epoch,
+                            reason,
+                            "worker-config: drift detected; fetching export"
+                        );
+                    }
+
+                    match reconcile_export(&runtime, force_epoch, reason)
+                    .await
+                    {
+                        Ok(outcome) if outcome.shutdown => return,
+                        Ok(outcome) if outcome.failed == 0 => {
+                            last_successful_export = Some(Instant::now());
+                            if outcome.applied > 0 {
+                                if let Some(notify) = generation_reconcile.as_ref() {
+                                    notify.notify_one();
+                                }
+                            }
+                            info!(
+                                epoch = outcome.epoch,
+                                applied = outcome.applied,
+                                skipped = outcome.skipped,
+                                state_updated = outcome.state_updated,
+                                reason,
+                                "worker-config: export reconcile complete"
+                            );
+                        }
+                        Ok(outcome) => {
+                            warn!(
+                                epoch = outcome.epoch,
+                                applied = outcome.applied,
+                                failed = outcome.failed,
+                                skipped = outcome.skipped,
+                                reason,
+                                "worker-config: export reconcile partial; epoch/hash not advanced"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, reason, "worker-config: export reconcile failed");
+                            record_reconcile(&metrics, "fetch_error");
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+async fn reconcile_export(
+    runtime: &ReconcileRuntime<'_>,
+    force_epoch: bool,
+    reason: &str,
+) -> Result<ExportOutcome, ReconcileError> {
+    let snapshot = runtime.client.fetch_export().await?;
+    let ipc = Arc::clone(&runtime.ipc);
+    let shutdown = Arc::clone(&runtime.shutdown);
+    Ok(reconcile_export_snapshot(
+        snapshot,
+        runtime.bundle,
+        &runtime.state,
+        &runtime.metrics,
+        force_epoch,
+        reason,
+        move |req, model_id, epoch| {
+            let ipc = Arc::clone(&ipc);
+            let shutdown = Arc::clone(&shutdown);
+            async move { apply_via_ipc_with_retry(ipc, shutdown, req, &model_id, epoch).await }
+        },
+    )
+    .await)
+}
+
+async fn reconcile_export_snapshot<F, Fut>(
+    snapshot: ExportSnapshot,
+    bundle: &str,
+    state: &ConfigApplyState,
+    metrics: &MetricsRegistry,
+    force_epoch: bool,
+    reason: &str,
+    mut apply: F,
+) -> ExportOutcome
+where
+    F: FnMut(ApplyModelConfigRequest, String, u64) -> Fut,
+    Fut: Future<Output = Result<Option<ApplyModelConfigResponse>, IpcError>>,
+{
+    let _apply_guard = state.lock_apply().await;
+
+    if !force_epoch && snapshot.epoch < state.epoch() {
+        record_reconcile(metrics, "stale_export");
+        return ExportOutcome {
+            epoch: snapshot.epoch,
+            applied: 0,
+            failed: 0,
+            skipped: snapshot.models.len(),
+            shutdown: false,
+            state_updated: false,
+        };
+    }
+
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let control_plane_hash = snapshot
+        .bundle_config_hashes
+        .get(bundle)
+        .filter(|hash| !hash.is_empty())
+        .cloned();
+    let mut last_bundle_hash: Option<String> = None;
+    let mut first_hash_mismatch: Option<String> = None;
+
+    for model in snapshot.models {
+        if !model.targets_bundle(bundle) {
+            skipped += 1;
+            continue;
+        }
+
+        let model_config = match model.config_body() {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    model = %model.model_id,
+                    error = %e,
+                    "worker-config: exported model_config could not be serialized"
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        if model_config.len() > MAX_MODEL_CONFIG_BYTES {
+            warn!(
+                model = %model.model_id,
+                bytes = model_config.len(),
+                max_bytes = MAX_MODEL_CONFIG_BYTES,
+                "worker-config: exported model_config is oversized"
+            );
+            failed += 1;
+            continue;
+        }
+
+        let req = ApplyModelConfigRequest {
+            bundle_id: bundle.to_string(),
+            model_id: model.model_id.clone(),
+            epoch: snapshot.epoch,
+            bundle_config_hash: String::new(),
+            profiles_added: vec![],
+            model_config,
+        };
+
+        let resp = match apply(req, model.model_id.clone(), snapshot.epoch).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                record_reconcile(metrics, "shutdown");
+                return ExportOutcome {
+                    epoch: snapshot.epoch,
+                    applied,
+                    failed,
+                    skipped,
+                    shutdown: true,
+                    state_updated: false,
+                };
+            }
+            Err(e) => {
+                warn!(
+                    model = %model.model_id,
+                    epoch = snapshot.epoch,
+                    error = %e,
+                    "worker-config: exported model apply failed"
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        if !resp.applied {
+            warn!(
+                model = %model.model_id,
+                epoch = snapshot.epoch,
+                "worker-config: exported model apply returned applied=false"
+            );
+            failed += 1;
+            continue;
+        }
+
+        if let Some(hash) = &control_plane_hash {
+            if !resp.bundle_config_hash.is_empty()
+                && resp.bundle_config_hash != *hash
+                && first_hash_mismatch.is_none()
+            {
+                first_hash_mismatch = Some(resp.bundle_config_hash.clone());
+            }
+            last_bundle_hash = Some(hash.clone());
+        } else if !resp.bundle_config_hash.is_empty() {
+            last_bundle_hash = Some(resp.bundle_config_hash);
+        }
+        applied += 1;
+    }
+
+    let state_updated = if failed == 0 {
+        if let (Some(control_hash), Some(applied_hash)) = (
+            control_plane_hash.as_deref(),
+            first_hash_mismatch.as_deref(),
+        ) {
+            warn!(
+                epoch = snapshot.epoch,
+                advertised_hash = %control_hash,
+                applied_hash = %applied_hash,
+                "worker-config: Python registry hash differs from control-plane export hash; advertising control-plane hash"
+            );
+        }
+        let state_updated =
+            state.mark_export_reconciled(snapshot.epoch, last_bundle_hash, force_epoch);
+        if state_updated {
+            metrics.config_epoch.set(snapshot.epoch as i64);
+        }
+        record_reconcile(
+            metrics,
+            if applied == 0 {
+                "no_relevant_models"
+            } else if state_updated {
+                "applied"
+            } else {
+                "stale_export"
+            },
+        );
+        state_updated
+    } else {
+        record_reconcile(metrics, "partial");
+        false
+    };
+
+    debug!(
+        epoch = snapshot.epoch,
+        applied,
+        failed,
+        skipped,
+        reason,
+        state_updated,
+        "worker-config: export reconcile attempt finished"
+    );
+
+    ExportOutcome {
+        epoch: snapshot.epoch,
+        applied,
+        failed,
+        skipped,
+        shutdown: false,
+        state_updated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tokio::sync::Mutex;
+
+    fn exported_model(model_id: &str, bundles: &[&str]) -> ExportedModel {
+        ExportedModel {
+            model_id: model_id.into(),
+            raw_yaml: Some(format!("sie_id: {model_id}\nprofiles:\n  default: {{}}\n")),
+            model_config: None,
+            affected_bundles: bundles.iter().map(|b| (*b).to_string()).collect(),
+        }
+    }
+
+    fn metrics() -> MetricsRegistry {
+        MetricsRegistry::new().expect("metrics registry")
+    }
+
+    #[test]
+    fn exported_model_targets_exact_bundle_only() {
+        let model = ExportedModel {
+            model_id: "m".into(),
+            raw_yaml: Some("sie_id: m\n".into()),
+            model_config: None,
+            affected_bundles: vec!["default".into(), "vision".into()],
+        };
+        assert!(model.targets_bundle("default"));
+        assert!(!model.targets_bundle("def"));
+        assert!(!model.targets_bundle("DEFAULT"));
+    }
+
+    #[test]
+    fn raw_yaml_wins_over_structured_model_config() {
+        let model = ExportedModel {
+            model_id: "m".into(),
+            raw_yaml: Some("sie_id: raw\n".into()),
+            model_config: Some(serde_json::json!({"sie_id": "json"})),
+            affected_bundles: vec!["default".into()],
+        };
+        assert_eq!(model.config_body().unwrap().as_deref(), Some("sie_id: raw"));
+    }
+
+    #[test]
+    fn structured_model_config_falls_back_to_json_yaml_subset() {
+        let model = ExportedModel {
+            model_id: "m".into(),
+            raw_yaml: None,
+            model_config: Some(serde_json::json!({"sie_id": "json"})),
+            affected_bundles: vec!["default".into()],
+        };
+        assert_eq!(
+            model.config_body().unwrap().as_deref(),
+            Some("{\"sie_id\":\"json\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_applies_target_bundle_and_updates_epoch_hash() {
+        let snapshot = ExportSnapshot {
+            epoch: 7,
+            bundle_config_hashes: HashMap::new(),
+            models: vec![
+                exported_model("target-model", &["default"]),
+                exported_model("other-model", &["vision"]),
+            ],
+        };
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+
+        let outcome =
+            reconcile_export_snapshot(snapshot, "default", &state, &metrics, false, "test", {
+                let applied = Arc::clone(&applied);
+                move |req, _model_id, _epoch| {
+                    let applied = Arc::clone(&applied);
+                    async move {
+                        applied.lock().await.push(req);
+                        Ok(Some(ApplyModelConfigResponse {
+                            applied: true,
+                            bundle_config_hash: "hash-7".into(),
+                            config_version: 7,
+                        }))
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.state_updated);
+        assert_eq!(state.epoch(), 7);
+        assert_eq!(
+            state.bundle_config_hash().read().unwrap().as_str(),
+            "hash-7"
+        );
+
+        let applied = applied.lock().await;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].model_id, "target-model");
+        assert_eq!(applied[0].bundle_id, "default");
+        assert_eq!(applied[0].epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_partial_failure_does_not_advance_state() {
+        let snapshot = ExportSnapshot {
+            epoch: 8,
+            bundle_config_hashes: HashMap::new(),
+            models: vec![
+                exported_model("ok-model", &["default"]),
+                exported_model("bad-model", &["default"]),
+            ],
+        };
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            "default",
+            &state,
+            &metrics,
+            false,
+            "test",
+            |req, _model_id, _epoch| async move {
+                if req.model_id == "bad-model" {
+                    Err(IpcError::Server("apply failed".into()))
+                } else {
+                    Ok(Some(ApplyModelConfigResponse {
+                        applied: true,
+                        bundle_config_hash: "hash-8".into(),
+                        config_version: 8,
+                    }))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed, 1);
+        assert!(!outcome.state_updated);
+        assert_eq!(state.epoch(), 0);
+        assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "old");
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_forced_epoch_rewind_only_after_success() {
+        let snapshot = ExportSnapshot {
+            epoch: 3,
+            bundle_config_hashes: HashMap::new(),
+            models: vec![exported_model("target-model", &["default"])],
+        };
+        let state = ConfigApplyState::new("old".into());
+        state.force_epoch(9);
+        let metrics = metrics();
+
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            "default",
+            &state,
+            &metrics,
+            true,
+            "test",
+            |_req, _model_id, _epoch| async move {
+                Ok(Some(ApplyModelConfigResponse {
+                    applied: true,
+                    bundle_config_hash: "hash-3".into(),
+                    config_version: 3,
+                }))
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.state_updated);
+        assert_eq!(state.epoch(), 3);
+        assert_eq!(
+            state.bundle_config_hash().read().unwrap().as_str(),
+            "hash-3"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_prefers_control_plane_bundle_hash() {
+        let snapshot = ExportSnapshot {
+            epoch: 11,
+            bundle_config_hashes: HashMap::from([(
+                "default".to_string(),
+                "control-hash".to_string(),
+            )]),
+            models: vec![exported_model("target-model", &["default"])],
+        };
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            "default",
+            &state,
+            &metrics,
+            false,
+            "test",
+            |_req, _model_id, _epoch| async move {
+                Ok(Some(ApplyModelConfigResponse {
+                    applied: true,
+                    bundle_config_hash: "python-hash".into(),
+                    config_version: 11,
+                }))
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.state_updated);
+        assert_eq!(state.epoch(), 11);
+        assert_eq!(
+            state.bundle_config_hash().read().unwrap().as_str(),
+            "control-hash"
+        );
+    }
+}

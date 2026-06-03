@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# SIE Server - CUDA 12.4 Image
+# SIE Server - CUDA 12 Image
 # Build from repo root:
 #   docker build -f packages/sie_server/Dockerfile.cuda12 -t sie-server:cuda12-default .
 #   docker build -f packages/sie_server/Dockerfile.cuda12 --build-arg BUNDLE=sglang -t sie-server:cuda12-sglang .
@@ -8,7 +8,7 @@ ARG BUNDLE=default
 ARG UV_VERSION=0.9.28
 
 # =============================================================================
-# Stage 1: uv + standalone Python 3.12 (no deadsnakes PPA)
+# Dependency image: uv and standalone Python 3.12
 # =============================================================================
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS deps
 
@@ -59,10 +59,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -e ".[gpu-metrics]"
 
 # =============================================================================
-# Stage 2: Base - source install + shared-venv finalization (no BUNDLE)
+# Shared CUDA base: source install and venv finalization
 # =============================================================================
 # Everything here is bundle-agnostic, so bundle-specific builds of a given
-# platform share every base-stage layer in local BuildKit cache and in
+# platform share every base image layer in local BuildKit cache and in
 # content-addressed registry layers.
 FROM deps AS base
 
@@ -126,7 +126,7 @@ RUN set -eux; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 3: Builder - bundle-specific deps
+# Bundle dependency builder: bundle-specific deps
 # =============================================================================
 FROM base AS builder
 
@@ -173,11 +173,19 @@ RUN set -eux; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 4: Runtime
+# Runtime image
 # =============================================================================
-# Use base CUDA image (not devel/runtime) — PyTorch wheels bundle CUDA libs,
-# cuDNN ships inside torch. Saves ~2GB vs `runtime` variant.
-FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime
+# Runtime base selection is bundle-scoped. Most CUDA bundles stay on the
+# smaller CUDA base runtime; SGLang-family bundles need the devel toolkit
+# because flashinfer/tvm_ffi perform runtime JIT through nvcc on first decode.
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime-default
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime-transformers5
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04 AS runtime-sglang
+ENV CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+FROM runtime-sglang AS runtime-sglang-embedding
+
+FROM runtime-${BUNDLE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 

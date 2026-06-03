@@ -111,6 +111,8 @@ class AdaptiveBatchState:
     headroom_ms: float | None
     fill_ratio: float | None
     integral: float
+    starvation_streak: int = 0
+    starvation_resets: int = 0
 
 
 @dataclass(slots=True)
@@ -146,6 +148,25 @@ class AdaptiveBatchController:
         the current limit). This prevents wasteful increases when batches
         aren't filling. No integral term needed — the gating condition
         acts as a form of conditional integration.
+
+    Starvation recovery (deadlock escape hatch):
+        The PI loop has a pathological attractor when observed p50 stays
+        above target for long enough to push both wait and cost to the
+        floor. At the floor, every batch holds a single item; the single
+        item has high p50 (dominated by one-item forward-pass + queue);
+        headroom stays negative; the loop keeps both knobs pinned — it
+        cannot raise wait (headroom < 0) and cannot raise cost
+        (``headroom_frac × cost_gain < 0``). To escape, we track a streak
+        of "batch produced at floor with size ≤ threshold". If the streak
+        exceeds ``starvation_window`` AND both knobs are at their floors,
+        we declare deadlock and hard-reset to a conservative recovery
+        point half-way between floor and initial values. The integrator
+        and ``last_step_time`` are also cleared so the next few samples
+        come from a clean state.
+
+        The counter only increments when ``step()`` is called with a
+        non-None ``batch_size`` — i.e. real traffic is flowing. Idle
+        worker loops don't trip it.
     """
 
     # Latency target — None means auto-calibrate from inference latency
@@ -156,11 +177,19 @@ class AdaptiveBatchController:
     min_target_p50_ms: float = 5.0
     max_target_p50_ms: float = 500.0
 
-    # Wait time bounds
+    # Wait time bounds. These are the PID-controller's internal default
+    # clamps; production deployments construct ``AdaptiveBatchController``
+    # explicitly from ``sie_server.config.engine.AdaptiveBatchingConfig``.
     min_wait_ms: float = 1.0
     max_wait_ms: float = 50.0
 
-    # Batch cost bounds (token limit)
+    # Batch cost bounds (token limit). These in-module defaults exist so
+    # the controller is constructible without arguments for tests; real
+    # deployments compute ``min_batch_cost`` from the model's
+    # ``max_batch_tokens`` (see ``ModelWorker.__init__``) so the floor
+    # scales with the model budget — a flat 256 is too low for anything
+    # but the smallest models and lets the cost knob collapse to a
+    # single-item batch under sustained negative-headroom load.
     min_batch_cost: int = 256
     max_batch_cost: int = 65536
 
@@ -170,6 +199,17 @@ class AdaptiveBatchController:
     cost_gain: float = 0.15
     update_interval: int = 10
     fill_ratio_threshold: float = 0.7
+
+    # Starvation detection / deadlock recovery
+    starvation_recovery_enabled: bool = True
+    starvation_window: int = 20
+    starvation_batch_size: int = 1
+
+    # Initial values used as recovery anchors (captured in __post_init__
+    # from the _current_* fields so operator-provided startup values are
+    # honoured rather than being replaced with hard-coded defaults).
+    _initial_wait_ms: float = 0.0
+    _initial_batch_cost: int = 0
 
     # Current state
     _current_wait_ms: float = 10.0
@@ -186,11 +226,21 @@ class AdaptiveBatchController:
     _integral_max: float = 20.0
     _last_step_time: float | None = None
 
+    # Starvation tracking (runtime)
+    _starvation_streak: int = 0
+    _starvation_resets: int = 0
+
     def __post_init__(self) -> None:
         if self.target_p50_ms is None:
             self._auto_calibrate = True
         else:
             self._calibrated = True
+        # Snapshot the operator-provided start values so ``reset()`` and
+        # starvation recovery can return to whatever the worker was
+        # configured with (e.g. from helm values) rather than this
+        # module's historic defaults.
+        self._initial_wait_ms = self._current_wait_ms
+        self._initial_batch_cost = self._current_batch_cost
 
     def record_inference_sample(self, inference_ms: float) -> None:
         """Record an inference-only latency sample for auto-calibration.
@@ -208,6 +258,7 @@ class AdaptiveBatchController:
         self,
         observed_p50_ms: float | None,
         fill_ratio: float | None,
+        batch_size: int | None = None,
     ) -> tuple[float, int]:
         """Advance the controller and return (new_wait_ms, new_batch_cost).
 
@@ -215,10 +266,22 @@ class AdaptiveBatchController:
             observed_p50_ms: Current rolling p50 latency (total_ms), or None
                 if not enough samples yet.
             fill_ratio: Mean batch fill ratio (0.0–1.0), or None.
+            batch_size: Size of the batch that triggered this step. Used by
+                the starvation detector to count consecutive tiny batches at
+                the floor. ``None`` (the default, for backward compatibility
+                with callers that don't track per-batch size) disables the
+                starvation counter — the loop still runs but can never
+                trigger recovery.
 
         Returns:
             Tuple of (max_batch_wait_ms, max_batch_cost).
         """
+        # Starvation tracking runs on every call (not every update_interval)
+        # but only counts while both knobs are pinned at the floor. Tiny
+        # batches before the floor are normal control-loop evidence, not a
+        # deadlock signal.
+        self._update_starvation_tracker(batch_size, pinned_at_floor=self._is_pinned_at_floor())
+
         self._steps_since_update += 1
         if self._steps_since_update < self.update_interval:
             return self._current_wait_ms, self._current_batch_cost
@@ -249,6 +312,13 @@ class AdaptiveBatchController:
             return self._current_wait_ms, self._current_batch_cost
 
         if observed_p50_ms is None or self.target_p50_ms is None:
+            return self._current_wait_ms, self._current_batch_cost
+
+        # --- Starvation recovery (before running the PI loop). ---
+        # If we trip this, skip the PI update this step — the recovery
+        # already set the knobs. The PI loop will resume next step with a
+        # cleared integrator and fresh latency samples.
+        if self._maybe_recover_from_starvation():
             return self._current_wait_ms, self._current_batch_cost
 
         target = self.target_p50_ms
@@ -290,13 +360,36 @@ class AdaptiveBatchController:
         self._current_wait_ms = _clamp(new_wait, self.min_wait_ms, self.max_wait_ms)
 
         # --- Knob 2: batch cost (proportional-only, gated on fill ratio) ---
+        # Symmetric anti-windup: don't push the cost further into saturation
+        # in the direction the error wants. Without this guard, once p50
+        # exceeds target the loop shrinks cost from initial all the way to
+        # ``min_batch_cost`` (since fill_ratio rises to ~1.0 as batches
+        # collapse — tiny batches always fill their tiny budget). That's the
+        # mechanism behind the queue-mode regression guarded by
+        # packages/sie_server_sidecar/docs/architecture-guide.md.
+        #
+        # The anti-windup only stops further shrinking once at the floor,
+        # it doesn't stop the collapse itself — that's why callers are
+        # expected to set ``min_batch_cost`` to a value large enough to
+        # keep GPU forwards amortized (see ModelWorker.__init__ which
+        # anchors it at ``max_batch_tokens // 4``). A flat floor of 256
+        # is too low for any non-trivial model.
         if fill_ratio is not None and fill_ratio >= self.fill_ratio_threshold:
-            cost_adjustment = self._current_batch_cost * headroom_frac * self.cost_gain
-            new_cost = self._current_batch_cost + cost_adjustment
-            self._current_batch_cost = int(_clamp(new_cost, self.min_batch_cost, self.max_batch_cost))
+            cost_at_max = self._current_batch_cost >= self.max_batch_cost
+            cost_at_min = self._current_batch_cost <= self.min_batch_cost
+            can_adjust_cost = True
+            if cost_at_max and headroom_ms > 0:
+                can_adjust_cost = False
+            if cost_at_min and headroom_ms < 0:
+                can_adjust_cost = False
+            if can_adjust_cost:
+                cost_adjustment = self._current_batch_cost * headroom_frac * self.cost_gain
+                new_cost = self._current_batch_cost + cost_adjustment
+                self._current_batch_cost = int(_clamp(new_cost, self.min_batch_cost, self.max_batch_cost))
 
         logger.debug(
-            "Adaptive batch: p50=%.1fms (target=%.1f), headroom=%.1fms, integral=%.2f, fill=%.2f, wait=%.1fms, cost=%d",
+            "Adaptive batch: p50=%.1fms (target=%.1f), headroom=%.1fms, integral=%.2f, "
+            "fill=%.2f, wait=%.1fms, cost=%d, starvation_streak=%d",
             observed_p50_ms,
             target,
             headroom_ms,
@@ -304,9 +397,93 @@ class AdaptiveBatchController:
             fill_ratio or 0.0,
             self._current_wait_ms,
             self._current_batch_cost,
+            self._starvation_streak,
         )
 
         return self._current_wait_ms, self._current_batch_cost
+
+    # ------------------------------------------------------------------
+    # Starvation detector helpers
+    # ------------------------------------------------------------------
+
+    def _is_pinned_at_floor(self) -> bool:
+        return self._current_wait_ms <= self.min_wait_ms and self._current_batch_cost <= self.min_batch_cost
+
+    def _update_starvation_tracker(self, batch_size: int | None, *, pinned_at_floor: bool) -> None:
+        """Advance the consecutive-tiny-batches counter.
+
+        The streak resets whenever we see a batch larger than the
+        ``starvation_batch_size`` threshold — a single healthy batch is
+        enough evidence that the loop is not deadlocked, regardless of
+        what the PI math is about to do this step.
+
+        ``batch_size is None`` means starvation detection is disabled
+        for this step, so clear any stale streak before the recovery
+        check runs.
+        """
+        if batch_size is None:
+            self._starvation_streak = 0
+            return
+        if not pinned_at_floor:
+            self._starvation_streak = 0
+            return
+        if batch_size > self.starvation_batch_size:
+            self._starvation_streak = 0
+        else:
+            self._starvation_streak += 1
+
+    def _maybe_recover_from_starvation(self) -> bool:
+        """If deadlock is detected, reset knobs and return True.
+
+        Deadlock = consecutive tiny batches + both knobs already pinned
+        at their floors. Once tripped, we jump to a conservative midway
+        point (half of initial) — aggressive enough to pull a few items
+        per batch (which re-establishes a healthy p50 signal) but not so
+        aggressive that we re-overshoot SLO immediately.
+
+        Integrator, last-step-time and the streak counter are all
+        cleared; the next iteration effectively starts the PI loop from
+        scratch using fresh samples.
+        """
+        if not self.starvation_recovery_enabled:
+            return False
+        if self._starvation_streak < self.starvation_window:
+            return False
+        if not self._is_pinned_at_floor():
+            return False
+
+        recovery_wait = _clamp(
+            (self.min_wait_ms + self._initial_wait_ms) / 2,
+            self.min_wait_ms,
+            self.max_wait_ms,
+        )
+        recovery_cost = int(
+            _clamp(
+                max(self._initial_batch_cost // 2, self.min_batch_cost * 4),
+                self.min_batch_cost,
+                self.max_batch_cost,
+            )
+        )
+
+        logger.warning(
+            "Adaptive batch: starvation recovery triggered after %d consecutive "
+            "batches with size <= %d at the floor (wait=%.1fms, cost=%d). "
+            "Resetting to wait=%.1fms, cost=%d.",
+            self._starvation_streak,
+            self.starvation_batch_size,
+            self._current_wait_ms,
+            self._current_batch_cost,
+            recovery_wait,
+            recovery_cost,
+        )
+
+        self._current_wait_ms = recovery_wait
+        self._current_batch_cost = recovery_cost
+        self._integral = 0.0
+        self._last_step_time = None
+        self._starvation_streak = 0
+        self._starvation_resets += 1
+        return True
 
     @property
     def current_wait_ms(self) -> float:
@@ -319,6 +496,14 @@ class AdaptiveBatchController:
     @property
     def calibrated(self) -> bool:
         return self._calibrated
+
+    @property
+    def starvation_streak(self) -> int:
+        return self._starvation_streak
+
+    @property
+    def starvation_resets(self) -> int:
+        return self._starvation_resets
 
     def snapshot(
         self,
@@ -340,20 +525,30 @@ class AdaptiveBatchController:
             headroom_ms=headroom,
             fill_ratio=fill_ratio,
             integral=self._integral,
+            starvation_streak=self._starvation_streak,
+            starvation_resets=self._starvation_resets,
         )
 
     def reset(self) -> None:
-        """Reset the controller to its initial state."""
-        self._current_wait_ms = _clamp(10.0, self.min_wait_ms, self.max_wait_ms)
-        self._current_batch_cost = int(_clamp(16384, self.min_batch_cost, self.max_batch_cost))
+        """Reset the controller to the operator-provided initial state.
+
+        ``_initial_wait_ms`` / ``_initial_batch_cost`` are captured in
+        ``__post_init__`` so this restores whatever the worker was
+        configured with at startup, not the module's legacy defaults.
+        """
+        self._current_wait_ms = _clamp(self._initial_wait_ms, self.min_wait_ms, self.max_wait_ms)
+        self._current_batch_cost = int(_clamp(self._initial_batch_cost, self.min_batch_cost, self.max_batch_cost))
         self._steps_since_update = 0
         self._integral = 0.0
         self._last_step_time = None
+        self._starvation_streak = 0
         if self._auto_calibrate:
             self._calibrated = False
             self.target_p50_ms = None
             self._inference_tracker.reset()
-        # If target was explicit, _calibrated stays True
+        # If target was explicit, _calibrated stays True.
+        # ``_starvation_resets`` is a monotonic counter and deliberately not
+        # cleared — it's an operational signal exposed via Prometheus.
 
 
 # Keep backward compat alias

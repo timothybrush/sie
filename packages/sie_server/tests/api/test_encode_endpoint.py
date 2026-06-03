@@ -388,7 +388,7 @@ class TestEncodeEndpoint:
 
 
 class TestMsgpackRequests:
-    """Tests for msgpack request body handling (DESIGN.md Section 4.3)."""
+    """Tests for msgpack request body handling."""
 
     def test_msgpack_request_basic(self, client: TestClient) -> None:
         """Msgpack request body is parsed correctly."""

@@ -138,6 +138,8 @@ class ModelLoader:
         attention_backend: AttentionBackend = "auto",
         max_batch_requests: int | None = None,
         max_batch_wait_ms: float | None = None,
+        coalesce_ms: float | None = None,
+        coalesce_ratio: float | None = None,
         max_queue_size: int | None = None,
         instrumentation: bool = False,
         max_loras_per_model: int = DEFAULT_MAX_LORAS,
@@ -162,6 +164,8 @@ class ModelLoader:
         self._attention_backend = attention_backend
         self._max_batch_requests = max_batch_requests
         self._max_batch_wait_ms = max_batch_wait_ms
+        self._coalesce_ms = coalesce_ms
+        self._coalesce_ratio = coalesce_ratio
         self._max_queue_size = max_queue_size
         self._instrumentation = instrumentation
         self._max_loras_per_model = max_loras_per_model
@@ -570,7 +574,7 @@ class ModelLoader:
                 self._preprocessor_registry.register_image(name, preprocessor)
                 logger.info("Registered image preprocessor for model '%s'", name)
 
-        # Register postprocessors if adapter provides them (Phase 5)
+        # Register postprocessors if adapter provides them.
         if hasattr(adapter, "get_postprocessors"):
             postprocessors = adapter.get_postprocessors()
             if postprocessors:
@@ -594,6 +598,8 @@ class ModelLoader:
             max_batch_tokens=resolved.max_batch_tokens,
             max_batch_requests=self._max_batch_requests or WorkerConfig().max_batch_requests,
             max_batch_wait_ms=self._max_batch_wait_ms or WorkerConfig().max_batch_wait_ms,
+            coalesce_ms=self._coalesce_ms if self._coalesce_ms is not None else WorkerConfig().coalesce_ms,
+            coalesce_ratio=self._coalesce_ratio if self._coalesce_ratio is not None else WorkerConfig().coalesce_ratio,
             max_queue_size=self._max_queue_size or WorkerConfig().max_queue_size,
             instrumentation=self._instrumentation,
             adaptive_batching=adaptive_params,

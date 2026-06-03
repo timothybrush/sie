@@ -77,19 +77,19 @@ class WorkItem(_WorkItemRequired, total=False):
     labels: list[str] | None
     output_schema: dict[str, Any] | None
 
-    # Generate-specific (walking-skeleton wire shape).
+    # Generate-specific wire shape.
     # Carries prompt + sampling params for one blocking call to
     # ``adapter.generate(...)``. Keys: prompt (str), max_new_tokens (int),
     # temperature (float), top_p (float), stop (list[str]).
     generate: dict[str, Any] | None
 
-    # M5: W3C Trace Context propagation. Populated by the gateway
+    # W3C Trace Context propagation. Populated by the gateway
     # when it has an active span (extracted from the inbound
     # ``traceparent`` HTTP header, or rooted at the gateway when
     # the client did not send one). Both fields are msgpack-
-    # skipped on the wire when ``None``, so a pre-M5 worker
-    # decoding a post-M5 envelope just sees its expected key set,
-    # and a post-M5 worker decoding a pre-M5 envelope sees both
+    # skipped on the wire when ``None``, so a worker without trace
+    # support sees its expected key set, and a trace-aware worker
+    # decoding an older envelope sees both
     # fields default to ``None`` via ``WorkItem.get(...)``.
     #
     # Privacy: the value is two opaque IDs (trace id + span id)

@@ -1,7 +1,6 @@
 # SIE KEDA ScaledObject Configuration
 #
 # GPU-optimized autoscaling for SIE inference workloads.
-# Based on research: product/research/cloud_deployment_research.md
 #
 # Prerequisites:
 #   - KEDA installed (via Terraform: install_keda = true)

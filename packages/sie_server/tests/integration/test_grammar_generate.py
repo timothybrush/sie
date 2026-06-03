@@ -2,7 +2,7 @@
 ``grammar``.
 
 Skipped unless ``SIE_GATEWAY_URL`` is set. Mirrors the acceptance
-criteria from ``product/plans/m4-req2-generate-issues/04-structured-outputs-outlines.md``:
+criteria for structured outputs:
 
 * §5.7 — moderate JSON Schema returns JSON conforming to the schema.
 * §5.9 — two identical-schema requests show exactly 1 compile + 1 hit

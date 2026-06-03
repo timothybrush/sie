@@ -8,6 +8,9 @@
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
 {{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
+{{- $rs := $root.Values.workers.common.workerSidecar }}
+{{- $rsTag := default $root.Chart.AppVersion $rs.image.tag }}
+{{- $rsImage := printf "%s:%s" $rs.image.repository $rsTag }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -46,6 +49,19 @@ spec:
             limits:
               cpu: "10m"
               memory: "16Mi"
+        {{- if $rs.enabled }}
+        - name: pull-sie-worker-sidecar-image
+          image: {{ $rsImage }}
+          imagePullPolicy: {{ $rs.image.pullPolicy }}
+          command: ["true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "10m"
+              memory: "16Mi"
+        {{- end }}
       containers:
         - name: pause
           image: registry.k8s.io/pause:3.10

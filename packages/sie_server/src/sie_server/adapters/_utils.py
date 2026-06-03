@@ -114,7 +114,10 @@ def extract_texts(
         text = item.text
 
         if template:
-            text = template.format(text=text, instruction=instruction or "")
+            kwargs: dict[str, str] = {"text": text}
+            if "{instruction}" in template:
+                kwargs["instruction"] = instruction or ""
+            text = template.format(**kwargs)
         elif instruction:
             text = f"{instruction} {text}"
 

@@ -173,7 +173,7 @@
             "type": "string"
           },
           "tool_calls": {
-            "description": "Per-candidate tool-call list (Workstream B). Present when the model\nemitted one or more tool calls for this choice; absent otherwise.\nEach entry has the OpenAI shape ``{id, type:\"function\",\nfunction:{name, arguments}}`` where ``arguments`` is a JSON-encoded string."
+            "description": "Per-candidate tool-call list. Present when the model\nemitted one or more tool calls for this choice; absent otherwise.\nEach entry has the OpenAI shape ``{id, type:\"function\",\nfunction:{name, arguments}}`` where ``arguments`` is a JSON-encoded string."
           }
         },
         "required": [
@@ -183,7 +183,7 @@
         "type": "object"
       },
       "ChatCompletionMessage": {
-        "description": "One chat message in an OpenAI chat-completions request.\n\nPer the strict allow-list parser (Workstream A), ``content`` is either a\nplain string OR a list of text-only content parts (``{type:\"text\"|\"input_text\",\ntext:\"...\"}``); ``image_url`` and ``input_image`` parts reject with 400\n``unsupported_field`` until a vision-capable model ships. Assistant\nmessages that carry ``tool_calls`` may set ``content: null``.\n\n``tool_calls`` is accepted only on ``role:\"assistant\"`` messages; each\nentry has the validated shape ``{id, type:\"function\", function:{name, arguments}}``\nwhere ``arguments`` is a JSON-encoded string (OpenAI convention).\n``tool_call_id`` is required on ``role:\"tool\"`` messages and rejected\non every other role.",
+        "description": "One chat message in an OpenAI chat-completions request.\n\nPer the strict allow-list parser, ``content`` is either a\nplain string OR a list of text-only content parts (``{type:\"text\"|\"input_text\",\ntext:\"...\"}``); ``image_url`` and ``input_image`` parts reject with 400\n``unsupported_field`` until a vision-capable model ships. Assistant\nmessages that carry ``tool_calls`` may set ``content: null``.\n\n``tool_calls`` is accepted only on ``role:\"assistant\"`` messages; each\nentry has the validated shape ``{id, type:\"function\", function:{name, arguments}}``\nwhere ``arguments`` is a JSON-encoded string (OpenAI convention).\n``tool_call_id`` is required on ``role:\"tool\"`` messages and rejected\non every other role.",
         "properties": {
           "content": {
             "description": "Either a string or an array of text-only content parts (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image content parts (`image_url` / `input_image`) reject with 400 unsupported_field until a vision-capable model ships. May be `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
@@ -277,7 +277,7 @@
         "type": "object"
       },
       "ChatCompletionRequest": {
-        "description": "OpenAI-compatible ``POST /v1/chat/completions`` request.\n\n**Strict allow-list:** unknown top-level fields reject with 400\n``unsupported_field``. Type-invalid values for accepted fields reject\nwith 400 ``invalid_request``.\n\n**Known-rejected fields** (per `product/design.md` §5.14):\n- ``functions`` / ``function_call`` — deprecated by OpenAI; use ``tools`` instead.\n- ``modalities``, ``audio``, ``metadata``, ``store``, ``service_tier``,\n  ``prediction``, ``reasoning_effort``, ``verbosity`` — out of scope.\n\n**Streaming:** ``stream: true`` is supported (SSE ``chat.completion.chunk``).\n``n > 1`` streaming fans candidates out as per-``choice_index``-tagged delta\nchunks with a per-choice closure carrying ``finish_reason`` (and a per-choice\n``delta.role:\"assistant\"`` once per choice) before the single global ``[DONE]``.",
+        "description": "OpenAI-compatible ``POST /v1/chat/completions`` request.\n\n**Strict allow-list:** unknown top-level fields reject with 400\n``unsupported_field``. Type-invalid values for accepted fields reject\nwith 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``functions`` / ``function_call`` — deprecated by OpenAI; use ``tools`` instead.\n- ``modalities``, ``audio``, ``metadata``, ``store``, ``service_tier``,\n  ``prediction``, ``reasoning_effort``, ``verbosity`` — out of scope.\n\n**Streaming:** ``stream: true`` is supported (SSE ``chat.completion.chunk``).\n``n > 1`` streaming fans candidates out as per-``choice_index``-tagged delta\nchunks with a per-choice closure carrying ``finish_reason`` (and a per-choice\n``delta.role:\"assistant\"`` once per choice) before the single global ``[DONE]``.",
         "properties": {
           "best_of": {
             "description": "Generate this many candidates and return the top `n` by cumulative logprob. Integer in [1, 128]. Cross-field rule: `best_of >= n` (otherwise 400 invalid_request). Rejected with 400 unsupported_field when `stream: true` (mirrors OpenAI).",
@@ -288,6 +288,9 @@
               "integer",
               "null"
             ]
+          },
+          "chat_template_kwargs": {
+            "description": "Per-request overrides for kwargs passed to the tokenizer's\n``apply_chat_template`` call. Object whose entries are merged on\ntop of the model YAML's ``chat_template_kwargs`` (the YAML wins\nfor keys present in both — adjust the YAML when a request needs\nto defeat a baked-in default). Typical use: pass\n``{\"enable_thinking\": false}`` to the Qwen3 family to suppress\n``<think>`` reasoning on a per-request basis. Absent → only the\nmodel YAML's defaults apply."
           },
           "frequency_penalty": {
             "description": "OpenAI ``frequency_penalty`` in ``[-2.0, 2.0]``; out-of-range or\nnon-numeric values yield 400 ``invalid_request``.",
@@ -349,6 +352,15 @@
               "$ref": "#/components/schemas/ChatCompletionMessage"
             },
             "type": "array"
+          },
+          "min_tokens": {
+            "description": "SGLang ``sampling_params.min_new_tokens``: integer ``>= 0`` capping\nhow many tokens the model must emit before any stop condition can\nfire. Use to work around models that occasionally emit the stop\ntoken as the very first decoded token (e.g. Qwen3.6 thinking-off\nunder greedy decode). Absent → sampler default (no minimum).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "model": {
             "type": "string"
@@ -693,7 +705,7 @@
         "type": "object"
       },
       "CompletionsRequest": {
-        "description": "OpenAI-compatible ``POST /v1/completions`` request (legacy raw-prompt surface).\n\n**Strict allow-list** (Workstream A): unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields** (per `product/design.md` §5.14):\n- ``echo`` — rejected with 400 ``unsupported_field``.\n- ``suffix`` — rejected with 400 ``unsupported_field``.\n- ``logprobs`` — rejected with 400 ``unsupported_field`` (the legacy\n  ``{tokens, token_logprobs}`` response shape is a follow-up; chat\n  ``logprobs`` is available on ``/v1/chat/completions``).\n- ``best_of`` — rejected with 400 ``unsupported_field`` (use chat).\n- ``n > 1`` — rejected with 400 ``unsupported_field`` (chat is the\n  multi-candidate surface). ``n == 1`` (or absent) is a no-op.\n- Batched array ``prompt`` — rejected with 400 ``unsupported_field``;\n  send one prompt string.\n\n**Streaming:** ``stream: true`` is supported (SSE ``text_completion``).\n\n**Response body wire change:** the always-null ``logprobs`` field has\nbeen dropped from the response body (Workstream A); SDKs that destructure\n``choices[].logprobs`` should treat absence as the new normal.",
+        "description": "OpenAI-compatible ``POST /v1/completions`` request (legacy raw-prompt surface).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``echo`` — rejected with 400 ``unsupported_field``.\n- ``suffix`` — rejected with 400 ``unsupported_field``.\n- ``logprobs`` — rejected with 400 ``unsupported_field`` (the legacy\n  ``{tokens, token_logprobs}`` response shape is a follow-up; chat\n  ``logprobs`` is available on ``/v1/chat/completions``).\n- ``best_of`` — rejected with 400 ``unsupported_field`` (use chat).\n- ``n > 1`` — rejected with 400 ``unsupported_field`` (chat is the\n  multi-candidate surface). ``n == 1`` (or absent) is a no-op.\n- Batched array ``prompt`` — rejected with 400 ``unsupported_field``;\n  send one prompt string.\n\n**Streaming:** ``stream: true`` is supported (SSE ``text_completion``).\n\n**Response body wire change:** the always-null ``logprobs`` field has\nbeen dropped from the response body; SDKs that destructure\n``choices[].logprobs`` should treat absence as the new normal.",
         "properties": {
           "frequency_penalty": {
             "description": "In ``[-2.0, 2.0]``; out-of-range or non-numeric values yield 400.",
@@ -1724,7 +1736,7 @@
         "description": "Capability summary surfaced on each entry of ``GET /v1/models``.\n\nMirrors the JSON shape constructed in\n``types/model.rs::to_model_info_value``. All fields are optional —\ntheir presence depends on what the model config declares.",
         "properties": {
           "grammar": {
-            "description": "Grammar kinds the model's active backend supports\n(``json_schema`` | ``regex`` | ``ebnf``). EBNF presence depends\non the backend: SGLang's Outlines backend does not implement\nEBNF, so a profile with ``grammar_backend: outlines`` advertises\nonly ``[\"json_schema\", \"regex\"]``; xgrammar/llguidance profiles\nadvertise all three. See ADR-0002.",
+            "description": "Grammar kinds the model's active backend supports\n(``json_schema`` | ``regex`` | ``ebnf``). EBNF presence depends\non the backend: SGLang's Outlines backend does not implement\nEBNF, so a profile with ``grammar_backend: outlines`` advertises\nonly ``[\"json_schema\", \"regex\"]``; xgrammar/llguidance profiles\nadvertise all three.",
             "items": {
               "type": "string"
             },
@@ -2518,10 +2530,10 @@
         "type": "object"
       },
       "ResponsesRequest": {
-        "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list** (Workstream A): unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields** (per `product/design.md` §5.14):\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field`` until a VL profile ships.",
+        "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field`` until a VL profile ships.",
         "properties": {
           "input": {
-            "description": "Either a string prompt OR an array of `{role, content}` messages (Workstream A array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of text-only content parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
+            "description": "Either a string prompt OR an array of `{role, content}` messages (array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of text-only content parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
             "oneOf": [
               {
                 "type": "string"
@@ -2599,7 +2611,7 @@
             ]
           },
           "stream": {
-            "description": "Accepted only as `false` (or absent). `true` rejects with 400 unsupported_field (Responses SSE is deferred; tracked in `product/design.md` §5.14).",
+            "description": "Accepted only as `false` (or absent). `true` rejects with 400 unsupported_field because Responses SSE is not supported yet.",
             "enum": [
               false,
               null
@@ -2858,7 +2870,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.4.1"
+    "version": "0.4.2"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3064,7 +3076,7 @@
     },
     "/v1/chat/completions": {
       "post": {
-        "description": "OpenAI-compatible chat completions. Strict allow-list parser (see `product/design.md` §5.14): unknown top-level fields reject with 400 `unsupported_field`. Streaming (`stream: true`) is supported and emits SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates out as per-`choice_index` delta chunks with per-choice closure chunks (each carrying `finish_reason`) before the single global `[DONE]`. Content is either a string or an array of text-only content parts; image content parts (`image_url` / `input_image`) reject with 400 `unsupported_field`. `lora_adapter` is forwarded to the worker as a top-level `lora_path` generation kwarg.",
+        "description": "OpenAI-compatible chat completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. Streaming (`stream: true`) is supported and emits SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates out as per-`choice_index` delta chunks with per-choice closure chunks (each carrying `finish_reason`) before the single global `[DONE]`. Content is either a string or an array of text-only content parts; image content parts (`image_url` / `input_image`) reject with 400 `unsupported_field`. `lora_adapter` is forwarded to the worker as a top-level `lora_path` generation kwarg.",
         "operationId": "proxy_chat",
         "parameters": [
           {
@@ -3190,7 +3202,7 @@
     },
     "/v1/completions": {
       "post": {
-        "description": "OpenAI-compatible legacy Completions. Strict allow-list parser (`product/design.md` §5.14): unknown top-level fields reject with 400 `unsupported_field`. `stream: true` is supported (SSE `text_completion`). Known-rejected fields: `echo`, `suffix`, `logprobs`, `best_of`, `n > 1`, batched array `prompt` — each rejects with 400 `unsupported_field`. The response body no longer carries the always-null `logprobs` field (Workstream A wire change).",
+        "description": "OpenAI-compatible legacy Completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `stream: true` is supported (SSE `text_completion`). Known-rejected fields: `echo`, `suffix`, `logprobs`, `best_of`, `n > 1`, batched array `prompt` — each rejects with 400 `unsupported_field`. The response body no longer carries the always-null `logprobs` field.",
         "operationId": "proxy_completions",
         "requestBody": {
           "content": {
@@ -3650,6 +3662,18 @@
             }
           },
           {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Client SDK version for skew warnings",
             "in": "header",
             "name": "X-SIE-SDK-Version",
@@ -3966,6 +3990,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -4322,6 +4358,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -5259,7 +5307,7 @@
     },
     "/v1/responses": {
       "post": {
-        "description": "OpenAI Responses API (MVP). Strict allow-list parser (`product/design.md` §5.14): unknown top-level fields reject with 400 `unsupported_field`. `input` is either a string prompt OR an array of `{role, content}` messages (Workstream A array-input support). Known-rejected fields: `tools`, `tool_choice`, `previous_response_id`, `reasoning`, `background`, `metadata`, `instructions` — each rejects with 400 `unsupported_field`. `stream: true` is rejected (Responses SSE is deferred). Multimodal image content parts reject with 400 `unsupported_field` on the array form.",
+        "description": "OpenAI Responses API (MVP). Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `input` is either a string prompt OR an array of `{role, content}` messages. Known-rejected fields: `tools`, `tool_choice`, `previous_response_id`, `reasoning`, `background`, `metadata`, `instructions` — each rejects with 400 `unsupported_field`. `stream: true` is rejected (Responses SSE is deferred). Multimodal image content parts reject with 400 `unsupported_field` on the array form.",
         "operationId": "proxy_responses",
         "requestBody": {
           "content": {
@@ -5369,6 +5417,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [

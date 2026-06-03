@@ -32,6 +32,6 @@ packages = ["src/sie_config"]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3,<9",
-    "pytest-asyncio>=0.24,<1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.0",
 ]

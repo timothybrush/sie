@@ -49,6 +49,7 @@
 //!   against `GET /v1/configs/epoch` so any missed NATS deltas after the
 //!   initial bootstrap are caught within one poll interval.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +76,7 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 use crate::state::bundles_hash::BundlesHash;
 use crate::state::config_epoch::ConfigEpoch;
 use crate::state::model_registry::ModelRegistry;
-use crate::types::bundle::BundleInfo;
+use crate::types::bundle::{BundleInfo, DEFAULT_ENGINE, KNOWN_ENGINES};
 use crate::types::model::ModelConfig;
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,6 +87,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 struct ExportSnapshot {
     #[serde(default)]
     epoch: u64,
+    #[serde(default)]
+    bundle_config_hashes: HashMap<String, String>,
     #[serde(default)]
     models: Vec<ExportedModel>,
 }
@@ -159,11 +162,17 @@ struct BundleSpec {
     priority: i32,
     #[serde(default)]
     adapters: Vec<String>,
+    #[serde(default = "BundleSpec::default_engine")]
+    engine: String,
 }
 
 impl BundleSpec {
     fn default_priority() -> i32 {
         100
+    }
+
+    fn default_engine() -> String {
+        DEFAULT_ENGINE.to_string()
     }
 }
 
@@ -345,10 +354,21 @@ impl BootstrapClient {
                     url: yaml_url.clone(),
                     body: format!("malformed bundle YAML: {}", e),
                 })?;
+            if !KNOWN_ENGINES.contains(&spec.engine.as_str()) {
+                return Err(BootstrapError::BadStatus {
+                    status: 200,
+                    url: yaml_url,
+                    body: format!(
+                        "unknown bundle engine {:?}; allowed={:?}",
+                        spec.engine, KNOWN_ENGINES
+                    ),
+                });
+            }
             out.push(BundleInfo {
                 name: spec.name,
                 priority: spec.priority,
                 adapters: spec.adapters,
+                engine: spec.engine,
             });
         }
 
@@ -443,6 +463,10 @@ impl BootstrapClient {
                     failed += 1;
                 }
             }
+        }
+
+        if failed == 0 {
+            registry.install_bundle_config_hashes(snapshot.bundle_config_hashes);
         }
 
         Ok(BootstrapOutcome {
@@ -665,6 +689,7 @@ mod tests {
             name: "default".to_string(),
             priority: 10,
             adapters: vec!["sie_server.adapters.sentence_transformer".to_string()],
+            engine: DEFAULT_ENGINE.to_string(),
         }]);
         (registry, temp)
     }
@@ -725,6 +750,7 @@ mod tests {
             "snapshot_version": 1,
             "epoch": 42,
             "generated_at": "2026-04-17T00:00:00Z",
+            "bundle_config_hashes": {"default": "control-plane-hash"},
             "models": [
                 {
                     "model_id": "test/model",
@@ -749,6 +775,10 @@ mod tests {
         assert_eq!(outcome.failed, 0);
         assert_eq!(outcome.total, 1);
         assert!(outcome.is_complete());
+        assert_eq!(
+            registry.compute_bundle_config_hash("default"),
+            "control-plane-hash"
+        );
         assert_eq!(
             registry.get_model_profile_names("test/model"),
             vec!["default".to_string()],
@@ -861,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_epoch_tolerates_missing_bundles_hash_field() {
-        // sie-config pre-dating the bundles_hash rollout returns only
+        // Older sie-config returns only
         // `{"epoch": N}`. The field carries `#[serde(default)]` so we
         // deserialize it as the empty string — the documented
         // "nothing to sync" sentinel that makes the poller skip the
@@ -1215,6 +1245,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fetch_bundles_rejects_unknown_engine() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/bundles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bundles": [{"bundle_id": "bad-engine", "priority": 10, "adapter_count": 1, "source": "filesystem"}],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/bundles/bad-engine"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "name: bad-engine\npriority: 10\nengine: candle\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), None).unwrap();
+        let err = client.fetch_bundles().await.unwrap_err();
+        match err {
+            BootstrapError::BadStatus { status, body, .. } => {
+                assert_eq!(status, 200);
+                assert!(body.contains("unknown bundle engine"));
+                assert!(body.contains("candle"));
+            }
+            other => panic!("expected BadStatus, got {:?}", other),
+        }
+    }
+
     /// Bundles fetched from `sie-config` must materialize into the registry
     /// before the model-apply loop runs. We start from a registry with the
     /// `default` bundle already installed (mimicking a previous successful
@@ -1310,11 +1370,13 @@ mod tests {
                 name: "a".to_string(),
                 priority: 10,
                 adapters: vec!["mod.a".to_string()],
+                engine: DEFAULT_ENGINE.to_string(),
             },
             BundleInfo {
                 name: "b".to_string(),
                 priority: 20,
                 adapters: vec!["mod.b".to_string()],
+                engine: DEFAULT_ENGINE.to_string(),
             },
         ]);
         let mut listed = registry.list_bundles();
@@ -1326,6 +1388,7 @@ mod tests {
             name: "a".to_string(),
             priority: 10,
             adapters: vec!["mod.a".to_string()],
+            engine: DEFAULT_ENGINE.to_string(),
         }]);
         assert_eq!(registry.list_bundles(), vec!["a".to_string()]);
         assert!(registry.get_bundle_info("b").is_none());

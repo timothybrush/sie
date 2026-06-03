@@ -1,5 +1,125 @@
 # Changelog
 
+## v0.4.2
+
+- chore(main): release 0.4.2
+- Scope SGLang CUDA toolkit runtime
+- Enable CUDA toolkit in SGLang worker runtime
+- perf(mineru_vl): O(L) incremental no-repeat-ngram for greedy decode
+- feat(sie_server): add MinerU2.5-Pro-2604-1.2B doc OCR adapter
+- build(deps): upgrade rust toolchain to 1.96
+- feat(models): add Marqo/marqo-fashionSigLIP (SigLIP open_clip, fashion image-text)
+- fix(ci): keep sidecar out of warm cache
+- fix(review): 0.6B ctx test 1024->4096, loader except logs, README gaps resolved
+- fix(ci): avoid nested mise in integration fixture
+- docs: align sidecar naming in active docs
+- fix(deploy): align server sidecar naming
+- fix(deploy): document worker-sidecar metrics wiring
+- fix(deploy): rename sidecar container to worker-sidecar
+- fix(deploy): align server sidecar naming and kind preload smoke
+- fix(deploy): publish server sidecar image
+- feat(model): bump Qwen3-0.6B serving context 1024→4096 for prod simple-task use
+- fix(bench): let via-SIE smoke serve a profile-variant model end-to-end
+- fix(loader): wire profile runtime.default_sampling into the adapter
+- feat(model+bench): RTX-PRO-6000 FP8 profile for Qwen3.6-27B + 6000 validation
+- refactor(glm_ocr): select patch-embed conv strictly by structure (CodeRabbit)
+- perf(glm_ocr): rebind vision Conv3d patch-embed to F.linear
+- chore(adapters,ci): remove Vidore3 throughput diagnosis instrumentation
+- fix(test): restore donut helper call contract
+- fix(ci): address analyzer findings and stale queue test
+- fix(adapters): replace Qwen3-VL vision Conv3d patch-embed with matmul
+- chore(helm): clean sidecar chart observability
+- feat(sidecar): add worker config and pool admission reconciliation
+- TEMP(colqwen3): time vision sub-modules (patch_embed/block/merger)
+- test(tilt): expand sidecar e2e coverage
+- feat(sidecar): wire generation direct dispatch
+- TEMP(colqwen3): split forward timing into vision vs text (revert before merge)
+- fix(adapters): route Qwen3-VL VLMs through flash attention (Vidore3 throughput)
+- TEMP(adapters,ci): timing instrumentation for Vidore3 throughput diag
+- chore(openapi): regenerate gateway spec for min_tokens + chat_template_kwargs
+- fix: address coderabbit + code-quality review on PR #1146
+- feat(bench+model): via-sie 4-task n=300 sweep + NEXTN smaller-draft on 27B
+- fix(worker): SGLang adapter accepts min_new_tokens kwarg + 27B via-sie validated
+- fix: slow sidecar nats consumer reconcile
+- fix: gate sidecar nats reconnect refresh
+- fix: address pr review quality issues
+- fix: harden sidecar config recovery
+- chore: clean sidecar docs and packaging
+- chore: prune sidecar compatibility paths
+- docs(sidecar): clarify worker sidecar source naming
+- fix(ci): refresh gateway openapi contract
+- fix(quality): repair adapter eval harness regressions
+- fix(worker-sidecar): harden queue carveout contracts
+- fix: scope bundle config hash cache per registry
+- chore: standardize worker sidecar packaging
+- feat: reconcile live worker config in sidecar
+- Add worker config reconciliation
+- chore: clean worker sidecar deployment surfaces
+- chore: enable rust sidecar in local tilt
+- fix: require rust sidecar for queue workers
+- docs: clarify worker config apply gap
+- chore: consolidate inference sidecar package
+- fix: preserve worker batch identity and publish image
+- chore: finish rust worker rebase integration
+- chore(helm): land S20+ rust-sidecar production tuning defaults
+- chore: scrub stale sie_candle references and dead candle metric
+- non-adapter carveout: ship sie_prep + wire passthrough end-to-end
+- non-adapter carveout: retire sie_candle, carve out sie_prep, Python passthrough
+- sie_worker_rust + sie_server: queue-depth metrics for IPC+Python loop
+- worker-rust + sie_candle: NATS health heartbeats and BERT cross-encoder
+- rust-worker: retire SIE_RUST_*_MODELS env vars, carve sie_candle out into its own crate (Stage 3 P1)
+- rust-worker: land Stage 1 (tokenise + framing) + Stage 2 (scheduler) + Stage 3 design
+- adding perf-tuning grafana dash fixes and extension
+- obs(helm): perf-tuning Grafana dashboard + ConfigMap
+- perf(rope_flash): vectorize CLS/mean pooling, eliminate per-item .item() sync
+- perf(adaptive): anchor min_batch_cost floor at max_batch_tokens // 4
+- revert: restore adaptive batching defaults to 15/50ms
+- perf(batching): tighten adaptive wait ceiling + revert gte-multilingual 32k
+- perf(gte-multilingual-base): raise max_batch_tokens 16k → 32k to stop IPC-batch shred
+- perf(server): FP16 on GPU, coalesce sized for IPC bursts, starvation self-heal
+- obs(worker+server): audit follow-ups for phase + fragmentation metrics
+- obs(worker+server): surface GPU phase latency + IPC-batch fragmentation
+- feat(worker/rust): IPC connection pool — lift the sidecar's last serialization bottleneck
+- fix(gateway+server): queue is the only mode — kill direct-mode cruft
+- fix(gateway): suppress H9 first-chunk-fallback on single-worker pools
+- worker(rust)+sie_server: post-audit P0 fixes — drain min-deadline, fallback eviction tests, dispatcher outcome binding, encoder UnsupportedModel coverage, model-label cardinality tests
+- worker(rust): finalise pre-Argo audit — native Candle, fallback breaker, full observability, Docker + Helm
+- chore(sie-server): drop dead code left over from sidecar cutover
+- fix(worker): harden payload store + error paths; surface silent success bugs
+- sie-server: commit to sidecar-only queue path; remove Python NATS
+- feat(sie_worker_rust): close parity gaps with Python pull loop + smoke test
+- feat(sie_server): UDS msgpack IPC server for Rust worker sidecar
+- feat(sie_server): carve out QueueExecutor + IPC types for Rust worker POC
+- feat(bench): 0.6B via-sie validated; harness + 27B config gains
+- fix(model): bump Qwen3.6-27B default/h100 mem_fraction_static 0.85 → 0.92
+- feat(gateway+worker): chat surface accepts min_tokens + chat_template_kwargs
+- fix: accept dense_dim in dense adapters
+- test: align structured output metric constants
+- fix(sie_server): clear CUDA cache on uncovered VLM paths + drop private sem _value access
+- chore: remove internal design doc references
+- docs: clean stale design references
+- docs: minimize design architecture docs
+- docs: update design document references
+- docs: remove internal planning references
+- docs: archive obsolete roadmap
+- fix(security): cap vite at ^6 + add Node engines to website
+- feat(gateway): strengthen generation isolation guardrails
+- feat(docling): accept image input + run on OCR-bench quality path
+- fix(security): bump sie_ts_sdk standalone pnpm transitives
+- fix(security): bump root pnpm deps + add overrides for transitives
+- fix(security): bump root Python deps to patched versions
+- fix(security): bump gateway deps to patched versions
+- chore: drop CodeQL rationale comments
+- fix(quality): batch3 of CodeQL findings + bench KIE bug
+- fix(quality): drop redundant inline imports in donut + registry
+- fix(security): use Reflect.construct for WebSocket headers shim
+- fix(quality): close CodeQL quality-tab findings
+- Fix gateway queue trace isolation
+- perf(bench,adapters): parallel VLM sub-batch dispatch + drop redundant empty_cache
+- Keep generation machinery off default queue path
+- docs(test): note `:` -> `__` replacement in test_model_yaml_filenames docstring
+- fix(models): rename ColQwen3 YAML to match sie_id casing (TomoroAI)
+
 ## v0.4.1
 
 - chore(main): release 0.4.1

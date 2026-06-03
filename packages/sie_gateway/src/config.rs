@@ -53,6 +53,7 @@ pub struct Config {
     // Tuning
     pub request_timeout: f64,
     pub max_stream_pending: u64,
+    pub stream_max_age_s: u64,
 
     // Configured GPUs (survives scale-to-zero)
     pub configured_gpus: Vec<String>,
@@ -212,6 +213,7 @@ impl Config {
 
             request_timeout: env_float("SIE_GATEWAY_REQUEST_TIMEOUT", 30.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
+            stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 120),
 
             configured_gpus,
             gpu_profile_map,
@@ -236,7 +238,7 @@ impl Config {
                 }
             },
 
-            payload_store_url: env_default("SIE_PAYLOAD_STORE_URL", "payload_store"),
+            payload_store_url: env_default("SIE_PAYLOAD_STORE_URL", ""),
         }
     }
 
@@ -601,7 +603,7 @@ mod tests {
     fn test_payload_store_url_default() {
         without_env(&["SIE_PAYLOAD_STORE_URL"], || {
             let cfg = Config::load();
-            assert_eq!(cfg.payload_store_url, "payload_store");
+            assert_eq!(cfg.payload_store_url, "");
         });
     }
 
@@ -614,6 +616,22 @@ mod tests {
                 assert_eq!(cfg.payload_store_url, "s3://my-bucket/payloads");
             },
         );
+    }
+
+    #[test]
+    fn test_stream_max_age_default_matches_worker_contract() {
+        without_env(&["SIE_STREAM_MAX_AGE_S"], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.stream_max_age_s, 120);
+        });
+    }
+
+    #[test]
+    fn test_stream_max_age_from_env() {
+        with_env(&[("SIE_STREAM_MAX_AGE_S", "240")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.stream_max_age_s, 240);
+        });
     }
 
     #[test]
@@ -665,6 +683,7 @@ mod tests {
             multi_router: false,
             request_timeout: 0.0,
             max_stream_pending: 0,
+            stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             bundles_dir: String::new(),

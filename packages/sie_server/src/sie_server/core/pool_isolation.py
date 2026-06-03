@@ -7,8 +7,7 @@ cross-worker pool registry. The validator fires when configs are added
 to a worker's :class:`ModelRegistry` (i.e. at startup config-load and
 at hot-reload time).
 
-Rationale (per source spec for the admission-control rollout): mixed-pool fairness across
-request shapes is an explicit M5+ concern. For the current horizon
+Rationale: mixed-pool fairness across request shapes is a separate concern. For the current horizon
 the simpler invariant — a single pool holds a single task class — is
 what the gateway's routing and the worker's batch-shape assumptions
 already assume. Reject loudly at config load so operators see the
@@ -190,8 +189,6 @@ def validate_no_legacy_scalar_lora_id(
         f"adapter_options.runtime, which is not supported on the "
         f"generation primitive. Multi-LoRA generation is shipped via "
         f"``adapter_options.loadtime.lora_paths`` (list of adapter ids); "
-        f"migrate to that form, or remove the ``lora_id`` entry. See "
-        f"product/research/generation-primitive-status.md "
-        f"(§4.8 pool isolation, §5/§6.2 LoRA on generation)."
+        f"migrate to that form, or remove the ``lora_id`` entry."
     )
     raise LegacyScalarLoraIdError(msg)

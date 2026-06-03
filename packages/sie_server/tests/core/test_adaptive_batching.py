@@ -373,6 +373,7 @@ class TestAdaptiveBatchController:
         assert ctrl.current_batch_cost == 8192
 
     def test_reset(self) -> None:
+        """Reset restores the controller to the values it was constructed with."""
         ctrl = AdaptiveBatchController(
             min_wait_ms=2.0,
             max_wait_ms=40.0,
@@ -384,8 +385,11 @@ class TestAdaptiveBatchController:
         )
         ctrl.step(observed_p50_ms=100.0, fill_ratio=0.5)
         ctrl.reset()
-        assert ctrl.current_wait_ms == 10.0
-        assert ctrl.current_batch_cost == 16384
+        # Reset returns to the values provided at construction, clamped
+        # to the configured min/max bounds. This lets operators pin the
+        # recovery anchor via helm values without a code change.
+        assert ctrl.current_wait_ms == 30.0
+        assert ctrl.current_batch_cost == 20000
         assert ctrl._steps_since_update == 0
 
     def test_sequential_adjustments(self) -> None:
@@ -501,7 +505,9 @@ class TestAdaptiveBatchingWorkerIntegration:
             prepared = [make_text_item([1, 2, 3], 0)]
             f = await worker.submit(prepared, items, ["dense"])
             await asyncio.wait_for(f, timeout=5.0)
-            assert worker._batch_config.max_batch_wait_ms == 10
+            # Tracks WorkerConfig().max_batch_wait_ms (kept in sync with
+            # the adaptive controller's min_wait_ms floor).
+            assert worker._batch_config.max_batch_wait_ms == WorkerConfig().max_batch_wait_ms
         finally:
             await worker.stop()
 
@@ -891,3 +897,273 @@ class TestProfileAdaptiveBatchingMerge:
         engine = AdaptiveBatchingParams(enabled=True, target_p50_ms=None, gain=0.3)
         result = _merge_adaptive_params(engine, None)
         assert result is engine
+
+
+class TestCostAntiWindup:
+    """Cost knob must not accumulate further into saturation once pinned.
+
+    Regression test for the deadlock observed on the queue path where the
+    controller shrank ``max_batch_cost`` to ``min_batch_cost`` under load
+    and could not escape because fill_ratio stayed high (tiny batches
+    always fill their tiny budget) while headroom stayed negative.
+    """
+
+    def test_cost_does_not_shrink_below_min_when_pinned(self) -> None:
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            cost_gain=0.5,
+            fill_ratio_threshold=0.7,
+            min_batch_cost=256,
+            max_batch_cost=65536,
+            update_interval=1,
+            _current_batch_cost=256,  # already at floor
+        )
+        # Very-over-SLO + saturated — exactly the deadlock scenario.
+        _, cost = ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99)
+        assert cost == 256
+        # The controller must not add negative slack to the floor.
+        assert ctrl._current_batch_cost == 256
+
+    def test_cost_can_still_grow_when_pinned_at_min_with_headroom(self) -> None:
+        """At floor + positive headroom, growth is allowed (recovery path)."""
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=100.0,
+            cost_gain=0.5,
+            fill_ratio_threshold=0.7,
+            min_batch_cost=256,
+            update_interval=1,
+            _current_batch_cost=256,
+        )
+        _, cost = ctrl.step(observed_p50_ms=40.0, fill_ratio=0.9)
+        # headroom_frac = 0.6, cost_adj = 256 * 0.6 * 0.5 = 76.8 → new_cost ~332
+        assert cost > 256
+
+    def test_cost_does_not_grow_above_max_when_pinned(self) -> None:
+        """Symmetric: at ceiling + positive headroom, cost stays capped."""
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=100.0,
+            cost_gain=0.5,
+            fill_ratio_threshold=0.7,
+            max_batch_cost=20000,
+            update_interval=1,
+            _current_batch_cost=20000,
+        )
+        _, cost = ctrl.step(observed_p50_ms=10.0, fill_ratio=0.99)
+        assert cost == 20000
+
+
+class TestStarvationRecovery:
+    """Deadlock escape hatch: consecutive tiny batches at the floor → reset.
+
+    See ``packages/sie_server_sidecar/docs/architecture-guide.md`` for
+    the queue-mode regression guard that motivated this feature.
+    """
+
+    def _make_pinned_controller(
+        self,
+        *,
+        starvation_window: int = 5,
+        starvation_recovery_enabled: bool = True,
+    ) -> AdaptiveBatchController:
+        """Controller pre-pinned at the floor on both knobs.
+
+        We construct the controller with healthy startup values so that
+        ``_initial_*`` anchors are meaningful, then manually drive the
+        current knobs down to the floor. This mirrors what happens in
+        production when the PI loop shrinks in response to sustained SLO
+        violation.
+        """
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            min_wait_ms=1.0,
+            max_wait_ms=50.0,
+            min_batch_cost=256,
+            max_batch_cost=65536,
+            gain=0.3,
+            integral_gain=0.05,
+            cost_gain=0.15,
+            update_interval=1,
+            starvation_window=starvation_window,
+            starvation_recovery_enabled=starvation_recovery_enabled,
+            _current_wait_ms=10.0,
+            _current_batch_cost=16384,
+        )
+        ctrl._current_wait_ms = ctrl.min_wait_ms
+        ctrl._current_batch_cost = ctrl.min_batch_cost
+        return ctrl
+
+    def test_streak_increments_on_tiny_batches(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=100)
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl.starvation_streak == 3
+
+    def test_streak_resets_on_healthy_batch(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=100)
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl.starvation_streak == 3
+        ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=16)
+        assert ctrl.starvation_streak == 0
+
+    def test_streak_resets_when_batch_size_omitted(self) -> None:
+        """Backward-compat: callers can omit batch_size to disable detection."""
+        ctrl = self._make_pinned_controller(starvation_window=100)
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl.starvation_streak == 3
+
+        ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99)  # no batch_size
+        assert ctrl.starvation_streak == 0
+
+    def test_streak_does_not_count_until_both_knobs_at_floor(self) -> None:
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            min_wait_ms=1.0,
+            min_batch_cost=256,
+            update_interval=1,
+            starvation_window=3,
+            _current_wait_ms=1.0,
+            _current_batch_cost=4096,
+        )
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.1, batch_size=1)
+        assert ctrl.starvation_streak == 0
+        assert ctrl.starvation_resets == 0
+
+    def test_recovery_fires_after_window(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=5)
+        pre_wait = ctrl.current_wait_ms
+        pre_cost = ctrl.current_batch_cost
+        # Five consecutive tiny batches at the floor → trip the detector.
+        for _ in range(5):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        # After recovery the knobs must be above the floor.
+        assert ctrl.current_wait_ms > pre_wait
+        assert ctrl.current_batch_cost > pre_cost
+        assert ctrl.starvation_resets == 1
+        # Streak is cleared so we don't immediately re-recover on the next batch.
+        assert ctrl.starvation_streak == 0
+
+    def test_recovery_anchors_to_initial_values(self) -> None:
+        """Recovery pulls knobs halfway toward the construction-time values."""
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            min_wait_ms=1.0,
+            max_wait_ms=50.0,
+            min_batch_cost=256,
+            max_batch_cost=65536,
+            update_interval=1,
+            starvation_window=3,
+            _current_wait_ms=20.0,  # operator-configured startup
+            _current_batch_cost=16384,
+        )
+        # Force knobs to the floor by hand, then drive tiny batches.
+        ctrl._current_wait_ms = ctrl.min_wait_ms
+        ctrl._current_batch_cost = ctrl.min_batch_cost
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        # Midway between floor (1.0) and initial (20.0) = 10.5
+        assert ctrl.current_wait_ms == pytest.approx(10.5)
+        # Midway is max(initial/2=8192, min_cost*4=1024) = 8192
+        assert ctrl.current_batch_cost == 8192
+
+    def test_recovery_skipped_if_not_at_both_floors(self) -> None:
+        """Tiny batches alone are not enough — both knobs must be pinned.
+
+        We suppress the cost knob (``fill_ratio`` below its threshold) so
+        the PI loop can't drive cost down during the test window; that
+        lets us observe the "streak overflow but cost above floor" branch
+        in isolation.
+        """
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            min_wait_ms=1.0,
+            min_batch_cost=256,
+            fill_ratio_threshold=0.7,
+            update_interval=1,
+            starvation_window=3,
+            _current_wait_ms=1.0,
+            _current_batch_cost=4096,
+        )
+        # fill_ratio=0.1 is below the threshold → cost adjustment gated off.
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.1, batch_size=1)
+        assert ctrl.current_batch_cost == 4096  # confirm cost didn't move
+        assert ctrl.starvation_streak == 0  # detector waits for both floors
+        assert ctrl.starvation_resets == 0
+
+    def test_recovery_clears_integrator(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=3)
+        ctrl._integral = -15.0
+        ctrl._last_step_time = time.monotonic() - 1.0
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl._integral == 0.0
+        assert ctrl._last_step_time is None
+
+    def test_recovery_disabled_by_flag(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=3, starvation_recovery_enabled=False)
+        for _ in range(10):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        # Streak still tracked but no recovery fired.
+        assert ctrl.starvation_streak == 10
+        assert ctrl.starvation_resets == 0
+        assert ctrl.current_wait_ms == 1.0
+        assert ctrl.current_batch_cost == 256
+
+    def test_recovery_counted_monotonically(self) -> None:
+        """Multiple separate deadlocks increment the counter each time."""
+        ctrl = self._make_pinned_controller(starvation_window=3)
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl.starvation_resets == 1
+        # Force back to floor + drive tiny batches again.
+        ctrl._current_wait_ms = ctrl.min_wait_ms
+        ctrl._current_batch_cost = ctrl.min_batch_cost
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        assert ctrl.starvation_resets == 2
+
+    def test_end_to_end_deadlock_then_recovery(self) -> None:
+        """Simulate the real regression: a healthy controller driven into the
+        batch-of-1 attractor, then observe that it escapes without manual
+        intervention.
+        """
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            min_wait_ms=1.0,
+            max_wait_ms=50.0,
+            min_batch_cost=256,
+            max_batch_cost=65536,
+            gain=0.3,
+            integral_gain=0.05,
+            cost_gain=0.15,
+            update_interval=1,
+            starvation_window=5,
+            _current_wait_ms=10.0,
+            _current_batch_cost=16384,
+        )
+        # Load spike pushes p50 above target, controller shrinks.
+        # Drive ten very-over-SLO updates with saturated fill.
+        for _ in range(10):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=32)
+        # Both knobs should have shrunk toward the floor.
+        assert ctrl.current_wait_ms < 10.0
+        # Batches collapse to 1-item. Simulate that sustained state.
+        ctrl._current_wait_ms = ctrl.min_wait_ms
+        ctrl._current_batch_cost = ctrl.min_batch_cost
+        for _ in range(5):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        # Recovery should have fired.
+        assert ctrl.starvation_resets >= 1
+        assert ctrl.current_wait_ms > ctrl.min_wait_ms
+        assert ctrl.current_batch_cost > ctrl.min_batch_cost
+
+    def test_snapshot_exposes_starvation_state(self) -> None:
+        ctrl = self._make_pinned_controller(starvation_window=10)
+        for _ in range(3):
+            ctrl.step(observed_p50_ms=500.0, fill_ratio=0.99, batch_size=1)
+        snap = ctrl.snapshot(observed_p50_ms=500.0, fill_ratio=0.99)
+        assert snap.starvation_streak == 3
+        assert snap.starvation_resets == 0

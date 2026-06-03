@@ -116,7 +116,7 @@ def client(mock_registry: MagicMock) -> TestClient:
 
 
 class TestOutputDtype:
-    """Tests for output_dtype parameter (DESIGN.md Section 5.9)."""
+    """Tests for output_dtype parameter."""
 
     def test_default_dtype_is_float32(self, client: TestClient) -> None:
         """Default output dtype is float32."""

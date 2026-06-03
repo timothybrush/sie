@@ -2,8 +2,6 @@
 
 Extracts current counter and histogram values from Prometheus registry
 for real-time display in the Terminal UI.
-
-See DESIGN.md Section 5.6.
 """
 
 from __future__ import annotations

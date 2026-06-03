@@ -1,4 +1,5 @@
-{{- if and .Values.certManagerBundle.trustBundle.enabled (eq .Values.ingress.tls.mode "self-signed") }}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- if and .Values.certManagerBundle.trustBundle.enabled (eq (default "byo" $tls.mode) "self-signed") }}
 apiVersion: trust.cert-manager.io/v1alpha1
 kind: Bundle
 metadata:
@@ -8,7 +9,7 @@ metadata:
 spec:
   sources:
     - secret:
-        name: {{ .Values.ingress.tls.selfSigned.rootCA.secretName | quote }}
+        name: {{ $tls.selfSigned.rootCA.secretName | quote }}
         key: ca.crt
   target:
     configMap:

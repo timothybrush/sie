@@ -66,8 +66,7 @@ max_sequence_length: 32768
 # kv_budget_tokens is set to ~40% of theoretical max, matching the L4
 # baseline ratio (32768/90000 ≈ 36%). The headroom absorbs batch growth,
 # speculative side-cell, grammar/Outlines compile arena, fragmentation.
-# Final empirical validation (concurrency-16 OOM-boundary sweep) is
-# tracked in product/plans/m4-req2-gpu-runbook.md §"#16/#19".
+# Final empirical validation should use concurrency and OOM-boundary sweeps.
 profiles:
   default:
     # max_batch_tokens is a generic engine knob; generation does not batch
@@ -93,7 +92,7 @@ profiles:
           top_p: 0.9
         stop_tokens:
           - "<|im_end|>"
-  # M5 audit #16/#19: analytical defaults for a100-40gb / h100. Production
+  # Analytical defaults for a100-40gb / h100. Production
   # capacity also grows: with 2-4× the KV budget the context window can be
   # widened proportionally so longer-context workloads (RAG with large
   # retrieved passages) fit comfortably. ``max_output_tokens`` doubles

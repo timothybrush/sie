@@ -291,6 +291,27 @@ def load_adapter(
             # If signature inspection fails, avoid passing unsupported kwargs
             pass
 
+    # Wire the profile's ``runtime.default_sampling`` into the adapter when its
+    # constructor accepts it. These defaults live under ``adapter_options.runtime``
+    # (not ``loadtime``) and were previously dropped entirely — so a profile's
+    # ``default_sampling`` silently no-op'd (e.g. a ``min_new_tokens`` floor for
+    # the Qwen3.6 stop-token-as-first-token bug never reached SGLang). The adapter
+    # merges this dict with ``setdefault`` semantics, so request-supplied sampling
+    # values still win; this only fills params the caller omitted, which is the
+    # documented intent of a ``default_sampling`` block. Guarded by signature
+    # inspection so adapters that don't accept the kwarg are unaffected.
+    if "default_sampling" not in adapter_kwargs:
+        try:
+            signature = inspect.signature(adapter_class.__init__)
+            default_sampling = dict(config.resolve_profile("default").runtime).get("default_sampling")
+            if "default_sampling" in signature.parameters and default_sampling:
+                adapter_kwargs["default_sampling"] = default_sampling
+        except (TypeError, ValueError):
+            logger.debug(
+                "Could not inspect adapter constructor for default_sampling support; skipping default_sampling wiring.",
+                exc_info=True,
+            )
+
     # Instantiate adapter using factory method for device-aware selection
     # All adapters inherit create_for_device() from ModelAdapter base class
     adapter = adapter_class.create_for_device(device=device, **adapter_kwargs)

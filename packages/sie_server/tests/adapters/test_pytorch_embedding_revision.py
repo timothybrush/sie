@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from sie_server.adapters.pytorch_embedding import PyTorchEmbeddingAdapter
 
 
@@ -13,10 +14,10 @@ class TestPyTorchEmbeddingAdapterRevision:
     when ModelConfig.hf_revision is set.
     """
 
-    def _patched_load(self, adapter: PyTorchEmbeddingAdapter) -> tuple[MagicMock, MagicMock]:
+    def _patched_load(self, adapter: PyTorchEmbeddingAdapter, hidden_size: int = 8) -> tuple[MagicMock, MagicMock]:
         """Drive adapter.load("cpu") with mocked HF loaders. Returns (tokenizer_cls, model_cls)."""
         mock_model = MagicMock()
-        mock_model.config.hidden_size = 8
+        mock_model.config.hidden_size = hidden_size
         mock_model.to.return_value = mock_model
 
         mock_tokenizer = MagicMock()
@@ -75,3 +76,34 @@ class TestPyTorchEmbeddingAdapterRevision:
 
         assert mock_tok_cls.from_pretrained.call_args.kwargs["trust_remote_code"] is True
         assert mock_mdl_cls.from_pretrained.call_args.kwargs["trust_remote_code"] is True
+
+    def test_accepts_dense_dim_kwarg(self) -> None:
+        """Construction with dense_dim= must not raise (loader contract)."""
+        adapter = PyTorchEmbeddingAdapter(
+            "google/embeddinggemma-300m",
+            pooling="last_token",
+            dense_dim=768,
+        )
+        assert adapter._configured_dense_dim == 768
+        assert adapter.dims.dense == 768
+
+    def test_load_accepts_matching_dense_dim(self) -> None:
+        adapter = PyTorchEmbeddingAdapter(
+            "google/embeddinggemma-300m",
+            pooling="last_token",
+            dense_dim=768,
+        )
+
+        self._patched_load(adapter, hidden_size=768)
+
+        assert adapter.dims.dense == 768
+
+    def test_load_rejects_dense_dim_mismatch(self) -> None:
+        adapter = PyTorchEmbeddingAdapter(
+            "google/embeddinggemma-300m",
+            pooling="last_token",
+            dense_dim=768,
+        )
+
+        with pytest.raises(ValueError, match="configured dense_dim=768, model hidden_size=1024"):
+            self._patched_load(adapter, hidden_size=1024)

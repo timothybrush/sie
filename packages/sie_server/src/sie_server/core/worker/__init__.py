@@ -10,8 +10,6 @@ Architecture:
 - ModelWorker: Manages lifecycle, batching, FCFS scheduling, stats
 - OperationHandler: Abstract interface for operation-specific logic
 - EncodeHandler, ExtractHandler, ScoreHandler: Concrete implementations
-
-See DESIGN.md Section 5.3.
 """
 
 from sie_server.core.worker.handlers import (

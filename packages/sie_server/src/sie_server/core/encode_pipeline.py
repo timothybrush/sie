@@ -1,12 +1,19 @@
+from __future__ import annotations
+
 import asyncio
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.core.prepared import ImagePayload, PreparedBatch, PreparedItem
+from sie_server.core.preprocessor.text import TextPreprocessor
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.encode import EncodeHandler
 from sie_server.types.inputs import Item
+
+if TYPE_CHECKING:
+    from sie_server.core.preprocessor_registry import PreprocessorRegistry
+    from sie_server.ipc_types import PreparedTokens
 
 
 class EncodePipeline:
@@ -21,14 +28,29 @@ class EncodePipeline:
         config: Any,
         is_query: bool,
         options: dict[str, Any],
+        prepared_tokens_per_item: list[PreparedTokens | None] | None = None,
     ) -> tuple[list[dict[str, Any]], RequestTiming]:
         """Main entry point: preprocess then execute encoding.
 
         This is the unified encode path that handles text, image, and direct modes.
+
+        ``prepared_tokens_per_item`` is the worker-sidecar's fast-path
+        token payload, aligned 1:1 with ``items``. When supplied,
+        the text preprocessor skips its own tokenisation iff the
+        tokenizer_id matches (see ``TextPreprocessor.try_prepare_from_prepared_tokens``).
+        Absent / mismatched → Python tokenises exactly like today.
         """
         timing = RequestTiming()
 
-        prepared_batch = await cls._prepare_batch(registry, model, items, config, is_query, timing)
+        prepared_batch = await cls._prepare_batch(
+            registry,
+            model,
+            items,
+            config,
+            is_query,
+            timing,
+            prepared_tokens_per_item=prepared_tokens_per_item,
+        )
 
         if prepared_batch is not None:
             # Batched worker path
@@ -77,10 +99,18 @@ class EncodePipeline:
         config: Any,
         is_query: bool,
         timing: RequestTiming,
+        *,
+        prepared_tokens_per_item: list[PreparedTokens | None] | None = None,
     ) -> PreparedBatch | None:
         """Run CPU preprocessing (tokenization/image processing) if a preprocessor exists.
 
         Returns None if no preprocessor is registered (direct adapter call path).
+
+        When ``prepared_tokens_per_item`` is supplied, the text path tries the
+        Rust-tokenise fast path first via
+        ``TextPreprocessor.try_prepare_from_prepared_tokens``; any rejection
+        (mismatch, missing, drift, etc.) transparently falls back to the
+        Python tokenizer so correctness is never at risk.
         """
         preprocessor_registry = registry.preprocessor_registry
         has_image_input = config.inputs is not None and config.inputs.image
@@ -90,6 +120,19 @@ class EncodePipeline:
         # Text-only path: use text preprocessor
         if preprocessor_registry.has_preprocessor(model, "text") and all_items_have_text and not any_items_have_images:
             timing.start_tokenization()
+            # Try the Rust-tokenise fast path first. Only the in-tree
+            # `TextPreprocessor` implements it; other preprocessors
+            # (e.g. `CharCountPreprocessor` for library-wrapped
+            # adapters) return None and we fall through to the
+            # normal path.
+            if prepared_tokens_per_item is not None:
+                fast_path = await cls._try_fast_path(
+                    preprocessor_registry, model, items, prepared_tokens_per_item, config=config
+                )
+                if fast_path is not None:
+                    timing.end_tokenization()
+                    return fast_path
+
             prepared_batch = await preprocessor_registry.prepare(model, items, config, is_query=is_query)
             timing.end_tokenization()
             return prepared_batch
@@ -118,3 +161,28 @@ class EncodePipeline:
 
         # No preprocessor available - return None to signal direct adapter call
         return None
+
+    @classmethod
+    async def _try_fast_path(
+        cls,
+        preprocessor_registry: PreprocessorRegistry,
+        model: str,
+        items: list[Item],
+        prepared_tokens_per_item: list[PreparedTokens | None],
+        *,
+        config: Any,
+    ) -> PreparedBatch | None:
+        """Attempt the Rust-tokenise fast path. Returns ``None`` if the
+        preprocessor for ``model`` isn't a plain ``TextPreprocessor``
+        (e.g. ``CharCountPreprocessor`` for library-wrapped adapters),
+        or if the fast path rejects the batch for any reason.
+
+        Runs synchronously — the fast path is pure Python list
+        manipulation, no tokenizer call. Skipping the ``to_thread``
+        hop saves ~1.5 ms of scheduling overhead for the common case
+        where every item hits the fast path.
+        """
+        preprocessor = preprocessor_registry.get_preprocessor(model, "text")
+        if not isinstance(preprocessor, TextPreprocessor):
+            return None
+        return preprocessor.try_prepare_from_prepared_tokens(items, prepared_tokens_per_item, config=config)

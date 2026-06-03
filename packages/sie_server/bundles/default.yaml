@@ -43,6 +43,7 @@ adapters:
 - sie_server.adapters.florence2
 - sie_server.adapters.docling
 - sie_server.adapters.paddleocr_vl
+- sie_server.adapters.mineru_vl
 deps:
   # Most flash adapters; sentence_transformer needs >=4.57
   transformers: '>=4.57,<5'

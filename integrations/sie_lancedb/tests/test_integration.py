@@ -15,7 +15,7 @@ import os
 
 import lancedb
 import pytest
-import sie_lancedb  # noqa: F401 — registers "sie" and "sie-multivector"
+import sie_lancedb  # registers "sie" and "sie-multivector" + used directly as sie_lancedb.SIE{Reranker,Extractor}
 from lancedb.embeddings import get_registry
 from lancedb.pydantic import LanceModel, Vector
 
@@ -94,8 +94,6 @@ class TestHybridSearchWithReranker:
 
     def test_hybrid_search_with_reranker(self, sie_url: str, db) -> None:
         """Hybrid search (vector + FTS) with SIE cross-encoder reranking."""
-        from sie_lancedb import SIEReranker
-
         sie = (
             get_registry()
             .get("sie")
@@ -122,7 +120,7 @@ class TestHybridSearchWithReranker:
 
         table.create_fts_index("text", replace=True)
 
-        reranker = SIEReranker(
+        reranker = sie_lancedb.SIEReranker(
             base_url=sie_url,
             model="jinaai/jina-reranker-v2-base-multilingual",
         )
@@ -146,9 +144,7 @@ class TestEntityExtraction:
 
     def test_extract_entities(self, sie_url: str) -> None:
         """Direct entity extraction from text."""
-        from sie_lancedb import SIEExtractor
-
-        extractor = SIEExtractor(
+        extractor = sie_lancedb.SIEExtractor(
             base_url=sie_url,
             model="urchade/gliner_multi-v2.1",
         )
@@ -167,8 +163,6 @@ class TestEntityExtraction:
 
     def test_enrich_table(self, sie_url: str, db) -> None:
         """Enrich a LanceDB table with extracted entities."""
-        from sie_lancedb import SIEExtractor
-
         table = db.create_table(
             "enrich_test",
             data=[
@@ -179,7 +173,7 @@ class TestEntityExtraction:
             mode="overwrite",
         )
 
-        extractor = SIEExtractor(
+        extractor = sie_lancedb.SIEExtractor(
             base_url=sie_url,
             model="urchade/gliner_multi-v2.1",
         )
