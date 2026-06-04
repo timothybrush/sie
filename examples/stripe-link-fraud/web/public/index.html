@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>stripe-link-fraud</title>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="https://js.stripe.com/v3/"></script>
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <span class="logo">🔒</span>
+        <h1>stripe-link-fraud</h1>
+        <span class="badge" id="badge">idle</span>
+      </div>
+      <div class="meta" id="sie-state">checking SIE...</div>
+      <div class="meta" id="stripe-state">Stripe: ...</div>
+      <div class="cta-row">
+        <a class="cta" href="https://github.com/superlinked/brave-new-demos/tree/main/stripe-link-fraud" target="_blank" rel="noopener">
+          <span>↗</span> Source
+        </a>
+        <a class="cta" href="https://github.com/superlinked/sie" target="_blank" rel="noopener">
+          <span>★</span> SIE repo
+        </a>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-text">
+        <p>
+          When a checkout lands, the merchant has seconds to decide:
+          authorize, hold for review, or block. SIE collapses that decision
+          into <strong>one server call</strong>: <em>extract</em> signals from
+          the order context, <em>encode</em> them, and <em>score</em> against
+          a corpus of past fraud patterns. Click a sample order on the left
+          to see the pipeline run, then watch the
+          <strong>Stripe Link</strong> payment form on the right react to the
+          risk band.
+        </p>
+      </div>
+      <div class="hero-diagram">
+        <img src="/static/architecture.svg" alt="stripe-link-fraud architecture" class="diagram-svg" />
+      </div>
+    </section>
+
+    <main>
+      <section class="panel" id="panel-orders">
+        <header><h2>Sample orders</h2></header>
+        <div class="list" id="orders">loading...</div>
+      </section>
+
+      <section class="panel" id="panel-risk">
+        <header>
+          <h2>SIE risk pipeline</h2>
+          <span class="hint" id="risk-meta"></span>
+        </header>
+        <div class="risk" id="risk">
+          <p class="hint">Click a sample order on the left.</p>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-checkout">
+        <header>
+          <h2>Stripe Link checkout</h2>
+          <span class="hint" id="checkout-meta"></span>
+        </header>
+        <div class="checkout" id="checkout">
+          <p class="hint">A Stripe Elements PaymentElement (with Link enabled) mounts here once a risk score is computed.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="footer">SIE on <code id="sie-url">http://localhost:8080</code></span>
+      <span id="timings"></span>
+    </footer>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

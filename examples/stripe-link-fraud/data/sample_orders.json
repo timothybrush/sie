@@ -1,0 +1,98 @@
+[
+  {
+    "id": "ord_clean_subscription",
+    "label": "Normal subscription renewal",
+    "description": "Returning Link customer (12 months of history), small recurring charge, billing and shipping addresses match.",
+    "cart": [
+      { "sku": "PRO-SEAT-MO", "name": "Pro plan seat (monthly)", "qty": 1, "unit_price_usd": 24 }
+    ],
+    "customer": {
+      "email": "samira@maple-studio.io",
+      "name": "Samira Bose",
+      "account_age_days": 412,
+      "prior_orders": 13,
+      "link_returning": true,
+      "billing_country": "US",
+      "shipping_country": "US",
+      "shipping_address": "1620 Lombard St, San Francisco, CA 94123",
+      "ip_country": "US"
+    }
+  },
+  {
+    "id": "ord_clean_apparel",
+    "label": "Returning customer, apparel reorder",
+    "description": "Customer has bought apparel three times before; this order matches her usual cart size and shipping address.",
+    "cart": [
+      { "sku": "TEE-NAVY-M", "name": "Heavyweight tee, navy (M)", "qty": 2, "unit_price_usd": 32 },
+      { "sku": "SOCK-PAIR", "name": "Ribbed crew socks", "qty": 1, "unit_price_usd": 14 }
+    ],
+    "customer": {
+      "email": "dan.wolfe@gmail.com",
+      "name": "Daniel Wolfe",
+      "account_age_days": 220,
+      "prior_orders": 3,
+      "link_returning": true,
+      "billing_country": "US",
+      "shipping_country": "US",
+      "shipping_address": "412 Pine Street, Apt 5, Portland, OR 97204",
+      "ip_country": "US"
+    }
+  },
+  {
+    "id": "ord_suspicious_giftcards",
+    "label": "Brand-new email, gift cards only",
+    "description": "Account created today, single payment method just added, cart is two $250 digital gift cards.",
+    "cart": [
+      { "sku": "GIFTCARD-250", "name": "Digital gift card ($250)", "qty": 2, "unit_price_usd": 250 }
+    ],
+    "customer": {
+      "email": "k4ne_999@mailinator.com",
+      "name": "K Doe",
+      "account_age_days": 0,
+      "prior_orders": 0,
+      "link_returning": false,
+      "billing_country": "US",
+      "shipping_country": "US",
+      "shipping_address": "n/a (digital delivery)",
+      "ip_country": "RU"
+    }
+  },
+  {
+    "id": "ord_suspicious_overnight",
+    "label": "First order, high value, overnight to reshipper",
+    "description": "First-ever order from this email. Single high-margin electronics SKU, overnight shipping to a known package-forwarder address.",
+    "cart": [
+      { "sku": "HEADPHONES-PRO", "name": "Studio Pro headphones", "qty": 1, "unit_price_usd": 489 }
+    ],
+    "customer": {
+      "email": "buyer.xyz.4471@outlook.com",
+      "name": "Alex Buyer",
+      "account_age_days": 0,
+      "prior_orders": 0,
+      "link_returning": false,
+      "billing_country": "GB",
+      "shipping_country": "US",
+      "shipping_address": "8400 NW 25th St, Doral, FL 33122 (Suite 4471)",
+      "ip_country": "NG"
+    }
+  },
+  {
+    "id": "ord_review_velocity",
+    "label": "Established account, sudden velocity spike",
+    "description": "Long-standing Link customer placing 4 orders in 30 minutes to 4 different addresses, each on a different state. Password was updated yesterday.",
+    "cart": [
+      { "sku": "HEADPHONES-PRO", "name": "Studio Pro headphones", "qty": 1, "unit_price_usd": 489 }
+    ],
+    "customer": {
+      "email": "amelia.brooks@protonmail.com",
+      "name": "Amelia Brooks",
+      "account_age_days": 600,
+      "prior_orders": 24,
+      "link_returning": true,
+      "billing_country": "US",
+      "shipping_country": "US",
+      "shipping_address": "915 Elm Ave, Apt 12, Newark, NJ 07103",
+      "ip_country": "US"
+    }
+  }
+]

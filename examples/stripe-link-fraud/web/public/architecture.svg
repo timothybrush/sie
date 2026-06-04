@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 360" role="img" aria-label="stripe-link-fraud architecture diagram">
+  <defs>
+    <style><![CDATA[
+      .bg     { fill: #0e1014; }
+      .card   { fill: #161a22; stroke: #232936; stroke-width: 1; rx: 10; ry: 10; }
+      .head   { fill: #1c2230; }
+      .label  { font: 600 12px "Inter", system-ui, sans-serif; fill: #e6e8ec; }
+      .sub    { font: 400 11px "Inter", system-ui, sans-serif; fill: #8b94a7; }
+      .mono   { font: 11px ui-monospace, "JetBrains Mono", monospace; fill: #c89cff; }
+      .accent { fill: #7c5dff; }
+      .info   { fill: #62b6ff; }
+      .succ   { fill: #5fd28b; }
+      .stroke-accent { stroke: #7c5dff; stroke-width: 1.5; fill: none; }
+      .stroke-info   { stroke: #62b6ff; stroke-width: 1.5; fill: none; }
+      .stroke-succ   { stroke: #5fd28b; stroke-width: 1.5; fill: none; }
+      .stroke-mute   { stroke: #232936; stroke-width: 1.5; fill: none; }
+      .pill-bg-accent { fill: rgba(124,93,255,0.15); }
+      .pill-bg-info   { fill: rgba(98,182,255,0.15); }
+      .pill-bg-succ   { fill: rgba(95,210,139,0.15); }
+    ]]></style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L6,3 z" fill="#8b94a7" />
+    </marker>
+    <marker id="arrow-accent" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L6,3 z" fill="#7c5dff" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="920" height="360" />
+
+  <!-- Step 1: checkout context -->
+  <g transform="translate(40,140)">
+    <rect class="card" width="180" height="80" rx="10" />
+    <rect class="head" x="0" y="0" width="180" height="22" rx="10" />
+    <rect class="head" x="0" y="12" width="180" height="10" />
+    <text class="label" x="14" y="16">checkout context</text>
+    <text class="sub" x="14" y="42">cart</text>
+    <text class="sub" x="14" y="58">customer profile</text>
+    <text class="sub" x="14" y="72">Link history + geo</text>
+    <circle class="info" cx="166" cy="11" r="4" />
+  </g>
+
+  <!-- Step 2: SIE server -->
+  <g transform="translate(280,80)">
+    <rect class="card" width="360" height="200" rx="10" />
+    <rect class="head" x="0" y="0" width="360" height="22" rx="10" />
+    <rect class="head" x="0" y="12" width="360" height="10" />
+    <text class="label" x="14" y="16">one SIE server</text>
+    <text class="sub" x="338" y="16" text-anchor="end">3 primitives, 1 round-trip</text>
+    <circle class="accent" cx="350" cy="11" r="3" />
+
+    <!-- 3 primitives inside SIE -->
+    <g transform="translate(20,40)">
+      <rect class="pill-bg-info" width="100" height="56" rx="6" />
+      <text class="label" x="50" y="22" text-anchor="middle">extract</text>
+      <text class="sub" x="50" y="40" text-anchor="middle">GLiNER</text>
+      <text class="sub" x="50" y="52" text-anchor="middle">signals</text>
+    </g>
+    <g transform="translate(130,40)">
+      <rect class="pill-bg-accent" width="100" height="56" rx="6" />
+      <text class="label" x="50" y="22" text-anchor="middle">encode</text>
+      <text class="sub" x="50" y="40" text-anchor="middle">MiniLM-L6</text>
+      <text class="sub" x="50" y="52" text-anchor="middle">dense 384-d</text>
+    </g>
+    <g transform="translate(240,40)">
+      <rect class="pill-bg-succ" width="100" height="56" rx="6" />
+      <text class="label" x="50" y="22" text-anchor="middle">score</text>
+      <text class="sub" x="50" y="40" text-anchor="middle">BGE-reranker</text>
+      <text class="sub" x="50" y="52" text-anchor="middle">top-K rerank</text>
+    </g>
+
+    <!-- corpus -->
+    <g transform="translate(60,118)">
+      <rect class="card" width="240" height="60" rx="8" />
+      <text class="label" x="120" y="22" text-anchor="middle">fraud_patterns.json</text>
+      <text class="sub" x="120" y="40" text-anchor="middle">12 past patterns, pre-encoded</text>
+      <text class="mono" x="120" y="54" text-anchor="middle">cosine top-3 → reranker</text>
+    </g>
+  </g>
+
+  <!-- Step 3: risk band -->
+  <g transform="translate(700,80)">
+    <rect class="card" width="180" height="200" rx="10" />
+    <rect class="head" x="0" y="0" width="180" height="22" rx="10" />
+    <rect class="head" x="0" y="12" width="180" height="10" />
+    <text class="label" x="14" y="16">risk band</text>
+    <circle class="succ" cx="166" cy="11" r="4" />
+
+    <g transform="translate(16,36)">
+      <rect class="pill-bg-succ" width="148" height="34" rx="6" />
+      <text class="label succ" x="14" y="22">low</text>
+      <text class="sub" x="50" y="22">cosine &lt; 0.47</text>
+    </g>
+    <g transform="translate(16,76)">
+      <rect width="148" height="34" rx="6" fill="rgba(247,201,72,0.18)" />
+      <text class="label" x="14" y="22" fill="#f7c948">medium</text>
+      <text class="sub" x="68" y="22">0.47-0.52</text>
+    </g>
+    <g transform="translate(16,116)">
+      <rect width="148" height="34" rx="6" fill="rgba(255,107,107,0.18)" />
+      <text class="label" x="14" y="22" fill="#ff6b6b">high</text>
+      <text class="sub" x="56" y="22">&gt; 0.52</text>
+    </g>
+    <g transform="translate(16,164)">
+      <text class="sub" x="0" y="0">→ PaymentIntent.metadata</text>
+      <text class="sub" x="0" y="14">→ Link Element CTA</text>
+    </g>
+  </g>
+
+  <!-- Arrows -->
+  <line class="stroke-mute" x1="220" y1="180" x2="278" y2="180" marker-end="url(#arrow)" />
+  <line class="stroke-mute" x1="640" y1="180" x2="698" y2="180" marker-end="url(#arrow)" />
+
+  <!-- Footer / title -->
+  <text class="label" x="460" y="40" text-anchor="middle">stripe-link-fraud</text>
+  <text class="sub" x="460" y="56" text-anchor="middle">pre-authorization fraud-risk gate, three SIE primitives in one round-trip</text>
+  <text class="sub" x="460" y="334" text-anchor="middle">Apache 2.0 · runs locally with docker compose · hosted on Hugging Face Spaces</text>
+</svg>
