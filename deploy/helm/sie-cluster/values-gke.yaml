@@ -125,11 +125,8 @@ workers:
     # GKE L4 pool (spot) — enable default bundle
     l4:
       enabled: true
-      minReplicas: 0
-      maxReplicas: 10
       machineProfile: l4
       gpuType: l4
-      bundle: default
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-l4
       gpu:
@@ -146,6 +143,10 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 10
 
 # ServiceAccount — Helm manages creation; Workload Identity annotation injected at deploy time.
 # NAMING CONTRACT: name must match Terraform's Workload Identity binding

@@ -3,7 +3,7 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.4.2"
+    "version": "0.5.0"
   },
   "paths": {
     "/": {
@@ -848,6 +848,41 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "ModelCapabilities": {
+        "properties": {
+          "grammar": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Grammar",
+            "default": []
+          },
+          "tools": {
+            "type": "boolean",
+            "title": "Tools",
+            "default": false
+          },
+          "code": {
+            "type": "boolean",
+            "title": "Code",
+            "default": false
+          },
+          "sql": {
+            "type": "boolean",
+            "title": "Sql",
+            "default": false
+          },
+          "guard": {
+            "type": "boolean",
+            "title": "Guard",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ModelCapabilities",
+        "description": "Advertised generation capabilities for a model.\n\nMirrors the gateway ``capabilities`` wire shape\n(``ModelCapabilitiesWire``) for the keys derivable from the loaded\nmodel config's :class:`~sie_server.config.model.GenerateCapabilities`.\n``code``/``sql``/``guard`` are informational flags advertising\nvalidated generation jobs that back the ``model=\"code\"`` /\n``model=\"sql\"`` / ``model=\"guard\"`` aliases. Populated only for\nmodels that declare ``tasks.generate``; ``None`` otherwise.\n\nThese flags mean the model *supports* a task \u2014 they are NOT a\nprecision-independent quality SLA. A flag is true at the model level even\nwhen quality is profile/precision-dependent (e.g. ``sql`` quality regresses\nunder FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``\nalias)."
+      },
       "ModelInfo": {
         "properties": {
           "name": {
@@ -919,6 +954,16 @@
             "type": "object",
             "title": "Profiles",
             "default": {}
+          },
+          "capabilities": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",

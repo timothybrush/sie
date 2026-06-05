@@ -118,6 +118,11 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.serviceMonitor.enabled }}
+            - name: gateway-metrics
+              containerPort: 9090
+              protocol: TCP
+            {{- end }}
           env:
             # Kubernetes-based worker discovery
             - name: SIE_GATEWAY_KUBERNETES
@@ -148,6 +153,14 @@ spec:
                 configMapKeyRef:
                   name: {{ include "sie-cluster.fullname" . }}-gpu-config
                   key: gpu-aliases
+            {{- with .Values.gateway.modelAliases }}
+            # Job/friendly model aliases (e.g. {"sql":"bf16-27b:/Qwen/Qwen3.6-27B"}).
+            # A bundle-qualified target routes that job to a precision/profile
+            # bundle (e.g. route SQL to a BF16 27B variant). Opt-in: only
+            # rendered when gateway.modelAliases is set.
+            - name: SIE_GATEWAY_MODEL_ALIASES
+              value: {{ toJson . | quote }}
+            {{- end }}
             # Machine profiles (JSON format for pool validation and routing)
             - name: SIE_GATEWAY_MACHINE_PROFILES
               valueFrom:
@@ -170,6 +183,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.gateway.auth.tokenSecretName }}
                   key: {{ .Values.gateway.auth.tokenSecretKey }}
+            {{- end }}
+            {{- if .Values.serviceMonitor.enabled }}
+            # Dedicated metrics listener. Keeps the public 8080 Service auth-gated
+            # while Prometheus scrapes a ClusterIP-only Service without a bearer token.
+            - name: SIE_METRICS_PORT
+              value: "9090"
             {{- end }}
             {{- if .Values.nats.enabled }}
             - name: SIE_NATS_URL

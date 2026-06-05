@@ -116,6 +116,38 @@ export interface ModelDims {
 }
 
 /**
+ * Advertised model capabilities.
+ *
+ * Mirrors the gateway `capabilities` object on each `/v1/models` entry
+ * (`ModelCapabilitiesWire`). All fields are optional; their presence
+ * depends on what the model config declares. `grammar` lists the
+ * supported grammar kinds ("json_schema" | "regex" | "ebnf").
+ * `code`/`sql`/`guard` are informational flags advertising validated
+ * generation jobs that back the model="code"/"sql"/"guard" aliases.
+ *
+ * These flags mean the model *supports* a task — they are NOT a
+ * precision-independent quality SLA. A flag is true at the model level even
+ * when quality is profile/precision-dependent (e.g. `sql` quality regresses
+ * under FP8; route SQL-critical traffic to a BF16 bundle via the `sql` alias).
+ */
+export interface ModelCapabilities {
+  /** Supported grammar kinds: ["json_schema", "regex", "ebnf"] */
+  grammar?: string[];
+  /** Whether the model supports tool / function calling */
+  tools?: boolean;
+  /** Union of LoRA served-names across profiles (display summary) */
+  lora_adapters?: string[];
+  /** Per-profile LoRA served-names, keyed by profile name */
+  profile_lora_adapters?: Record<string, string[]>;
+  /** Validated for code generation; backs model="code" */
+  code?: boolean;
+  /** Supports text-to-SQL; backs model="sql". Precision-sensitive (FP8 regresses SQL) — a support flag, not a per-profile quality guarantee. */
+  sql?: boolean;
+  /** Generative guard model; backs model="guard" */
+  guard?: boolean;
+}
+
+/**
  * Information about a model returned by listModels().
  */
 export interface ModelInfo {
@@ -131,6 +163,8 @@ export interface ModelInfo {
   dims?: ModelDims;
   /** Maximum sequence length the model supports */
   maxSequenceLength?: number;
+  /** Advertised model capabilities (grammar, tools, code/sql/guard, LoRA adapters) */
+  capabilities?: ModelCapabilities;
 }
 
 /**

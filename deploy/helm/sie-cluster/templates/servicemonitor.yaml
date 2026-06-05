@@ -19,14 +19,16 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  jobLabel: sie.superlinked.com/prometheus-job
   selector:
     matchLabels:
-      {{- include "sie-cluster.gateway.selectorLabels" . | nindent 6 }}
+      {{- include "sie-cluster.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway-metrics
   namespaceSelector:
     matchNames:
       - {{ include "sie-cluster.namespace" . }}
   endpoints:
-    - port: http
+    - port: gateway-metrics
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics

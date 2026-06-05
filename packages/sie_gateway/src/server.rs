@@ -102,6 +102,12 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .with_state(state)
 }
 
+pub fn create_metrics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .with_state(state)
+}
+
 #[utoipa::path(
     get,
     path = "/metrics",

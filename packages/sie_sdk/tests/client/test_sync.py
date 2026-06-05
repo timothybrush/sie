@@ -5,6 +5,7 @@ import msgpack
 import numpy as np
 import pytest
 from sie_sdk import RequestError, ServerError, SIEClient, SIEConnectionError
+from sie_sdk.types import ModelCapabilities
 
 
 class TestSIEClientInit:
@@ -416,6 +417,43 @@ class TestListModels:
             assert models[0]["name"] == "bge-m3"
             assert models[0]["loaded"] is True
             assert "dense" in models[0]["outputs"]
+            client.close()
+
+    def test_list_models_surfaces_capabilities(self) -> None:
+        """Generation models surface the typed ``capabilities`` field."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "models": [
+                {
+                    "name": "qwen3-4b",
+                    "loaded": True,
+                    "inputs": ["text"],
+                    "outputs": ["text"],
+                    "dims": {},
+                    "max_sequence_length": 32768,
+                    "capabilities": {
+                        "grammar": ["json_schema", "regex"],
+                        "tools": True,
+                        "code": True,
+                        "sql": True,
+                        "guard": False,
+                    },
+                }
+            ]
+        }
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.get.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            models = client.list_models()
+
+            caps: ModelCapabilities = models[0]["capabilities"]
+            assert caps["grammar"] == ["json_schema", "regex"]
+            assert caps["tools"] is True
+            assert caps["code"] is True
+            assert caps["sql"] is True
+            assert caps["guard"] is False
             client.close()
 
     def test_get_model_returns_info(self) -> None:

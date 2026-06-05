@@ -1944,6 +1944,12 @@ pub struct ModelInfoWire {
 /// Mirrors the JSON shape constructed in
 /// ``types/model.rs::to_model_info_value``. All fields are optional —
 /// their presence depends on what the model config declares.
+///
+/// These flags indicate that a model *supports* a task — they are NOT a
+/// precision-independent quality SLA. A flag is true at the model level even
+/// when quality is profile/precision-dependent (e.g. ``sql`` quality regresses
+/// under FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``
+/// alias). Treat them as "can do this", not "guaranteed to score X".
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelCapabilitiesWire {
     /// Union of LoRA served-names across profiles. Back-compat summary
@@ -1968,6 +1974,18 @@ pub struct ModelCapabilitiesWire {
     /// Whether the model supports tool / function calling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
+    /// Whether the model is validated for code generation — backs the
+    /// ``model="code"`` alias. Informational only; never request-gated.
+    pub code: bool,
+    /// Whether the model targets the SQL path — backs the ``model="sql"``
+    /// alias. Informational only; never request-gated. Precision-sensitive:
+    /// SQL quality can regress sharply under FP8, so this model-level flag is a
+    /// support signal, not a per-profile quality guarantee.
+    pub sql: bool,
+    /// Whether the model is a content-moderation / policy-check guard —
+    /// backs the ``model="guard"`` alias. Informational only; never
+    /// request-gated.
+    pub guard: bool,
 }
 
 /// One OpenAI-shaped model object in the `data` array of

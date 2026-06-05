@@ -18,21 +18,35 @@ fast at render time.
 {{- end }}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
-{{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
-{{- /* imageBundle decouples the image-tag suffix from the logical bundle name.
-       Defaults to $bundle, but pools whose logical bundle has no dedicated
-       Docker image (e.g. `sglang-embedding`, which shares deps and image with
-       `sglang`) set this to the bundle whose image they reuse. Labels, env
-       vars, --bundle flag, and metrics still use $bundle. */ -}}
-{{- $imageBundle := default $bundle (default $root.Values.workers.common.imageBundle $pool.imageBundle) }}
+{{- if not $pool.bundles }}
+{{- fail (printf "workers.pools.%s: missing required `bundles:` map. Define at least one bundle under the pool (e.g. `bundles: { default: { minReplicas: 0, maxReplicas: 1 } }`)." $poolName) }}
+{{- end }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
 {{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
+{{- range $bundleName, $bundleCfg := $pool.bundles }}
+{{- if dig "enabled" true $bundleCfg }}
+{{- if not (hasKey $bundleCfg "minReplicas") }}
+{{- fail (printf "workers.pools.%s.bundles.%s: missing required `minReplicas`." $poolName $bundleName) }}
+{{- end }}
+{{- if not (hasKey $bundleCfg "maxReplicas") }}
+{{- fail (printf "workers.pools.%s.bundles.%s: missing required `maxReplicas`." $poolName $bundleName) }}
+{{- end }}
+{{- if lt (int $bundleCfg.maxReplicas) (int $bundleCfg.minReplicas) }}
+{{- fail (printf "workers.pools.%s.bundles.%s: `maxReplicas` (%d) must be >= `minReplicas` (%d)." $poolName $bundleName (int $bundleCfg.maxReplicas) (int $bundleCfg.minReplicas)) }}
+{{- end }}
+{{- $bundle := $bundleName }}
+{{- /* imageBundle decouples the image-tag suffix from the logical bundle name.
+       Defaults to $bundle, but bundles whose logical name has no dedicated
+       Docker image (e.g. `sglang-embedding`, which shares deps and image with
+       `sglang`) set this to the bundle whose image they reuse. Labels, env
+       vars, --bundle flag, and metrics still use $bundle. */ -}}
+{{- $imageBundle := default $bundle $bundleCfg.imageBundle }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}
+  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}
   namespace: {{ include "sie-cluster.namespace" $root }}
   labels:
     {{- include "sie-cluster.worker.labels" $root | nindent 4 }}
@@ -42,12 +56,13 @@ metadata:
     sie.superlinked.com/pool: {{ $poolName | quote }}
 spec:
   serviceName: {{ include "sie-cluster.worker.serviceName" $root }}
-  replicas: {{ $pool.minReplicas }}
+  replicas: {{ $bundleCfg.minReplicas }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "sie-cluster.worker.selectorLabels" $root | nindent 6 }}
       sie.superlinked.com/pool: {{ $poolName | quote }}
+      sie.superlinked.com/bundle: {{ $bundle | quote }}
   template:
     metadata:
       labels:
@@ -184,6 +199,9 @@ spec:
             {{- end }}
             {{- end }}
             {{- with $root.Values.workers.common.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with $bundleCfg.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           lifecycle:
@@ -459,7 +477,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       affinity:
-        # Prefer spreading across nodes
+        # Prefer spreading same-bundle workers across nodes
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
@@ -468,6 +486,7 @@ spec:
                   matchLabels:
                     {{- include "sie-cluster.worker.selectorLabels" $root | nindent 20 }}
                     sie.superlinked.com/pool: {{ $poolName | quote }}
+                    sie.superlinked.com/bundle: {{ $bundle | quote }}
                 topologyKey: kubernetes.io/hostname
       volumes:
         # Shared memory for PyTorch DataLoader
@@ -487,5 +506,7 @@ spec:
             medium: Memory
             sizeLimit: 64Mi
         {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

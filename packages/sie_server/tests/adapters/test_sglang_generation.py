@@ -20,7 +20,9 @@ from sie_server.adapters._generation_base import GenerationChunk, collect_genera
 from sie_server.adapters.sglang.generation import (
     SGLangGenerationAdapter,
     _chunk_from_sglang_event,
+    _p_unsafe_from_verdict_logprobs,
     _parse_sglang_generate_response,
+    _thresholded_verdict,
 )
 
 
@@ -440,6 +442,34 @@ def test_generate_request_body_uses_stream_true(mock_async_client: MagicMock, ad
     assert body["sampling_params"]["max_new_tokens"] == 64
     assert body["sampling_params"]["temperature"] == pytest.approx(0.7)
     assert "rid" in body  # cancellation handle
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_logprobs_request_sets_return_text_in_logprobs(mock_async_client: MagicMock, adapter) -> None:
+    """A logprobs request must ask SGLang for decoded token TEXT.
+
+    Without ``return_text_in_logprobs`` SGLang returns
+    ``[logprob, token_id, None]`` and the OpenAI ``token`` field (and the guard
+    ``yes``/``no`` verdict match) sees only empty strings — confirmed on a real
+    Granite Guardian L4 run.
+    """
+    sse_lines = [
+        'data: {"text": "x", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+    ]
+    client_instance = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    mock_async_client.return_value = client_instance
+    adapter._server_url = "http://localhost:30005"
+
+    async def _drain() -> None:
+        async for _ in adapter.generate(prompt="Hi", max_new_tokens=8, logprobs=True, top_logprobs=20):
+            pass
+
+    asyncio.run(_drain())
+
+    body = client_instance.stream.call_args.kwargs["json"]
+    assert body["return_logprob"] is True
+    assert body["return_text_in_logprobs"] is True
+    assert body["top_logprobs_num"] == 20
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
@@ -1079,3 +1109,375 @@ def test_generate_n_gt_one_non_streaming_omits_logprobs_when_not_requested(
     # Ranking is enabled (best_of>n triggers return_logprob), but the
     # candidate's surfaced logprobs field must remain None.
     assert term.candidates[0]["logprobs"] is None
+
+
+def _lp(token: str, logprob: float) -> dict[str, Any]:
+    return {"token": token, "logprob": logprob}
+
+
+class TestGuardVerdictThreshold:
+    """P(unsafe) threshold applied to a guard model's verdict (CHECK POLICY)."""
+
+    def _chunk_logprobs(self, lp_yes: float, lp_no: float) -> tuple[dict[str, Any], ...]:
+        # One content token with a top_logprobs distribution over Yes/No.
+        return ({"token": "Yes", "logprob": lp_yes, "top_logprobs": [_lp("Yes", lp_yes), _lp("No", lp_no)]},)
+
+    def test_p_unsafe_renormalises_over_yes_no(self) -> None:
+        # Equal logprobs -> 0.5; Yes dominant -> >0.5.
+        assert _p_unsafe_from_verdict_logprobs(self._chunk_logprobs(-0.5, -0.5)) == pytest.approx(0.5)
+        assert _p_unsafe_from_verdict_logprobs(self._chunk_logprobs(-0.1, -2.3)) > 0.8
+
+    def test_p_unsafe_none_without_verdict_tokens(self) -> None:
+        lp = ({"token": "Maybe", "logprob": -0.1, "top_logprobs": [_lp("Maybe", -0.1), _lp("Perhaps", -1.0)]},)
+        assert _p_unsafe_from_verdict_logprobs(lp) is None
+        assert _p_unsafe_from_verdict_logprobs(()) is None
+
+    def test_threshold_dial(self) -> None:
+        # P(unsafe)=~0.5 (equal logprobs). threshold 0.5 -> Yes; 0.8 -> No.
+        lp = self._chunk_logprobs(-0.5, -0.5)
+        assert _thresholded_verdict(lp, {"threshold": 0.5}) == "Yes"
+        assert _thresholded_verdict(lp, {"threshold": 0.8}) == "No"
+
+    def test_threshold_high_recall_vs_precision(self) -> None:
+        # A borderline-unsafe row (P(unsafe)=0.6): caught at 0.5, missed at 0.8.
+        lp = self._chunk_logprobs(-0.51, -0.92)  # exp ratio ~0.6
+        assert _thresholded_verdict(lp, {"threshold": 0.5}) == "Yes"
+        assert _thresholded_verdict(lp, {"threshold": 0.8}) == "No"
+
+    def test_no_threshold_or_no_logprobs_leaves_output(self) -> None:
+        # Missing/invalid threshold or absent verdict logprobs -> None (raw kept).
+        assert _thresholded_verdict(self._chunk_logprobs(-0.1, -2.0), {}) is None
+        assert _thresholded_verdict((), {"threshold": 0.8}) is None
+
+    def test_custom_labels(self) -> None:
+        lp = self._chunk_logprobs(-0.1, -3.0)  # P(unsafe) high
+        assert _thresholded_verdict(lp, {"threshold": 0.5, "positive": "UNSAFE", "negative": "SAFE"}) == "UNSAFE"
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_applies_guard_threshold_in_serving_path(mock_async_client: MagicMock) -> None:
+    """End-to-end: the served verdict is the thresholded one, not the raw argmax.
+
+    The model argmax-emits "Yes" (top_logprobs Yes -0.1 / No -2.0 → P(unsafe)≈0.87),
+    but a high-precision guard threshold (0.95) flips the served verdict to "No".
+    Proves the SGLang adapter applies the threshold in the real streaming path.
+    """
+    import json as _json
+
+    guard_adapter = SGLangGenerationAdapter(
+        model_name_or_path="ibm-granite/granite-guardian-3.0-2b",
+        served_model_name="ibm-granite/granite-guardian-3.0-2b",
+        guard={"threshold": 0.95},
+    )
+    lp = {
+        "output_token_logprobs": [[-0.1, 100, "Yes"]],
+        "output_top_logprobs": [[[-0.1, 100, "Yes"], [-2.0, 200, "No"]]],
+    }
+    sse_lines = [
+        "data: " + _json.dumps({"text": "Yes", "meta_info": {"prompt_tokens": 5, **lp}}),
+        "data: "
+        + _json.dumps(
+            {
+                "text": "Yes",
+                "meta_info": {"prompt_tokens": 5, "completion_tokens": 1, "finish_reason": {"type": "stop"}, **lp},
+            }
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    guard_adapter._server_url = "http://localhost:30005"
+
+    async def _collect() -> list[GenerationChunk]:
+        out: list[GenerationChunk] = []
+        async for chunk in guard_adapter.generate(prompt="is this unsafe?", max_new_tokens=8):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(_collect())
+    # The raw model token was "Yes"; the 0.95 threshold rewrites it to "No".
+    assert chunks[0].text_delta == "No"
+    assert chunks[0].is_first is True
+    # The stale leading logprob entry (described the original "Yes") is dropped
+    # so callers aren't handed token metadata inconsistent with the served verdict.
+    assert chunks[0].logprobs is None
+
+
+def test_generate_rejects_multi_candidate_for_guard_models() -> None:
+    """A guard request with n>1 / best_of>1 must fail fast, not silently skip the
+    threshold via the multi-candidate path.
+    """
+    guard_adapter = SGLangGenerationAdapter(
+        model_name_or_path="ibm-granite/granite-guardian-3.0-2b",
+        served_model_name="ibm-granite/granite-guardian-3.0-2b",
+        guard={"threshold": 0.5},
+    )
+    guard_adapter._server_url = "http://localhost:30005"
+
+    async def _drive(**kw: Any) -> None:
+        await guard_adapter.generate(prompt="x", max_new_tokens=8, **kw).__anext__()
+
+    for kw in ({"n": 2}, {"best_of": 2}):
+        with pytest.raises(ValueError, match="single-candidate"):
+            asyncio.run(_drive(**kw))
+
+
+# -- Guard streaming: verdict-position scan + logprobs leakage (M4/H2) -------
+
+
+def _sglang_token(token: str, logprob: float, tid: int = 0) -> list[Any]:
+    """One SGLang flat token-logprob entry: ``[logprob, token_id, token_text]``."""
+    return [logprob, tid, token]
+
+
+def _guard_top(yes: float | None = None, no: float | None = None, *, filler: str = "x") -> list[list[Any]]:
+    """Top-logprobs distribution for one position. With ``yes``/``no`` it carries
+    a verdict; otherwise just a non-verdict filler token (no Yes/No).
+    """
+    if yes is None and no is None:
+        return [_sglang_token(filler, -0.1, 1)]
+    out: list[list[Any]] = []
+    if yes is not None:
+        out.append(_sglang_token("Yes", yes, 100))
+    if no is not None:
+        out.append(_sglang_token("No", no, 200))
+    return out
+
+
+def _guard_event(
+    text: str,
+    token_lp: list[list[Any]],
+    top_lp: list[list[list[Any]]],
+    *,
+    terminal: bool = False,
+) -> str:
+    """A cumulative SGLang SSE event line carrying flat + top logprobs."""
+    import json as _json
+
+    meta: dict[str, Any] = {
+        "prompt_tokens": 5,
+        "output_token_logprobs": token_lp,
+        "output_top_logprobs": top_lp,
+    }
+    if terminal:
+        meta["completion_tokens"] = len(token_lp)
+        meta["finish_reason"] = {"type": "stop"}
+    return "data: " + _json.dumps({"text": text, "meta_info": meta})
+
+
+def _guard_adapter(**guard_overrides: Any) -> SGLangGenerationAdapter:
+    guard = {"threshold": 0.5, **guard_overrides}
+    a = SGLangGenerationAdapter(
+        model_name_or_path="ibm-granite/granite-guardian-3.0-2b",
+        served_model_name="ibm-granite/granite-guardian-3.0-2b",
+        guard=guard,
+    )
+    a._server_url = "http://localhost:30005"
+    return a
+
+
+def _drive_guard(adapter: SGLangGenerationAdapter, sse_lines: list[str], **gen_kwargs: Any) -> list[GenerationChunk]:
+    async def _collect() -> list[GenerationChunk]:
+        out: list[GenerationChunk] = []
+        async for chunk in adapter.generate(prompt="is this unsafe?", max_new_tokens=8, **gen_kwargs):
+            out.append(chunk)
+        return out
+
+    return asyncio.run(_collect())
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_leading_whitespace_then_verdict_applies_threshold(mock_async_client: MagicMock) -> None:
+    """H2: a leading WHITESPACE token (no Yes/No at position 0) must not skip the
+    threshold — the scan finds the verdict at position 1 and applies it.
+    """
+    # Position 0: whitespace, no verdict. Position 1: "Yes" with P(unsafe)≈0.5
+    # over Yes/No (equal logprobs) → 0.5 threshold yields "Yes".
+    sse_lines = [
+        _guard_event(" ", [_sglang_token(" ", -0.2)], [_guard_top(filler=" ")]),
+        _guard_event(
+            " Yes",
+            [_sglang_token(" ", -0.2), _sglang_token("Yes", -0.3, 100)],
+            [_guard_top(filler=" "), _guard_top(yes=-0.5, no=-0.5)],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines)
+    verdicts = [c for c in chunks if c.text_delta]
+    assert verdicts, "expected at least one verdict chunk"
+    assert verdicts[0].text_delta == "Yes"
+    assert verdicts[0].is_first is True
+    # No leading whitespace chunk leaked.
+    assert all(c.text_delta in ("Yes", "") for c in chunks)
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_leading_punctuation_then_verdict_applies_threshold(mock_async_client: MagicMock) -> None:
+    """H2: a leading PUNCTUATION/preamble token before the verdict is suppressed,
+    and the threshold is applied to the verdict at the next position.
+    """
+    sse_lines = [
+        _guard_event(":", [_sglang_token(":", -0.2)], [_guard_top(filler=":")]),
+        _guard_event(
+            ": Yes",
+            [_sglang_token(":", -0.2), _sglang_token("Yes", -0.1, 100)],
+            # P(unsafe) high (Yes -0.1 / No -2.0 ≈ 0.87). 0.95 threshold → "No".
+            [_guard_top(filler=":"), _guard_top(yes=-0.1, no=-2.0)],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(threshold=0.95), sse_lines)
+    verdicts = [c for c in chunks if c.text_delta]
+    assert verdicts[0].text_delta == "No"  # threshold flips argmax "Yes" → "No"
+    assert verdicts[0].is_first is True
+    assert all(c.text_delta in ("No", "") for c in chunks)
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_verdict_in_second_position_applies_threshold(mock_async_client: MagicMock) -> None:
+    """H2: verdict logprobs accumulated across chunks resolve from the SECOND
+    position even when both leading tokens arrive in separate stream events.
+    """
+    sse_lines = [
+        _guard_event("Pre", [_sglang_token("Pre", -0.2)], [_guard_top(filler="Pre")]),
+        _guard_event(
+            "PreYes",
+            [_sglang_token("Pre", -0.2), _sglang_token("Yes", -0.3, 100)],
+            [_guard_top(filler="Pre"), _guard_top(yes=-0.5, no=-0.5)],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines)
+    verdicts = [c for c in chunks if c.text_delta]
+    assert verdicts[0].text_delta == "Yes"
+    assert verdicts[0].is_first is True
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_no_verdict_in_scan_window_falls_back_to_raw(mock_async_client: MagicMock) -> None:
+    """H2 fallback: no Yes/No anywhere in the first N positions → the raw buffered
+    output is preserved (never dropped or hung).
+    """
+    sse_lines = [
+        _guard_event("a", [_sglang_token("a", -0.1)], [_guard_top(filler="a")]),
+        _guard_event(
+            "ab",
+            [_sglang_token("a", -0.1), _sglang_token("b", -0.1, 2)],
+            [_guard_top(filler="a"), _guard_top(filler="b")],
+        ),
+        _guard_event(
+            "abc",
+            [_sglang_token("a", -0.1), _sglang_token("b", -0.1, 2), _sglang_token("c", -0.1, 3)],
+            [_guard_top(filler="a"), _guard_top(filler="b"), _guard_top(filler="c")],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines)
+    # Raw output preserved: the concatenated deltas reproduce the model output.
+    assert "".join(c.text_delta for c in chunks) == "abc"
+    assert any(c.done for c in chunks)
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_no_client_logprobs_strips_forced_logprobs_on_success(mock_async_client: MagicMock) -> None:
+    """M4: client did NOT request logprobs → every yielded chunk has
+    logprobs=None even though the guard forced logprobs internally.
+    """
+    sse_lines = [
+        _guard_event(" ", [_sglang_token(" ", -0.2)], [_guard_top(filler=" ")]),
+        _guard_event(
+            " Yes",
+            [_sglang_token(" ", -0.2), _sglang_token("Yes", -0.3, 100)],
+            [_guard_top(filler=" "), _guard_top(yes=-0.5, no=-0.5)],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines)  # logprobs not requested
+    assert all(c.logprobs is None for c in chunks)
+    assert next(c for c in chunks if c.text_delta).text_delta == "Yes"
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_no_client_logprobs_strips_forced_logprobs_on_fallback(mock_async_client: MagicMock) -> None:
+    """M4: on the fallback path (no verdict parsed) the forced logprobs are still
+    stripped when the client did not request them.
+    """
+    sse_lines = [
+        _guard_event("a", [_sglang_token("a", -0.1)], [_guard_top(filler="a")]),
+        _guard_event(
+            "ab",
+            [_sglang_token("a", -0.1), _sglang_token("b", -0.1, 2)],
+            [_guard_top(filler="a"), _guard_top(filler="b")],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines)
+    assert all(c.logprobs is None for c in chunks)
+    assert "".join(c.text_delta for c in chunks) == "ab"
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_guard_client_logprobs_preserved_minus_verdict_entry(mock_async_client: MagicMock) -> None:
+    """M4: client DID request logprobs → logprobs preserved, minus the consumed
+    verdict entry (the position that produced the verdict).
+    """
+    # Position 0: leading whitespace (no verdict). Position 1: the "Yes" verdict.
+    # Both arrive in one event so the buffer holds two entries at resolution; the
+    # consumed verdict entry (position 1) is dropped, the whitespace entry kept.
+    sse_lines = [
+        _guard_event(
+            " Yes",
+            [_sglang_token(" ", -0.2), _sglang_token("Yes", -0.3, 100)],
+            [_guard_top(filler=" "), _guard_top(yes=-0.5, no=-0.5)],
+            terminal=True,
+        ),
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    chunks = _drive_guard(_guard_adapter(), sse_lines, logprobs=True, top_logprobs=20)
+    verdict_chunk = next(c for c in chunks if c.text_delta)
+    assert verdict_chunk.text_delta == "Yes"
+    # The consumed verdict entry (position 1) is dropped; the leading whitespace
+    # entry remains so callers still get the surrounding token metadata.
+    assert verdict_chunk.logprobs is not None
+    assert [e["token"] for e in verdict_chunk.logprobs] == [" "]
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_non_guard_model_streaming_unaffected(mock_async_client: MagicMock, adapter) -> None:
+    """A non-guard model takes the byte-for-byte unchanged path: no suppression,
+    no stripping, logprobs only present when the client asked.
+    """
+    sse_lines = [
+        'data: {"text": "Hello", "meta_info": {"prompt_tokens": 5}}',
+        'data: {"text": "Hello!", "meta_info": {"prompt_tokens": 5, "completion_tokens": 2, "finish_reason": {"type": "stop"}}}',
+        "data: [DONE]",
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    adapter._server_url = "http://localhost:30005"
+
+    async def _collect() -> list[GenerationChunk]:
+        out: list[GenerationChunk] = []
+        async for chunk in adapter.generate(prompt="hi", max_new_tokens=8):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(_collect())
+    # Leading "Hello" chunk is NOT suppressed; deltas reproduce the output.
+    assert "".join(c.text_delta for c in chunks) == "Hello!"
+    assert chunks[0].text_delta == "Hello"
+    assert chunks[0].is_first is True
+    # Client didn't request logprobs and the model isn't a guard → all None.
+    assert all(c.logprobs is None for c in chunks)
+    assert any(c.done for c in chunks)

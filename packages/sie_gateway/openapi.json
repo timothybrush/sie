@@ -1733,8 +1733,12 @@
         "type": "object"
       },
       "ModelCapabilitiesWire": {
-        "description": "Capability summary surfaced on each entry of ``GET /v1/models``.\n\nMirrors the JSON shape constructed in\n``types/model.rs::to_model_info_value``. All fields are optional —\ntheir presence depends on what the model config declares.",
+        "description": "Capability summary surfaced on each entry of ``GET /v1/models``.\n\nMirrors the JSON shape constructed in\n``types/model.rs::to_model_info_value``. All fields are optional —\ntheir presence depends on what the model config declares.\n\nThese flags indicate that a model *supports* a task — they are NOT a\nprecision-independent quality SLA. A flag is true at the model level even\nwhen quality is profile/precision-dependent (e.g. ``sql`` quality regresses\nunder FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``\nalias). Treat them as \"can do this\", not \"guaranteed to score X\".",
         "properties": {
+          "code": {
+            "description": "Whether the model is validated for code generation — backs the\n``model=\"code\"`` alias. Informational only; never request-gated.",
+            "type": "boolean"
+          },
           "grammar": {
             "description": "Grammar kinds the model's active backend supports\n(``json_schema`` | ``regex`` | ``ebnf``). EBNF presence depends\non the backend: SGLang's Outlines backend does not implement\nEBNF, so a profile with ``grammar_backend: outlines`` advertises\nonly ``[\"json_schema\", \"regex\"]``; xgrammar/llguidance profiles\nadvertise all three.",
             "items": {
@@ -1744,6 +1748,10 @@
               "array",
               "null"
             ]
+          },
+          "guard": {
+            "description": "Whether the model is a content-moderation / policy-check guard —\nbacks the ``model=\"guard\"`` alias. Informational only; never\nrequest-gated.",
+            "type": "boolean"
           },
           "lora_adapters": {
             "description": "Union of LoRA served-names across profiles. Back-compat summary\nfor consumers that don't care about profile scope; validation\nMUST go through ``profile_lora_adapters``.",
@@ -1771,6 +1779,10 @@
               "null"
             ]
           },
+          "sql": {
+            "description": "Whether the model targets the SQL path — backs the ``model=\"sql\"``\nalias. Informational only; never request-gated. Precision-sensitive:\nSQL quality can regress sharply under FP8, so this model-level flag is a\nsupport signal, not a per-profile quality guarantee.",
+            "type": "boolean"
+          },
           "tools": {
             "description": "Whether the model supports tool / function calling.",
             "type": [
@@ -1779,6 +1791,11 @@
             ]
           }
         },
+        "required": [
+          "code",
+          "sql",
+          "guard"
+        ],
         "type": "object"
       },
       "ModelConfigStatusResponse": {
@@ -2870,7 +2887,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.4.2"
+    "version": "0.5.0"
   },
   "openapi": "3.1.0",
   "paths": {

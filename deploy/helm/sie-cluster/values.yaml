@@ -129,6 +129,15 @@ config:
 # config deltas. It does not own config persistence or writes;
 # POST /v1/configs/models is not registered on the gateway (axum returns 405).
 gateway:
+  # -- Job/friendly model aliases → canonical model id, optionally bundle-
+  # qualified. Maps a request like `model: "sql"` to a real model, and a
+  # `bundle:/org/model` target pins a precision/profile bundle (e.g. route SQL
+  # to a BF16 27B variant that avoids the FP8 SQL-accuracy regression). Empty by
+  # default (the gateway's built-in code/sql/guard aliases still apply). Example:
+  #   modelAliases:
+  #     sql: "bf16-27b:/Qwen/Qwen3.6-27B"
+  modelAliases: {}
+
   # -- Number of gateway replicas (default 1; bump to 2+ for HA).
   # Also used as KEDA's `minReplicaCount` floor (see
   # templates/keda-scaledobject.yaml). The gateway is stateless on the
@@ -317,18 +326,6 @@ workers:
 
     # -- Models to preload on startup (empty = lazy loading)
     preloadModels: []
-
-    # -- Bundle to use (default)
-    bundle: default
-
-    # -- Image-tag bundle suffix override. Set this only when the logical
-    # `bundle` has no dedicated Docker image and reuses another bundle's
-    # image. Example: `sglang-embedding` shares deps and image with
-    # `sglang` (lockstep deps enforced by tests/test_bundles.py), so pools
-    # whose logical bundle is `sglang-embedding` set `imageBundle: sglang`
-    # to pull the built image. When unset, falls back to `bundle`. Labels,
-    # env vars, `--bundle` flag, and metrics still reflect `bundle`.
-    imageBundle: ""
 
     # -- Python ModelWorker passthrough mode. When `true` (and the Rust
     # sidecar is enabled), the Python adapter process bypasses its internal
@@ -579,47 +576,51 @@ workers:
   # WorkerGroup naming convention: <machineProfile> (e.g. l4, a100-40gb, cpu).
   # All pools scale to zero by default; enable the ones you need.
   #
-  # Per-pool keys (alphabetical, with defaults):
-  #   bundle:          string. Overrides workers.common.bundle. Required to
-  #                    match a real bundle in sie_config; otherwise the
-  #                    sidecar refuses to start.
-  #   enabled:         bool. Skip rendering when false.
+  # Schema (pool = GPU/node class, bundles = workloads served on it):
+  #
+  # Pool-level keys (shared across bundles on this hardware):
+  #   enabled:         bool. Skip rendering the whole pool when false.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
   #   gpu.product:     string. nvidia.com/gpu.product node-label match.
   #   gpuType:         short label (l4, a100-40gb, cpu, …) used by the
-  #                    gateway for routing/metrics. Doubles as the
-  #                    statefulset suffix.
+  #                    gateway for routing/metrics.
   #   machineProfile:  long label used by KEDA scalers + Prometheus.
-  #   maxReplicas:     KEDA upper bound.
-  #   minReplicas:     baseline replicas (0 = scale-to-zero).
   #   nodeSelector:    map. Merged with workers.common.nodeSelector.
   #   platform:        Optional override (e.g. "cpu"). Used as the
   #                    image-tag suffix for the worker image
   #                    (e.g. `<repo>:<tag>-cpu-<bundle>`),
   #                    NOT propagated to a pod env var.
+  #   queuePool:       string. Optional override of common.queuePool.
   #   resources:       requests/limits for the Python ``worker``
   #                    container (the GPU-bound forward-pass server).
+  #   runtimeClassName: Optional override of common.runtimeClassName.
   #   tolerations:     extra tolerations on top of the chart defaults.
   #
-  # NOTE: a stray ``engine`` key on a pool is silently ignored by
-  # this chart (only ``pytorch``-style pods are rendered).
+  # bundles: map keyed by bundle name (matches a bundle in sie_config;
+  #   otherwise the sidecar refuses to start). Per-bundle keys:
+  #     enabled:       bool, default true. Skip this bundle on this pool.
+  #     imageBundle:   string. Optional image-tag bundle suffix override.
+  #                    Set only when the logical bundle reuses another
+  #                    bundle's image (e.g. `sglang-embedding` -> `sglang`).
+  #     extraEnv:      list. Extra env vars on the ``worker`` container.
+  #                    Rendered after workers.common.extraEnv so a
+  #                    bundle-level entry wins on duplicate names.
+  #     maxReplicas:   KEDA upper bound.
+  #     minReplicas:   baseline replicas (0 = scale-to-zero).
+  #
+  # Each (pool, bundle) renders one StatefulSet + KEDA ScaledObject +
+  # PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
   pools:
 
     # L4 GPU
 
     l4:
       enabled: false
-      # -- Minimum replicas (0 for scale-to-zero)
-      minReplicas: 0
-      # -- Maximum replicas
-      maxReplicas: 10
       # -- Machine profile name (key from machineProfiles section)
       # Used for routing, metrics, and KEDA scaling
       machineProfile: l4
       # -- GPU type label for routing (short form used by gateway)
       gpuType: l4
-      # -- Bundle to use (overrides common.bundle if set)
-      bundle: default
       # -- Optional runtime class override for this pool
       # runtimeClassName: "nvidia"
       # -- Node selector for GPU nodes (override per cloud in values-gke/aws.yaml)
@@ -642,16 +643,20 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      # -- Workloads running on this pool. Each key is a bundle name.
+      bundles:
+        default:
+          # -- Minimum replicas (0 for scale-to-zero)
+          minReplicas: 0
+          # -- Maximum replicas
+          maxReplicas: 10
 
     # A100 40GB
 
     a100-40gb:
       enabled: false
-      minReplicas: 0
-      maxReplicas: 5
       machineProfile: a100-40gb
       gpuType: a100-40gb
-      bundle: default
       nodeSelector: {}
       gpu:
         count: 1
@@ -667,16 +672,17 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 5
 
     # A100 80GB
 
     a100-80gb:
       enabled: false
-      minReplicas: 0
-      maxReplicas: 3
       machineProfile: a100-80gb
       gpuType: a100-80gb
-      bundle: default
       nodeSelector: {}
       gpu:
         count: 1
@@ -692,16 +698,17 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 3
 
     # CPU (local testing with kind, no GPU)
 
     cpu:
       enabled: false
-      minReplicas: 1
-      maxReplicas: 3
       machineProfile: cpu
       gpuType: cpu
-      bundle: default
       # -- Platform override for CPU pool
       platform: cpu
       # No node selector - runs on any node
@@ -717,6 +724,10 @@ workers:
           cpu: "4"
           memory: "12Gi"
       tolerations: []
+      bundles:
+        default:
+          minReplicas: 1
+          maxReplicas: 3
 
 # -- Autoscaling configuration using KEDA ScaledObjects.
 # -- Requires KEDA operator. Set keda.install=true to install KEDA as a sub-chart,

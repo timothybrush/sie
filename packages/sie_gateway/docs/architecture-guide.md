@@ -484,6 +484,14 @@ Config reads (read auth unless noted):
 
 Both services expose Prometheus metrics on `GET /metrics`. The gateway uses the `prometheus` Rust crate; `sie-config` uses `prometheus-client` (matches `sie-server`'s library choice). All metric names use the `sie_gateway_` or `sie_config_` prefix to make cross-service dashboards unambiguous.
 
+When `SIE_METRICS_PORT` is set, the gateway also binds a metrics-only listener
+on that port with a single unauthenticated `GET /metrics` route. The Helm chart
+enables this for `serviceMonitor.enabled=true`: Prometheus scrapes a
+ClusterIP-only gateway metrics Service on port 9090, while the normal gateway
+Service on port 8080 keeps the public request surface behind the configured
+auth mode. The 8080 `/metrics` route still exists and follows the main app's
+auth rules.
+
 ### 15.1 Request and latency — gateway
 
 Emitted from a Tower middleware (`MetricsLayer` in `middleware/metrics.rs`) that wraps the proxy routes. Putting it in middleware rather than inline in handlers ensures these counters cover every response including early rejections (validation, auth, capacity, timeout).

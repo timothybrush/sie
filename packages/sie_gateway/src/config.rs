@@ -6,6 +6,7 @@ pub struct Config {
     // Server
     pub host: String,
     pub port: u16,
+    pub metrics_port: Option<u16>,
 
     // Discovery
     pub worker_urls: Vec<String>,
@@ -60,6 +61,13 @@ pub struct Config {
     // Pre-computed lowercase→original map for GPU profile resolution (avoids HashMap rebuild per request)
     pub gpu_profile_map: HashMap<String, String>,
 
+    // Job/friendly model aliases: lowercase alias → canonical model id. Lets a
+    // caller request `model: "code"` and have it resolve to the recommended
+    // model before the registry lookup. Ships with built-in defaults (see
+    // `build_model_aliases`); extend/override via `SIE_GATEWAY_MODEL_ALIASES`
+    // (JSON map). Mirrors the `SIE_GATEWAY_GPU_ALIASES` mechanism.
+    pub model_aliases: HashMap<String, String>,
+
     // Model registry paths (filesystem seed; same volume mounted into sie-config
     // for consistency, but the gateway never writes to them).
     pub bundles_dir: String,
@@ -95,6 +103,10 @@ fn env_int(key: &str, fallback: u16) -> u16 {
         .unwrap_or(fallback)
 }
 
+fn env_optional_int(key: &str) -> Option<u16> {
+    env::var(key).ok().and_then(|s| s.parse().ok())
+}
+
 fn env_float(key: &str, fallback: f64) -> f64 {
     env::var(key)
         .ok()
@@ -127,6 +139,52 @@ fn env_json_string_map(key: &str) -> HashMap<String, String> {
         }
         _ => HashMap::new(),
     }
+}
+
+/// Job/friendly model aliases: lowercase alias → model id (or `bundle:/model`).
+///
+/// Ships with built-in defaults so `model="code"` works without operator
+/// config (and makes "each agent job routes to the right model" true by
+/// default). `SIE_GATEWAY_MODEL_ALIASES` (a JSON map) extends or overrides
+/// them. Empty alias/target pairs are skipped; aliases are stored lowercased
+/// because resolution lowercases the lookup.
+///
+/// A target may be a bare model id (`Org/Model`) or a bundle-qualified spec
+/// (`bundle:/Org/Model`). The bundle form lets an operator pin a precision /
+/// profile bundle for a job — e.g. map `sql` to a BF16 bundle that avoids the
+/// FP8 SQL-accuracy regression (ADR 0001), since the `:profile` variant suffix
+/// is stripped before worker dispatch and so cannot itself route by precision.
+/// `resolve_model_spec_with_aliases` (proxy.rs) applies the bundle.
+fn build_model_aliases(overrides: HashMap<String, String>) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    // Built-in: the code-generation job → the model with a MEASURED
+    // HumanEval/MBPP pass@1 baseline that also serves reliably
+    // (Qwen3-4B-Instruct-2507: 0.866 / 0.74). Qwen3.5-4B is stronger on paper
+    // but its NEXTN/hybrid serving path does not come up reliably yet, so it is
+    // not the default until measured + its serving init is fixed.
+    map.insert(
+        "code".to_string(),
+        "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+    );
+    // Text-to-SQL job → an ebnf-grammar-capable LLM for the "any LLM + SQL
+    // grammar" path. Repoint to SQLCoder once that model is onboarded.
+    map.insert("sql".to_string(), "Qwen/Qwen3-4B-Instruct-2507".to_string());
+    // CHECK POLICY job → a generative guard model that emits a safe/unsafe
+    // verdict. Granite Guardian 3.0 2B (Apache-2.0, ungated) measured on
+    // ToxicChat via the generation gate; serves on the same SGLang path.
+    map.insert(
+        "guard".to_string(),
+        "ibm-granite/granite-guardian-3.0-2b".to_string(),
+    );
+    for (alias, target) in overrides {
+        let alias = alias.trim().to_lowercase();
+        let target = target.trim().to_string();
+        if alias.is_empty() || target.is_empty() {
+            continue;
+        }
+        map.insert(alias, target);
+    }
+    map
 }
 
 fn build_gpu_profile_map(
@@ -169,10 +227,12 @@ impl Config {
             &configured_gpus,
             env_json_string_map("SIE_GATEWAY_GPU_ALIASES"),
         );
+        let model_aliases = build_model_aliases(env_json_string_map("SIE_GATEWAY_MODEL_ALIASES"));
 
         Self {
             host: "0.0.0.0".to_string(),
             port: 8080,
+            metrics_port: env_optional_int("SIE_METRICS_PORT"),
 
             worker_urls: env_csv("SIE_GATEWAY_WORKERS"),
             use_kubernetes: env_bool("SIE_GATEWAY_KUBERNETES"),
@@ -217,6 +277,7 @@ impl Config {
 
             configured_gpus,
             gpu_profile_map,
+            model_aliases,
 
             bundles_dir: env_default("SIE_BUNDLES_DIR", "bundles"),
             models_dir: env_default("SIE_MODELS_DIR", "models"),
@@ -508,6 +569,37 @@ mod tests {
     }
 
     #[test]
+    fn test_build_model_aliases_has_builtin_code_default() {
+        let result = build_model_aliases(HashMap::new());
+        assert_eq!(
+            result.get("code"),
+            Some(&"Qwen/Qwen3-4B-Instruct-2507".to_string())
+        );
+        assert_eq!(
+            result.get("sql"),
+            Some(&"Qwen/Qwen3-4B-Instruct-2507".to_string())
+        );
+        assert_eq!(
+            result.get("guard"),
+            Some(&"ibm-granite/granite-guardian-3.0-2b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_model_aliases_env_overrides_and_extends() {
+        let mut overrides = HashMap::new();
+        overrides.insert("code".to_string(), "Org/Coder".to_string()); // override default
+        overrides.insert("SQL".to_string(), "Org/SQLModel".to_string()); // extend + lowercased
+        overrides.insert("blank".to_string(), "".to_string()); // skipped (empty target)
+
+        let result = build_model_aliases(overrides);
+
+        assert_eq!(result.get("code"), Some(&"Org/Coder".to_string()));
+        assert_eq!(result.get("sql"), Some(&"Org/SQLModel".to_string()));
+        assert!(!result.contains_key("blank"));
+    }
+
+    #[test]
     fn test_build_gpu_profile_map_does_not_override_canonical_profile() {
         let mut aliases = HashMap::new();
         aliases.insert("l4".to_string(), "l4-spot".to_string());
@@ -619,6 +711,38 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_port_from_env() {
+        with_env(&[("SIE_METRICS_PORT", "9090")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, Some(9090));
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_unset_is_none() {
+        without_env(&["SIE_METRICS_PORT"], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_invalid_is_none() {
+        with_env(&[("SIE_METRICS_PORT", "not-a-number")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_out_of_range_is_none() {
+        with_env(&[("SIE_METRICS_PORT", "70000")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
     fn test_stream_max_age_default_matches_worker_contract() {
         without_env(&["SIE_STREAM_MAX_AGE_S"], || {
             let cfg = Config::load();
@@ -663,6 +787,7 @@ mod tests {
         let mut cfg = Config {
             host: String::new(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: String::new(),
@@ -686,6 +811,7 @@ mod tests {
             stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,

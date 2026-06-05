@@ -132,15 +132,33 @@ See `values.yaml` for all options. Key settings:
 **Important**: All worker pools are disabled by default. You must explicitly enable
 the pools you need in your values override.
 
+The values below are an illustrative shape; concrete per-cluster sizes
+live in each cluster's own values file (e.g. the tester cluster's
+rtx6000 default bundle scales 3–10 — see
+`deploy/terraform/aws/internal-examples/tester-cluster/DEPLOY.md`).
+
 ```yaml
 # Worker pool configuration (must explicitly enable pools)
 # Pool naming: <machineProfile> (e.g. l4, a100-40gb, cpu)
+# Each pool can serve multiple bundles. Each (pool, bundle) renders its
+# own StatefulSet + ScaledObject named worker-<pool>-<bundle>.
 workers:
   pools:
     l4:
-      enabled: true     # Enable this pool (disabled by default)
-      minReplicas: 0    # Scale to zero
-      maxReplicas: 10
+      enabled: true       # Enable this pool (disabled by default)
+      bundles:
+        default:
+          minReplicas: 0  # Scale to zero
+          maxReplicas: 10
+    rtx6000:
+      enabled: true
+      bundles:
+        default:          # embedding/rerank baseline
+          minReplicas: 1
+          maxReplicas: 5
+        sglang:           # generation, scale-from-zero on same GPUs
+          minReplicas: 0
+          maxReplicas: 5
 
 # Gateway configuration
 gateway:
@@ -151,6 +169,41 @@ autoscaling:
   enabled: true
   cooldownPeriod: 600  # 10 min before scale-down
 ```
+
+### Upgrading from the legacy single-bundle pool schema
+
+Releases up to and including 0.4.x used a flat schema where each pool
+declared a single `bundle:` plus `minReplicas:`/`maxReplicas:` at the
+pool level. That shape is no longer accepted — `bundles:` is required
+(see schema docs in `values.yaml`).
+
+The rename also changes resource names from `worker-<pool>` to
+`worker-<pool>-<bundle>` for StatefulSets, KEDA ScaledObjects, PDBs, and
+the image-prepull DaemonSet. `helm upgrade` creates the new resources
+but does not delete the old ones. The legacy resources are
+distinguishable from the new ones by the absence of the
+`sie.superlinked.com/bundle` label:
+
+```bash
+NS=sie  # release namespace
+
+# Pre-refactor worker family (no bundle label) — delete before/after upgrade
+kubectl -n "$NS" delete statefulset,pdb,daemonset \
+  -l 'app.kubernetes.io/component=worker,!sie.superlinked.com/bundle'
+
+# Pre-refactor image-prepull DaemonSets
+kubectl -n "$NS" delete daemonset \
+  -l 'app.kubernetes.io/component=image-prepull,!sie.superlinked.com/bundle'
+
+# Pre-refactor KEDA ScaledObjects (the chart's apply Job only creates;
+# it never deletes obsolete entries)
+kubectl -n "$NS" delete scaledobject \
+  -l 'app.kubernetes.io/component=worker,!sie.superlinked.com/bundle'
+```
+
+Run these once per cluster after the upgrade settles. Leftover
+ScaledObjects will keep trying to scale deleted StatefulSets and spam
+KEDA logs; leftover PDBs will block node drains.
 
 ## Ingress
 

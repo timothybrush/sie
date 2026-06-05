@@ -1,0 +1,70 @@
+sie_id: defog/sqlcoder-7b-2
+hf_id: defog/sqlcoder-7b-2
+# SQLCoder-7B-2 (Defog) — a CodeLlama-7B base fine-tuned for text-to-SQL.
+# Served via the existing SGLang generation adapter (LlamaForCausalLM is native
+# to SGLang); onboarding is config-only.
+#
+# CAVEATS (read before pointing model="sql" at this):
+#   * COMPLETION model, not chat-tuned. It expects its verbatim template
+#     (``### Task ... ### Database Schema ... ### Answer ...[SQL]``) via the
+#     completions path — a chat-completions wrapper will underperform. The
+#     model="sql" alias currently targets Qwen3-4B-Instruct (chat + grammar
+#     path); repoint here only once the SQLCoder prompt template + completions
+#     rendering are wired and measured on Spider.
+#   * dtype float16 (CodeLlama base; the card pins fp16).
+#   * License CC-BY-SA-4.0 (share-alike copyleft) — clear distribution/bundle
+#     use before shipping.
+#   * Card recommends num_beams=4 (beam search); SGLang serves greedy, so
+#     expect a small delta vs the published SQL-Eval numbers.
+#   * MEASURED in SIE (Modal A100): serves via the sglang.generation adapter.
+#     The native ### Task...[SQL] completions template is ESSENTIAL — generic
+#     chat prompt scored 0.025, the native template (spider_sqlcoder task,
+#     --mode completions) scored 0.467 (140/300, greedy) on 2026-06-03. But that
+#     still LOSES to general Qwen3-4B-Instruct at 0.70 on Spider exec-acc, so the
+#     model="sql" alias STAYS on Qwen3-4B-Instruct. (The card recommends
+#     num_beams=4; SGLang serves greedy, so 0.467 is a lower bound, but beam
+#     search is a serving change and would still likely trail.) See
+#     benchmarks/generation/Qwen__Qwen3-4B-Instruct-2507/sql/measured_baseline.json.
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  generate:
+    # Base model supports 16384; 8192 comfortably fits a Spider schema + question.
+    context_length: 8192
+    max_output_tokens: 512
+    capabilities:
+      # Grammar-constrained SQL (the "any LLM + grammar" path) is plausible via
+      # the SGLang outlines/xgrammar backend but unverified for this model, so
+      # nothing is advertised here yet.
+      grammar: []
+      streaming: true
+      tools: false
+      # NOT advertising sql:true. The capability flag would expose this model as
+      # SQL-ready to capability-based SDK/UI selection, but the currently-wired
+      # served path (generic chat) scores only 0.025 on Spider, and even with its
+      # native completions template (0.467) it loses to Qwen3-4B-Instruct (0.70 —
+      # the actual model="sql" target). Flip on only once SQLCoder beats the
+      # incumbent on a wired, measured path.
+profiles:
+  default:
+    # Generation does not batch at the SIE layer (SGLang batches internally) but
+    # the validator requires the field.
+    max_batch_tokens: 16384
+    compute_precision: float16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: defog/sqlcoder-7b-2
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        # Deterministic decode for text-to-SQL (the card uses do_sample=False).
+        default_sampling:
+          temperature: 0.0
+          top_p: 1.0

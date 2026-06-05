@@ -1904,6 +1904,68 @@ profiles:
     }
 
     #[test]
+    fn test_precision_bundle_override_routes_or_conflicts() {
+        // Validates the premise behind bundle-carrying job aliases (proxy.rs
+        // resolve_model_spec_with_aliases): one base model can be registered
+        // under TWO precision-labeled bundles that share the same generation
+        // adapter, so a `<bundle>:/model` override (what a `sql` alias expands
+        // to) actually routes to the chosen precision — and an unregistered
+        // bundle 409s rather than silently falling back to the FP8 default.
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        // Two bundles, same generation adapter → both match the model.
+        for name in ["fp8-pytorch", "bf16-pytorch"] {
+            fs::write(
+                bundles_dir.join(format!("{name}.yaml")),
+                format!(
+                    r#"
+name: {name}
+priority: 10
+adapters:
+  - sie_server.adapters.sglang.generation
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        fs::write(
+            models_dir.join("qwen3-27b.yaml"),
+            r#"
+name: Qwen/Qwen3.6-27B
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // The model lives in BOTH bundles → an operator can deploy a BF16
+        // variant under its own bundle (the deployment story the ADR describes).
+        assert_eq!(
+            registry
+                .resolve_bundle("Qwen/Qwen3.6-27B", Some("bf16-pytorch"))
+                .unwrap(),
+            "bf16-pytorch",
+        );
+        assert_eq!(
+            registry
+                .resolve_bundle("Qwen/Qwen3.6-27B", Some("fp8-pytorch"))
+                .unwrap(),
+            "fp8-pytorch",
+        );
+        // An alias pointing at a bundle the model is NOT registered under is a
+        // hard BundleConflict (409), not a silent fallback — the failure mode
+        // an operator must avoid when wiring SIE_GATEWAY_MODEL_ALIASES.
+        assert!(matches!(
+            registry.resolve_bundle("Qwen/Qwen3.6-27B", Some("no-such-bundle")),
+            Err(ResolveError::BundleConflict(_)),
+        ));
+    }
+
+    #[test]
     fn test_bundle_priority_ordering() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
 

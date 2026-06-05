@@ -29,6 +29,11 @@ tasks:
       grammar: ["json_schema", "regex"]
       streaming: true
       tools: true
+      # NOTE: not advertising code:true here yet — Qwen3.5-4B is the strongest
+      # model on paper but its NEXTN/hybrid serving path does not come up
+      # reliably on the current eval image, so it has no measured HumanEval/MBPP
+      # baseline. The ``model="code"`` alias points to the measured
+      # Qwen3-4B-Instruct-2507; promote this once 3.5-4B is measured.
     # Grammar backend: ``outlines`` (set per-profile under
     # ``adapter_options.loadtime``). Earlier revisions forced ``xgrammar``
     # here because the worker-side Outlines preflight (``compile_outlines``)

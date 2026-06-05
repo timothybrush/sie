@@ -1,0 +1,93 @@
+sie_id: ibm-granite/granite-guardian-3.0-2b
+hf_id: ibm-granite/granite-guardian-3.0-2b
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  # CHECK POLICY job: a generative guard model. It takes a conversation (or a
+  # single user message) and *generates* a one-token verdict — "Yes" (unsafe)
+  # or "No" (safe) — under a risk taxonomy. Its chat template defaults to the
+  # ``harm`` risk when no ``guardian_config`` is supplied, so the standard
+  # OpenAI ``/v1/chat/completions`` path elicits a moderation verdict with no
+  # special kwargs. Served on the same SGLang generation adapter as the other
+  # decoder-only LLMs (architecture: GraniteForCausalLM).
+  generate:
+    context_length: 8192
+    # Moderation needs only a couple of tokens ("Yes"/"No"); the cap is a
+    # generous ceiling, not a target.
+    max_output_tokens: 512
+    capabilities:
+      # Guard verdicts are free-form single tokens — no grammar/tools needed.
+      grammar: []
+      streaming: true
+      tools: false
+      # Content-moderation / policy-check job — MEASURED on ToxicChat via the
+      # generation gate (see safety/measured_baseline.json): high-recall (0.97)
+      # / low-precision (0.16) under the default 'harm' risk. Backs the
+      # model="guard" alias. Informational (not request-gated).
+      guard: true
+max_sequence_length: 8192
+profiles:
+  default:
+    # max_batch_tokens is a generic engine knob; generation does not batch at
+    # the SIE layer (SGLang batches internally) but the validator requires it.
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Conservative L4 baseline; moderation prompts are short so a small KV
+    # budget is ample. Re-calibrate with a concurrency/OOM sweep if promoted.
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: ibm-granite/granite-guardian-3.0-2b
+        # CHECK POLICY precision dial. The adapter reads the verdict-token
+        # logprobs, computes P(unsafe) over Yes/No, and returns "Yes" iff
+        # P(unsafe) >= threshold. threshold=0.5 == the model's argmax (the
+        # current high-recall default: recall 0.97 / precision 0.16). Measured
+        # ToxicChat trade-off (guard baseline logprob_threshold_sweep):
+        #   0.5  -> F1 0.26  recall 0.97  precision 0.15  (catch-everything)
+        #   0.8  -> F1 0.38  recall 0.54  precision 0.29  (best F1)
+        #   0.95 -> F1 0.31  recall 0.20  precision 0.70  (precision-critical)
+        # Raising it trades recall for precision — a PRODUCT/safety decision per
+        # deployment (a moderation guard usually favours recall), so the shipped
+        # default stays at argmax. Operators raise it to taste.
+        guard:
+          threshold: 0.5
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        # Greedy: a guard verdict must be deterministic.
+        default_sampling:
+          temperature: 0.0
+        stop_tokens:
+          - "<|end_of_text|>"
+  a100-40gb:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # ~2.5B weights leave most of a 40 GB card for KV; moderation traffic is
+    # short-context so this budget is set for many concurrent admissions.
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: ibm-granite/granite-guardian-3.0-2b
+        # Duplicated from ``default`` — this is a NON-extending profile, and
+        # loadtime blocks are whole-dict replaced (not deep-merged), so the
+        # CHECK POLICY precision dial would otherwise be dropped here and the
+        # A100 variant would silently fall back to raw argmax (self._guard={}).
+        # Keep in sync with the ``default`` profile's guard.threshold.
+        guard:
+          threshold: 0.5
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.0
+        stop_tokens:
+          - "<|end_of_text|>"

@@ -34,6 +34,23 @@ tasks:
       grammar: ["json_schema", "regex"]
       streaming: true
       tools: true
+      # Validated on code + text-to-SQL — MEASURED on Modal H100 (bf16 no-spec,
+      # greedy+min_tokens=10; accuracy is GPU-invariant + FP8≈BF16 per ADR
+      # 0001): HumanEval 0.933, MBPP 0.81 (beats the 4B code default 0.866/0.74),
+      # Spider exec-acc 0.693. See code_sql_tools/measured_baseline.json.
+      # Informational (not request-gated); surfaces the high-end code/SQL option.
+      code: true
+      # CAVEAT: this flag is precision-agnostic, but FP8 weight quant regresses
+      # SQL ~13pts (Spider 0.71 BF16 -> 0.58 FP8, same-subset control; see the
+      # ADR + baseline). Code/tools/MC are FP8-safe. The default rtx-pro-6000
+      # profile is FP8, so route SQL-critical traffic to the BF16+NEXTN variant
+      # (the 96GB card fits it). The `:profile` variant suffix can't route by
+      # precision (it's stripped before worker dispatch), so deploy the BF16
+      # variant under a distinct bundle and point the `sql` job alias at it via
+      # a bundle-qualified target, e.g.
+      # SIE_GATEWAY_MODEL_ALIASES={"sql":"<bf16-bundle>:/Qwen/Qwen3.6-27B"}
+      # (gateway resolve_model_spec_with_aliases; see ADR 0001).
+      sql: true
     # Qwen3.6 emits ``<think>...</think>`` reasoning by default. We
     # disable it for the OpenAI-compat path so visible output is the
     # answer only. Operators wanting CoT can flip this profile-side.

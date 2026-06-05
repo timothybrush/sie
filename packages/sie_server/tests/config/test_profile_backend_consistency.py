@@ -93,3 +93,75 @@ def test_status_doc_names_outlines_as_backend_of_record() -> None:
         f"reconciled: {hits}. Production profiles ship grammar_backend: "
         f"outlines; the doc must match the code."
     )
+
+
+MODELS_DIR = SIE_SERVER_ROOT / "models"
+GUARDIAN_PROFILE = MODELS_DIR / "ibm-granite__granite-guardian-3.0-2b.yaml"
+
+# The SGLang generation adapter defaults ``grammar_backend`` to "outlines"
+# (see adapters/sglang/generation.py). Only these backends actually compile
+# EBNF; outlines skips/fails it.
+DEFAULT_GRAMMAR_BACKEND = "outlines"
+EBNF_CAPABLE_BACKENDS = {"xgrammar", "llguidance"}
+
+
+def _grammar_capabilities(data: dict) -> list[str]:
+    caps = ((data.get("tasks") or {}).get("generate") or {}).get("capabilities") or {}
+    grammar = caps.get("grammar") or []
+    return [str(k) for k in grammar] if isinstance(grammar, list) else []
+
+
+def test_advertised_ebnf_requires_capable_backend() -> None:
+    """A model may advertise ``ebnf`` only if every profile pins an EBNF-capable backend.
+
+    The gateway admits grammar requests purely on the advertised
+    ``capabilities.grammar`` list. If a profile advertises ``ebnf`` but runs the
+    default ``outlines`` backend (which cannot compile EBNF), the gateway admits
+    a request the worker then fails to serve. This guards that advertise-vs-serve
+    invariant across every shipped model YAML.
+    """
+    offenders: list[str] = []
+    for path in sorted(MODELS_DIR.glob("*.yaml")):
+        data = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(data, dict) or "ebnf" not in _grammar_capabilities(data):
+            continue
+        profiles = data.get("profiles") or {}
+        for name, entry in profiles.items():
+            if not isinstance(entry, dict):
+                continue
+            loadtime = (entry.get("adapter_options") or {}).get("loadtime") or {}
+            backend = str(loadtime.get("grammar_backend") or DEFAULT_GRAMMAR_BACKEND)
+            if backend not in EBNF_CAPABLE_BACKENDS:
+                offenders.append(f"{path.name}:{name} advertises ebnf but runs grammar_backend={backend!r}")
+    assert not offenders, (
+        "Model(s) advertise 'ebnf' without an EBNF-capable grammar_backend "
+        f"({sorted(EBNF_CAPABLE_BACKENDS)}); the gateway would admit EBNF requests "
+        f"the worker cannot serve: {offenders}"
+    )
+
+
+def test_guardian_profiles_carry_guard_threshold() -> None:
+    """Every Granite Guardian profile must carry the guard threshold load-time dial.
+
+    Loadtime blocks are whole-dict replaced (not deep-merged) across profiles, so
+    a non-extending variant that omits ``guard`` constructs with ``self._guard={}``
+    and silently skips CHECK POLICY thresholding (falls back to raw argmax).
+    """
+    if not GUARDIAN_PROFILE.exists():
+        pytest.skip(f"Guardian profile not present at {GUARDIAN_PROFILE}")
+    data = yaml.safe_load(GUARDIAN_PROFILE.read_text()) or {}
+    profiles = data.get("profiles") or {}
+    assert profiles, f"No profiles found in {GUARDIAN_PROFILE.name}"
+    missing: list[str] = []
+    for name, entry in profiles.items():
+        if not isinstance(entry, dict):
+            continue
+        loadtime = (entry.get("adapter_options") or {}).get("loadtime") or {}
+        threshold = (loadtime.get("guard") or {}).get("threshold")
+        if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+            missing.append(name)
+    assert not missing, (
+        f"Granite Guardian profile(s) missing guard.threshold load-time config: "
+        f"{missing}. Non-extending profiles do not inherit it, so the variant would "
+        f"skip thresholding. Duplicate the guard block into each profile's loadtime."
+    )

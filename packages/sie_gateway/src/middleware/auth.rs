@@ -323,6 +323,7 @@ mod tests {
         Arc::new(Config {
             host: String::new(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: String::new(),
@@ -346,6 +347,7 @@ mod tests {
             stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,

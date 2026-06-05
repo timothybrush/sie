@@ -31,6 +31,23 @@ pub struct ModelInfoExtras {
     /// has no ``generate`` task). Defaults to ``false`` per
     /// :class:`sie_server.config.model.GenerateCapabilities`.
     pub tools_supported: Option<bool>,
+    /// ``tasks.generate.capabilities.code`` from the model YAML — a
+    /// boolean advertising whether the model is validated for code
+    /// generation (backs the ``model="code"`` alias). Informational
+    /// only; never request-gated. Defaults to ``false`` when the
+    /// ``capabilities`` block or the key is absent.
+    pub code: bool,
+    /// ``tasks.generate.capabilities.sql`` from the model YAML — a
+    /// boolean advertising whether the model targets the SQL path
+    /// (backs the ``model="sql"`` alias). Informational only; never
+    /// request-gated. Defaults to ``false`` when absent.
+    pub sql: bool,
+    /// ``tasks.generate.capabilities.guard`` from the model YAML — a
+    /// boolean advertising whether the model is a content-moderation /
+    /// policy-check guard (backs the ``model="guard"`` alias).
+    /// Informational only; never request-gated. Defaults to ``false``
+    /// when absent.
+    pub guard: bool,
     /// Multi-LoRA served-names advertised on ``/v1/models`` under
     /// ``capabilities.lora_adapters``. Union of the public served-names across
     /// the model's profiles (``profiles.<p>.adapter_options.loadtime.lora_paths``
@@ -163,6 +180,23 @@ impl ModelInfoExtras {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 extras.tools_supported = Some(tools);
+                // ``capabilities.{code,sql,guard}: bool`` — informational
+                // job-capability flags that back the ``model="code"`` /
+                // ``"sql"`` / ``"guard"`` aliases. Each defaults to
+                // ``false`` when the ``capabilities`` block or the key is
+                // absent (mirrors :class:`GenerateCapabilities`).
+                extras.code = capabilities
+                    .and_then(|m| m.get("code"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                extras.sql = capabilities
+                    .and_then(|m| m.get("sql"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                extras.guard = capabilities
+                    .and_then(|m| m.get("guard"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             }
         }
 
@@ -231,6 +265,9 @@ impl ModelInfoExtras {
                 max_output_tokens: None,
                 grammar_capabilities: None,
                 tools_supported: None,
+                code: false,
+                sql: false,
+                guard: false,
                 lora_adapters: None,
                 profile_lora_adapters: None,
             },
@@ -313,6 +350,9 @@ impl ModelEntry {
                 "profile_lora_adapters": self.info_extras.profile_lora_adapters,
                 "grammar": self.info_extras.grammar_capabilities,
                 "tools": self.info_extras.tools_supported,
+                "code": self.info_extras.code,
+                "sql": self.info_extras.sql,
+                "guard": self.info_extras.guard,
             },
         })
     }
@@ -742,6 +782,142 @@ tasks:
         .unwrap();
         let extras = ModelInfoExtras::from_yaml_raw(&raw);
         assert_eq!(extras.tools_supported, Some(true));
+    }
+
+    #[test]
+    fn test_model_info_extras_code_sql_guard_capabilities_parsed() {
+        // Qwen3-4B-Instruct-2507 advertises code + sql (and tools); it is
+        // not a guard model. Mirrors
+        // ``packages/sie_server/models/Qwen__Qwen3-4B-Instruct-2507.yaml``.
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: Qwen/Qwen3-4B-Instruct-2507
+inputs:
+  text: true
+tasks:
+  generate:
+    context_length: 32768
+    max_output_tokens: 4096
+    capabilities:
+      grammar: ["json_schema", "regex", "ebnf"]
+      tools: true
+      code: true
+      sql: true
+"#,
+        )
+        .unwrap();
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert!(extras.code);
+        assert!(extras.sql);
+        assert!(!extras.guard);
+
+        // Qwen3.6-27B also advertises code + sql. Mirrors
+        // ``packages/sie_server/models/Qwen__Qwen3.6-27B.yaml``.
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: Qwen/Qwen3.6-27B
+inputs:
+  text: true
+tasks:
+  generate:
+    context_length: 32768
+    max_output_tokens: 4096
+    capabilities:
+      grammar: ["json_schema", "regex"]
+      tools: true
+      code: true
+      sql: true
+"#,
+        )
+        .unwrap();
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert!(extras.code);
+        assert!(extras.sql);
+        assert!(!extras.guard);
+
+        // Granite Guardian 3.0-2b advertises guard only. Mirrors
+        // ``packages/sie_server/models/ibm-granite__granite-guardian-3.0-2b.yaml``.
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: ibm-granite/granite-guardian-3.0-2b
+inputs:
+  text: true
+tasks:
+  generate:
+    context_length: 8192
+    max_output_tokens: 512
+    capabilities:
+      grammar: []
+      tools: false
+      guard: true
+"#,
+        )
+        .unwrap();
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert!(extras.guard);
+        assert!(!extras.code);
+        assert!(!extras.sql);
+    }
+
+    #[test]
+    fn test_model_info_extras_code_sql_guard_default_false_when_absent() {
+        // No ``capabilities`` block at all — all three default to false.
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: m
+inputs:
+  text: true
+tasks:
+  generate:
+    context_length: 1024
+    max_output_tokens: 512
+"#,
+        )
+        .unwrap();
+        let extras = ModelInfoExtras::from_yaml_raw(&raw);
+        assert!(!extras.code);
+        assert!(!extras.sql);
+        assert!(!extras.guard);
+    }
+
+    #[test]
+    fn test_to_model_info_value_surfaces_code_sql_guard_flags() {
+        // The three flags must surface inside the same ``capabilities``
+        // JSON object as ``grammar``/``tools``, using snake_case wire keys.
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+name: Qwen/Qwen3-4B-Instruct-2507
+inputs:
+  text: true
+tasks:
+  generate:
+    context_length: 32768
+    max_output_tokens: 4096
+    capabilities:
+      grammar: ["json_schema"]
+      tools: true
+      code: true
+      sql: true
+"#,
+        )
+        .unwrap();
+        let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
+        let entry = ModelEntry {
+            name: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            bundles: Vec::new(),
+            adapter_modules: HashSet::new(),
+            profile_names: HashSet::new(),
+            profile_configs: HashMap::new(),
+            info_extras,
+        };
+        let body = entry.to_model_info_value(false);
+        let caps = body
+            .get("capabilities")
+            .and_then(|c| c.as_object())
+            .expect("capabilities block");
+        assert_eq!(caps.get("code"), Some(&json!(true)));
+        assert_eq!(caps.get("sql"), Some(&json!(true)));
+        assert_eq!(caps.get("guard"), Some(&json!(false)));
     }
 
     #[test]

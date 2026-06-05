@@ -109,10 +109,19 @@ class TestFlorence2Adapter:
         prompt = adapter._build_prompt("<OCR>", labels=None, instruction=None)
         assert prompt == "<OCR>"
 
-    def test_build_prompt_with_instruction(self, adapter: Florence2Adapter) -> None:
-        """Build prompt appends instruction."""
-        prompt = adapter._build_prompt("<OCR>", labels=None, instruction="Extract all text")
-        assert prompt == "<OCR>Extract all text"
+    def test_build_prompt_free_text_instruction_uses_docvqa(self, adapter: Florence2Adapter) -> None:
+        """A free-text instruction is answered via DocVQA, not appended to the task.
+
+        Regression for #1053: appending an instruction to a region/OCR task token
+        makes Florence-2's processor raise ("task token should be the only token").
+        """
+        prompt = adapter._build_prompt("<OCR_WITH_REGION>", labels=None, instruction="What is the title?")
+        assert prompt == "<DocVQA>What is the title?"
+
+    def test_build_prompt_instruction_with_task_token_used_verbatim(self, adapter: Florence2Adapter) -> None:
+        """An instruction that already carries a task token is used verbatim (no double token)."""
+        prompt = adapter._build_prompt("<DocVQA>", labels=None, instruction="<DocVQA> What is the title?")
+        assert prompt == "<DocVQA>What is the title?"
 
     def test_build_prompt_phrase_grounding_with_labels(self, adapter: Florence2Adapter) -> None:
         """Build prompt appends labels for phrase grounding."""
@@ -159,3 +168,75 @@ class TestFlorence2Adapter:
         assert objects[0]["label"] == "car"
         assert objects[0]["score"] == 1.0
         assert objects[0]["bbox"] is not None
+
+    def test_extract_threads_docvqa_task_into_postprocessing(
+        self,
+        adapter: Florence2Adapter,
+        mock_florence2_model: MagicMock,
+        mock_florence2_processor: MagicMock,
+    ) -> None:
+        """A free-text instruction makes extract() post-process as DocVQA, not OCR.
+
+        Regression for #1053: the configured task is <OCR_WITH_REGION>, but an
+        instruction must switch both the prompt and the post-processing to DocVQA.
+        """
+        import io
+
+        from PIL import Image as PILImage
+        from sie_server.types.inputs import ImageInput
+
+        mock_florence2_processor.batch_decode.return_value = ["<s><DocVQA>1.8 to 5.5 V</s>"]
+        mock_florence2_processor.post_process_generation.return_value = {"<DocVQA>": "1.8 to 5.5 V"}
+        adapter._model = mock_florence2_model
+        adapter._processor = mock_florence2_processor
+        adapter._device = "cpu"
+
+        buf = io.BytesIO()
+        PILImage.new("RGB", (8, 8), "white").save(buf, format="JPEG")
+        items = [Item(images=[ImageInput(data=buf.getvalue(), format="jpeg")])]
+        out = adapter.extract(items, instruction="What is the operating voltage range?")
+
+        # Post-processing must be asked for the DocVQA task, not the configured OCR task.
+        _, kwargs = mock_florence2_processor.post_process_generation.call_args
+        assert kwargs["task"] == "<DocVQA>"
+        assert out.entities[0][0]["text"] == "1.8 to 5.5 V"
+        assert out.entities[0][0]["label"] == "answer"
+
+
+class TestResolveFlorence2Prompt:
+    """Tests for the shared Florence-2 prompt/task resolver."""
+
+    def test_no_instruction_keeps_configured_task(self) -> None:
+        from sie_server.core.preprocessor.vision import resolve_florence2_prompt
+
+        assert resolve_florence2_prompt("<OCR_WITH_REGION>", None, None) == (
+            "<OCR_WITH_REGION>",
+            "<OCR_WITH_REGION>",
+        )
+
+    def test_free_text_instruction_becomes_docvqa(self) -> None:
+        from sie_server.core.preprocessor.vision import resolve_florence2_prompt
+
+        # Even though the configured task is OCR, a free-text question is DocVQA.
+        assert resolve_florence2_prompt("<OCR_WITH_REGION>", None, "What is the title?") == (
+            "<DocVQA>What is the title?",
+            "<DocVQA>",
+        )
+
+    def test_instruction_with_task_token_is_verbatim(self) -> None:
+        from sie_server.core.preprocessor.vision import resolve_florence2_prompt
+
+        # No double task token, leading/inner whitespace normalised.
+        assert resolve_florence2_prompt("<DocVQA>", None, "<DocVQA> What is the title?") == (
+            "<DocVQA>What is the title?",
+            "<DocVQA>",
+        )
+        assert resolve_florence2_prompt("<OCR_WITH_REGION>", None, "<CAPTION>") == ("<CAPTION>", "<CAPTION>")
+
+    def test_phrase_grounding_appends_labels(self) -> None:
+        from sie_server.core.preprocessor.vision import resolve_florence2_prompt
+
+        assert resolve_florence2_prompt("<CAPTION_TO_PHRASE_GROUNDING>", ["person", "car"], None) == (
+            "<CAPTION_TO_PHRASE_GROUNDING>person, car",
+            "<CAPTION_TO_PHRASE_GROUNDING>",
+        )

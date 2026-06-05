@@ -169,6 +169,33 @@ class ModelDims(TypedDict, total=False):
     multivector: int
 
 
+class ModelCapabilities(TypedDict, total=False):
+    """Advertised model capabilities.
+
+    Mirrors the gateway ``capabilities`` object on each ``/v1/models``
+    entry (``ModelCapabilitiesWire``). All keys are optional; their
+    presence depends on what the model config declares. ``grammar`` is
+    the list of supported grammar kinds (``json_schema`` | ``regex`` |
+    ``ebnf``). ``code``/``sql``/``guard`` are informational flags that
+    advertise validated generation jobs and back the ``model="code"`` /
+    ``model="sql"`` / ``model="guard"`` aliases.
+
+    These flags mean the model *supports* a task — they are NOT a
+    precision-independent quality SLA. A flag is true at the model level even
+    when quality is profile/precision-dependent (e.g. ``sql`` quality regresses
+    under FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``
+    alias). Treat them as "can do this", not "guaranteed to score X".
+    """
+
+    grammar: list[str]
+    tools: bool
+    lora_adapters: list[str]
+    profile_lora_adapters: dict[str, list[str]]
+    code: bool
+    sql: bool
+    guard: bool
+
+
 class ModelInfo(TypedDict, total=False):
     """Information about a model returned by list_models().
 
@@ -181,6 +208,7 @@ class ModelInfo(TypedDict, total=False):
     outputs: list[str]  # ["dense"], ["dense", "sparse"], etc.
     dims: ModelDims
     max_sequence_length: int
+    capabilities: ModelCapabilities
 
 
 class ScoreEntry(TypedDict):

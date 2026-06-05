@@ -1,20 +1,26 @@
 {{- $root := . -}}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
+{{- range $bundleName, $bundleCfg := $pool.bundles }}
+{{- if dig "enabled" true $bundleCfg }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}
+  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}
   namespace: {{ include "sie-cluster.namespace" $root }}
   labels:
     {{- include "sie-cluster.worker.labels" $root | nindent 4 }}
     sie.superlinked.com/pool: {{ $poolName | quote }}
+    sie.superlinked.com/bundle: {{ $bundleName | quote }}
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "sie-cluster.worker.selectorLabels" $root | nindent 6 }}
       sie.superlinked.com/pool: {{ $poolName | quote }}
+      sie.superlinked.com/bundle: {{ $bundleName | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

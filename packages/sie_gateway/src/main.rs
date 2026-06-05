@@ -23,6 +23,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::watch;
 use tracing::info;
 
 use config::Config;
@@ -635,7 +636,10 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         config_epoch: config_epoch.clone(),
     });
 
-    let app = server::create_router(state, Arc::clone(&config));
+    let app = server::create_router(Arc::clone(&state), Arc::clone(&config));
+    let metrics_app = config
+        .metrics_port
+        .map(|_| server::create_metrics_router(Arc::clone(&state)));
 
     info!(
         addr = %addr,
@@ -644,11 +648,39 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         "starting SIE Gateway"
     );
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let listener = TcpListener::bind(&addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let metrics_handle = match (config.metrics_port, metrics_app) {
+        (Some(metrics_port), Some(metrics_app)) => {
+            let metrics_addr = format!("{}:{}", config.host, metrics_port);
+            let metrics_listener = TcpListener::bind(&metrics_addr).await?;
+            let metrics_shutdown = shutdown_rx.clone();
+            info!(
+                addr = %metrics_addr,
+                "starting SIE Gateway metrics listener"
+            );
+            Some(tokio::spawn(async move {
+                axum::serve(metrics_listener, metrics_app)
+                    .with_graceful_shutdown(wait_for_shutdown(metrics_shutdown))
+                    .await
+            }))
+        }
+        _ => None,
+    };
+
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx_for_signal.send(true);
+        })
+        .await;
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = metrics_handle {
+        handle.await??;
+    }
+    serve_result?;
 
     info!("server stopped");
 
@@ -693,6 +725,14 @@ async fn shutdown_signal() {
         }
         _ = terminate => {
             info!("shutdown signal received (SIGTERM)");
+        }
+    }
+}
+
+async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            break;
         }
     }
 }

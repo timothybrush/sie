@@ -14,12 +14,18 @@ tasks:
     context_length: 32768
     max_output_tokens: 4096
     capabilities:
-      # Outlines-backed JSON Schema, regex, and EBNF grammars are
-      # all supported by the SGLang adapter (Outlines and XGrammar
-      # both accept EBNF natively). The gateway gates requests on
-      # this exact list — adding a new ``grammar.kind`` variant
-      # requires both the gateway parser and this list to be updated.
-      grammar: ["json_schema", "regex", "ebnf"]
+      # Same constraint as Qwen3.5-4B / Qwen3.6-27B: this profile runs the
+      # default ``grammar_backend: outlines``, and SGLang's outlines_backend
+      # does NOT implement ebnf (it logs ``Skip unsupported key_type='ebnf'``
+      # then fails the compile — confirmed on A100 smoke 2026-05-26). Only
+      # advertise ``"ebnf"`` here once a profile pins an EBNF-capable backend
+      # (``grammar_backend: xgrammar``) AND a via-SIE EBNF smoke passes; the
+      # gateway gates requests on this exact list, so advertising ebnf without
+      # an ebnf-capable backend admits requests the worker then fails to serve.
+      # The ``test_advertised_ebnf_requires_capable_backend`` consistency test
+      # guards this invariant. Adding a new ``grammar.kind`` variant requires
+      # both the gateway parser and this list to be updated.
+      grammar: ["json_schema", "regex"]
       streaming: true
       # Qwen3-4B-Instruct's chat template emits OpenAI-compatible
       # ``<tool_call>{...}</tool_call>`` blocks when ``tools`` is
@@ -28,6 +34,16 @@ tasks:
       # them on ``delta.tool_calls`` for SSE and on
       # ``message.tool_calls`` for non-streaming requests.
       tools: true
+      # Validated for code generation — MEASURED HumanEval 0.866 / MBPP 0.74 on
+      # Modal A100 (see benchmarks/generation/.../code/measured_baseline.json).
+      # Backs the model="code" alias. Informational (not request-gated).
+      code: true
+      # Backs the model="sql" alias. NOTE: this profile runs the outlines
+      # backend (no ebnf), so SQL output here relies on the model's native
+      # text-to-SQL ability, NOT an EBNF grammar constraint. Re-add ``"ebnf"``
+      # to ``grammar`` above (behind an xgrammar profile + via-SIE EBNF smoke)
+      # to enable grammar-constrained SQL. Informational (not request-gated).
+      sql: true
     # Forwarded verbatim to ``tokenizer.apply_chat_template(**kwargs)`` when
     # the worker renders an OpenAI-shaped ``messages`` request.
     # Qwen3's chat template emits a ``<think>``/``</think>`` reasoning block

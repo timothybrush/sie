@@ -387,6 +387,83 @@ class NemoColEmbedPreprocessor:
         }
 
 
+# Florence-2 dispatches behaviour on a single leading task token. The processor
+# asserts that region/OCR task tokens (e.g. <OCR_WITH_REGION>) stand alone, so an
+# instruction must never be appended to them — a free-text instruction is a
+# question and is answered through DocVQA instead.
+_FLORENCE2_DOCVQA = "<DocVQA>"
+_FLORENCE2_PHRASE_GROUNDING = "<CAPTION_TO_PHRASE_GROUNDING>"
+_FLORENCE2_TASK_TOKENS = frozenset(
+    {
+        "<OCR>",
+        "<OCR_WITH_REGION>",
+        "<OD>",
+        "<CAPTION>",
+        "<DETAILED_CAPTION>",
+        "<MORE_DETAILED_CAPTION>",
+        "<DENSE_REGION_CAPTION>",
+        "<REGION_PROPOSAL>",
+        "<CAPTION_TO_PHRASE_GROUNDING>",
+        "<DocVQA>",
+        "<REFERRING_EXPRESSION_SEGMENTATION>",
+        "<REGION_TO_SEGMENTATION>",
+        "<OPEN_VOCABULARY_DETECTION>",
+        "<REGION_TO_CATEGORY>",
+        "<REGION_TO_DESCRIPTION>",
+        "<REGION_TO_OCR>",
+    }
+)
+
+
+def _leading_florence2_task_token(text: str) -> str | None:
+    """Return the leading Florence-2 ``<TASK>`` token of ``text``, or None."""
+    if not text.startswith("<"):
+        return None
+    end = text.find(">")
+    if end == -1:
+        return None
+    token = text[: end + 1]
+    return token if token in _FLORENCE2_TASK_TOKENS else None
+
+
+def resolve_florence2_prompt(
+    task: str,
+    labels: list[str] | None,
+    instruction: str | None,
+) -> tuple[str, str]:
+    """Resolve the Florence-2 prompt and its effective task token.
+
+    Florence-2 selects its task from a single leading token. A free-text
+    ``instruction`` is a question, so it is answered via DocVQA unless it already
+    carries an explicit task token (which is then used verbatim). The configured
+    ``task`` is used only when no instruction is supplied; appending an
+    instruction to a region/OCR task is invalid (the processor asserts that such
+    tokens must stand alone) and so is never done.
+
+    Args:
+        task: Configured task token (e.g. ``<OCR_WITH_REGION>``).
+        labels: Optional labels, appended for phrase grounding.
+        instruction: Optional free-text instruction or explicit ``<TASK>`` prompt.
+
+    Returns:
+        Tuple of (prompt, effective_task): the prompt string fed to the processor
+        and the task token to use when post-processing the generated text.
+    """
+    if instruction:
+        instr = instruction.strip()
+        token = _leading_florence2_task_token(instr)
+        if token is not None:
+            body = instr[len(token) :].strip()
+            return (f"{token}{body}" if body else token), token
+        return f"{_FLORENCE2_DOCVQA}{instr}", _FLORENCE2_DOCVQA
+
+    if task == _FLORENCE2_PHRASE_GROUNDING and labels:
+        label_text = ", ".join(labels)
+        return f"{task}{label_text}", task
+
+    return task, task
+
+
 class Florence2Preprocessor:
     """Preprocessor for Florence-2 document understanding model.
 
@@ -496,10 +573,9 @@ class Florence2Preprocessor:
         Returns:
             PreparedBatch with Florence2Payload items.
         """
-        # Build prompt
-        prompt = task or self._default_task
-        if instruction:
-            prompt = f"{prompt}{instruction}"
+        # Build prompt. A free-text instruction is answered via DocVQA; it is
+        # never appended to a region/OCR task token (see resolve_florence2_prompt).
+        prompt, _ = resolve_florence2_prompt(task or self._default_task, None, instruction)
 
         # Single item: process directly (no thread pool overhead)
         if len(items) == 1:

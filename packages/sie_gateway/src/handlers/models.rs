@@ -175,6 +175,9 @@ fn worker_only_model_info(name: &str, loaded: bool) -> Value {
             max_output_tokens: None,
             grammar_capabilities: None,
             tools_supported: None,
+            code: false,
+            sql: false,
+            guard: false,
             lora_adapters: None,
             profile_lora_adapters: None,
         },
@@ -321,6 +324,7 @@ mod route_tests {
         Config {
             host: "127.0.0.1".to_string(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: "default".to_string(),
@@ -344,6 +348,7 @@ mod route_tests {
             stream_max_age_s: 120,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
@@ -409,6 +414,71 @@ mod route_tests {
                 max_sequence_length: None,
             })
             .unwrap();
+    }
+
+    // End-to-end through the routing entry point (proxy::resolve_model_and_bundle),
+    // not just the pure resolver: a `sql` job alias whose target carries a BF16
+    // bundle routes model="sql" to that bundle, a `code` alias to the FP8 bundle
+    // of the SAME base model, an explicit caller bundle overrides the alias, and
+    // an alias pointing at a bundle the model isn't registered under is a hard
+    // error (not a silent FP8 fallback). Validates the #1184 precision-routing
+    // mechanism against a real AppState + ModelRegistry.
+    #[test]
+    fn test_resolve_model_and_bundle_alias_carries_precision_bundle() {
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        // Two bundles sharing the seeded model's adapter → the model lives in both.
+        for name in ["fp8-pytorch", "bf16-pytorch"] {
+            std::fs::write(
+                bundles_dir.path().join(format!("{name}.yaml")),
+                format!("name: {name}\nadapters:\n  - module\n"),
+            )
+            .unwrap();
+        }
+
+        let mut config = test_config(
+            bundles_dir.path().to_str().unwrap(),
+            models_dir.path().to_str().unwrap(),
+        );
+        config.model_aliases = HashMap::from([
+            ("sql".to_string(), "bf16-pytorch:/test/model".to_string()),
+            ("code".to_string(), "fp8-pytorch:/test/model".to_string()),
+            ("broken".to_string(), "ghost-bundle:/test/model".to_string()),
+        ]);
+        let config = Arc::new(config);
+        let model_registry = Arc::new(ModelRegistry::new(
+            bundles_dir.path(),
+            models_dir.path(),
+            true,
+        ));
+        let state = AppState {
+            registry: Arc::new(WorkerRegistry::new(Duration::from_secs(30), None)),
+            config: Arc::clone(&config),
+            model_registry,
+            pool_manager: Arc::new(PoolManager::new(Vec::new())),
+            work_publisher: None,
+            demand_tracker: Arc::new(DemandTracker::new()),
+            config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+        };
+        seed_model(&state, "test/model");
+
+        use crate::handlers::proxy::resolve_model_and_bundle;
+        // sql -> BF16 bundle; code -> FP8 bundle (same base model, different precision).
+        assert_eq!(
+            resolve_model_and_bundle(&state, "sql").unwrap(),
+            ("test/model".to_string(), "bf16-pytorch".to_string()),
+        );
+        assert_eq!(
+            resolve_model_and_bundle(&state, "code").unwrap(),
+            ("test/model".to_string(), "fp8-pytorch".to_string()),
+        );
+        // An explicit caller bundle overrides the alias's bundle.
+        assert_eq!(
+            resolve_model_and_bundle(&state, "fp8-pytorch:/sql").unwrap(),
+            ("test/model".to_string(), "fp8-pytorch".to_string()),
+        );
+        // Alias -> a bundle the model isn't registered under: hard 409, no fallback.
+        assert!(resolve_model_and_bundle(&state, "broken").is_err());
     }
 
     /// Seed a multi-profile model whose profiles declare disjoint LoRA

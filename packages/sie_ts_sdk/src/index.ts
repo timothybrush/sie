@@ -40,6 +40,7 @@ export type {
   DetectedObject,
   ExtractResult,
   // Model and cluster info
+  ModelCapabilities,
   ModelDims,
   ModelInfo,
   ModelState,

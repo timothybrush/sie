@@ -76,16 +76,18 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation
     helm.sh/hook-weight: "1"
 data:
-  # Worker pool ScaledObjects (one per enabled pool)
+  # Worker pool ScaledObjects (one per enabled (pool, bundle))
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
-{{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
 {{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
-  scaledobject-worker-{{ $poolName }}.yaml: |
+{{- range $bundleName, $bundleCfg := $pool.bundles }}
+{{- if dig "enabled" true $bundleCfg }}
+{{- $bundle := $bundleName }}
+  scaledobject-worker-{{ $poolName }}-{{ $bundleName }}.yaml: |
     apiVersion: keda.sh/v1alpha1
     kind: ScaledObject
     metadata:
-      name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-scaler
+      name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}-scaler
       namespace: {{ include "sie-cluster.namespace" $root }}
       labels:
         {{- include "sie-cluster.worker.labels" $root | nindent 8 }}
@@ -94,9 +96,9 @@ data:
     spec:
       scaleTargetRef:
         kind: StatefulSet
-        name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}
-      minReplicaCount: {{ $pool.minReplicas }}
-      maxReplicaCount: {{ $pool.maxReplicas }}
+        name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}
+      minReplicaCount: {{ $bundleCfg.minReplicas }}
+      maxReplicaCount: {{ $bundleCfg.maxReplicas }}
       pollingInterval: {{ $root.Values.autoscaling.pollingInterval }}
       cooldownPeriod: {{ $root.Values.autoscaling.cooldownPeriod }}
       fallback:
@@ -129,21 +131,21 @@ data:
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
-            metricName: sie_gateway_pending_demand_{{ $poolName }}
+            metricName: sie_gateway_pending_demand_{{ $poolName }}_{{ $bundleName }}
             query: sum(sie_gateway_pending_demand{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: "1"
             activationThreshold: "0"
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
-            metricName: sie_gateway_queue_depth_{{ $poolName }}
+            metricName: sie_gateway_queue_depth_{{ $poolName }}_{{ $bundleName }}
             query: sum(sie_gateway_worker_queue_depth{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: {{ $root.Values.autoscaling.queueDepthThreshold | quote }}
             activationThreshold: {{ $root.Values.autoscaling.queueDepthActivation | quote }}
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
-            metricName: sie_gateway_active_lease_gpus_{{ $poolName }}
+            metricName: sie_gateway_active_lease_gpus_{{ $poolName }}_{{ $bundleName }}
             query: sum(sie_gateway_active_lease_gpus{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: "1"
             activationThreshold: "0"
@@ -183,6 +185,8 @@ data:
             query: sum(rate(sie_gateway_rejected_requests_total{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}", reason!~"resource_exhausted|upstream_model_loading|upstream_timeout_model_loading|upstream_lora_loading"}[2m])) or vector(0)
             threshold: "1"
             activationThreshold: "0"
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
   # Gateway ScaledObject

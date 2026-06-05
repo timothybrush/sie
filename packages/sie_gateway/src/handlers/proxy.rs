@@ -604,11 +604,13 @@ async fn proxy_request(
         );
     }
 
-    // Parse model spec: [bundle:/]org/model
-    let (bundle_override, model_name_from_path) = parse_model_spec(&model);
-    let model_name = resolve_path_model_id(&model_name_from_path, |id| {
-        state.model_registry.resolve_canonical_model_name(id)
-    });
+    // Parse model spec: [bundle:/]org/model, expanding a job/friendly alias
+    // whose target may carry a precision/profile bundle (see
+    // resolve_model_spec_with_aliases).
+    let (bundle_override, model_name) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, &model, |m| {
+            state.model_registry.resolve_canonical_model_name(m)
+        });
     let bundle_override_ref = if bundle_override.is_empty() {
         None
     } else {
@@ -4059,14 +4061,14 @@ fn map_chat_finish_reason(sie: &str) -> &'static str {
 // resolution helpers return it for the caller to `return` directly, mirroring
 // the handlers' own pattern.
 #[allow(clippy::result_large_err)]
-fn resolve_model_and_bundle(
+pub(crate) fn resolve_model_and_bundle(
     state: &AppState,
     model_spec: &str,
 ) -> Result<(String, String), Response> {
-    let (bundle_override, model_name_from_body) = parse_model_spec(model_spec);
-    let model_name = resolve_path_model_id(&model_name_from_body, |id| {
-        state.model_registry.resolve_canonical_model_name(id)
-    });
+    let (bundle_override, model_name) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, model_spec, |m| {
+            state.model_registry.resolve_canonical_model_name(m)
+        });
     let bundle_override_ref = if bundle_override.is_empty() {
         None
     } else {
@@ -6188,6 +6190,87 @@ fn resolve_path_model_id(path_id: &str, canonicalize: impl Fn(&str) -> Option<St
         }
     }
     path_id.to_string()
+}
+
+/// Canonicalise `id`, falling back to a configured job/friendly alias.
+///
+/// A real model id resolves through `canonicalize` directly. Otherwise, if
+/// `id` (case-insensitive) is a configured alias (e.g. `"code"`), its target
+/// is substituted and canonicalised; when the target itself is not in the
+/// registry the target string is returned verbatim (so the downstream
+/// model-not-found path references the resolved model, not the alias).
+/// Mirrors the GPU-alias mechanism (`SIE_GATEWAY_GPU_ALIASES`).
+fn canonicalize_with_aliases(
+    aliases: &std::collections::HashMap<String, String>,
+    id: &str,
+    canonicalize: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(canonical) = canonicalize(id) {
+        return Some(canonical);
+    }
+    lookup_alias(aliases, id).map(|target| {
+        // The alias target may be `bundle:/model`; the bundle is routed
+        // separately (resolve_model_spec_with_aliases), so resolve only the
+        // model portion here. A bare target leaves the model unchanged.
+        // Resolve it like any path id: handles the SIE-safe "__"->"/" form and
+        // canonical case-folding, falling back to the target model verbatim (so
+        // model-not-found references the resolved model).
+        let (_bundle, model) = parse_model_spec(target);
+        resolve_path_model_id(&model, &canonicalize)
+    })
+}
+
+/// Look up a job/friendly alias by its name, tolerating a `:profile` variant
+/// suffix on the request.
+///
+/// Tries the full (lowercased) id first, then the base before the first `:`, so
+/// `sql:rtx-pro-6000` still resolves the `sql` alias. The `:profile` suffix
+/// can't route by precision anyway (it's stripped before worker dispatch), so
+/// dropping it for alias resolution is safe; the alias's own bundle is what
+/// routes. (A real model id with a `:` resolves through `canonicalize` before
+/// this is reached, so this never shadows one.)
+fn lookup_alias<'a>(
+    aliases: &'a std::collections::HashMap<String, String>,
+    id: &str,
+) -> Option<&'a String> {
+    let key = id.to_ascii_lowercase();
+    aliases
+        .get(&key)
+        .or_else(|| key.split_once(':').and_then(|(base, _)| aliases.get(base)))
+}
+
+/// Resolve a request's model spec to `(bundle_override, canonical_model_name)`,
+/// expanding a job/friendly alias whose target may itself carry a bundle.
+///
+/// Replaces the `parse_model_spec` + `canonicalize_with_aliases` pair at the
+/// routing sites. The model-name resolution is unchanged (real id, else alias
+/// target, else the `__`->`/` form, else verbatim). The addition: an alias
+/// *target* may be a full `bundle:/org/model` spec, so an operator can pin a
+/// precision/profile bundle for a job alias — e.g. map `sql` to a BF16 bundle
+/// that avoids the FP8 SQL-accuracy regression (ADR 0001), since the `:profile`
+/// variant suffix is stripped before worker dispatch and cannot itself route by
+/// precision. An explicit caller bundle (`somebundle:/sql`) always wins over the
+/// alias's bundle.
+pub(crate) fn resolve_model_spec_with_aliases(
+    aliases: &std::collections::HashMap<String, String>,
+    spec: &str,
+    canonicalize: impl Fn(&str) -> Option<String>,
+) -> (String, String) {
+    let (req_bundle, req_model) = parse_model_spec(spec);
+    let model_name = resolve_path_model_id(&req_model, |id| {
+        canonicalize_with_aliases(aliases, id, &canonicalize)
+    });
+    // Adopt the alias target's bundle only when the caller pinned none AND the
+    // bare model resolved through an alias (not a real model id). Uses the same
+    // `:profile`-tolerant lookup as the model-name resolution above, so a
+    // `sql:profile` request adopts the `sql` alias bundle too.
+    if req_bundle.is_empty() && canonicalize(&req_model).is_none() {
+        if let Some(target) = lookup_alias(aliases, &req_model) {
+            let (alias_bundle, _) = parse_model_spec(target);
+            return (alias_bundle, model_name);
+        }
+    }
+    (req_bundle, model_name)
 }
 
 fn decode_model_path(raw: &str) -> Result<String, String> {
@@ -8845,6 +8928,167 @@ mod tests {
             resolve_path_model_id("Qwen__Qwen3-4B-Instruct-2507", registry),
             "Qwen/Qwen3-4B-Instruct-2507"
         );
+    }
+
+    #[test]
+    fn test_canonicalize_with_aliases_passes_through_real_model() {
+        // A real model id resolves directly; aliases are not consulted.
+        let aliases = std::collections::HashMap::new();
+        let out =
+            canonicalize_with_aliases(&aliases, "Qwen/Qwen3.5-4B", canon_of("Qwen/Qwen3.5-4B"));
+        assert_eq!(out.as_deref(), Some("Qwen/Qwen3.5-4B"));
+    }
+
+    #[test]
+    fn test_canonicalize_with_aliases_resolves_alias_to_target() {
+        // "code" → target, case-insensitive on the alias key; the target is
+        // then canonicalised through the registry.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("code".to_string(), "Qwen/Qwen3.5-4B".to_string());
+        let canon = canon_of("Qwen/Qwen3.5-4B");
+        assert_eq!(
+            canonicalize_with_aliases(&aliases, "code", &canon).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+        assert_eq!(
+            canonicalize_with_aliases(&aliases, "CODE", &canon).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_with_aliases_target_verbatim_when_registry_empty() {
+        // Alias target not in the registry → return the target verbatim so the
+        // 404 references the resolved model, not the alias.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("code".to_string(), "Qwen/Qwen3.5-4B".to_string());
+        assert_eq!(
+            canonicalize_with_aliases(&aliases, "code", |_| None).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_with_aliases_resolves_sie_safe_target() {
+        // An alias target stored in the SIE-safe "__" form resolves to the
+        // slash form via resolve_path_model_id, not just bare canonicalize.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("code".to_string(), "Qwen__Qwen3.5-4B".to_string());
+        assert_eq!(
+            canonicalize_with_aliases(&aliases, "code", canon_of("Qwen/Qwen3.5-4B")).as_deref(),
+            Some("Qwen/Qwen3.5-4B")
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_with_aliases_unknown_falls_through() {
+        // Neither a real model nor a configured alias → None (normal 404 path).
+        let aliases = std::collections::HashMap::new();
+        assert_eq!(canonicalize_with_aliases(&aliases, "nope", |_| None), None);
+    }
+
+    #[test]
+    fn test_resolve_model_spec_real_model_no_bundle() {
+        // A real model id resolves directly; aliases not consulted, no bundle.
+        let aliases = std::collections::HashMap::new();
+        let (bundle, model) = resolve_model_spec_with_aliases(
+            &aliases,
+            "Qwen/Qwen3.5-4B",
+            canon_of("Qwen/Qwen3.5-4B"),
+        );
+        assert_eq!(bundle, "");
+        assert_eq!(model, "Qwen/Qwen3.5-4B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_caller_bundle_preserved() {
+        // An explicit `bundle:/model` request keeps its bundle.
+        let aliases = std::collections::HashMap::new();
+        let (bundle, model) = resolve_model_spec_with_aliases(
+            &aliases,
+            "bf16:/Qwen/Qwen3.5-4B",
+            canon_of("Qwen/Qwen3.5-4B"),
+        );
+        assert_eq!(bundle, "bf16");
+        assert_eq!(model, "Qwen/Qwen3.5-4B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_alias_carries_bundle() {
+        // The headline feature: a `sql` alias whose target carries a bundle
+        // routes to that (BF16) bundle while resolving the base model.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("sql".to_string(), "bf16:/Qwen/Qwen3.6-27B".to_string());
+        let (bundle, model) =
+            resolve_model_spec_with_aliases(&aliases, "sql", canon_of("Qwen/Qwen3.6-27B"));
+        assert_eq!(bundle, "bf16");
+        assert_eq!(model, "Qwen/Qwen3.6-27B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_alias_with_profile_suffix_still_routes() {
+        // A profile-suffixed alias request (`sql:rtx-pro-6000`) must still hit
+        // the `sql` alias and adopt its BF16 bundle; the (precision-inert)
+        // profile suffix is dropped for alias resolution.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("sql".to_string(), "bf16:/Qwen/Qwen3.6-27B".to_string());
+        let (bundle, model) = resolve_model_spec_with_aliases(
+            &aliases,
+            "sql:rtx-pro-6000",
+            canon_of("Qwen/Qwen3.6-27B"),
+        );
+        assert_eq!(bundle, "bf16");
+        assert_eq!(model, "Qwen/Qwen3.6-27B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_alias_bare_target_has_no_bundle() {
+        // An alias with a plain (bundle-less) target resolves the model and
+        // leaves the bundle empty — unchanged from the pre-feature behavior.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "code".to_string(),
+            "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+        );
+        let (bundle, model) = resolve_model_spec_with_aliases(
+            &aliases,
+            "CODE",
+            canon_of("Qwen/Qwen3-4B-Instruct-2507"),
+        );
+        assert_eq!(bundle, "");
+        assert_eq!(model, "Qwen/Qwen3-4B-Instruct-2507");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_caller_bundle_wins_over_alias_bundle() {
+        // An explicit caller bundle on an aliased request overrides the alias's
+        // bundle (the model still resolves through the alias).
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("sql".to_string(), "bf16:/Qwen/Qwen3.6-27B".to_string());
+        let (bundle, model) =
+            resolve_model_spec_with_aliases(&aliases, "fp8:/sql", canon_of("Qwen/Qwen3.6-27B"));
+        assert_eq!(bundle, "fp8");
+        assert_eq!(model, "Qwen/Qwen3.6-27B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_alias_bundle_with_sie_safe_target() {
+        // The alias target's model portion may use the SIE-safe `__` form.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("sql".to_string(), "bf16:/Qwen__Qwen3.6-27B".to_string());
+        let (bundle, model) =
+            resolve_model_spec_with_aliases(&aliases, "sql", canon_of("Qwen/Qwen3.6-27B"));
+        assert_eq!(bundle, "bf16");
+        assert_eq!(model, "Qwen/Qwen3.6-27B");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_unknown_passthrough_no_bundle() {
+        // Neither a real model nor an alias → verbatim model, no bundle (404 path).
+        let aliases = std::collections::HashMap::new();
+        let (bundle, model) = resolve_model_spec_with_aliases(&aliases, "nope", |_| None);
+        assert_eq!(bundle, "");
+        assert_eq!(model, "nope");
     }
 
     #[test]
@@ -13692,6 +13936,9 @@ mod tests {
             max_output_tokens: None,
             grammar_capabilities: None,
             tools_supported: None,
+            code: false,
+            sql: false,
+            guard: false,
             // Union summary (back-compat). The gate must NOT consult this.
             lora_adapters: Some(vec!["a1".to_string(), "a2".to_string(), "b1".to_string()]),
             profile_lora_adapters: Some(per_profile),

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.5.0
+
+- chore(main): release 0.5.0
+- docs(helm): clarify README pool example is illustrative, not tester-specific
+- fix(helm): fail-fast on missing/invalid bundle replica bounds
+- chore(helm): address PR #1205 review feedback
+- fix(helm): preserve gateway metrics scrape labels
+- feat(helm)!: split worker pools into pool × bundles schema
+- fix(gateway): expose unauthenticated metrics scrape port
+- chore(openapi): regenerate spec for code/sql/guard capability fields
+- fix(models): drop unsupported ebnf advertisement + restore guardian a100 guard threshold
+- feat(models): surface code/sql/guard capabilities; resolve job aliases in configs/resolve
+- fix(guard): robust verdict thresholding, logprob hygiene, decoded-token logprobs
+- feat(tester-cluster): add sglang worker pool for generative models
+- fix(sie_server): honor params.instruction in Florence-2 extract (#1053)
+- fix(helm): use sidecar binary for image pre-pull
+- chore: remove agent-jobs runbook, ADR 0001, and m5-planning docs
+- fix(guard): reject multi-candidate sampling + keep logprobs consistent on rewrite
+- feat(guard): P(unsafe) logprob threshold for CHECK POLICY precision (#1187)
+- docs(ops): agent-jobs prod-readiness runbook + opt-in model-alias deploy config
+- fix(review): address #1184 review comments + restore dropped A/B fix
+- bench(sql): grammar A/B + SQLCoder native-template measured on Spider
+- test(gateway): end-to-end precision routing through resolve_model_and_bundle
+- test(gateway): prove a model routes across two precision bundles
+- feat(gateway): job aliases can carry a precision bundle (SQL->BF16 routing)
+- docs(27b): flag FP8 SQL regression on sql cap + clarify targets are documentary
+- feat(27b): measure Qwen3.6-27B on code/SQL/tools; advertise code+sql
+- feat(guard): CHECK POLICY content-moderation model + ToxicChat F1 eval
+- bench(sql): measured Spider execution accuracy + anchored floor; SQLCoder serve-validated
+- feat(code): point model="code" at the measured model; xgrammar-validate SQL grammar
+- feat(sql): onboard SQLCoder (Defog) config + starter SQL grammar artifact
+- feat(bench): add Spider text-to-SQL execution-accuracy eval + model="sql" alias
+- fix(review): address PR feedback on the code-eval
+- feat(server,gateway): advertise code capability + model="code" alias
+
 ## v0.4.2
 
 - chore(main): release 0.4.2

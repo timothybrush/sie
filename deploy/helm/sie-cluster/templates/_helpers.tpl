@@ -177,6 +177,14 @@ Gateway service name (used for worker discovery)
 {{- end }}
 
 {{/*
+Gateway metrics service name (ClusterIP-only ServiceMonitor scrape target)
+Budget: prefix (≤47) + "-gateway-metrics" (16) = 63 (DNS-1123 label max).
+*/}}
+{{- define "sie-cluster.gateway.metricsServiceName" -}}
+{{- printf "%s-gateway-metrics" (include "sie-cluster.fullname" . | trunc 47 | trimSuffix "-") }}
+{{- end }}
+
+{{/*
 In-cluster URL used by workers to ask the gateway whether they are admitted
 to pull from their configured queue pool.
 */}}

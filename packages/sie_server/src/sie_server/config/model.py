@@ -67,6 +67,17 @@ class GenerateCapabilities(BaseModel):
     grammar: list[Literal["json_schema", "regex", "ebnf"]] = []
     streaming: bool = True
     tools: bool = False
+    # Advertises that the model is validated for code generation (HumanEval /
+    # MBPP pass@1 in the generation quality gate). Informational only — unlike
+    # ``grammar``, the gateway does not reject requests on this flag; it lets
+    # the SDK/UI surface the capability and backs the ``model="code"`` alias.
+    code: bool = False
+    # Same, for text-to-SQL (Spider execution accuracy); backs ``model="sql"``.
+    sql: bool = False
+    # Same, for the content-moderation / policy-check job (CHECK POLICY): a
+    # generative guard model that emits a safe/unsafe verdict (e.g. Granite
+    # Guardian, measured on ToxicChat). Backs the ``model="guard"`` alias.
+    guard: bool = False
 
 
 # Kinds permitted in ``prewarm_grammars`` entries. Mirrors the

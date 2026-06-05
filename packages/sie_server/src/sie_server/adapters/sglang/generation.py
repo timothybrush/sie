@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
+import math
 import os
 import shlex
 import subprocess
@@ -64,6 +66,15 @@ _GENERATE_POOL_TIMEOUT_S = float(os.environ.get("SIE_SGLANG_GENERATE_POOL_TIMEOU
 # an independent background task instead of being cut off by the teardown
 # wait_for. Override via ``SIE_SGLANG_ABORT_REQUEST_TIMEOUT_S``.
 _ABORT_REQUEST_TIMEOUT_S = float(os.environ.get("SIE_SGLANG_ABORT_REQUEST_TIMEOUT_S", "1.5"))
+
+# How many leading token POSITIONS to scan for the guard's Yes/No verdict
+# distribution. A guard's verdict usually sits at position 0, but a leading
+# whitespace/punctuation/preamble token can push it back a slot — so we scan
+# the first few positions for the first one that carries a Yes/No top_logprobs
+# distribution. Mirrors the eval runner's ``content[:3]`` scan
+# (``sie_bench.eval.generation_runner._p_unsafe_from_logprobs``) so serving and
+# eval agree on which position the verdict is read from.
+_GUARD_VERDICT_SCAN_POSITIONS = 3
 
 
 def _resolve_read_timeout() -> float | None:
@@ -127,6 +138,14 @@ class SGLangGenerationAdapter(GenerationAdapter):
         grammar_backend: str | None = "outlines",
         reasoning_parser: str | None = None,
         tool_call_parser: str | None = None,
+        # Generative guard models (CHECK POLICY) emit a one-token Yes/No verdict.
+        # When set (``{"threshold": 0.8, "positive": "Yes"}``) the adapter reads
+        # the verdict-token logprobs, computes P(unsafe) over the Yes/No tokens,
+        # and returns "Yes" iff P(unsafe) >= threshold — a precision/recall dial
+        # that lifts the argmax 0.16 precision (measured: F1 0.27->0.38, prec
+        # 0.16->0.29 at 0.8; see the guard baseline). Only guard model YAMLs set
+        # this, so it is inert for every other model.
+        guard: dict[str, Any] | None = None,
         speculative: dict[str, Any] | None = None,
         extra_launch_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
@@ -173,6 +192,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # ``--tool-call-parser`` (e.g. ``qwen3_coder`` for Qwen3.5).
         # Set ``None`` to omit the flag.
         self._tool_call_parser = tool_call_parser
+        # Guard verdict thresholding (see the kwarg docstring). Empty for every
+        # non-guard model, which makes the verdict rewrite in ``generate`` a
+        # no-op for them.
+        self._guard = guard or {}
         # Generic speculative-decoding surface accepts
         # ``{enabled, algorithm, num_steps?, eagle_topk?,
         # num_draft_tokens?, draft_model?}``; translated by
@@ -744,6 +767,25 @@ class SGLangGenerationAdapter(GenerationAdapter):
     ) -> AsyncIterator[GenerationChunk]:
         self._check_loaded()
 
+        # Guard verdict thresholding only runs on the single-candidate (n=1)
+        # path, so reject multi-candidate sampling up front — otherwise a guard
+        # request with n>1 / best_of>1 would silently return an UN-thresholded
+        # verdict from the multi-candidate path. Inert for non-guard models.
+        if self._guard and ((n is not None and n > 1) or (best_of is not None and best_of > 1)):
+            raise ValueError("guard models support single-candidate generation only (n=1, best_of<=1)")
+        # Whether the CLIENT asked for logprobs, captured before the guard
+        # forcing below. Guard models force logprobs on internally to compute
+        # the verdict threshold; those forced logprobs are an implementation
+        # detail and MUST NOT leak to a client that did not request them
+        # (GenerationChunk.logprobs contract). The streaming guard intercept
+        # uses this to decide whether to strip the forced logprobs.
+        client_requested_logprobs = logprobs
+        # Thresholding needs the verdict-token distribution — force logprobs on
+        # even if the caller didn't ask. Only affects the n=1 path below.
+        if self._guard:
+            logprobs = True
+            top_logprobs = max(top_logprobs or 0, 20)
+
         sampling_params: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
@@ -810,10 +852,14 @@ class SGLangGenerationAdapter(GenerationAdapter):
             elif grammar.kind == "regex":
                 sampling_params["regex"] = grammar.value
             elif grammar.kind == "ebnf":
-                # SGLang accepts EBNF on both Outlines and XGrammar
-                # backends. The gateway has size-capped the source via
-                # ``MAX_EBNF_LEN``; further compile-time validation
-                # happens inside the backend.
+                # SGLang accepts EBNF only on EBNF-capable backends
+                # (``xgrammar``/``llguidance``) — the default ``outlines``
+                # backend skips/fails it. Models must therefore only
+                # advertise ``"ebnf"`` in their grammar capabilities when
+                # their profile pins such a backend (gated by the gateway
+                # capability check + the profile-backend consistency test).
+                # The gateway has size-capped the source via ``MAX_EBNF_LEN``;
+                # further compile-time validation happens inside the backend.
                 sampling_params["ebnf"] = grammar.value
 
         # Multi-candidate (``n > 1`` and/or ``best_of``): ask SGLang for all
@@ -848,6 +894,11 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 sbody["lora_path"] = lora_path
             if logprobs:
                 sbody["return_logprob"] = True
+                # Without this SGLang omits the decoded token TEXT from
+                # output_(top_)logprobs (entries are [logprob, token_id, None]),
+                # so the OpenAI ``token`` field comes back empty and the guard
+                # verdict thresholding cannot match ``yes``/``no``.
+                sbody["return_text_in_logprobs"] = True
                 if top_logprobs is not None and top_logprobs > 0:
                     sbody["top_logprobs_num"] = top_logprobs
             sclient = await self._get_or_create_http_client()
@@ -974,6 +1025,9 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 nbody["lora_path"] = lora_path
             if logprobs or rank:
                 nbody["return_logprob"] = True
+                # Surface decoded token text (see streaming body below) so the
+                # OpenAI ``token`` field is populated and guard thresholding works.
+                nbody["return_text_in_logprobs"] = True
                 if top_logprobs is not None and top_logprobs > 0:
                     nbody["top_logprobs_num"] = top_logprobs
             nclient = await self._get_or_create_http_client()
@@ -1080,6 +1134,11 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # .logprobs.content`` shape.
         if logprobs:
             body["return_logprob"] = True
+            # SGLang only includes the decoded token TEXT in
+            # output_(top_)logprobs when this is set; without it the entries are
+            # [logprob, token_id, None] and the OpenAI ``token`` field (and the
+            # guard ``yes``/``no`` verdict match) sees only empty strings.
+            body["return_text_in_logprobs"] = True
             if top_logprobs is not None and top_logprobs > 0:
                 body["top_logprobs_num"] = top_logprobs
 
@@ -1122,6 +1181,20 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 # so we slice off the tail-since-last-event each
                 # round to build per-chunk OpenAI-shape logprobs.
                 logprobs_surfaced = 0
+                # Guard verdict buffering (CHECK POLICY) — inert for non-guard
+                # models. A guard's Yes/No verdict can sit a few token positions
+                # in, behind a leading whitespace/punctuation/preamble token that
+                # SGLang spreads across streaming chunks. We accumulate the
+                # leading chunks' per-token logprob entries (``guard_lp_buffer``)
+                # and SUPPRESS their text (the guard consumer wants just the
+                # verdict, not the preamble) until a verdict resolves within the
+                # first ``_GUARD_VERDICT_SCAN_POSITIONS`` positions — or the
+                # stream terminates first, in which case we flush the raw buffered
+                # chunks unchanged (fallback, never drop output).
+                guard_active = bool(self._guard)
+                guard_resolved = False
+                guard_lp_buffer: list[dict[str, Any]] = []
+                guard_pending: list[GenerationChunk] = []
 
                 async for raw_line in response.aiter_lines():
                     line = raw_line.strip()
@@ -1166,10 +1239,69 @@ class SGLangGenerationAdapter(GenerationAdapter):
                             cumulative_lp = event_meta.get("output_token_logprobs")
                             if isinstance(cumulative_lp, list):
                                 logprobs_surfaced = max(logprobs_surfaced, len(cumulative_lp))
-                    stream_timer.mark_yield(has_text=bool(chunk.text_delta))
-                    yield chunk
-                    if chunk.done:
-                        break
+                    # Guard verdict thresholding (CHECK POLICY): resolve the
+                    # P(unsafe)>=threshold verdict from the first parseable
+                    # position within ``_GUARD_VERDICT_SCAN_POSITIONS`` and emit a
+                    # single verdict chunk. Inert for non-guard models, which take
+                    # the byte-for-byte unchanged ``else`` path below.
+                    if guard_active and not guard_resolved:
+                        # Accumulate this chunk's forced logprob entries so a
+                        # verdict that lands on a later token position is visible.
+                        if chunk.logprobs:
+                            guard_lp_buffer.extend(chunk.logprobs)
+                        guard_pending.append(chunk)
+                        verdict = _thresholded_verdict(tuple(guard_lp_buffer), self._guard)
+                        if verdict is not None:
+                            guard_resolved = True
+                            # Carry through terminal state if the verdict resolved
+                            # on (or only by) the terminal chunk, so done /
+                            # finish_reason / completion_tokens are preserved.
+                            last = guard_pending[-1]
+                            # Strip the internally-forced logprobs when the client
+                            # did not ask for them (implementation detail). When
+                            # the client did ask, drop the single verdict entry
+                            # that was consumed/rewritten (it described the raw
+                            # sampled token, not the served threshold verdict) and
+                            # keep the rest of the buffered token metadata.
+                            if client_requested_logprobs:
+                                v_idx = _verdict_position(tuple(guard_lp_buffer))
+                                kept = [e for i, e in enumerate(guard_lp_buffer) if i != v_idx]
+                                remaining = tuple(kept) or None
+                            else:
+                                remaining = None
+                            verdict_chunk = dataclasses.replace(
+                                last,
+                                text_delta=verdict,
+                                is_first=True,
+                                logprobs=remaining,
+                            )
+                            stream_timer.mark_yield(has_text=True)
+                            yield verdict_chunk
+                            if verdict_chunk.done:
+                                break
+                        elif chunk.done:
+                            # Terminal reached without a parseable verdict in the
+                            # first N positions: flush the raw buffered chunks
+                            # unchanged so the response is never dropped. Strip the
+                            # forced logprobs only when the client didn't ask.
+                            guard_resolved = True
+                            for buffered in guard_pending:
+                                if not client_requested_logprobs:
+                                    buffered = dataclasses.replace(buffered, logprobs=None)
+                                stream_timer.mark_yield(has_text=bool(buffered.text_delta))
+                                yield buffered
+                            break
+                        # else: keep buffering (suppress this leading chunk's text).
+                    else:
+                        # Guard tail chunks (after the verdict resolved) must still
+                        # honour the M4 logprobs contract: strip the internally
+                        # forced logprobs when the client didn't request them.
+                        if guard_active and not client_requested_logprobs and chunk.logprobs is not None:
+                            chunk = dataclasses.replace(chunk, logprobs=None)
+                        stream_timer.mark_yield(has_text=bool(chunk.text_delta))
+                        yield chunk
+                        if chunk.done:
+                            break
 
                 if not terminal_yielded:
                     raise RuntimeError("SGLang stream terminated without terminal event")
@@ -1207,6 +1339,94 @@ class SGLangGenerationAdapter(GenerationAdapter):
             # Emit TPOT regardless of normal completion vs cancellation.
             # ``finalize`` is a no-op if no non-empty chunks were observed.
             stream_timer.finalize(completion_tokens=terminal_completion_tokens)
+
+
+def _p_unsafe_from_entry(entry: Any) -> float | None:
+    """``P(unsafe)`` from one OpenAI-shape content token's ``top_logprobs``.
+
+    Renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over the ``yes``/``no``
+    verdict tokens in this single position. ``None`` when neither appears.
+    """
+    if not isinstance(entry, dict):
+        return None
+    lp_yes: float | None = None
+    lp_no: float | None = None
+    for top in entry.get("top_logprobs") or []:
+        if not isinstance(top, dict):
+            continue
+        tok = str(top.get("token") or "").strip().lower()
+        val = top.get("logprob")
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            continue
+        if tok == "yes":
+            lp_yes = val if lp_yes is None else max(lp_yes, val)
+        elif tok == "no":
+            lp_no = val if lp_no is None else max(lp_no, val)
+    if lp_yes is None and lp_no is None:
+        return None
+    ey = math.exp(lp_yes) if lp_yes is not None else 0.0
+    en = math.exp(lp_no) if lp_no is not None else 0.0
+    return ey / (ey + en) if (ey + en) > 0 else None
+
+
+def _verdict_position(chunk_logprobs: Any, scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS) -> int | None:
+    """Index of the first position (within ``scan_positions``) carrying a verdict
+    distribution, or ``None``. The consumed/rewritten verdict entry the streaming
+    intercept drops from client-requested logprobs.
+    """
+    if not chunk_logprobs:
+        return None
+    for idx, entry in enumerate(chunk_logprobs[:scan_positions]):
+        if _p_unsafe_from_entry(entry) is not None:
+            return idx
+    return None
+
+
+def _p_unsafe_from_verdict_logprobs(
+    chunk_logprobs: Any, scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS
+) -> float | None:
+    """``P(unsafe)`` from a guard verdict chunk's logprobs, or ``None``.
+
+    ``chunk_logprobs`` is the OpenAI ``content`` shape this adapter builds —
+    ``({"token", "logprob", "top_logprobs": [{"token", "logprob"}, ...]}, ...)``.
+    Scans the first up-to ``scan_positions`` content tokens for the first whose
+    ``top_logprobs`` carries a ``yes``/``no`` verdict distribution, then
+    renormalises ``exp(lp_yes)/(exp(lp_yes)+exp(lp_no))`` over those two tokens.
+    Scanning past position 0 keeps a leading whitespace/punctuation/preamble
+    token from hiding the verdict, matching the eval runner's ``content[:3]``
+    scan. ``None`` when no verdict token appears in range (caller keeps raw).
+    """
+    if not chunk_logprobs:
+        return None
+    for entry in chunk_logprobs[:scan_positions]:
+        p_unsafe = _p_unsafe_from_entry(entry)
+        if p_unsafe is not None:
+            return p_unsafe
+    return None
+
+
+def _thresholded_verdict(
+    chunk_logprobs: Any,
+    guard: dict[str, Any],
+    scan_positions: int = _GUARD_VERDICT_SCAN_POSITIONS,
+) -> str | None:
+    """The guard's thresholded verdict token, or ``None`` to leave output as-is.
+
+    ``guard`` is ``{"threshold": float, "positive": "Yes", "negative": "No"}``
+    (positive/negative default to Yes/No). Returns the ``positive`` label iff
+    ``P(unsafe) >= threshold``, else ``negative``; ``None`` when P(unsafe) can't
+    be computed (no verdict logprobs within ``scan_positions``) so the raw model
+    token is preserved.
+    """
+    p_unsafe = _p_unsafe_from_verdict_logprobs(chunk_logprobs, scan_positions)
+    if p_unsafe is None:
+        return None
+    threshold = guard.get("threshold")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        return None
+    positive = str(guard.get("positive") or "Yes")
+    negative = str(guard.get("negative") or "No")
+    return positive if p_unsafe >= float(threshold) else negative
 
 
 def _cumulative_logprob(result: Any) -> float:
