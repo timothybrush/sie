@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 
+use serde::Deserialize;
+
+use crate::types::pool::PoolSpec;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // Server
@@ -60,6 +64,10 @@ pub struct Config {
     pub configured_gpus: Vec<String>,
     // Pre-computed lowercase→original map for GPU profile resolution (avoids HashMap rebuild per request)
     pub gpu_profile_map: HashMap<String, String>,
+
+    // Helm-declared queue pools that are long-lived admission boundaries.
+    // API-created pools remain lease-based; these specs do not expire.
+    pub static_queue_pools: Vec<PoolSpec>,
 
     // Job/friendly model aliases: lowercase alias → canonical model id. Lets a
     // caller request `model: "code"` and have it resolve to the recommended
@@ -139,6 +147,61 @@ fn env_json_string_map(key: &str) -> HashMap<String, String> {
         }
         _ => HashMap::new(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StaticQueuePoolEnvSpec {
+    #[serde(default)]
+    bundle: Option<String>,
+    #[serde(default)]
+    gpus: HashMap<String, u32>,
+    #[serde(default, alias = "gpu_caps")]
+    gpu_caps: HashMap<String, u32>,
+    #[serde(default, alias = "minimum_worker_count")]
+    minimum_worker_count: u32,
+}
+
+fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
+    let parsed = match env::var(key) {
+        Ok(s) if !s.trim().is_empty() => {
+            match serde_json::from_str::<HashMap<String, StaticQueuePoolEnvSpec>>(&s) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    panic!("failed to parse {key}: {error}; fix or unset {key}")
+                }
+            }
+        }
+        _ => HashMap::new(),
+    };
+
+    let mut specs: Vec<PoolSpec> = parsed
+        .into_iter()
+        .filter_map(|(name, spec)| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let bundle = spec.bundle.and_then(|bundle| {
+                let bundle = bundle.trim().to_string();
+                if bundle.is_empty() {
+                    None
+                } else {
+                    Some(bundle)
+                }
+            });
+            Some(PoolSpec {
+                name,
+                bundle,
+                gpus: spec.gpus,
+                gpu_caps: spec.gpu_caps,
+                ttl_seconds: None,
+                minimum_worker_count: spec.minimum_worker_count,
+            })
+        })
+        .collect();
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    specs
 }
 
 /// Job/friendly model aliases: lowercase alias → model id (or `bundle:/model`).
@@ -277,6 +340,7 @@ impl Config {
 
             configured_gpus,
             gpu_profile_map,
+            static_queue_pools: env_static_queue_pools("SIE_GATEWAY_STATIC_QUEUE_POOLS"),
             model_aliases,
 
             bundles_dir: env_default("SIE_BUNDLES_DIR", "bundles"),
@@ -558,6 +622,60 @@ mod tests {
     }
 
     #[test]
+    fn test_env_static_queue_pools_accepts_helm_shape() {
+        with_env(
+            &[(
+                "_TEST_STATIC_QUEUE_POOLS",
+                r#"{
+                    "companyA": {
+                        "gpus": {"l4": 0},
+                        "gpuCaps": {},
+                        "minimumWorkerCount": 1
+                    },
+                    "companyB": {
+                        "bundle": "sglang",
+                        "gpus": {"a100": 1},
+                        "gpu_caps": {"a100": 2},
+                        "minimum_worker_count": 2
+                    }
+                }"#,
+            )],
+            || {
+                let result = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
+
+                assert_eq!(result.len(), 2);
+                assert_eq!(result[0].name, "companyA");
+                assert_eq!(result[0].gpus.get("l4"), Some(&0));
+                assert!(result[0].gpu_caps.is_empty());
+                assert_eq!(result[0].minimum_worker_count, 1);
+                assert_eq!(result[0].ttl_seconds, None);
+
+                assert_eq!(result[1].name, "companyB");
+                assert_eq!(result[1].bundle.as_deref(), Some("sglang"));
+                assert_eq!(result[1].gpus.get("a100"), Some(&1));
+                assert_eq!(result[1].gpu_caps.get("a100"), Some(&2));
+                assert_eq!(result[1].minimum_worker_count, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_static_queue_pools_invalid_panics() {
+        with_env(&[("_TEST_STATIC_QUEUE_POOLS", "not-json")], || {
+            let result = std::panic::catch_unwind(|| {
+                let _ = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
+            });
+            let panic = result.expect_err("invalid static queue pool JSON must fail fast");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains("failed to parse _TEST_STATIC_QUEUE_POOLS"));
+        });
+    }
+
+    #[test]
     fn test_build_gpu_profile_map_preserves_canonical_and_aliases() {
         let mut aliases = HashMap::new();
         aliases.insert("l4".to_string(), "l4-spot".to_string());
@@ -811,6 +929,7 @@ mod tests {
             stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),

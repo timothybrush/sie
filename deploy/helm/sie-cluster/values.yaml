@@ -340,16 +340,16 @@ workers:
     passthroughMode: true
 
     # -- Logical queue pool consumed by workers in queue-routing mode.
-    # When unset (the default), each pool uses its own name as the queue
-    # pool, so a worker in `workers.pools.rtx6000` subscribes to
-    # `sie.work.rtx6000.rtx6000.default.*` for the default bundle,
-    # preventing the cross-pool durable-consumer collision that happens
-    # when every pool shares one queue. Set this
-    # to a fixed string (e.g. `"default"`) only to deliberately share a
-    # queue across multiple pools (e.g. `l4` + `l4-spot` competing for
-    # the same work). Per-pool overrides via `workers.pools.<name>.queuePool`
-    # take precedence over both.
-    queuePool: ""
+    # The default baseline queue pool is `default`, so SDK calls like
+    # `gpu="l4"` route to `(pool=default, machineProfile=l4)` without
+    # requiring callers to spell the pool as `gpu="default/l4"`.
+    # Routing, metrics, and KEDA still stay lane-specific because the
+    # NATS subject and Prometheus labels include machineProfile and bundle.
+    # Set per-pool `workers.pools.<name>.queuePool` only when a worker group
+    # should consume from a dedicated logical queue namespace / tenant pool
+    # such as `customer-acme`, in which case callers must send that pool
+    # explicitly (SDK `gpu="customer-acme/l4"`).
+    queuePool: default
 
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
     runtimeClassName: ""
@@ -599,7 +599,7 @@ workers:
   #                    (e.g. `<repo>:<tag>-cpu-<bundle>`),
   #                    NOT propagated to a pod env var.
   #   queuePool:       string. Optional override of common.queuePool.
-  #                    If both are unset, defaults to the worker group key.
+  #                    Defaults to `default` via workers.common.queuePool.
   #   resources:       requests/limits for the Python ``worker``
   #                    container (the GPU-bound forward-pass server).
   #   runtimeClassName: Optional override of common.runtimeClassName.
@@ -1058,6 +1058,20 @@ queueRouting:
   # -- Maximum age (seconds) for messages in the pool-level stream.
   # Messages older than this are discarded. Set higher for slow model loads.
   streamMaxAgeSec: 120
+  # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
+  # queue namespaces. Keys are queue pool names. Use this when
+  # poolAdmission.enabled=true and a worker group sets a named non-default
+  # workers.pools.<name>.queuePool but the pool is static/deploy-owned rather
+  # than created through the expiring /v1/pools API.
+  #
+  # Example:
+  # staticQueuePools:
+  #   companyA:
+  #     gpus:
+  #       l4: 0
+  #     gpuCaps: {}
+  #     minimumWorkerCount: 0
+  staticQueuePools: {}
   # -- NATS fetch budget: max messages pulled per fetch() call.
   # This is the primary driver of GPU batch size in queue mode; the worker
   # groups fetched messages by model and dispatches them as a single forward pass.
@@ -1065,6 +1079,11 @@ queueRouting:
   natsFetchBudget: 64
   # -- Worker admission gate for capped pools. Workers ask the gateway whether
   # their pod is in the pool's assigned_workers before pulling from NATS.
+  # The baseline `default` pool fails open. Named non-default queue pools are
+  # runtime pool/admission boundaries: if you set `workers.pools.<name>.queuePool`
+  # to a custom value without declaring the matching `staticQueuePools` entry
+  # or creating the matching `/v1/pools/<queuePool>` object, workers will pause
+  # instead of pulling.
   poolAdmission:
     enabled: true
     checkIntervalSec: 10

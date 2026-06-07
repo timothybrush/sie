@@ -145,9 +145,15 @@ rtx6000 default bundle scales 3–10 — see
 # Worker pool configuration (must explicitly enable pools)
 # The map key is the Kubernetes capacity family/resource name. When
 # machineProfile is omitted, it defaults to that map key. machineProfile is the
-# runtime lane label used by routing and metrics. queuePool is the logical queue
-# namespace / tenant boundary; when omitted it inherits workers.common.queuePool,
-# then falls back to the worker group key.
+# runtime lane label used by routing and metrics. queuePool is the logical
+# queue namespace / tenant boundary; by default all worker groups use the
+# shared `default` queue pool so SDK calls can pass just gpu="<profile>".
+# Set queuePool on a worker group only for a dedicated tenant/logical pool,
+# then target it explicitly as gpu="<queuePool>/<machineProfile>".
+# With poolAdmission enabled, named non-default queue pools must also exist as
+# gateway-visible pool objects. For deploy-owned pools, declare them under
+# queueRouting.staticQueuePools. For API-owned pools, create/renew them through
+# /v1/pools.
 # Each worker group renders its own StatefulSet + ScaledObject named
 # worker-<pool>-<bundle>.
 workers:
@@ -177,6 +183,48 @@ autoscaling:
   enabled: true
   cooldownPeriod: 600  # 10 min before scale-down
 ```
+
+### Queue Pool Patterns
+
+Use one of these patterns deliberately:
+
+- **Shared baseline pool**: leave `workers.common.queuePool: default`.
+  Workers render with `SIE_POOL=default` and their own
+  `SIE_MACHINE_PROFILE`; SDK calls use `gpu="<machineProfile>"`.
+- **Static custom queue namespace**: set a worker group's `queuePool` to a
+  named value and declare the same name under
+  `queueRouting.staticQueuePools`. These pool objects are synthesized by the
+  gateway at startup and do not expire. Example:
+
+  ```yaml
+  queueRouting:
+    staticQueuePools:
+      companyA:
+        gpus:
+          l4: 0
+        gpuCaps: {}
+  workers:
+    pools:
+      l4:
+        queuePool: companyA
+  ```
+
+  `gpuCaps: {}` means uncapped admission for matching workers. Use
+  `gpuCaps: {l4: 10}` to cap admission for that machine profile.
+- **Dynamic isolated pool**: set a worker group's `queuePool` to the dedicated
+  pool name, keep `queueRouting.poolAdmission.enabled=true`, and create/renew
+  the matching pool through `/v1/pools`. SDK calls use
+  `gpu="<queuePool>/<machineProfile>"`.
+
+Missing named pools intentionally do not fail open. Falling back from
+`pool=default,machineProfile=l4` to `pool=l4,machineProfile=l4` would cross the
+logical capacity boundary without an explicit caller request.
+
+For emergency or legacy static namespaces that are not backed by either
+`queueRouting.staticQueuePools` or `/v1/pools`, disabling
+`queueRouting.poolAdmission.enabled` lets workers pull without the admission
+gate. Prefer declaring static pools instead, so capped/dynamic pools keep their
+fail-closed isolation behavior.
 
 ### Upgrading from the legacy single-bundle pool schema
 

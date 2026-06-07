@@ -9378,6 +9378,7 @@ mod tests {
             stream_max_age_s: 300,
             configured_gpus: vec!["l4".to_string()],
             gpu_profile_map,
+            static_queue_pools: Vec::new(),
             model_aliases: std::collections::HashMap::new(),
             bundles_dir: bundles_dir.path().to_string_lossy().to_string(),
             models_dir: models_dir.path().to_string_lossy().to_string(),

@@ -23,7 +23,7 @@ fast at render time.
 {{- end }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
 {{- $machineProfile := default $poolName $pool.machineProfile }}
-{{- $queuePool := default (default $poolName $root.Values.workers.common.queuePool) $pool.queuePool }}
+{{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
 {{- range $bundleName, $bundleCfg := $pool.bundles }}
 {{- if dig "enabled" true $bundleCfg }}
 {{- if not (hasKey $bundleCfg "minReplicas") }}

@@ -393,6 +393,20 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     if pools_enabled {
         pool_manager.create_default_pool().await;
+        if !config.static_queue_pools.is_empty() {
+            match pool_manager
+                .sync_static_pools(&config.static_queue_pools)
+                .await
+            {
+                Ok(count) if count > 0 => {
+                    info!(count = count, "synced static Helm queue pools");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
         // Restore pools from K8s backend on startup
         match pool_manager.restore_from_k8s().await {
             Ok(count) if count > 0 => {

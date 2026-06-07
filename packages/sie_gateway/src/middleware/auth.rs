@@ -347,6 +347,7 @@ mod tests {
             stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.1
+
+- chore(main): release 0.6.1
+- fix(gateway): fail fast on invalid static pool config
+- fix(gateway): canonicalize static queue pool names
+- feat(gateway): support static queue pools
+
 ## v0.6.0
 
 - chore(main): release 0.6.0
