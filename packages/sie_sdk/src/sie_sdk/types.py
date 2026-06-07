@@ -10,7 +10,7 @@ These types support flexible Python inputs
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 import numpy as np
 
@@ -504,7 +504,7 @@ class WorkerInfo(TypedDict, total=False):
     loaded_models: list[str]
     memory_used_bytes: int
     memory_total_bytes: int
-    bundle: str
+    bundle: NotRequired[str]
     bundle_config_hash: str
 
 
@@ -566,11 +566,13 @@ class AssignedWorkerInfo(TypedDict):
         name: Worker name/identifier.
         url: Worker base URL.
         gpu: GPU type (e.g., "l4", "a100-80gb").
+        bundle: Runtime bundle this worker serves.
     """
 
     name: str
     url: str
     gpu: str
+    bundle: str
 
 
 class PoolStatusInfo(TypedDict, total=False):
@@ -840,7 +842,7 @@ class WorkerStatusMessage(TypedDict, total=False):
         name: Worker name/identifier.
         machine_profile: Machine profile for routing. In K8s: from SIE_MACHINE_PROFILE env var
             (e.g., "l4-spot"). Standalone: detected GPU type (e.g., "l4").
-        pool_name: NATS work-queue pool name (from SIE_POOL env var, e.g., "l4-spot-default").
+        pool_name: Logical NATS work-queue pool name (from SIE_POOL env var, e.g., "default" or "customer-acme").
             Used by the gateway in queue mode to publish to the correct JetStream subject.
             Empty string when not in queue mode or not set.
         gpu_count: Number of GPUs on this worker.

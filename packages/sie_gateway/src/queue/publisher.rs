@@ -362,102 +362,7 @@ pub struct GenerateParams {
     pub lora_adapter: Option<String>,
 }
 
-/// Work item published to JetStream for queue mode.
-/// Serialized as a msgpack **map** (named fields) to match the Python WorkItem TypedDict
-/// that the worker consumer expects (`wi.get("operation")` etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkItem {
-    pub work_item_id: String,
-    pub request_id: String,
-    pub item_index: u32,
-    pub total_items: u32,
-    pub operation: String,
-    pub model_id: String,
-    #[serde(default)]
-    pub profile_id: String,
-    /// Execution engine the bundle that resolved this request
-    /// declares. Today only ``"pytorch"`` is recognised (see
-    /// ``KNOWN_ENGINES`` in ``types::bundle``). Workers can use
-    /// this as a sanity check (``assert engine == self.engine``)
-    /// or as a soft dispatch hint when a single pool ever ends up
-    /// multiplexing engines. Older workers default to ``""`` and
-    /// ignore the field — back-compat is preserved by
-    /// ``#[serde(default)]``.
-    #[serde(default)]
-    pub engine: String,
-    pub pool_name: String,
-    pub machine_profile: String,
-    /// Per-item payload. Carried as `rmpv::Value` so msgpack request
-    /// bodies (especially those with `bin`/`ext` fields such as
-    /// encoded numpy arrays) can round-trip to the worker byte-for-
-    /// byte, without the old
-    /// `msgpack → rmpv::Value → serde_json::Value → msgpack` detour
-    /// that used to expand every `bin` into a `Vec<Number>`.
-    #[serde(default)]
-    pub item: Option<rmpv::Value>,
-    #[serde(default)]
-    pub payload_ref: Option<String>,
-    #[serde(default)]
-    pub output_types: Option<Vec<String>>,
-    #[serde(default)]
-    pub instruction: Option<String>,
-    #[serde(default)]
-    pub is_query: bool,
-    #[serde(default)]
-    pub options: Option<serde_json::Value>,
-    /// Score query. Same rationale as `item` above.
-    #[serde(default)]
-    pub query_item: Option<rmpv::Value>,
-    #[serde(default)]
-    pub query_payload_ref: Option<String>,
-    /// Score items. Same rationale as `item` above.
-    #[serde(default)]
-    pub score_items: Option<Vec<rmpv::Value>>,
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    #[serde(default)]
-    pub output_schema: Option<serde_json::Value>,
-    /// Generate-only params. Absent on encode/score/extract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generate: Option<GenerateParams>,
-    /// Routing-affinity hint. Carried alongside
-    /// ``generate`` so direct-dispatch logic can read it
-    /// without unpacking the typed generate block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing_key: Option<String>,
-    /// Prompt-cache hint. Same plumbing as
-    /// :attr:`routing_key`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
-    #[serde(default)]
-    pub bundle_config_hash: String,
-    #[serde(default)]
-    pub router_id: String,
-    pub reply_subject: String,
-    /// Epoch seconds (f64) when the work item was created (for queue latency tracking).
-    #[serde(default)]
-    pub timestamp: f64,
-    /// W3C Trace Context `traceparent` header value, injected at
-    /// publish time when a trace is active on the gateway. Absent
-    /// (skipped during msgpack encode) when no parent context was
-    /// extracted from the inbound HTTP request and no gateway span
-    /// is recording — keeping the envelope shape backward-compatible
-    /// with pre-M5 callers.
-    ///
-    /// Privacy: the value is two opaque IDs (trace + span) plus
-    /// flags; do not log it at info-level (debug is fine). The
-    /// gateway intentionally does not propagate the inbound
-    /// `traceparent` *byte-for-byte* — it injects the *gateway*
-    /// span's context, which is a valid child of the inbound trace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// W3C Trace Context `tracestate` header value (vendor state).
-    /// Same semantics as [`Self::traceparent`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tracestate: Option<String>,
-}
-
-/// Borrowed, serialize-only view of a [`WorkItem`].
+/// Borrowed, serialize-only view of the worker work-item envelope.
 ///
 /// Used on the publish hot path to avoid cloning per-item the fields
 /// that every item in a batch shares (pool/model/gpu/router_id/
@@ -467,12 +372,11 @@ pub struct WorkItem {
 /// this saves roughly `7N` small-string clones plus `4N` deep
 /// `Option<Vec<_>> / Option<serde_json::Value>` clones.
 ///
-/// The field names, order, and serde attributes are kept identical
-/// to [`WorkItem`] so that `rmp_serde::to_vec_named(&WorkItemRef)`
-/// produces the same msgpack wire bytes as encoding the equivalent
-/// owned `WorkItem`. Deserialization is intentionally not supported
-/// — results arrive as `WorkResult`, and inbound `WorkItem`s (only
-/// in tests) still use the owned form.
+/// The field names, order, and serde attributes are guarded by tests
+/// against an owned envelope shape so `rmp_serde::to_vec_named(&WorkItemRef)`
+/// keeps producing the msgpack map the Python worker consumes.
+/// Deserialization is intentionally not supported; results arrive as
+/// `WorkResult`.
 #[derive(Debug, Serialize)]
 struct WorkItemRef<'a> {
     pub work_item_id: &'a str,
@@ -507,8 +411,8 @@ struct WorkItemRef<'a> {
     pub reply_subject: &'a str,
     pub timestamp: f64,
     /// W3C Trace Context. Skipped on serialisation when `None`,
-    /// preserving byte-identical msgpack with the owned [`WorkItem`]
-    /// view that locks the legacy (pre-M5) wire shape.
+    /// preserving the compact pre-observability wire shape when no
+    /// trace context is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -631,10 +535,20 @@ fn stream_name(pool: &str) -> String {
     format!("WORK_POOL_{}", pool)
 }
 
-/// Normalize a model ID for use as a single NATS subject token.
+fn canonical_stream_subjects(observed: Vec<String>, desired: &str) -> Option<Vec<String>> {
+    if observed.len() == 1 && observed.first().is_some_and(|subject| subject == desired) {
+        None
+    } else {
+        Some(vec![desired.to_string()])
+    }
+}
+
+/// Normalize a model ID or operator-provided lane id for use as a single
+/// NATS subject token.
 ///
-/// The workers' JetStream pull consumer filters on `sie.work.*.{pool}`, which
-/// matches **exactly one token** in the model-ID position. NATS subject tokens
+/// The workers' JetStream pull consumer filters on
+/// `sie.work.{pool}.{machine_profile}.{bundle}.*`, which matches
+/// **exactly one token** in the model-ID position. NATS subject tokens
 /// legally contain `/` but MUST NOT contain `.`, `*`, `>`, or whitespace.
 /// Without this normalization, a model with `.` in its id (e.g.
 /// `vidore/colqwen2.5-v0.2`) would expand into multiple tokens, the publish
@@ -673,18 +587,30 @@ fn normalize_model_id(model_id: &str) -> String {
     out
 }
 
-fn work_subject(model: &str, pool: &str) -> String {
-    format!("sie.work.{}.{}", normalize_model_id(model), pool)
+fn work_subject(pool: &str, machine_profile: &str, bundle: &str, model: &str) -> String {
+    format!(
+        "sie.work.{}.{}.{}.{}",
+        pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model)
+    )
 }
 
-/// Per-worker subject `sie.work.{model}.{pool}.{worker_id}`.
+/// Per-worker subject `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`.
 ///
 /// Matches `sie_sdk.queue_types.work_worker_subject` so workers and
 /// the gateway agree on the wire-level subject. The pool stream
-/// filters on `sie.work.*.{pool}` (3 tokens after `sie.work.`) so
-/// this 4-token subject cannot be captured by it — exactly the
-/// double-delivery guarantee the design requires.
-fn work_subject_worker(model: &str, pool: &str, worker_id: &str) -> String {
+/// filters on `sie.work.{pool}.*.*.*`, so this worker-addressed subject
+/// cannot be captured by it — exactly the double-delivery guarantee
+/// the design requires.
+fn work_subject_worker(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+    worker_id: &str,
+) -> String {
     // Worker ids are operator-controlled (set via `WorkerStatusMessage.name`,
     // ultimately sourced from `SIE_WORKER_ID` / `HOSTNAME` / `POD_NAME` on the
     // worker side) and would otherwise be interpolated verbatim into a NATS
@@ -703,9 +629,11 @@ fn work_subject_worker(model: &str, pool: &str, worker_id: &str) -> String {
     // Python helper or direct-dispatch will silently miss every worker whose
     // raw id contains the newly-changed character.
     format!(
-        "sie.work.{}.{}.{}",
-        normalize_model_id(model),
+        "sie.work.{}.{}.{}.{}.{}",
         pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model),
         normalize_model_id(worker_id)
     )
 }
@@ -720,15 +648,22 @@ fn work_subject_worker(model: &str, pool: &str, worker_id: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum PublishTarget {
     /// Direct-dispatch to a specific worker. Subject:
-    /// `sie.work.{model}.{pool}.{worker_id}`.
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`.
     Worker {
-        model: String,
         pool: String,
+        machine_profile: String,
+        bundle: String,
+        model: String,
         worker_id: String,
     },
     /// Pool fan-out — any worker subscribed to
-    /// `sie.work.*.{pool}` can pick it up.
-    Pool { model: String, pool: String },
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.*` can pick it up.
+    Pool {
+        pool: String,
+        machine_profile: String,
+        bundle: String,
+        model: String,
+    },
 }
 
 impl PublishTarget {
@@ -736,11 +671,18 @@ impl PublishTarget {
     pub fn subject(&self) -> String {
         match self {
             PublishTarget::Worker {
-                model,
                 pool,
+                machine_profile,
+                bundle,
+                model,
                 worker_id,
-            } => work_subject_worker(model, pool, worker_id),
-            PublishTarget::Pool { model, pool } => work_subject(model, pool),
+            } => work_subject_worker(pool, machine_profile, bundle, model, worker_id),
+            PublishTarget::Pool {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+            } => work_subject(pool, machine_profile, bundle, model),
         }
     }
 
@@ -761,12 +703,24 @@ impl PublishTarget {
     #[allow(dead_code)]
     pub fn as_pool_fallback(&self) -> PublishTarget {
         match self {
-            PublishTarget::Worker { model, pool, .. } | PublishTarget::Pool { model, pool } => {
-                PublishTarget::Pool {
-                    model: model.clone(),
-                    pool: pool.clone(),
-                }
+            PublishTarget::Worker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                ..
             }
+            | PublishTarget::Pool {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+            } => PublishTarget::Pool {
+                pool: pool.clone(),
+                machine_profile: machine_profile.clone(),
+                bundle: bundle.clone(),
+                model: model.clone(),
+            },
         }
     }
 
@@ -779,6 +733,17 @@ impl PublishTarget {
     pub fn pool(&self) -> &str {
         match self {
             PublishTarget::Worker { pool, .. } | PublishTarget::Pool { pool, .. } => pool,
+        }
+    }
+
+    pub fn machine_profile(&self) -> &str {
+        match self {
+            PublishTarget::Worker {
+                machine_profile, ..
+            }
+            | PublishTarget::Pool {
+                machine_profile, ..
+            } => machine_profile,
         }
     }
 }
@@ -1122,25 +1087,6 @@ impl WorkPublisher {
         &self.router_id
     }
 
-    /// Number of JetStream consumers registered on the pool's
-    /// ``WORK_POOL_<pool>`` stream — refreshed by the stream-info
-    /// monitor. ``None`` when the pool hasn't been observed yet
-    /// (cold cache); ``Some(0)`` is possible briefly during worker
-    /// roll-over.
-    ///
-    /// Callers use this to gate the H9 first-chunk-fallback path: in
-    /// single-consumer pools the republish targets the same worker
-    /// that's already handling the original request, which produces
-    /// a self-induced cancel-tombstone race
-    /// (``cancel arrived before this worker registered;
-    /// pool-republished attempt is authoritative``). Skipping the
-    /// fallback in that shape preserves the legitimate overall_timeout
-    /// fallback for genuinely slow workers without trading it for a
-    /// guaranteed 503.
-    pub fn pool_consumer_count(&self, pool: &str) -> Option<usize> {
-        self.stream_info_cache.get(pool).map(|v| v.num_consumers)
-    }
-
     /// Ensure the stream exists for the given pool (cached — admin call happens once per pool).
     ///
     /// Returns the cached JetStream stream name as an `Arc<str>` so
@@ -1152,7 +1098,8 @@ impl WorkPublisher {
         }
 
         let name = stream_name(pool);
-        let subjects = vec![format!("sie.work.*.{}", pool)];
+        let desired_subject = format!("sie.work.{}.*.*.*", pool);
+        let subjects = vec![desired_subject.clone()];
 
         let mut stream = self
             .jetstream
@@ -1167,6 +1114,28 @@ impl WorkPublisher {
             })
             .await
             .map_err(|e| format!("create/get stream {}: {}", name, e))?;
+        let observed_subjects = stream.cached_info().config.subjects.clone();
+        if let Some(updated_subjects) =
+            canonical_stream_subjects(observed_subjects.clone(), &desired_subject)
+        {
+            let mut updated = stream.cached_info().config.clone();
+            updated.subjects = updated_subjects;
+            self.jetstream
+                .update_stream(updated)
+                .await
+                .map_err(|e| format!("update stream {} subjects: {}", name, e))?;
+            stream = self
+                .jetstream
+                .get_stream(name.clone())
+                .await
+                .map_err(|e| format!("refresh stream {} after subject update: {}", name, e))?;
+            info!(
+                stream = %name,
+                observed_subjects = ?observed_subjects,
+                desired_subject = %desired_subject,
+                "reconciled JetStream stream subjects to canonical queue lane routing"
+            );
+        }
 
         // Prime the backpressure cache so the very first request to
         // this pool sees real consumer/pending numbers instead of
@@ -1203,15 +1172,15 @@ impl WorkPublisher {
     /// Check backpressure from cached stream info (lock-free DashMap read).
     /// Actual NATS stream.info() calls happen in the background monitor task.
     ///
-    /// **Direct-dispatch caveat:** this check measures the pool-subject's
+    /// **Direct-dispatch caveat:** this check measures the pool stream's
     /// pending count. When HRW routes to a worker's private subject
-    /// (`sie.work.{model}.{pool}.{worker_id}`) the pool count can read
-    /// low while the chosen worker's inbox is saturated. The first-chunk
-    /// timeout in `proxy::stream_generate_response` is the safety net: on
-    /// timeout, `republish_to_pool` redrives the work item onto the pool
-    /// subject so any healthy worker can pick it up. Tighter per-worker
-    /// admission is M5+ work (tracked alongside the §6 mixed-pool
-    /// fairness scheduler).
+    /// (`sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`)
+    /// the pool count can read low while the chosen worker's inbox is
+    /// saturated. The first-chunk timeout in `proxy::stream_generate_response`
+    /// is the safety net: on timeout, `republish_to_pool` redrives the work
+    /// item onto the lane's pool subject so any healthy matching worker can
+    /// pick it up. Tighter per-worker admission is M5+ work (tracked
+    /// alongside the §6 mixed-pool fairness scheduler).
     fn check_backpressure(&self, pool: &str) -> Result<(), String> {
         if let Some(info) = self.stream_info_cache.get(pool) {
             if info.num_consumers == 0 {
@@ -1291,7 +1260,7 @@ impl WorkPublisher {
         pool: &str,
         endpoint: &str,
         model: &str,
-        _bundle: &str,
+        bundle: &str,
         engine: &str,
         gpu: &str,
         bundle_config_hash: &str,
@@ -1319,7 +1288,7 @@ impl WorkPublisher {
             items.len() as u32
         };
 
-        let subject = work_subject(model, pool);
+        let subject = work_subject(pool, gpu, bundle, model);
 
         // Set up result collector (DashMap — lock-free per-key insert)
         let (tx, rx) = oneshot::channel();
@@ -1560,9 +1529,7 @@ impl WorkPublisher {
     pub async fn publish_generate_streaming(
         &self,
         target: PublishTarget,
-        _bundle: &str,
         engine: &str,
-        gpu: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
     ) -> Result<
@@ -1575,6 +1542,7 @@ impl WorkPublisher {
     > {
         let model = target.model().to_string();
         let pool = target.pool().to_string();
+        let machine_profile = target.machine_profile().to_string();
         // Reuse the same JetStream stream + backpressure plumbing as
         // the batch path. The stream collector replaces ResultCollector.
         self.ensure_stream(&pool).await?;
@@ -1587,7 +1555,7 @@ impl WorkPublisher {
         let request_id = uuid::Uuid::now_v7().to_string();
         let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
         let subject = target.subject();
-        let pool_fallback_subject = work_subject(&model, &pool);
+        let pool_fallback_subject = target.as_pool_fallback().subject();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1613,7 +1581,7 @@ impl WorkPublisher {
             endpoint: "generate",
             model: &model,
             pool: &pool,
-            gpu,
+            gpu: &machine_profile,
             engine,
             bundle_config_hash,
             router_id: &self.router_id,
@@ -1671,9 +1639,7 @@ impl WorkPublisher {
     pub async fn publish_generate_streaming_sse(
         &self,
         target: PublishTarget,
-        _bundle: &str,
         engine: &str,
-        gpu: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
     ) -> Result<
@@ -1686,6 +1652,7 @@ impl WorkPublisher {
     > {
         let model = target.model().to_string();
         let pool = target.pool().to_string();
+        let machine_profile = target.machine_profile().to_string();
         self.ensure_stream(&pool).await?;
         self.check_backpressure(&pool)?;
 
@@ -1696,7 +1663,7 @@ impl WorkPublisher {
         let request_id = uuid::Uuid::now_v7().to_string();
         let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
         let subject = target.subject();
-        let pool_fallback_subject = work_subject(&model, &pool);
+        let pool_fallback_subject = target.as_pool_fallback().subject();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1719,7 +1686,7 @@ impl WorkPublisher {
             endpoint: "generate",
             model: &model,
             pool: &pool,
-            gpu,
+            gpu: &machine_profile,
             engine,
             bundle_config_hash,
             router_id: &self.router_id,
@@ -2639,10 +2606,95 @@ pub fn encode_response(
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct WorkItem {
+        pub work_item_id: String,
+        pub request_id: String,
+        pub item_index: u32,
+        pub total_items: u32,
+        pub operation: String,
+        pub model_id: String,
+        #[serde(default)]
+        pub profile_id: String,
+        #[serde(default)]
+        pub engine: String,
+        pub pool_name: String,
+        pub machine_profile: String,
+        #[serde(default)]
+        pub item: Option<rmpv::Value>,
+        #[serde(default)]
+        pub payload_ref: Option<String>,
+        #[serde(default)]
+        pub output_types: Option<Vec<String>>,
+        #[serde(default)]
+        pub instruction: Option<String>,
+        #[serde(default)]
+        pub is_query: bool,
+        #[serde(default)]
+        pub options: Option<serde_json::Value>,
+        #[serde(default)]
+        pub query_item: Option<rmpv::Value>,
+        #[serde(default)]
+        pub query_payload_ref: Option<String>,
+        #[serde(default)]
+        pub score_items: Option<Vec<rmpv::Value>>,
+        #[serde(default)]
+        pub labels: Option<Vec<String>>,
+        #[serde(default)]
+        pub output_schema: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generate: Option<GenerateParams>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routing_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prompt_cache_key: Option<String>,
+        #[serde(default)]
+        pub bundle_config_hash: String,
+        #[serde(default)]
+        pub router_id: String,
+        pub reply_subject: String,
+        #[serde(default)]
+        pub timestamp: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub traceparent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tracestate: Option<String>,
+    }
+
     #[test]
     fn test_stream_name() {
         assert_eq!(stream_name("default"), "WORK_POOL_default");
         assert_eq!(stream_name("eval-l4"), "WORK_POOL_eval-l4");
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_replaces_legacy_subject() {
+        let observed = vec!["sie.work.*.default".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_drops_extra_subjects() {
+        let observed = vec![
+            "sie.work.*.default".to_string(),
+            "sie.work.other.*.*.*".to_string(),
+        ];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_noops_when_exact() {
+        let observed = vec!["sie.work.default.*.*.*".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            None
+        );
     }
 
     #[test]
@@ -2704,32 +2756,45 @@ mod tests {
     #[test]
     fn test_work_subject() {
         assert_eq!(
-            work_subject("BAAI/bge-m3", "default"),
-            "sie.work.BAAI__bge-m3.default"
+            work_subject("default", "rtx6000", "default", "BAAI/bge-m3"),
+            "sie.work.default.rtx6000.default.BAAI__bge-m3"
         );
         assert_eq!(
-            work_subject("my-model", "eval-l4"),
-            "sie.work.my-model.eval-l4"
+            work_subject("eval-l4", "l4-spot", "sglang", "my-model"),
+            "sie.work.eval-l4.l4-spot.sglang.my-model"
+        );
+        assert_eq!(
+            work_subject_worker(
+                "default",
+                "rtx6000",
+                "sglang",
+                "Qwen/Qwen3.6-27B",
+                "worker-0.svc"
+            ),
+            "sie.work.default.rtx6000.sglang.Qwen__Qwen3_dot_6-27B.worker-0_dot_svc"
         );
     }
 
-    /// Regression: model IDs containing `.` must produce exactly 4
-    /// subject tokens (`sie`, `work`, `{normalized_model}`, `{pool}`) so
-    /// the worker's consumer filter `sie.work.*.{pool}` matches them.
+    /// Regression: model IDs containing `.` must produce exactly 6
+    /// subject tokens (`sie`, `work`, `{pool}`, `{machine_profile}`,
+    /// `{bundle}`, `{normalized_model}`) so the worker's consumer filter
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.*` matches them.
     #[test]
     fn test_work_subject_token_count_with_dotted_model() {
-        let subj = work_subject("vidore/colqwen2.5-v0.2", "l4");
+        let subj = work_subject("default", "l4", "default", "vidore/colqwen2.5-v0.2");
         let tokens: Vec<&str> = subj.split('.').collect();
         assert_eq!(
             tokens.len(),
-            4,
-            "subject {subj} must have 4 tokens to match sie.work.*.{{pool}}"
+            6,
+            "subject {subj} must have 6 tokens to match sie.work.{{pool}}.{{machine_profile}}.{{bundle}}.*"
         );
         assert_eq!(tokens[0], "sie");
         assert_eq!(tokens[1], "work");
+        assert_eq!(tokens[2], "default");
         assert_eq!(tokens[3], "l4");
-        // Token[2] contains no '.' (it's the normalized model id).
-        assert!(!tokens[2].contains('.'));
+        assert_eq!(tokens[4], "default");
+        // Token[5] contains no '.' (it's the normalized model id).
+        assert!(!tokens[5].contains('.'));
     }
 
     #[test]

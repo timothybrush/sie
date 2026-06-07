@@ -37,7 +37,8 @@ async def test_build_status_message_uses_pull_loop_worker_id(
 
     The scenario this prevents: ``SIE_WORKER_ID="w-prod-3"`` is set and
     ``HOSTNAME`` is the K8s pod name. Pre-fix, the pull loop subscribed
-    on ``sie.work.*.{pool}.w-prod-3`` but the WS payload reported
+    on ``sie.work.{pool}.{machine_profile}.{bundle}.*.w-prod-3`` but the
+    WS payload reported
     ``name = {pod-name}`` — the gateway's HRW pick used ``{pod-name}``
     for the dispatch subject and no worker was listening on it.
     """

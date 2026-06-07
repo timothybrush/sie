@@ -71,10 +71,12 @@ async fn nak_republish_cancels_original_before_pool_publish() {
     let router_id = "test-router";
     let request_id = unique("req-cancel-ordering");
     let pool = unique("pool-cancel-order");
+    let machine = "rtx6000";
+    let bundle = "sglang";
     let model = "BAAI__bge-m3"; // already subject-normalized (`/` -> `__`)
 
     let cancel_subject = format!("cancel.{router_id}.{request_id}");
-    let pool_subject = format!("sie.work.{model}.{pool}");
+    let pool_subject = format!("sie.work.{pool}.{machine}.{bundle}.{model}");
 
     // Record the order in which the two events are observed by the
     // "original worker" (cancel) and a "pool worker" (republished work).
@@ -141,12 +143,14 @@ async fn nak_republish_lands_on_pool_subject() {
     };
 
     let pool = unique("pool-lands");
+    let machine = "rtx6000";
+    let bundle = "sglang";
     let model = "BAAI__bge-m3";
-    let pool_subject = format!("sie.work.{model}.{pool}");
+    let pool_subject = format!("sie.work.{pool}.{machine}.{bundle}.{model}");
 
-    // A pool worker subscribes on the pool subject (3 tokens after
+    // A pool worker subscribes on the pool subject (4 tokens after
     // `sie.work.`), confirming the republish target is the pool fan-out
-    // subject and not a per-worker (4-token) subject.
+    // subject and not a per-worker (5-token) subject.
     let mut pool_sub = client
         .subscribe(pool_subject.clone())
         .await

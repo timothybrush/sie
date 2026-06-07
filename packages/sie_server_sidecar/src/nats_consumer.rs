@@ -72,15 +72,16 @@ fn generation_stream_max_age_secs() -> u64 {
 /// sweep only deletes consumers that have **zero** pull waiters
 /// (`num_waiting == 0`) and **zero** in-flight acks
 /// (`num_ack_pending == 0`). Default behaviour (env unset / `0`)
-/// keeps the historical aggressive delete because today's topology is
-/// one bundle per pool — flipping bundles on a pool must clobber the
-/// old durable for the new worker to bind.
+/// keeps the historical aggressive delete because a concrete
+/// `(pool, machine_profile, bundle)` lane must have one active durable
+/// owner. Bundle peers can now share the same pool stream safely because
+/// their lane filters do not overlap.
 ///
-/// Flip this on if you ever introduce a topology where two bundles
-/// legitimately share a pool stream with overlapping filters; we
-/// then refuse to delete a healthy peer consumer and let the
-/// authoritative `get_or_create_consumer` error surface so the
-/// operator can resolve the conflict explicitly.
+/// Flip this on if you ever introduce a topology where two consumers
+/// legitimately share overlapping lane filters; we then refuse to delete
+/// a healthy peer consumer and let the authoritative
+/// `get_or_create_consumer` error surface so the operator can resolve
+/// the conflict explicitly.
 fn conservative_cleanup() -> bool {
     std::env::var("SIE_NATS_CONSERVATIVE_CLEANUP")
         .ok()
@@ -118,6 +119,51 @@ pub async fn connect(nats_url: &str) -> Result<(async_nats::Client, JsContext), 
     Ok((client, js))
 }
 
+fn canonical_stream_subjects(observed: Vec<String>, desired: &str) -> Option<Vec<String>> {
+    if observed.len() == 1 && observed.first().is_some_and(|subject| subject == desired) {
+        None
+    } else {
+        Some(vec![desired.to_string()])
+    }
+}
+
+async fn reconcile_stream_subjects(
+    js: &JsContext,
+    stream: &mut JsStream,
+    stream_name: &str,
+    desired_subject: &str,
+) -> Result<(), NatsSetupError> {
+    let observed_subjects = stream.cached_info().config.subjects.clone();
+    let Some(updated_subjects) =
+        canonical_stream_subjects(observed_subjects.clone(), desired_subject)
+    else {
+        return Ok(());
+    };
+
+    let mut updated = stream.cached_info().config.clone();
+    updated.subjects = updated_subjects;
+    js.update_stream(updated)
+        .await
+        .map_err(|e| NatsSetupError::EnsureStream {
+            name: stream_name.to_string(),
+            source: e.into(),
+        })?;
+    *stream = js
+        .get_stream(stream_name)
+        .await
+        .map_err(|e| NatsSetupError::EnsureStream {
+            name: stream_name.to_string(),
+            source: e.into(),
+        })?;
+    info!(
+        stream = %stream_name,
+        observed_subjects = ?observed_subjects,
+        desired_subject = %desired_subject,
+        "reconciled NATS stream subjects to canonical queue lane routing"
+    );
+    Ok(())
+}
+
 /// Predicate used by [`cleanup_overlapping_consumers`]. Returns true
 /// iff any of the consumer's configured filter(s) overlaps the
 /// worker's intended `desired_subject` per NATS wildcard semantics.
@@ -137,122 +183,70 @@ fn any_filter_overlaps(
         .any(|s| subjects_overlap(s, desired_subject))
 }
 
-fn is_legacy_per_model_work_stream(stream_name: &str) -> bool {
-    stream_name.starts_with("WORK_") && !stream_name.starts_with("WORK_POOL_")
-}
-
-fn legacy_stream_overlaps_pool(
-    stream_name: &str,
-    subjects: &[String],
-    desired_stream_name: &str,
+fn consumer_filter_matches_desired(
+    primary_filter: &str,
+    multi_filters: &[String],
     desired_subject: &str,
 ) -> bool {
-    stream_name != desired_stream_name
-        && is_legacy_per_model_work_stream(stream_name)
-        && subjects
-            .iter()
-            .any(|subject| subjects_overlap(subject, desired_subject))
+    if primary_filter == desired_subject && multi_filters.is_empty() {
+        return true;
+    }
+    primary_filter.is_empty()
+        && multi_filters.len() == 1
+        && multi_filters.first().is_some_and(|s| s == desired_subject)
 }
 
-fn legacy_stream_is_safe_to_delete(
-    stream_name: &str,
-    subjects: &[String],
-    desired_stream_name: &str,
+async fn reconcile_same_name_consumer_filter(
+    stream: &JsStream,
+    mut consumer: PullConsumer,
+    consumer_name: &str,
     desired_subject: &str,
-    message_count: u64,
-) -> bool {
-    message_count == 0
-        && legacy_stream_overlaps_pool(stream_name, subjects, desired_stream_name, desired_subject)
-}
+    consumer_cfg: ConsumerConfig,
+) -> Result<PullConsumer, NatsSetupError> {
+    let Ok(info) = consumer.info().await else {
+        return Ok(consumer);
+    };
+    if consumer_filter_matches_desired(
+        &info.config.filter_subject,
+        &info.config.filter_subjects,
+        desired_subject,
+    ) {
+        return Ok(consumer);
+    }
 
-/// Best-effort: delete empty old per-model `WORK_<model>` streams whose
-/// subjects overlap the pool stream we are about to create.
-///
-/// Older Python adapter processes created one WorkQueue stream per model. The Rust
-/// sidecar creates one pool stream (`WORK_POOL_<pool>`) for
-/// `sie.work.*.<pool>`. NATS forbids overlapping WorkQueue streams, so a
-/// leftover per-model stream can prevent the new pool stream from being
-/// created. We only delete empty streams that match the old naming convention
-/// and overlap this pool's subject filter; non-empty streams must be drained
-/// or migrated explicitly so startup never drops queued work.
-async fn cleanup_legacy_per_model_streams(
-    js: &JsContext,
-    desired_stream_name: &str,
-    desired_subject: &str,
-) {
-    let mut listing = js.streams();
-    let mut stale = Vec::new();
+    warn!(
+        stream = %stream.cached_info().config.name,
+        consumer = %consumer_name,
+        observed_filter_subject = %info.config.filter_subject,
+        observed_filter_subjects = ?info.config.filter_subjects,
+        desired_subject,
+        "durable consumer filter drift: updating same-name consumer to the current queue lane"
+    );
 
-    loop {
-        match listing.try_next().await {
-            Ok(Some(info)) => {
-                if legacy_stream_overlaps_pool(
-                    &info.config.name,
-                    &info.config.subjects,
-                    desired_stream_name,
-                    desired_subject,
-                ) {
-                    if legacy_stream_is_safe_to_delete(
-                        &info.config.name,
-                        &info.config.subjects,
-                        desired_stream_name,
-                        desired_subject,
-                        info.state.messages,
-                    ) {
-                        stale.push((info.config.name, info.config.subjects));
-                    } else {
-                        warn!(
-                            stale_stream = %info.config.name,
-                            desired_stream = %desired_stream_name,
-                            desired_subject,
-                            messages = info.state.messages,
-                            subjects = ?info.config.subjects,
-                            "legacy per-model stream overlaps the pool stream but still has \
-                             queued messages; drain or migrate it before starting this sidecar"
-                        );
-                    }
+    match stream.update_consumer(consumer_cfg.clone()).await {
+        Ok(updated) => Ok(updated),
+        Err(update_error) => {
+            warn!(
+                stream = %stream.cached_info().config.name,
+                consumer = %consumer_name,
+                error = %update_error,
+                "durable consumer update failed; deleting and recreating stale same-name consumer"
+            );
+            stream.delete_consumer(consumer_name).await.map_err(|e| {
+                NatsSetupError::EnsureConsumer {
+                    name: consumer_name.to_string(),
+                    source: e.into(),
                 }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    desired_stream = %desired_stream_name,
-                    desired_subject,
-                    "listing streams failed during legacy per-model stream cleanup; \
-                     proceeding to pool stream creation"
-                );
-                return;
-            }
+            })?;
+            consumer = stream
+                .get_or_create_consumer(consumer_name, consumer_cfg)
+                .await
+                .map_err(|e| NatsSetupError::EnsureConsumer {
+                    name: consumer_name.to_string(),
+                    source: e.into(),
+                })?;
+            Ok(consumer)
         }
-    }
-
-    let mut deleted = 0usize;
-    for (stream_name, subjects) in stale {
-        warn!(
-            stale_stream = %stream_name,
-            desired_stream = %desired_stream_name,
-            desired_subject,
-            subjects = ?subjects,
-            "deleting legacy per-model stream that overlaps the pool stream"
-        );
-        match js.delete_stream(&stream_name).await {
-            Ok(_) => deleted += 1,
-            Err(e) => warn!(
-                stale_stream = %stream_name,
-                error = %e,
-                "failed to delete legacy per-model stream; pool stream creation may fail"
-            ),
-        }
-    }
-
-    if deleted > 0 {
-        info!(
-            desired_stream = %desired_stream_name,
-            desired_subject,
-            deleted,
-            "deleted legacy per-model streams before pool stream creation"
-        );
     }
 }
 
@@ -367,8 +361,9 @@ pub async fn reconcile_stream_and_consumer(
 /// Ensure the worker-specific stream used by generation direct-dispatch.
 ///
 /// The gateway publishes direct generation work to
-/// `sie.work.{model}.{pool}.{worker_id}`. That subject intentionally does
-/// not match the pool stream (`sie.work.*.{pool}`), so the sidecar must
+/// `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`. That
+/// subject intentionally does not match the pool stream
+/// (`sie.work.{pool}.*.*.*`), so the sidecar must
 /// bind this second stream for generation to avoid relying solely on
 /// first-chunk fallback republish to the pool.
 pub async fn ensure_worker_stream_and_consumer(
@@ -394,13 +389,14 @@ pub async fn ensure_worker_stream_and_consumer(
     let desired_ack_wait = Duration::from_secs(GENERATION_ACK_WAIT_SECS);
     let desired_max_deliver = max_deliver();
     let desired_max_ack_pending = max_ack_pending();
-    let stream =
+    let mut stream =
         js.get_or_create_stream(stream_cfg)
             .await
             .map_err(|e| NatsSetupError::EnsureStream {
                 name: stream_name.clone(),
                 source: e.into(),
             })?;
+    reconcile_stream_subjects(js, &mut stream, &stream_name, &subject).await?;
 
     cleanup_overlapping_consumers(&stream, &consumer_name, &subject).await;
 
@@ -420,6 +416,22 @@ pub async fn ensure_worker_stream_and_consumer(
             name: consumer_name.clone(),
             source: e.into(),
         })?;
+    let consumer = reconcile_same_name_consumer_filter(
+        &stream,
+        consumer,
+        &consumer_name,
+        &subject,
+        ConsumerConfig {
+            durable_name: Some(consumer_name.clone()),
+            filter_subject: subject.clone(),
+            ack_policy: AckPolicy::Explicit,
+            ack_wait: desired_ack_wait,
+            max_deliver: desired_max_deliver,
+            max_ack_pending: desired_max_ack_pending,
+            ..Default::default()
+        },
+    )
+    .await?;
     info!(
         stream = %stream_name,
         consumer = %consumer_name,
@@ -445,12 +457,13 @@ async fn ensure_stream_and_consumer_inner(
     log_success_at_info: bool,
 ) -> Result<PullConsumer, NatsSetupError> {
     let stream_name = config.stream_name();
+    let stream_subject = config.stream_subject_filter();
     let subject = config.subject_filter();
     let consumer_name = config.consumer_name();
 
     let stream_cfg = StreamConfig {
         name: stream_name.clone(),
-        subjects: vec![subject.clone()],
+        subjects: vec![stream_subject.clone()],
         retention: RetentionPolicy::WorkQueue,
         storage: StorageType::Memory,
         max_age: Duration::from_secs(stream_max_age_secs()),
@@ -465,20 +478,23 @@ async fn ensure_stream_and_consumer_inner(
     let desired_max_ack_pending = max_ack_pending();
     let desired_ack_wait = Duration::from_secs(ACK_WAIT_SECS);
 
-    cleanup_legacy_per_model_streams(js, &stream_name, &subject).await;
-
-    let stream =
+    let mut stream =
         js.get_or_create_stream(stream_cfg)
             .await
             .map_err(|e| NatsSetupError::EnsureStream {
                 name: stream_name.clone(),
                 source: e.into(),
             })?;
+    reconcile_stream_subjects(js, &mut stream, &stream_name, &stream_subject).await?;
 
     // `get_or_create_stream` is a no-op against an EXISTING stream with a
-    // different config (the first writer's config wins). If the gateway
-    // and the worker disagree on `max_age`, retries may be purged before
-    // `max_deliver` is reached — silent data loss. Warn so ops can tell.
+    // different config (the first writer's config wins). We reconcile
+    // subject filters above to the canonical lane-aware shape. This is a
+    // cutover, not a mixed-version bridge: old subjects are intentionally
+    // removed from the stream config. Other config drift (such as max_age)
+    // is still warned below: if the gateway and the worker disagree on
+    // `max_age`, retries may be purged before `max_deliver` is reached —
+    // silent data loss.
     let observed_max_age = stream.cached_info().config.max_age;
     if observed_max_age != desired_max_age {
         warn!(
@@ -491,13 +507,12 @@ async fn ensure_stream_and_consumer_inner(
         );
     }
 
-    // Self-heal stale durables left behind by a prior bundle deploy on
-    // this pool. Without this, NATS rejects our consumer create with
-    // `consumer filter subject overlaps with X` and the worker
-    // CrashLoops until an operator runs `nats consumer rm` by hand.
-    // Concretely: a previous deploy may leave `<old-bundle>_l4`
-    // filtering on `sie.work.*.l4` while the new `<new-bundle>_l4`
-    // wants the same filter.
+    // Self-heal stale durables whose filters overlap this concrete
+    // `(pool, machine_profile, bundle)` lane. Without this, NATS rejects
+    // our consumer create with `consumer filter subject overlaps with X`
+    // and the worker CrashLoops until an operator removes the stale
+    // durable. Different bundles in the same pool no longer overlap
+    // because the bundle is now a subject token.
     cleanup_overlapping_consumers(&stream, &consumer_name, &subject).await;
 
     let consumer_cfg = ConsumerConfig {
@@ -517,6 +532,22 @@ async fn ensure_stream_and_consumer_inner(
             name: consumer_name.clone(),
             source: e.into(),
         })?;
+    consumer = reconcile_same_name_consumer_filter(
+        &stream,
+        consumer,
+        &consumer_name,
+        &subject,
+        ConsumerConfig {
+            durable_name: Some(consumer_name.clone()),
+            filter_subject: subject.clone(),
+            ack_policy: AckPolicy::Explicit,
+            ack_wait: desired_ack_wait,
+            max_deliver: desired_max_deliver,
+            max_ack_pending: desired_max_ack_pending,
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // Same drift warning for the durable consumer. `get_or_create_consumer`
     // inherits the existing durable's config; new tuning here is silently
@@ -618,6 +649,36 @@ mod tests {
     }
 
     #[test]
+    fn canonical_stream_subjects_replaces_legacy_subject() {
+        let observed = vec!["sie.work.*.default".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn canonical_stream_subjects_drops_extra_subjects() {
+        let observed = vec![
+            "sie.work.*.default".to_string(),
+            "sie.work.other.*.*.*".to_string(),
+        ];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn canonical_stream_subjects_noops_when_exact() {
+        let observed = vec!["sie.work.default.*.*.*".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            None
+        );
+    }
+
+    #[test]
     fn env_free_accessors_match_defaults() {
         // Env-free calls must return the hardcoded defaults. We do not
         // touch the environment (would be racy with other tests) — this
@@ -665,8 +726,9 @@ mod tests {
             health_publish_interval_ms: 5_000,
         };
         assert_eq!(cfg.stream_name(), "WORK_POOL_default");
-        assert_eq!(cfg.consumer_name(), "b_default");
-        assert_eq!(cfg.subject_filter(), "sie.work.*.default");
+        assert_eq!(cfg.consumer_name(), "default_default_b");
+        assert_eq!(cfg.stream_subject_filter(), "sie.work.default.*.*.*");
+        assert_eq!(cfg.subject_filter(), "sie.work.default.default.b.*");
     }
 
     // Connect/ensure tests need a live NATS and are covered by integration
@@ -674,88 +736,26 @@ mod tests {
     #[allow(dead_code)]
     fn _compile_check(_js: &JsContext, _cfg: &WorkerConfig) {}
 
-    // ----- legacy per-model stream cleanup predicate --------------------------
-
-    #[test]
-    fn legacy_stream_cleanup_targets_overlapping_per_model_streams() {
-        let subjects = vec!["sie.work.BAAI__bge-m3.l4".to_string()];
-        assert!(legacy_stream_overlaps_pool(
-            "WORK_BAAI__bge-m3",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4"
-        ));
-        assert!(legacy_stream_is_safe_to_delete(
-            "WORK_BAAI__bge-m3",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4",
-            0
-        ));
-    }
-
-    #[test]
-    fn legacy_stream_cleanup_does_not_auto_delete_non_empty_streams() {
-        let subjects = vec!["sie.work.BAAI__bge-m3.l4".to_string()];
-        assert!(!legacy_stream_is_safe_to_delete(
-            "WORK_BAAI__bge-m3",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4",
-            1
-        ));
-    }
-
-    #[test]
-    fn legacy_stream_cleanup_ignores_pool_streams() {
-        let subjects = vec!["sie.work.*.l4".to_string()];
-        assert!(!legacy_stream_overlaps_pool(
-            "WORK_POOL_l4",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4"
-        ));
-        assert!(!legacy_stream_overlaps_pool(
-            "WORK_POOL_other",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4"
-        ));
-    }
-
-    #[test]
-    fn legacy_stream_cleanup_ignores_non_overlapping_work_streams() {
-        let subjects = vec!["sie.work.BAAI__bge-m3.h100".to_string()];
-        assert!(!legacy_stream_overlaps_pool(
-            "WORK_BAAI__bge-m3",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4"
-        ));
-    }
-
-    #[test]
-    fn legacy_stream_cleanup_ignores_unrelated_stream_names() {
-        let subjects = vec!["sie.work.BAAI__bge-m3.l4".to_string()];
-        assert!(!legacy_stream_overlaps_pool(
-            "ORDERS",
-            &subjects,
-            "WORK_POOL_l4",
-            "sie.work.*.l4"
-        ));
-    }
-
     // ----- stale-durable predicate -------------------------------------------
 
     #[test]
-    fn any_filter_overlaps_detects_bundle_flip_collision() {
-        // Real-world case: previous deploy left a `<stale-bundle>_l4`
-        // consumer with filter `sie.work.*.l4`; new deploy wants
-        // `default_l4` with the same filter. The cleanup pass must
-        // mark the old one as overlapping.
-        let stale_filter = "sie.work.*.l4";
-        let desired = "sie.work.*.l4";
+    fn any_filter_overlaps_detects_same_lane_collision() {
+        // Same pool + machine profile + bundle must overlap: replicas of
+        // one StatefulSet intentionally share one durable consumer.
+        let stale_filter = "sie.work.default.rtx6000.sglang.*";
+        let desired = "sie.work.default.rtx6000.sglang.*";
         assert!(any_filter_overlaps(stale_filter, &[], desired));
+    }
+
+    #[test]
+    fn any_filter_overlaps_allows_different_bundles_in_same_pool() {
+        // The queue-pool fix: default and sglang can share logical pool
+        // `default` and machine profile `rtx6000` without overlapping.
+        assert!(!any_filter_overlaps(
+            "sie.work.default.rtx6000.default.*",
+            &[],
+            "sie.work.default.rtx6000.sglang.*"
+        ));
     }
 
     #[test]
@@ -763,9 +763,9 @@ mod tests {
         // A `default_h100` consumer on a shared NATS account must not
         // be deleted just because we're deploying `default_l4`.
         assert!(!any_filter_overlaps(
-            "sie.work.*.h100",
+            "sie.work.default.h100.default.*",
             &[],
-            "sie.work.*.l4"
+            "sie.work.default.l4.default.*"
         ));
     }
 
@@ -773,14 +773,66 @@ mod tests {
     fn any_filter_overlaps_handles_filter_subjects_list() {
         // Newer NATS consumers can use the multi-filter
         // `filter_subjects` list (with `filter_subject` blank).
-        let multi = vec!["sie.work.foo.h100".to_string(), "sie.work.*.l4".to_string()];
-        assert!(any_filter_overlaps("", &multi, "sie.work.*.l4"));
+        let multi = vec![
+            "sie.work.foo.h100.default.*".to_string(),
+            "sie.work.default.l4.default.*".to_string(),
+        ];
+        assert!(any_filter_overlaps(
+            "",
+            &multi,
+            "sie.work.default.l4.default.*"
+        ));
 
         let multi_disjoint = vec![
-            "sie.work.foo.h100".to_string(),
-            "sie.work.*.eval-l4".to_string(),
+            "sie.work.foo.h100.default.*".to_string(),
+            "sie.work.eval-l4.l4.default.*".to_string(),
         ];
-        assert!(!any_filter_overlaps("", &multi_disjoint, "sie.work.*.l4"));
+        assert!(!any_filter_overlaps(
+            "",
+            &multi_disjoint,
+            "sie.work.default.l4.default.*"
+        ));
+    }
+
+    #[test]
+    fn consumer_filter_matches_desired_primary_filter() {
+        assert!(consumer_filter_matches_desired(
+            "sie.work.default.rtx6000.sglang.*.worker-0",
+            &[],
+            "sie.work.default.rtx6000.sglang.*.worker-0"
+        ));
+    }
+
+    #[test]
+    fn consumer_filter_matches_desired_single_multi_filter() {
+        let filters = vec!["sie.work.default.rtx6000.sglang.*.worker-0".to_string()];
+        assert!(consumer_filter_matches_desired(
+            "",
+            &filters,
+            "sie.work.default.rtx6000.sglang.*.worker-0"
+        ));
+    }
+
+    #[test]
+    fn consumer_filter_matches_desired_rejects_legacy_same_name_filter() {
+        assert!(!consumer_filter_matches_desired(
+            "sie.work.*.default.worker-0",
+            &[],
+            "sie.work.default.rtx6000.sglang.*.worker-0"
+        ));
+    }
+
+    #[test]
+    fn consumer_filter_matches_desired_rejects_extra_multi_filter() {
+        let filters = vec![
+            "sie.work.default.rtx6000.sglang.*.worker-0".to_string(),
+            "sie.work.default.rtx6000.default.*.worker-0".to_string(),
+        ];
+        assert!(!consumer_filter_matches_desired(
+            "",
+            &filters,
+            "sie.work.default.rtx6000.sglang.*.worker-0"
+        ));
     }
 
     #[test]
@@ -790,6 +842,10 @@ mod tests {
         // creating that on a WorkQueue stream, so it shouldn't
         // appear, but if it ever does we don't want to spuriously
         // delete it.
-        assert!(!any_filter_overlaps("", &[], "sie.work.*.l4"));
+        assert!(!any_filter_overlaps(
+            "",
+            &[],
+            "sie.work.default.l4.default.*"
+        ));
     }
 }

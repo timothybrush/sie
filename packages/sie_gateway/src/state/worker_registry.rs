@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +68,18 @@ pub type OnWorkerHealthy = Arc<dyn Fn(&WorkerState) + Send + Sync>;
 /// Used by the proxy/publisher to invalidate cached per-`(model, pool)`
 /// ring snapshots and (optionally) to log a structured trace.
 pub type OnWorkerDegraded = Arc<dyn Fn(&WorkerState) + Send + Sync>;
+
+/// Concrete queue lane resolved from the worker registry.
+///
+/// `pool_name` is the logical tenant/capacity pool. `machine_profile`
+/// is the hardware lane that must be embedded in the NATS subject so
+/// non-interchangeable worker groups sharing the same pool do not
+/// overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRoute {
+    pub pool_name: String,
+    pub machine_profile: String,
+}
 
 /// Pre-computed snapshot of healthy workers, indexed by bundle.
 /// Rebuilt on every worker state change and swapped atomically via Arc.
@@ -319,11 +331,12 @@ impl WorkerRegistry {
         }
     }
 
-    /// Dispatch-eligible workers for a `(model, pool)` —
-    /// healthy, not saturated, with `model` in `loaded_models` and
-    /// `pool_name` matching `pool`. Pool match is case-insensitive
-    /// to mirror [`resolve_queue_pool_matching`]. Used by the proxy
-    /// to build per-request HRW snapshots.
+    /// Dispatch-eligible workers for a `(model, pool, machine_profile, bundle)` —
+    /// healthy, not saturated, with `model` in `loaded_models`, a matching
+    /// bundle config hash, and the full queue lane matching. Pool /
+    /// machine-profile / bundle matches are case-insensitive to mirror
+    /// [`resolve_queue_route_matching`]. Used by the proxy to build
+    /// per-request HRW snapshots.
     ///
     /// A `model:profile` request is matched against the **base** model
     /// id: workers advertise only base model names in `loaded_models`
@@ -333,24 +346,89 @@ impl WorkerRegistry {
     /// eligible worker and would always fall through to the pool subject
     /// (mislabelled `unhealthy_skipped`). HF model ids never contain `:`,
     /// so the suffix split is unambiguous.
-    pub fn dispatch_workers_for(&self, model: &str, pool: &str) -> Vec<WorkerState> {
+    #[cfg(test)]
+    pub fn dispatch_workers_for(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+    ) -> Vec<WorkerState> {
+        self.dispatch_workers_for_matching(
+            model,
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            None,
+        )
+    }
+
+    fn dispatch_workers_for_matching(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> Vec<WorkerState> {
         let base_model = base_model_id(model);
         let snap = self.snapshot.load();
         snap.all_healthy
             .iter()
             .filter(|w| {
                 !w.saturated
+                    && worker_allowed_by_admission(w, admitted_worker_names)
+                    && !w.machine_profile.is_empty()
                     && w.pool_name.eq_ignore_ascii_case(pool)
+                    && w.machine_profile.eq_ignore_ascii_case(machine_profile)
+                    && w.bundle.eq_ignore_ascii_case(bundle)
+                    && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
                     && w.models.iter().any(|m| m.eq_ignore_ascii_case(base_model))
             })
             .cloned()
             .collect()
     }
 
-    /// Build a [`RingSnapshot`] for the given `(model, pool)`. Uses
+    /// Workers that can receive a pool fallback for this concrete lane.
+    ///
+    /// Unlike [`Self::dispatch_workers_for`], this intentionally does not
+    /// require `model` to already be present in `loaded_models`: the pool
+    /// fallback path can land on a healthy same-lane worker that lazy-loads
+    /// the model. This count is used only to decide whether first-chunk
+    /// failover has an alternate consumer.
+    pub fn pool_fallback_lane_worker_count(
+        &self,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> usize {
+        let snap = self.snapshot.load();
+        let bundle_lower = bundle.to_lowercase();
+        let Some(candidates) = snap.by_bundle.get(&bundle_lower) else {
+            return 0;
+        };
+        candidates
+            .iter()
+            .filter(|w| {
+                !w.saturated
+                    && worker_allowed_by_admission(w, admitted_worker_names)
+                    && !w.machine_profile.is_empty()
+                    && w.pool_name.eq_ignore_ascii_case(pool)
+                    && w.machine_profile.eq_ignore_ascii_case(machine_profile)
+                    && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
+            })
+            .count()
+    }
+
+    /// Build a [`RingSnapshot`] for the given concrete queue lane. Uses
     /// the worker `name` (direct-dispatch worker_id convention) as the ring
     /// key; the same name shows up on the per-worker NATS subject
-    /// `sie.work.{model}.{pool}.{worker_id}`.
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`.
     ///
     /// The output is sorted by worker name so HRW tie-breaks are
     /// identical across gateway replicas regardless of the upstream
@@ -364,8 +442,61 @@ impl WorkerRegistry {
     /// choice is deterministic across replicas, and warn (rate-limited)
     /// that an operator misconfiguration was observed. The wire-level
     /// subject format is unchanged — only which workers enter the ring.
-    pub fn ring_snapshot_for(&self, model: &str, pool: &str) -> RingSnapshot {
-        let mut workers = self.dispatch_workers_for(model, pool);
+    #[cfg(test)]
+    pub fn ring_snapshot_for(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+    ) -> RingSnapshot {
+        self.ring_snapshot_for_matching(
+            model,
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            None,
+        )
+    }
+
+    pub fn ring_snapshot_for_admitted(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> RingSnapshot {
+        self.ring_snapshot_for_matching(
+            model,
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            admitted_worker_names,
+        )
+    }
+
+    fn ring_snapshot_for_matching(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> RingSnapshot {
+        let mut workers = self.dispatch_workers_for_matching(
+            model,
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            admitted_worker_names,
+        );
         // Sort by `(name, url)` so duplicate names are adjacent and the
         // smallest-`url` entry comes first within each name group.
         workers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.url.cmp(&b.url)));
@@ -404,10 +535,12 @@ impl WorkerRegistry {
         gpu: &str,
         bundle_config_hash: &str,
     ) -> Option<String> {
-        self.resolve_queue_pool_matching(bundle, gpu, None, bundle_config_hash)
+        self.resolve_queue_route_matching(bundle, gpu, None, bundle_config_hash)
+            .map(|route| route.pool_name)
     }
 
     /// Resolve the NATS pool name, constrained to a specific logical pool.
+    #[cfg(test)]
     pub async fn resolve_queue_pool_in_pool(
         &self,
         bundle: &str,
@@ -415,16 +548,29 @@ impl WorkerRegistry {
         pool_name: &str,
         bundle_config_hash: &str,
     ) -> Option<String> {
-        self.resolve_queue_pool_matching(bundle, gpu, Some(pool_name), bundle_config_hash)
+        self.resolve_queue_route_in_pool(bundle, gpu, pool_name, bundle_config_hash)
+            .await
+            .map(|route| route.pool_name)
     }
 
-    fn resolve_queue_pool_matching(
+    /// Resolve a concrete queue lane, constrained to a specific logical pool.
+    pub async fn resolve_queue_route_in_pool(
+        &self,
+        bundle: &str,
+        gpu: &str,
+        pool_name: &str,
+        bundle_config_hash: &str,
+    ) -> Option<QueueRoute> {
+        self.resolve_queue_route_matching(bundle, gpu, Some(pool_name), bundle_config_hash)
+    }
+
+    fn resolve_queue_route_matching(
         &self,
         bundle: &str,
         gpu: &str,
         pool_name: Option<&str>,
         bundle_config_hash: &str,
-    ) -> Option<String> {
+    ) -> Option<QueueRoute> {
         let snap = self.snapshot.load();
 
         // `by_bundle` is keyed with `w.bundle.to_lowercase()` in
@@ -445,6 +591,9 @@ impl WorkerRegistry {
             if w.pool_name.is_empty() {
                 continue;
             }
+            if w.machine_profile.is_empty() {
+                continue;
+            }
             if let Some(pool_name) = pool_name {
                 if !w.pool_name.eq_ignore_ascii_case(pool_name) {
                     continue;
@@ -456,7 +605,10 @@ impl WorkerRegistry {
             if !bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash) {
                 continue;
             }
-            return Some(w.pool_name.clone());
+            return Some(QueueRoute {
+                pool_name: w.pool_name.clone(),
+                machine_profile: w.machine_profile.clone(),
+            });
         }
         None
     }
@@ -589,6 +741,16 @@ impl WorkerRegistry {
 
 fn bundle_config_hash_matches(worker_hash: &str, expected_hash: &str) -> bool {
     expected_hash.is_empty() || worker_hash == expected_hash
+}
+
+fn worker_allowed_by_admission(
+    worker: &WorkerState,
+    admitted_worker_names: Option<&HashSet<String>>,
+) -> bool {
+    match admitted_worker_names {
+        Some(names) => names.contains(&worker.name),
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -1014,22 +1176,23 @@ mod tests {
 
         // A `:profile` request must direct-dispatch to the base-model
         // worker rather than fall through to the pool.
-        let direct = reg.dispatch_workers_for("BAAI/bge-m3:fast", "default");
+        let direct =
+            reg.dispatch_workers_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
         assert_eq!(direct.len(), 1, "profile variant should match base worker");
         assert_eq!(direct[0].name, "w1");
 
         // The bare base id still works (regression guard).
-        let base = reg.dispatch_workers_for("BAAI/bge-m3", "default");
+        let base = reg.dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "default", "");
         assert_eq!(base.len(), 1);
 
         // The ring snapshot (built from the same filter) is non-empty,
         // so HRW can pick a worker for the profile variant.
-        let ring = reg.ring_snapshot_for("BAAI/bge-m3:fast", "default");
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
         assert_eq!(ring.len(), 1);
 
         // An unknown base id still finds nothing.
         assert!(reg
-            .dispatch_workers_for("unknown/model:fast", "default")
+            .dispatch_workers_for("unknown/model:fast", "default", "l4-spot", "default", "")
             .is_empty());
     }
 
@@ -1053,11 +1216,15 @@ mod tests {
         reg.update_worker("http://w-a:8080", b).await;
 
         // Both are dispatch-eligible…
-        assert_eq!(reg.dispatch_workers_for("BAAI/bge-m3", "default").len(), 2);
+        assert_eq!(
+            reg.dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "default", "")
+                .len(),
+            2
+        );
         // …but the ring collapses them to a single deterministic entry so
         // the HRW pick is unambiguous and only one per-worker subject is
         // targeted.
-        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default");
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default", "l4-spot", "default", "");
         assert_eq!(ring.len(), 1);
         assert_eq!(ring.entries[0].worker_id, "dup");
     }
@@ -1077,7 +1244,7 @@ mod tests {
         b.loaded_models = vec!["BAAI/bge-m3".into()];
         reg.update_worker("http://w2:8080", b).await;
 
-        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default");
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "default", "l4-spot", "default", "");
         assert_eq!(ring.len(), 2);
     }
 
@@ -1336,7 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_workers_for_filters_by_model_pool_and_saturation() {
+    async fn test_dispatch_workers_for_filters_by_lane_model_and_saturation() {
         let reg = registry();
         let mut a = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
         a.name = "worker-a".into();
@@ -1358,9 +1525,127 @@ mod tests {
         e.name = "worker-e".into();
         reg.update_worker("http://e:8080", e).await;
 
-        let elig = reg.dispatch_workers_for("BAAI/bge-m3", "p1");
+        let mut f = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        f.name = "worker-f".into();
+        f.machine_profile = "a100".into();
+        reg.update_worker("http://f:8080", f).await;
+
+        let mut g = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        g.name = "worker-g".into();
+        g.bundle = "sglang".into();
+        reg.update_worker("http://g:8080", g).await;
+
+        let elig = reg.dispatch_workers_for("BAAI/bge-m3", "p1", "l4", "default", "");
         let names: Vec<_> = elig.iter().map(|w| w.name.clone()).collect();
         assert_eq!(names, vec!["worker-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_workers_for_filters_stale_bundle_hash() {
+        let reg = registry();
+        let mut current = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        current.name = "current".into();
+        current.bundle_config_hash = "h1".into();
+        reg.update_worker("http://current:8080", current).await;
+
+        let mut stale = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        stale.name = "stale".into();
+        stale.bundle_config_hash = "old".into();
+        reg.update_worker("http://stale:8080", stale).await;
+
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3", "p1", "l4", "default", "h1");
+        let ids: Vec<_> = ring.entries.iter().map(|e| e.worker_id.clone()).collect();
+        assert_eq!(ids, vec!["current".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_pool_fallback_lane_worker_count_includes_cold_workers() {
+        let reg = registry();
+        let mut warm = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        warm.name = "warm".into();
+        reg.update_worker("http://warm:8080", warm).await;
+
+        let mut cold = make_dispatch_msg(true, false, "p1", &[]).await;
+        cold.name = "cold".into();
+        reg.update_worker("http://cold:8080", cold).await;
+
+        assert_eq!(
+            reg.dispatch_workers_for("BAAI/bge-m3", "p1", "l4", "default", "")
+                .len(),
+            1
+        );
+        assert_eq!(
+            reg.pool_fallback_lane_worker_count("p1", "l4", "default", "", None),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_fallback_lane_worker_count_filters_unusable_workers() {
+        let reg = registry();
+        let mut active = make_dispatch_msg(true, false, "p1", &[]).await;
+        active.name = "active".into();
+        active.bundle_config_hash = "h1".into();
+        reg.update_worker("http://active:8080", active).await;
+
+        let mut saturated = make_dispatch_msg(true, true, "p1", &[]).await;
+        saturated.name = "saturated".into();
+        saturated.bundle_config_hash = "h1".into();
+        reg.update_worker("http://saturated:8080", saturated).await;
+
+        let mut stale_hash = make_dispatch_msg(true, false, "p1", &[]).await;
+        stale_hash.name = "stale-hash".into();
+        stale_hash.bundle_config_hash = "old".into();
+        reg.update_worker("http://stale-hash:8080", stale_hash)
+            .await;
+
+        let mut other_bundle = make_dispatch_msg(true, false, "p1", &[]).await;
+        other_bundle.name = "other-bundle".into();
+        other_bundle.bundle = "sglang".into();
+        other_bundle.bundle_config_hash = "h1".into();
+        reg.update_worker("http://other-bundle:8080", other_bundle)
+            .await;
+
+        assert_eq!(
+            reg.pool_fallback_lane_worker_count("p1", "l4", "default", "h1", None),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_fallback_lane_worker_count_respects_admitted_workers() {
+        let reg = registry();
+        let mut assigned = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        assigned.name = "assigned".into();
+        assigned.bundle_config_hash = "h1".into();
+        reg.update_worker("http://assigned:8080", assigned).await;
+
+        let mut paused = make_dispatch_msg(true, false, "p1", &["BAAI/bge-m3"]).await;
+        paused.name = "paused".into();
+        paused.bundle_config_hash = "h1".into();
+        reg.update_worker("http://paused:8080", paused).await;
+
+        let admitted = HashSet::from(["assigned".to_string()]);
+
+        assert_eq!(
+            reg.pool_fallback_lane_worker_count("p1", "l4", "default", "h1", None),
+            2
+        );
+        assert_eq!(
+            reg.pool_fallback_lane_worker_count("p1", "l4", "default", "h1", Some(&admitted)),
+            1
+        );
+
+        let ring = reg.ring_snapshot_for_admitted(
+            "BAAI/bge-m3",
+            "p1",
+            "l4",
+            "default",
+            "h1",
+            Some(&admitted),
+        );
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.entries[0].worker_id, "assigned");
     }
 
     #[tokio::test]
@@ -1371,7 +1656,7 @@ mod tests {
             m.name = format!("w-{i}");
             reg.update_worker(&format!("http://h{i}:8080"), m).await;
         }
-        let snap = reg.ring_snapshot_for("m", "p1");
+        let snap = reg.ring_snapshot_for("m", "p1", "l4", "default", "");
         let ids: Vec<_> = snap.entries.iter().map(|e| e.worker_id.clone()).collect();
         assert!(ids.contains(&"w-0".to_string()));
         assert!(!ids.contains(&"w-1".to_string()));

@@ -84,12 +84,12 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(sie_request_queue_depth{namespace=\"$namespace\", model=\"$model\"}) by (pod)",
-          "legendFormat": "{{pod}}",
+          "expr": "sum(sie_gateway_worker_queue_depth{namespace=\"$namespace\"}) by (worker, pool, machine_profile, bundle)",
+          "legendFormat": "{{worker}} {{pool}}/{{machine_profile}}/{{bundle}}",
           "refId": "A"
         }
       ],
-      "title": "Queue Depth by Pod",
+      "title": "Queue Depth by Worker Lane",
       "type": "timeseries"
     },
     {

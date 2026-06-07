@@ -18,10 +18,10 @@ struct Cli {
     #[arg(long, env = "SIE_NATS_URL")]
     nats_url: String,
 
-    #[arg(long, env = "SIE_POOL", default_value = "_default")]
+    #[arg(long, env = "SIE_POOL")]
     pool: String,
 
-    #[arg(long, env = "SIE_BUNDLE", default_value = "default")]
+    #[arg(long, env = "SIE_BUNDLE")]
     bundle: String,
 
     #[arg(long, env = "SIE_IPC_SOCKET_PATH", default_value = "/tmp/sie-ipc.sock")]
@@ -83,13 +83,13 @@ struct Cli {
     #[arg(long, env = "SIE_WORKER_READYZ_STALE_MULT", default_value = "3")]
     ready_stale_mult: u32,
 
-    /// Machine-profile label echoed in NATS health heartbeats.
-    /// Used by the gateway when a request carries
-    /// `X-SIE-MACHINE-PROFILE`; empty disables that filter.
-    /// Defaults to the pool name (the historical convention where
-    /// pool == GPU type, e.g. `l4`).
+    /// Machine-profile label echoed in NATS health heartbeats and
+    /// embedded in this worker's queue subject lane. Requests carrying
+    /// `X-SIE-MACHINE-PROFILE` constrain route resolution to this value.
+    /// Required. Helm sets it explicitly from the worker pool's
+    /// machineProfile.
     #[arg(long, env = "SIE_MACHINE_PROFILE")]
-    machine_profile: Option<String>,
+    machine_profile: String,
 
     /// GPU count surfaced in heartbeats. Informational; the
     /// gateway coerces 0 to 1. Defaults to 1.
@@ -143,17 +143,13 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let pool = cli.pool;
-    // Default machine_profile to the pool name: in practice every
-    // existing helm pool we operate (`l4`, `a100`, `h100`) is named
-    // after its GPU SKU, and the gateway compares the field
-    // case-insensitively. Operators with a non-conventional pool
-    // (`mixed-spot-1`) can override via `SIE_MACHINE_PROFILE`.
-    let machine_profile = cli.machine_profile.unwrap_or_else(|| pool.clone());
+    let pool = validate_lane_segment("SIE_POOL", cli.pool)?;
+    let bundle = validate_lane_segment("SIE_BUNDLE", cli.bundle)?;
+    let machine_profile = validate_lane_segment("SIE_MACHINE_PROFILE", cli.machine_profile)?;
     let config = WorkerConfig {
         nats_url: cli.nats_url,
         pool,
-        bundle: cli.bundle,
+        bundle,
         ipc_socket_path: cli.ipc_socket_path.into(),
         ipc_pool_size: cli
             .ipc_pool_size
@@ -211,6 +207,20 @@ fn init_tracing() {
     fmt().with_env_filter(filter).json().init();
 }
 
+fn validate_lane_segment(name: &str, raw: String) -> anyhow::Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '.' | '*' | '>'))
+    {
+        anyhow::bail!("{name} must not contain '.', '*', '>', or whitespace");
+    }
+    Ok(value.to_string())
+}
+
 fn env_bool_value(raw: Option<&str>, default: bool) -> bool {
     let Some(raw) = raw else {
         return default;
@@ -227,4 +237,24 @@ fn seconds_to_millis(seconds: f64, min_ms: u64) -> u64 {
         return min_ms;
     }
     ((seconds * 1_000.0).round() as u64).max(min_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_lane_segment;
+
+    #[test]
+    fn validate_lane_segment_trims_valid_values() {
+        assert_eq!(
+            validate_lane_segment("SIE_POOL", " default-pool ".to_string()).unwrap(),
+            "default-pool"
+        );
+    }
+
+    #[test]
+    fn validate_lane_segment_rejects_subject_wildcards_and_dot_tokens() {
+        for raw in ["", "   ", "foo.bar", "foo*", "foo>", "foo bar"] {
+            assert!(validate_lane_segment("SIE_POOL", raw.to_string()).is_err());
+        }
+    }
 }

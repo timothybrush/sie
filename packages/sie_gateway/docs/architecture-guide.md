@@ -46,7 +46,7 @@ Key terms used throughout this document:
    - `POST /v1/extract/{*model}`
    - `POST /v1/embeddings` — OpenAI-compatible JSON surface; the gateway accepts **string** or **list of strings** for `input`, supports `encoding_format=float` (default) or `base64`, translates to an internal **`POST /v1/encode/{model}`** with `items[].text` and `params.output_types=["dense"]`, then maps encode `items[].dense` vectors into OpenAI `data[].embedding` plus a rough `usage` estimate. Token-id / nested-array inputs are rejected with **`400`**.
 2. Gateway resolves the request to a model, a bundle, a machine profile, and a queue pool using its in-memory registry.
-3. Gateway publishes work to JetStream on `sie.work.{model}.{pool}`.
+3. Gateway publishes work to JetStream on `sie.work.{pool}.{machine_profile}.{bundle}.{model}`.
 4. A matching worker consumes the work item and executes inference.
 5. Worker publishes the result on `_INBOX.{router_id}.{request_id}` (NATS Core).
 6. Gateway collects the result and returns the HTTP response.
@@ -280,8 +280,8 @@ Per-subject transport:
 
 | Path | Subject pattern | Transport | Notes |
 |---|---|---|---|
-| Inference work (`encode` / `score` / `extract`) | `sie.work.{model}.{pool}` | JetStream | Durability and max-delivery semantics required. Work-item payload is msgpack. One stream per pool (`WORK_POOL_{pool}`) captures all non-generation work for the pool; see §8.2. |
-| Generation direct-dispatch | `sie.work.{model}.{pool}.{worker_id}` | JetStream | Worker-specific stream used only by pools that host generation-capable models. Non-generation workers must not create or poll this stream; keeping them pool-only preserves queue batching for `encode` / `score` / `extract`. |
+| Inference work (`encode` / `score` / `extract`) | `sie.work.{pool}.{machine_profile}.{bundle}.{model}` | JetStream | Durability and max-delivery semantics required. Work-item payload is msgpack. One stream per pool (`WORK_POOL_{pool}`) captures all non-generation work for the pool, while worker consumers filter one concrete machine-profile/bundle lane; see §8.2. |
+| Generation direct-dispatch | `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}` | JetStream | Worker-specific stream used only by pools that host generation-capable models. Non-generation workers must not create or poll this stream; keeping them pool-only preserves queue batching for `encode` / `score` / `extract`. |
 | Inference results | `_INBOX.{router_id}.{request_id}` | NATS Core | Gateway is waiting synchronously; a brief blip after publish but before delivery means the result is lost and the client retries (the gateway returns `503` with `X-SIE-Error-Code: MODEL_LOADING` and `Retry-After: 5` — see §2). Result payload is msgpack. |
 | Config deltas | `sie.config.models.{bundle}`, `sie.config.models._all` | NATS Core | Lightweight fan-out. Gateway durability comes from the snapshot/export path (§4), not the bus. JSON payload (control plane, not hot path). The gateway subscribes on `_all`; worker-sidecar containers subscribe on their bundle subject and apply through Python IPC. |
 | Worker health | `sie.health.>` | NATS Core | Ephemeral, last-heartbeat-wins. The gateway subscribes in `health_mode=nats` (see `discovery/nats_health.rs`). Worker-sidecar containers publish this heartbeat and include the latest bundle hash after successful config apply; the **default `health_mode=ws`** still uses the Python WebSocket path. |
@@ -294,7 +294,7 @@ The gateway's `ensure_stream` (per pool, called lazily on first publish) creates
 
 ```
 name:      WORK_POOL_{pool}
-subjects:  ["sie.work.*.{pool}"]
+subjects:  ["sie.work.{pool}.*.*.*"]
 retention: WorkQueue
 storage:   Memory
 max_age:   60s  (gateway-side)
@@ -303,11 +303,18 @@ max_msgs:  100_000
 
 The worker-sidecar (`packages/sie_server_sidecar`, binary `sie-server-sidecar`) also calls `add_stream` with the **same** name but a default `max_age` of 120 s (`SIE_STREAM_MAX_AGE_S`). `get_or_create_stream` / `add_stream` does not update an existing stream's config, so whichever side races to the broker first wins. To avoid drift, pick one owner (either the gateway or the worker); the Helm values should set `SIE_STREAM_MAX_AGE_S` on workers to match the gateway's constant, or the gateway should read the same env.
 
-The stream's subject filter `sie.work.*.{pool}` matches **exactly one token** in the model position. NATS subject tokens legally contain `/`, so `BAAI/bge-m3` works directly. They cannot contain `.`, `*`, `>`, or whitespace, so any model whose `sie_id` contains one of those characters would — without normalization — expand into multiple tokens, not match the stream filter, and get rejected at the broker.
+When a gateway or sidecar observes an existing `WORK_POOL_{pool}` stream, it
+reconciles the stream subjects to exactly `sie.work.{pool}.*.*.*`. Legacy
+subjects such as `sie.work.*.{pool}` are intentionally removed from the stream
+configuration. This release is a cutover to the lane-aware subject shape, not a
+mixed-version bridge: all gateways and workers in the cluster must use the new
+shape, and any old queued work should be drained or purged before rollout.
 
-To prevent that, the Rust gateway's `work_subject(model, pool)` in `packages/sie_gateway/src/queue/publisher.rs` calls a private `normalize_model_id` helper that mirrors the Python SDK (`sie_sdk.queue_types.normalize_model_id`): `/` → `__`, `.` → `_dot_`, and `*`/`>`/space → `_`. So `vidore/colqwen2.5-v0.2` publishes on `sie.work.vidore__colqwen2_dot_5-v0_dot_2.default` — exactly four tokens, matches the consumer filter. The DLQ token extractor in `queue/dlq.rs` splits the advisory subject on `.` and takes `parts[2]`, which with the normalization in place is already a single safe token.
+The stream's subject filter `sie.work.{pool}.*.*.*` matches exactly one token each for machine profile, bundle, and model. Workers attach durable consumers with the narrower `sie.work.{pool}.{machine_profile}.{bundle}.*` filter, so multiple bundles can share a pool stream without stealing each other's work. NATS subject tokens legally contain `/`, so `BAAI/bge-m3` works directly. They cannot contain `.`, `*`, `>`, or whitespace, so any model whose `sie_id` contains one of those characters would — without normalization — expand into multiple tokens, not match the stream or consumer filters, and get rejected at the broker.
 
-Generation adds a worker-specific subject, `sie.work.{model}.{pool}.{worker_id}`, which has one additional token after the pool. That subject intentionally does not match the pool stream's `sie.work.*.{pool}` filter. The worker runtime binds the worker-specific stream only when the local pool hosts a generation model; encode-only pools keep the pre-generation queue runtime: exactly one hot JetStream consumer, the pool pull loop, the existing adaptive fetch timeout, and the existing dispatch path. This is a batching invariant, not just a resource optimization: generation-only machinery, including the streaming processor, cancel subscription, grammar prewarm, and direct-dispatch pull loop, must not start on encode-only workers because it can perturb shared NATS intake and collapse queue-side batch size. If live config reconciliation adds a generation model to a previously encode-only sidecar, the sidecar rechecks `WorkerCapabilities` and activates this worker-specific stream exactly once.
+To prevent that, the Rust gateway's `work_subject(pool, machine_profile, bundle, model)` in `packages/sie_gateway/src/queue/publisher.rs` calls a private `normalize_model_id` helper that mirrors the Python SDK (`sie_sdk.queue_types.normalize_model_id`): `/` → `__`, `.` → `_dot_`, and `*`/`>`/space → `_`. So `vidore/colqwen2.5-v0.2` on the default RTX 6000 default-bundle lane publishes on `sie.work.default.rtx6000.default.vidore__colqwen2_dot_5-v0_dot_2` — exactly six tokens, matches the lane consumer filter. The DLQ token extractor in `queue/dlq.rs` splits the advisory subject on `.` and takes `parts[5]`, which with the normalization in place is already a single safe token.
+
+Generation adds a worker-specific subject, `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`, which has one additional token after the model. That subject intentionally does not match the pool stream's `sie.work.{pool}.*.*.*` filter. The worker runtime binds the worker-specific stream only when the local pool hosts a generation model; encode-only pools keep the pre-generation queue runtime: exactly one hot JetStream consumer, the pool pull loop, the existing adaptive fetch timeout, and the existing dispatch path. This is a batching invariant, not just a resource optimization: generation-only machinery, including the streaming processor, cancel subscription, grammar prewarm, and direct-dispatch pull loop, must not start on encode-only workers because it can perturb shared NATS intake and collapse queue-side batch size. If live config reconciliation adds a generation model to a previously encode-only sidecar, the sidecar rechecks `WorkerCapabilities` and activates this worker-specific stream exactly once.
 
 The same isolation applies in the gateway. `encode` / `score` / `extract` and `/v1/embeddings` must not pay generation-specific proxy spans, HRW/direct-dispatch routing, per-worker subjects, or trace-context envelope injection. Their work items stay on the pool JetStream subject and keep the pre-generation queue-publish hot path. Generation endpoints may open gateway spans and inject W3C trace context only on generation direct-dispatch or generation fallback work. New gateway hot-path decisions should use the shared endpoint classifier and its regression tests, not one-off string checks.
 
@@ -502,14 +509,14 @@ Emitted from a Tower middleware (`MetricsLayer` in `middleware/metrics.rs`) that
 ### 15.2 Routing outcomes — gateway
 
 - `sie_gateway_provisioning_responses_total{machine_profile}` — counter. `202 Accepted` returned when no ready worker exists; paired with `sie_gateway_pending_demand` for KEDA scale-up.
-- `sie_gateway_rejected_requests_total{machine_profile,bundle,reason}` — counter. In-handler emission because the `reason` label (`timeout`, `capacity`, `no_workers`, ...) is too granular for the middleware.
-- `sie_gateway_pending_demand{machine_profile,bundle}` — gauge. KEDA trigger. Cleared by `clear_fulfilled_demand` when healthy workers appear.
-- `sie_gateway_active_lease_gpus{machine_profile,bundle}` — gauge. KEDA trigger. Recomputed from the current pool list on every `update_pool_metrics`.
+- `sie_gateway_rejected_requests_total{pool,machine_profile,bundle,reason}` — counter. In-handler emission because the `reason` label (`timeout`, `capacity`, `no_workers`, ...) is too granular for the middleware.
+- `sie_gateway_pending_demand{pool,machine_profile,bundle}` — gauge. KEDA trigger. Cleared by `clear_fulfilled_demand` when healthy workers appear on the exact queue lane.
+- `sie_gateway_active_lease_gpus{pool,machine_profile,bundle}` — gauge. KEDA trigger. Recomputed from the current pool list on every `update_pool_metrics`; bundle-pinned pools use the pool spec bundle, while unfiltered pools split by the assigned workers' actual bundles.
 
 ### 15.3 Worker and model state — gateway
 
 - `sie_gateway_workers{status}` — gauge, healthy/unhealthy counts.
-- `sie_gateway_worker_queue_depth{worker,machine_profile,bundle}` — gauge.
+- `sie_gateway_worker_queue_depth{pool,worker,machine_profile,bundle}` — gauge.
 - `sie_gateway_worker_memory_used_bytes{worker,machine_profile,bundle}` — gauge.
 - `sie_gateway_model_workers{model}` — gauge, worker count per model.
 
@@ -628,11 +635,12 @@ curl -X POST https://gateway/v1/encode/BAAI/bge-m3 \
 Model:    BAAI/bge-m3
 Bundle:   default          (bge_m3_flash is in the default bundle)
 Pool:     default          (no X-SIE-POOL header, no machine-profile override)
-Subject:  sie.work.BAAI__bge-m3.default
+Machine:  default          (no X-SIE-MACHINE-PROFILE header)
+Subject:  sie.work.default.default.default.BAAI__bge-m3
 Stream:   WORK_POOL_default
 ```
 
-The work subject is constructed by `work_subject(model, pool)` in `queue/publisher.rs`, which runs the model id through `normalize_model_id` (the Rust mirror of `sie_sdk.queue_types.normalize_model_id`: `/` → `__`, `.` → `_dot_`, `*`/`>`/space → `_`). The result is always exactly four dot-separated tokens so it matches the worker's `sie.work.*.{pool}` consumer filter — this is the guarantee that makes dotted ids like `vidore/colqwen2.5-v0.2` work. The DLQ path extracts the third token from the advisory subject, applies the same compatibility slash normalization, and publishes on `sie.dlq.{model_normalized}` — so `sie.work.BAAI__bge-m3.default` becomes `sie.dlq.BAAI__bge-m3` when a message hits max-deliveries.
+The work subject is constructed by `work_subject(pool, machine_profile, bundle, model)` in `queue/publisher.rs`, which runs the lane tokens and model id through `normalize_model_id` (the Rust mirror of `sie_sdk.queue_types.normalize_model_id`: `/` → `__`, `.` → `_dot_`, `*`/`>`/space → `_`). The result is always exactly six dot-separated tokens so it matches the worker's `sie.work.{pool}.{machine_profile}.{bundle}.*` consumer filter — this is the guarantee that makes dotted ids like `vidore/colqwen2.5-v0.2` work. The DLQ path extracts the sixth token from the advisory subject, applies the same compatibility slash normalization, and publishes on `sie.dlq.{model_normalized}` — so `sie.work.default.default.default.BAAI__bge-m3` becomes `sie.dlq.BAAI__bge-m3` when a message hits max-deliveries.
 
 **Step 2 — Gateway publishes work items to JetStream** (`queue/publisher.rs`). For a 2-item request the gateway publishes two msgpack work items:
 
@@ -646,7 +654,7 @@ WorkItem {
   model_id:      "BAAI/bge-m3",
   profile_id:    "default",
   pool_name:     "default",
-  machine_profile: "l4-spot",
+  machine_profile: "default",
   item:          { "text": "..." },       // or omitted + payload_ref if >1MB
   reply_subject: "_INBOX.gw-1.abc-123",
   bundle_config_hash: "a1b2c3…",
@@ -711,11 +719,11 @@ POST /v1/pools
 }
 ```
 
-`gpus` is required capacity; `gpu_caps` is an optional assignment cap. The `default` pool has zero requirements and no caps. The worker-sidecar polls pool status every 10 seconds before NATS pulls when the admission gate is enabled. Capped named pools fail closed unless this pod appears in `status.assigned_workers`; the `default` pool fails open during transient gateway/status errors so baseline capacity remains available. HA gateways sort workers deterministically and persist named-pool assignment status.
+`gpus` is required capacity; `gpu_caps` is an optional assignment cap. `bundle` is an optional assignment filter: when omitted, the logical pool may span multiple worker bundles and `status.assigned_workers[]` records each worker's actual bundle so `active_lease_gpus` can stay lane-aware. The `default` pool has zero requirements and no caps. The worker-sidecar polls pool status every 10 seconds before NATS pulls when the admission gate is enabled. Capped named pools fail closed unless this pod appears in `status.assigned_workers`; the `default` pool fails open during transient gateway/status errors so baseline capacity remains available. HA gateways sort workers deterministically and persist named-pool assignment status.
 
 Helm publishes canonical machine profiles in `SIE_GATEWAY_CONFIGURED_GPUS` and request aliases in `SIE_GATEWAY_GPU_ALIASES`.
 
-Each pool gets its own JetStream stream (`WORK_POOL_{name}`) with subjects `sie.work.*.{name}`. Workers are deployed with `SIE_POOL={name}` and consume only from their own pool's stream. That is the isolation boundary.
+Each pool gets its own JetStream stream (`WORK_POOL_{name}`) with subjects `sie.work.{name}.*.*.*`. Workers are deployed with `SIE_POOL={name}`, `SIE_MACHINE_PROFILE={profile}`, and `SIE_BUNDLE={bundle}`; they consume only from their concrete `sie.work.{name}.{profile}.{bundle}.*` lane. The pool is the tenant/logical-capacity boundary; machine profile and bundle are the runtime lane inside that pool. A cold `X-SIE-POOL` request without `X-SIE-MACHINE-PROFILE` can emit lane-specific `pending_demand` only when the registered pool spec contains exactly one machine profile; multi-profile pools require the caller to send the profile because the gateway must not guess which StatefulSet KEDA should scale.
 
 Creating a usable custom pool is a two-step operation: add the pool to Helm values so a `StatefulSet` of workers actually exists with `queuePool`/`SIE_POOL` set to the logical pool name, then register the pool on the gateway via `POST /v1/pools` so it tracks fulfillment and admission. Clients then target the pool with an `X-SIE-POOL: customer-acme` header. Pools expire after their TTL unless renewed with `POST /v1/pools/{name}/renew`; the `default` pool is protected and cannot be deleted.
 

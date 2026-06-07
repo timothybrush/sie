@@ -59,15 +59,6 @@ pub struct PoolAdmissionStatus {
     pub assigned_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolAdmissionSummary {
-    pub capped_profiles: Vec<String>,
-    pub zero_cap_profiles: Vec<String>,
-    pub assigned_count: usize,
-    pub total_assigned_count: usize,
-    pub has_uncapped_profiles: bool,
-}
-
 pub struct PoolManager {
     pools: RwLock<HashMap<String, Pool>>,
     lease_duration_s: f64,
@@ -322,12 +313,13 @@ impl PoolManager {
         pools.get(name).cloned()
     }
 
-    pub async fn capped_profile_status(
+    pub async fn capped_lane_status(
         &self,
         pool_name: &str,
-        gpu: &str,
+        machine_profile: &str,
+        bundle: &str,
     ) -> Option<PoolAdmissionStatus> {
-        if gpu.is_empty() {
+        if machine_profile.is_empty() {
             return None;
         }
 
@@ -337,13 +329,14 @@ impl PoolManager {
             .spec
             .gpu_caps
             .iter()
-            .find(|(profile, _)| profile.eq_ignore_ascii_case(gpu))
+            .find(|(profile, _)| profile.eq_ignore_ascii_case(machine_profile))
             .map(|(_, cap)| *cap)?;
         let assigned_count = pool
             .status
             .assigned_workers
             .iter()
-            .filter(|worker| worker.gpu.eq_ignore_ascii_case(gpu))
+            .filter(|worker| worker.gpu.eq_ignore_ascii_case(machine_profile))
+            .filter(|worker| worker.bundle.eq_ignore_ascii_case(bundle))
             .count();
 
         Some(PoolAdmissionStatus {
@@ -352,55 +345,75 @@ impl PoolManager {
         })
     }
 
-    pub async fn capped_pool_status(&self, pool_name: &str) -> Option<PoolAdmissionSummary> {
-        let pools = self.pools.read().await;
-        let pool = pools.get(pool_name)?;
-        if pool.spec.gpu_caps.is_empty() {
+    /// Return the assigned worker names for a capped concrete lane.
+    ///
+    /// `None` means the pool/profile is uncapped, so callers should not apply
+    /// an admission filter. `Some(empty)` means admission is enabled for this
+    /// profile but no worker is currently admitted. This mirrors the
+    /// worker-side pool-admission gate: named pools with missing status fail
+    /// closed, while the default pool remains fail-open.
+    pub async fn admitted_worker_names_for_capped_lane(
+        &self,
+        pool_name: &str,
+        machine_profile: &str,
+        bundle: &str,
+    ) -> Option<HashSet<String>> {
+        if machine_profile.trim().is_empty() {
             return None;
         }
 
-        let caps_by_profile: HashMap<String, u32> = pool
+        let pools = self.pools.read().await;
+        let Some(pool) = pools.get(pool_name) else {
+            return if pool_name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
+                None
+            } else {
+                Some(HashSet::new())
+            };
+        };
+        let cap = pool
             .spec
             .gpu_caps
             .iter()
-            .map(|(profile, cap)| (profile.to_lowercase(), *cap))
-            .collect();
-        let mut capped_profiles: Vec<String> = pool.spec.gpu_caps.keys().cloned().collect();
-        capped_profiles.sort();
-        let mut zero_cap_profiles: Vec<String> = pool
-            .spec
-            .gpu_caps
-            .iter()
-            .filter_map(|(profile, cap)| {
-                if *cap == 0 {
-                    Some(profile.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        zero_cap_profiles.sort();
+            .find(|(profile, _)| profile.eq_ignore_ascii_case(machine_profile))
+            .map(|(_, cap)| *cap)?;
+        if cap == 0 {
+            return Some(HashSet::new());
+        }
 
-        let has_uncapped_profiles = pool
-            .spec
-            .gpus
-            .keys()
-            .any(|profile| !caps_by_profile.contains_key(&profile.to_lowercase()));
-        let assigned_count = pool
-            .status
-            .assigned_workers
-            .iter()
-            .filter(|worker| caps_by_profile.contains_key(&worker.gpu.to_lowercase()))
-            .count();
-        let total_assigned_count = pool.status.assigned_workers.len();
+        Some(
+            pool.status
+                .assigned_workers
+                .iter()
+                .filter(|worker| worker.gpu.eq_ignore_ascii_case(machine_profile))
+                .filter(|worker| worker.bundle.eq_ignore_ascii_case(bundle))
+                .map(|worker| worker.name.clone())
+                .collect(),
+        )
+    }
 
-        Some(PoolAdmissionSummary {
-            capped_profiles,
-            zero_cap_profiles,
-            assigned_count,
-            total_assigned_count,
-            has_uncapped_profiles,
-        })
+    /// Return the pool's only configured machine profile, if the spec is
+    /// unambiguous across both requirements (`gpus`) and admission caps
+    /// (`gpu_caps`). Used by cold queue routing when a caller pins only a
+    /// pool: the NATS subject still needs a concrete machine-profile token so
+    /// KEDA can observe `pending_demand{pool,machine_profile,bundle}`.
+    pub async fn single_machine_profile_for_pool(&self, pool_name: &str) -> Option<String> {
+        let pools = self.pools.read().await;
+        let pool = pools.get(pool_name)?;
+        let mut profiles: Vec<String> = Vec::new();
+        for profile in pool.spec.gpus.keys().chain(pool.spec.gpu_caps.keys()) {
+            if profiles
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(profile))
+            {
+                continue;
+            }
+            profiles.push(profile.to_lowercase());
+        }
+        if profiles.len() == 1 {
+            profiles.pop()
+        } else {
+            None
+        }
     }
 
     pub async fn list_pools(&self) -> Vec<Pool> {
@@ -527,6 +540,7 @@ impl PoolManager {
                         name: w.0.clone(),
                         url: w.1.clone(),
                         gpu: w.2.clone(),
+                        bundle: w.3.clone(),
                     });
                 }
             }
@@ -716,10 +730,7 @@ fn worker_consumes_pool(worker_pool: &str, pool_name: &str) -> bool {
 }
 
 fn normalize_pool_name(name: &str) -> String {
-    match name.trim().to_lowercase().as_str() {
-        "" | "_default" => DEFAULT_POOL_NAME.to_string(),
-        other => other.to_string(),
-    }
+    name.trim().to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -1065,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_capped_profile_status_reports_cap_and_assigned_count() {
+    async fn test_capped_lane_status_reports_cap_and_assigned_count() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
         let mut gpus = HashMap::new();
@@ -1085,68 +1096,123 @@ mod tests {
         )];
         pm.assign_workers("test", &workers).await;
 
-        let status = pm
-            .capped_profile_status("test", "L4-SPOT")
+        let lane_status = pm
+            .capped_lane_status("test", "L4-SPOT", "default")
             .await
-            .expect("profile should be capped");
-        assert_eq!(status.cap, 2);
-        assert_eq!(status.assigned_count, 1);
-        assert!(pm.capped_profile_status("test", "a100").await.is_none());
+            .expect("lane should be capped");
+        assert_eq!(lane_status.cap, 2);
+        assert_eq!(lane_status.assigned_count, 1);
+        assert!(pm
+            .capped_lane_status("test", "a100", "default")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
-    async fn test_capped_pool_status_reports_aggregate_admission() {
-        let pm = PoolManager::new(vec!["l4-spot".to_string(), "a100".to_string()]);
+    async fn test_admitted_worker_names_for_capped_lane_filters_assignment() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 0);
-        gpus.insert("a100".to_string(), 0);
-        let mut gpu_caps = HashMap::new();
-        gpu_caps.insert("l4-spot".to_string(), 0);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
-            .await
-            .unwrap();
-
-        let summary = pm
-            .capped_pool_status("test")
-            .await
-            .expect("pool should have caps");
-        assert_eq!(summary.capped_profiles, vec!["l4-spot"]);
-        assert_eq!(summary.zero_cap_profiles, vec!["l4-spot"]);
-        assert_eq!(summary.assigned_count, 0);
-        assert_eq!(summary.total_assigned_count, 0);
-        assert!(summary.has_uncapped_profiles);
-    }
-
-    #[tokio::test]
-    async fn test_capped_pool_status_reports_total_assigned_workers() {
-        let pm = PoolManager::new(vec!["l4-spot".to_string(), "a100".to_string()]);
-
-        let mut gpus = HashMap::new();
-        gpus.insert("l4-spot".to_string(), 0);
-        gpus.insert("a100".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 1);
         pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
             .await
             .unwrap();
 
-        let workers = vec![worker_in_pool(
-            "w1",
-            "http://w1:8080",
-            "a100",
-            "default",
-            "test",
-        )];
+        let workers = vec![
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+        ];
         pm.assign_workers("test", &workers).await;
 
-        let summary = pm
-            .capped_pool_status("test")
+        let admitted = pm
+            .admitted_worker_names_for_capped_lane("test", "L4-SPOT", "default")
             .await
-            .expect("pool should have caps");
-        assert_eq!(summary.assigned_count, 0);
-        assert_eq!(summary.total_assigned_count, 1);
-        assert!(summary.has_uncapped_profiles);
+            .expect("profile should be capped");
+        assert_eq!(admitted, HashSet::from(["w1".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_capped_lane_respects_bundle() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "sglang", "test"),
+        ];
+        pm.assign_workers("test", &workers).await;
+
+        let admitted = pm
+            .admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+            .await
+            .expect("profile should be capped");
+        assert_eq!(admitted, HashSet::from(["w1".to_string()]));
+
+        let default_status = pm
+            .capped_lane_status("test", "l4-spot", "default")
+            .await
+            .expect("default lane should be capped");
+        assert_eq!(default_status.assigned_count, 1);
+        let missing_status = pm
+            .capped_lane_status("test", "l4-spot", "rerank")
+            .await
+            .expect("missing bundle lane should still be capped");
+        assert_eq!(missing_status.assigned_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_uncapped_lane_returns_none() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string(), "a100".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("a100".to_string(), 1);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        assert!(pm
+            .admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_zero_cap_and_missing_named_pool_fail_closed() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 0);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pm.admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+                .await,
+            Some(HashSet::new())
+        );
+        assert_eq!(
+            pm.admitted_worker_names_for_capped_lane("missing", "l4-spot", "default")
+                .await,
+            Some(HashSet::new())
+        );
+        assert!(pm
+            .admitted_worker_names_for_capped_lane(DEFAULT_POOL_NAME, "l4-spot", "default")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -1325,6 +1391,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_default_pool_requires_explicit_worker_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        pm.create_default_pool().await;
+
+        let workers = vec![
+            worker_in_pool("empty", "http://w1:8080", "l4-spot", "default", ""),
+            worker_in_pool(
+                "_default",
+                "http://w2:8080",
+                "l4-spot",
+                "default",
+                "_default",
+            ),
+        ];
+        pm.assign_workers(DEFAULT_POOL_NAME, &workers).await;
+
+        let pool = pm.get_pool(DEFAULT_POOL_NAME).await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Pending);
+        assert!(pool.status.assigned_workers.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_restore_from_k8s_no_backend() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
         // No K8s backend → returns Ok(0)
@@ -1410,6 +1499,7 @@ mod tests {
             name: "worker-a".to_string(),
             url: "http://worker-a:8080".to_string(),
             gpu: "l4-spot".to_string(),
+            bundle: "default".to_string(),
         }];
 
         pm.apply_remote_pool(remote).await;

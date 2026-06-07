@@ -18,11 +18,12 @@
 //! * `bundle` — must match the bundle resolved by the gateway's
 //!   model registry (lowercase compared); routes only consider
 //!   workers whose bundle index entry contains them.
-//! * `pool_name` — non-empty so [`resolve_queue_pool`] can return
+//! * `pool_name` — non-empty so [`resolve_queue_route`] can return
 //!   the pool the dispatcher publishes work onto. An empty
 //!   `pool_name` makes the worker invisible to the queue path.
-//! * `machine_profile` — only consulted when the request carries
-//!   `X-SIE-MACHINE-PROFILE`; ignored otherwise.
+//! * `machine_profile` — the hardware lane embedded in the queue
+//!   subject. `X-SIE-MACHINE-PROFILE` constrains route resolution to
+//!   this value; otherwise the gateway infers it from a healthy worker.
 //! * `ready` — drives the `WorkerHealth::Healthy` transition. We
 //!   gate on the local [`Readiness`] state so the heartbeat agrees
 //!   with `/readyz`.
@@ -34,7 +35,7 @@
 //! plus its own model registry.
 //!
 //! [`WorkerStatusMessage`]: https://github.com/search?q=WorkerStatusMessage+repo%3Asie-internal
-//! [`resolve_queue_pool`]: https://github.com/search?q=resolve_queue_pool+repo%3Asie-internal
+//! [`resolve_queue_route`]: https://github.com/search?q=resolve_queue_route+repo%3Asie-internal
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -80,9 +81,10 @@ pub struct HealthPublisherConfig {
     /// match `BundleConfig.id`. Sourced from `SIE_BUNDLE`.
     pub bundle: String,
     /// Pool name. The gateway publishes work onto
-    /// `sie.work.<model>.<pool_name>`; the worker must echo the
-    /// same pool here or `resolve_queue_pool` returns `None` and
-    /// requests 202-provision forever. Sourced from `SIE_POOL`.
+    /// `sie.work.<pool_name>.<machine_profile>.<bundle>.<model>`; the
+    /// worker must echo the same pool here or queue-route resolution
+    /// returns `None` and requests 202-provision forever. Sourced from
+    /// `SIE_POOL`.
     pub pool_name: String,
     /// Optional machine-profile label (e.g. `l4`, `a100`).
     /// Consulted only when the inbound request carries

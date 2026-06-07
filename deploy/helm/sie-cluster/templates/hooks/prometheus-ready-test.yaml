@@ -8,7 +8,7 @@
 {{- $promAddr := .Values.autoscaling.prometheusAddress }}
 {{- if index .Values "kube-prometheus-stack" "install" }}
 {{- $promNs = include "sie-cluster.namespace" . }}
-{{- $promAddr = printf "http://prometheus-operated.%s.svc.cluster.local:9090" (include "sie-cluster.namespace" .) }}
+{{- $promAddr = include "sie-cluster.kubePrometheusStack.prometheusAddress" . }}
 {{- end }}
 apiVersion: v1
 kind: ServiceAccount

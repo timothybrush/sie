@@ -10,12 +10,12 @@ pub struct WorkerConfig {
     /// NATS server URL (e.g. `nats://localhost:4222`).
     pub nats_url: String,
 
-    /// Pool name — drives the stream (`WORK_POOL_{pool}`), consumer
-    /// (`{bundle}_{pool}`), and subject filter.
+    /// Pool name — drives the stream (`WORK_POOL_{pool}`), durable consumer
+    /// (`{pool}_{machine_profile}_{bundle}`), and subject filters.
     pub pool: String,
 
-    /// Bundle ID — forms part of the durable consumer name so multiple
-    /// bundles on the same pool don't step on each other.
+    /// Bundle ID — forms part of the durable consumer name and subject lane
+    /// so multiple bundles on the same pool don't step on each other.
     pub bundle: String,
 
     /// Unix domain socket used to talk to the Python `ipc_server.py`.
@@ -86,8 +86,7 @@ pub struct WorkerConfig {
     /// only — the `X-SIE-MACHINE-PROFILE` route filter compares
     /// case-insensitively against this value. Empty disables the
     /// filter (route by bundle alone). Sourced from
-    /// `SIE_MACHINE_PROFILE`; falls back to `pool` to preserve
-    /// the historical convention where pool name == GPU type.
+    /// `SIE_MACHINE_PROFILE`; required so the queue lane is explicit.
     pub machine_profile: String,
 
     /// GPU count surfaced in heartbeats. Informational —
@@ -135,14 +134,28 @@ impl WorkerConfig {
         format!("WORK_POOL_{}", self.pool)
     }
 
+    pub fn stream_subject_filter(&self) -> String {
+        format!("sie.work.{}.*.*.*", self.pool)
+    }
+
     pub fn consumer_name(&self) -> String {
-        // Matches `sie_sdk.queue_types.work_consumer_name(bundle, pool)` so
+        // Matches `sie_sdk.queue_types.work_consumer_name(pool, machine, bundle)` so
         // Rust and Python adapter processes converge on the same durable consumer.
-        format!("{}_{}", self.bundle, self.pool)
+        format!(
+            "{}_{}_{}",
+            crate::subject::normalize_model_id(&self.pool),
+            crate::subject::normalize_model_id(&self.machine_profile),
+            crate::subject::normalize_model_id(&self.bundle)
+        )
     }
 
     pub fn subject_filter(&self) -> String {
-        format!("sie.work.*.{}", self.pool)
+        format!(
+            "sie.work.{}.{}.{}.*",
+            self.pool,
+            crate::subject::normalize_model_id(&self.machine_profile),
+            crate::subject::normalize_model_id(&self.bundle)
+        )
     }
 
     pub fn worker_stream_name(&self) -> String {
@@ -161,8 +174,10 @@ impl WorkerConfig {
 
     pub fn worker_subject_filter(&self) -> String {
         format!(
-            "sie.work.*.{}.{}",
+            "sie.work.{}.{}.{}.*.{}",
             self.pool,
+            crate::subject::normalize_model_id(&self.machine_profile),
+            crate::subject::normalize_model_id(&self.bundle),
             crate::subject::normalize_model_id(&self.worker_id)
         )
     }
@@ -208,17 +223,22 @@ mod tests {
         // Must agree with sie_gateway's NATS naming so publisher and
         // consumer land on the same stream/consumer.
         assert_eq!(c.stream_name(), "WORK_POOL_l4");
-        assert_eq!(c.consumer_name(), "default_l4");
-        assert_eq!(c.subject_filter(), "sie.work.*.l4");
+        assert_eq!(c.stream_subject_filter(), "sie.work.l4.*.*.*");
+        assert_eq!(c.consumer_name(), "l4_l4_default");
+        assert_eq!(c.subject_filter(), "sie.work.l4.l4.default.*");
         assert_eq!(c.worker_stream_name(), "WORK_WORKER_worker-test");
         assert_eq!(c.worker_consumer_name(), "gen-worker-test");
-        assert_eq!(c.worker_subject_filter(), "sie.work.*.l4.worker-test");
+        assert_eq!(
+            c.worker_subject_filter(),
+            "sie.work.l4.l4.default.*.worker-test"
+        );
     }
 
     #[test]
     fn subject_filter_contains_pool() {
         let mut c = sample();
         c.pool = "eval-h100".into();
-        assert!(c.subject_filter().ends_with(".eval-h100"));
+        assert!(c.stream_subject_filter().starts_with("sie.work.eval-h100."));
+        assert!(c.subject_filter().starts_with("sie.work.eval-h100."));
     }
 }

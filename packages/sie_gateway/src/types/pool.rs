@@ -40,6 +40,12 @@ pub struct AssignedWorker {
     pub name: String,
     pub url: String,
     pub gpu: String,
+    #[serde(default = "default_bundle")]
+    pub bundle: String,
+}
+
+fn default_bundle() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -130,6 +136,7 @@ mod tests {
                 name: "w1".into(),
                 url: "http://w1:8080".into(),
                 gpu: "l4".into(),
+                bundle: "default".into(),
             }],
         );
         assert!(pool.has_worker("http://w1:8080"));
@@ -145,11 +152,13 @@ mod tests {
                     name: "w1".into(),
                     url: "http://w1:8080".into(),
                     gpu: "l4".into(),
+                    bundle: "default".into(),
                 },
                 AssignedWorker {
                     name: "w2".into(),
                     url: "http://w2:8080".into(),
                     gpu: "l4".into(),
+                    bundle: "default".into(),
                 },
             ],
         );
@@ -187,6 +196,7 @@ mod tests {
                 name: "w1".into(),
                 url: "http://w1:8080".into(),
                 gpu: "l4".into(),
+                bundle: "default".into(),
             }],
         );
         let json = serde_json::to_string(&pool).unwrap();

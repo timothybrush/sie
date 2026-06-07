@@ -34,9 +34,10 @@ impl RingEntry {
     }
 }
 
-/// Immutable snapshot of the eligible workers for a single
-/// `(model, pool)`. Built by `WorkerRegistry::ring_snapshot_for` and
-/// cached on the registry's `ArcSwap` so per-request picks are lock-free.
+/// Immutable worker ring for one `(model, pool, machine_profile, bundle)` lane.
+/// `WorkerRegistry::ring_snapshot_for` rebuilds this per request from the
+/// registry snapshot; the broader worker view is what lives behind `ArcSwap`,
+/// so reads stay lock-free even though this lane ring is freshly constructed.
 #[derive(Debug, Clone, Default)]
 pub struct RingSnapshot {
     pub entries: Vec<RingEntry>,

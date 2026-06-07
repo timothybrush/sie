@@ -300,7 +300,7 @@ machineProfiles:
     machineType: ""
     spot: false
 
-# -- Worker pools configuration (one StatefulSet per pool)
+# -- Worker pools configuration (one StatefulSet per enabled queuePool/machineProfile/bundle lane)
 workers:
   # -- Common worker settings
   common:
@@ -340,10 +340,16 @@ workers:
     passthroughMode: true
 
     # -- Logical queue pool consumed by workers in queue-routing mode.
-    # Defaults to "default" so Helm WorkerGroups serve unpinned SDK traffic.
-    # Override per worker pool with workers.pools.<name>.queuePool only for
-    # explicit isolation pools targeted via X-SIE-Pool or gpu="pool/profile".
-    queuePool: default
+    # When unset (the default), each pool uses its own name as the queue
+    # pool, so a worker in `workers.pools.rtx6000` subscribes to
+    # `sie.work.rtx6000.rtx6000.default.*` for the default bundle,
+    # preventing the cross-pool durable-consumer collision that happens
+    # when every pool shares one queue. Set this
+    # to a fixed string (e.g. `"default"`) only to deliberately share a
+    # queue across multiple pools (e.g. `l4` + `l4-spot` competing for
+    # the same work). Per-pool overrides via `workers.pools.<name>.queuePool`
+    # take precedence over both.
+    queuePool: ""
 
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
     runtimeClassName: ""
@@ -570,8 +576,9 @@ workers:
           cpu: "2"
           memory: "2Gi"
 
-  # -- Worker pools (one StatefulSet per pool)
-  # Each map entry creates a WorkerGroup: one StatefulSet + one pre-pull DaemonSet.
+  # -- Worker pools (one StatefulSet per enabled queuePool/machineProfile/bundle lane)
+  # Each map entry creates a WorkerGroup family: one StatefulSet + one
+  # pre-pull DaemonSet per enabled bundle.
   # The map key names the Kubernetes WorkerGroup, not the SDK logical pool.
   # WorkerGroup naming convention: <machineProfile> (e.g. l4, a100-40gb, cpu).
   # All pools scale to zero by default; enable the ones you need.
@@ -582,15 +589,17 @@ workers:
   #   enabled:         bool. Skip rendering the whole pool when false.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
   #   gpu.product:     string. nvidia.com/gpu.product node-label match.
-  #   gpuType:         short label (l4, a100-40gb, cpu, …) used by the
-  #                    gateway for routing/metrics.
-  #   machineProfile:  long label used by KEDA scalers + Prometheus.
+  #   gpuType:         GPU/node label used for node selection and display.
+  #   machineProfile:  Optional queue-lane label used by KEDA scalers,
+  #                    Prometheus, gateway routing, and worker subjects.
+  #                    Defaults to the worker group key.
   #   nodeSelector:    map. Merged with workers.common.nodeSelector.
   #   platform:        Optional override (e.g. "cpu"). Used as the
   #                    image-tag suffix for the worker image
   #                    (e.g. `<repo>:<tag>-cpu-<bundle>`),
   #                    NOT propagated to a pod env var.
   #   queuePool:       string. Optional override of common.queuePool.
+  #                    If both are unset, defaults to the worker group key.
   #   resources:       requests/limits for the Python ``worker``
   #                    container (the GPU-bound forward-pass server).
   #   runtimeClassName: Optional override of common.runtimeClassName.
@@ -608,8 +617,8 @@ workers:
   #     maxReplicas:   KEDA upper bound.
   #     minReplicas:   baseline replicas (0 = scale-to-zero).
   #
-  # Each (pool, bundle) renders one StatefulSet + KEDA ScaledObject +
-  # PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
+  # Each queuePool/machineProfile/bundle lane renders one StatefulSet +
+  # KEDA ScaledObject + PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
   pools:
 
     # L4 GPU

@@ -49,6 +49,33 @@ async fn smoke_test_guard() -> OwnedSemaphorePermit {
         .expect("smoke test semaphore is open")
 }
 
+fn pool_work_subject(pool: &str, machine_profile: &str, bundle: &str, model_id: &str) -> String {
+    format!(
+        "sie.work.{}.{}.{}.{}",
+        pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model_id)
+    )
+}
+
+fn worker_work_subject(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model_id: &str,
+    worker_id: &str,
+) -> String {
+    format!(
+        "sie.work.{}.{}.{}.{}.{}",
+        pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model_id),
+        normalize_model_id(worker_id)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Skip helpers — keep the test happy on bare-bones dev machines
 // ---------------------------------------------------------------------------
@@ -471,6 +498,7 @@ impl WorkerHarness {
         let mut cmd = Command::new(exe);
         cmd.env("SIE_NATS_URL", nats_url)
             .env("SIE_POOL", pool)
+            .env("SIE_MACHINE_PROFILE", pool)
             .env("SIE_BUNDLE", bundle)
             .env("SIE_IPC_SOCKET_PATH", ipc_socket)
             .env("SIE_WORKER_METRICS_PORT", metrics_port.to_string())
@@ -568,8 +596,7 @@ async fn smoke_encode_request_round_trips_through_rust_worker() {
 
     // 6. Publish a synthetic encode WorkItem on the pool subject.
     let model_id = "BAAI/bge-m3";
-    let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
     let request_id = "smoke-req-1";
 
     // Stamp `timestamp` at `now - 0.25s` so the worker sees a realistic
@@ -588,7 +615,7 @@ async fn smoke_encode_request_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: Some(serde_json::json!({"text": "hello rust worker"})),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
@@ -744,12 +771,7 @@ async fn smoke_generate_direct_dispatch_round_trips_through_rust_worker() {
         .expect("subscribe reply");
 
     let request_id = "smoke-generate-1";
-    let subject = format!(
-        "sie.work.{}.{}.{}",
-        normalize_model_id(model_id),
-        pool,
-        normalize_model_id("smoke-worker"),
-    );
+    let subject = worker_work_subject(pool, pool, bundle, model_id, "smoke-worker");
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -764,7 +786,7 @@ async fn smoke_generate_direct_dispatch_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: None,
         payload_ref: None,
         output_types: None,
@@ -890,12 +912,7 @@ async fn smoke_generation_direct_dispatch_activates_after_capability_reconcile()
         .expect("subscribe reply");
 
     let request_id = "smoke-generate-hot-add-1";
-    let subject = format!(
-        "sie.work.{}.{}.{}",
-        normalize_model_id(model_id),
-        pool,
-        normalize_model_id("smoke-worker"),
-    );
+    let subject = worker_work_subject(pool, pool, bundle, model_id, "smoke-worker");
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -910,7 +927,7 @@ async fn smoke_generation_direct_dispatch_activates_after_capability_reconcile()
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: None,
         payload_ref: None,
         output_types: None,
@@ -1048,8 +1065,7 @@ async fn smoke_payload_ref_request_round_trips_through_rust_worker() {
         .expect("subscribe reply");
 
     let model_id = "BAAI/bge-m3";
-    let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1064,7 +1080,7 @@ async fn smoke_payload_ref_request_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: None,
         payload_ref: Some(payload_ref.clone()),
         output_types: Some(vec!["dense".into()]),
@@ -1232,7 +1248,7 @@ async fn publish_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: Some(serde_json::json!({"text": format!("concurrent-{request_id}")})),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
@@ -1307,7 +1323,7 @@ async fn pool_admission_pauses_until_gateway_assigns_worker() {
 
     let model_id = "BAAI/bge-m3";
     let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
     publish_work_item(
         &js,
         &subject,
@@ -1381,7 +1397,7 @@ async fn stress_concurrent_requests_do_not_stall_on_ack_wait() {
 
     let model_id = "BAAI/bge-m3";
     let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
 
     // One subscription per request on a unique inbox; collect all N in a
     // concurrent `JoinSet` so the publishes are temporally clustered.
@@ -1501,7 +1517,7 @@ async fn stress_sustained_load_finishes_within_budget() {
 
     let model_id = "BAAI/bge-m3";
     let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
 
     let mut join = tokio::task::JoinSet::new();
     let start = Instant::now();
@@ -1742,7 +1758,7 @@ async fn pool_enables_concurrent_in_flight_ipc() {
                 .subscribe(reply_subject.clone())
                 .await
                 .expect("subscribe reply");
-            let subject = format!("sie.work.{}.{}", normalized, pool);
+            let subject = pool_work_subject(pool, pool, bundle, model_id);
             let model_id = (*model_id).to_string();
             let normalized = (*normalized).to_string();
             let pool = pool.to_string();
@@ -1893,7 +1909,6 @@ async fn smoke_prepared_tokens_round_trip_through_rust_worker() {
     //    max_seq_len (64) so we can assert it round-trips through
     //    PreparedTokens.max_seq_len.
     let model_id = "tiny-prepared-tokens";
-    let normalized = "tiny-prepared-tokens"; // no slash to normalize
     let pool = "smoke-pt";
     let bundle = "default";
     let metrics_port = find_free_tcp_port();
@@ -1917,7 +1932,7 @@ async fn smoke_prepared_tokens_round_trip_through_rust_worker() {
     // 4. Publish a plain-text encode WorkItem that satisfies the
     //    Rust-tokenisation safety rules (text-only, no instruction,
     //    is_query = false) so the dispatcher actually pre-tokenizes.
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
     let request_id = "smoke-pt-req-1";
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1933,7 +1948,7 @@ async fn smoke_prepared_tokens_round_trip_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: Some(serde_json::json!({"text": "hello world"})),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
@@ -2109,7 +2124,7 @@ async fn publish_score_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: None,
         payload_ref: None,
         output_types: None,
@@ -2159,7 +2174,7 @@ async fn publish_extract_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
-        machine_profile: "cpu".into(),
+        machine_profile: pool.into(),
         item: Some(serde_json::json!({"text": "Barack Obama was born in Hawaii."})),
         payload_ref: None,
         output_types: None,
@@ -2221,8 +2236,7 @@ async fn smoke_scheduler_routes_score_request_end_to_end() {
     let js = async_nats::jetstream::new(client.clone());
 
     let model_id = "BAAI/bge-m3";
-    let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
 
     let reply_subject = format!("_INBOX.sched-score.{}", uuid::Uuid::new_v4());
     let mut sub = client
@@ -2297,8 +2311,7 @@ async fn smoke_scheduler_routes_extract_request_end_to_end() {
     let js = async_nats::jetstream::new(client.clone());
 
     let model_id = "BAAI/bge-m3";
-    let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
 
     let reply_subject = format!("_INBOX.sched-extract.{}", uuid::Uuid::new_v4());
     let mut sub = client
@@ -2383,7 +2396,7 @@ async fn smoke_scheduler_coalesces_concurrent_encodes() {
 
     let model_id = "BAAI/bge-m3";
     let normalized = "BAAI__bge-m3";
-    let subject = format!("sie.work.{}.{}", normalized, pool);
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
 
     let mut join = tokio::task::JoinSet::new();
     for i in 0..CONCURRENCY {

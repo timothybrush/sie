@@ -1,5 +1,6 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -9,12 +10,16 @@ use crate::metrics;
 
 const DEMAND_EXPIRY_SECS: u64 = 120;
 
-/// Tracks pending demand per (gpu, bundle) with refreshable expiry deadlines.
+type DemandKey = (String, String, String);
+type DemandEntry = (String, String, String, Arc<Notify>, Arc<AtomicU64>);
+
+/// Tracks pending demand per (pool, machine_profile, bundle) with refreshable expiry deadlines.
 /// Each active demand entry has a background task that clears the metric
 /// after 120s of inactivity. Calling `record` resets the timer.
 pub struct DemandTracker {
-    /// Map from (gpu_lowercase, bundle_lowercase) to (original_gpu, original_bundle, notify).
-    entries: DashMap<(String, String), (String, String, Arc<Notify>)>,
+    /// Map from (pool_lowercase, machine_profile_lowercase, bundle_lowercase) to
+    /// (original_pool, original_machine_profile, original_bundle, notify, generation).
+    entries: DashMap<DemandKey, DemandEntry>,
 }
 
 impl Default for DemandTracker {
@@ -30,53 +35,97 @@ impl DemandTracker {
         }
     }
 
-    /// Record pending demand for a (gpu, bundle) pair.
+    /// Record pending demand for a (pool, machine_profile, bundle) lane.
     /// Sets the PENDING_DEMAND gauge to 1.0 and starts/refreshes
     /// the 120s auto-expiry timer.
-    pub fn record(self: &Arc<Self>, gpu: &str, bundle: &str) {
-        let key = (gpu.to_lowercase(), bundle.to_lowercase());
+    pub fn record(self: &Arc<Self>, pool: &str, machine_profile: &str, bundle: &str) {
+        let key = (
+            pool.to_lowercase(),
+            machine_profile.to_lowercase(),
+            bundle.to_lowercase(),
+        );
 
         // Use entry() API for atomic get-or-insert to avoid TOCTOU race
         match self.entries.entry(key.clone()) {
             Entry::Occupied(entry) => {
-                let (ref orig_gpu, ref orig_bundle, ref notify) = *entry.get();
+                let (
+                    ref orig_pool,
+                    ref orig_machine_profile,
+                    ref orig_bundle,
+                    ref notify,
+                    ref generation,
+                ) = *entry.get();
                 // Set gauge with the original-case labels to avoid creating duplicate series
                 metrics::PENDING_DEMAND
-                    .with_label_values(&[orig_gpu, orig_bundle])
+                    .with_label_values(&[orig_pool, orig_machine_profile, orig_bundle])
                     .set(1.0);
+                generation.fetch_add(1, Ordering::AcqRel);
                 notify.notify_one();
             }
             Entry::Vacant(entry) => {
                 let notify = Arc::new(Notify::new());
-                entry.insert((gpu.to_string(), bundle.to_string(), Arc::clone(&notify)));
+                let generation = Arc::new(AtomicU64::new(0));
+                entry.insert((
+                    pool.to_string(),
+                    machine_profile.to_string(),
+                    bundle.to_string(),
+                    Arc::clone(&notify),
+                    Arc::clone(&generation),
+                ));
 
                 // Set gauge with the canonical label casing (first caller defines it)
                 metrics::PENDING_DEMAND
-                    .with_label_values(&[gpu, bundle])
+                    .with_label_values(&[pool, machine_profile, bundle])
                     .set(1.0);
 
-                let gpu_owned = gpu.to_string();
+                let pool_owned = pool.to_string();
+                let machine_profile_owned = machine_profile.to_string();
                 let bundle_owned = bundle.to_string();
                 let tracker = Arc::clone(self);
 
                 tokio::spawn(async move {
-                    let key = (gpu_owned.to_lowercase(), bundle_owned.to_lowercase());
+                    let key = (
+                        pool_owned.to_lowercase(),
+                        machine_profile_owned.to_lowercase(),
+                        bundle_owned.to_lowercase(),
+                    );
                     loop {
-                        if !tracker.entries.contains_key(&key) {
+                        let is_current_entry = tracker
+                            .entries
+                            .get(&key)
+                            .map(|entry| Arc::ptr_eq(&entry.4, &generation))
+                            .unwrap_or(false);
+                        if !is_current_entry {
                             return;
                         }
+                        let observed_generation = generation.load(Ordering::Acquire);
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(DEMAND_EXPIRY_SECS)) => {
-                                metrics::PENDING_DEMAND
-                                    .with_label_values(&[&gpu_owned, &bundle_owned])
-                                    .set(0.0);
-                                tracker.entries.remove(&key);
-                                info!(
-                                    gpu = %gpu_owned,
-                                    bundle = %bundle_owned,
-                                    "pending demand expired (no requests for 120s)"
-                                );
-                                return;
+                                let removed = tracker.entries.remove_if(&key, |_, entry| {
+                                    Arc::ptr_eq(&entry.4, &generation)
+                                        && entry.4.load(Ordering::Acquire) == observed_generation
+                                });
+                                if let Some((_, (orig_pool, orig_machine_profile, orig_bundle, _, _))) = removed {
+                                    metrics::PENDING_DEMAND
+                                        .with_label_values(&[&orig_pool, &orig_machine_profile, &orig_bundle])
+                                        .set(0.0);
+                                    info!(
+                                        pool = %orig_pool,
+                                        machine_profile = %orig_machine_profile,
+                                        bundle = %orig_bundle,
+                                        "pending demand expired (no requests for 120s)"
+                                    );
+                                    return;
+                                }
+                                let is_current_entry = tracker
+                                    .entries
+                                    .get(&key)
+                                    .map(|entry| Arc::ptr_eq(&entry.4, &generation))
+                                    .unwrap_or(false);
+                                if !is_current_entry {
+                                    return;
+                                }
+                                continue;
                             }
                             _ = notify.notified() => {
                                 continue;
@@ -88,19 +137,25 @@ impl DemandTracker {
         }
     }
 
-    /// Explicitly clear demand for a (gpu, bundle) pair.
+    /// Explicitly clear demand for a (pool, machine_profile, bundle) lane.
     /// Removes the entry and zeros the gauge.
-    pub fn clear(&self, gpu: &str, bundle: &str) {
-        let key = (gpu.to_lowercase(), bundle.to_lowercase());
-        if let Some((_, (orig_gpu, orig_bundle, notify))) = self.entries.remove(&key) {
+    pub fn clear(&self, pool: &str, machine_profile: &str, bundle: &str) {
+        let key = (
+            pool.to_lowercase(),
+            machine_profile.to_lowercase(),
+            bundle.to_lowercase(),
+        );
+        if let Some((_, (orig_pool, orig_machine_profile, orig_bundle, notify, _))) =
+            self.entries.remove(&key)
+        {
             notify.notify_one();
             metrics::PENDING_DEMAND
-                .with_label_values(&[&orig_gpu, &orig_bundle])
+                .with_label_values(&[&orig_pool, &orig_machine_profile, &orig_bundle])
                 .set(0.0);
         } else {
             // No tracked entry, but clear the gauge anyway with the provided values
             metrics::PENDING_DEMAND
-                .with_label_values(&[gpu, bundle])
+                .with_label_values(&[pool, machine_profile, bundle])
                 .set(0.0);
         }
     }
@@ -114,56 +169,90 @@ mod tests {
     async fn test_record_sets_demand_gauge() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("l4-spot", "default");
+        tracker.record("default", "l4-spot", "default");
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .get();
         assert!((val - 1.0).abs() < f64::EPSILON);
-        tracker.clear("l4-spot", "default");
+        tracker.clear("default", "l4-spot", "default");
     }
 
     #[tokio::test]
     async fn test_demand_entry_exists_after_record() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("test-gpu-expire", "test-bundle-expire");
+        tracker.record("test-pool-expire", "test-gpu-expire", "test-bundle-expire");
         assert!(tracker.entries.contains_key(&(
+            "test-pool-expire".to_string(),
             "test-gpu-expire".to_string(),
             "test-bundle-expire".to_string()
         )));
-        tracker.clear("test-gpu-expire", "test-bundle-expire");
+        tracker.clear("test-pool-expire", "test-gpu-expire", "test-bundle-expire");
     }
 
     #[tokio::test]
     async fn test_record_refreshes_existing_timer() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("l4-refresh", "default");
+        tracker.record("default", "l4-refresh", "default");
         // Record again -- should not create a second entry
-        tracker.record("l4-refresh", "default");
-        assert!(tracker
-            .entries
-            .contains_key(&("l4-refresh".to_string(), "default".to_string())));
+        tracker.record("default", "l4-refresh", "default");
+        assert!(tracker.entries.contains_key(&(
+            "default".to_string(),
+            "l4-refresh".to_string(),
+            "default".to_string()
+        )));
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-refresh", "default"])
+            .with_label_values(&["default", "l4-refresh", "default"])
             .get();
         assert!((val - 1.0).abs() < f64::EPSILON);
-        tracker.clear("l4-refresh", "default");
+        tracker.clear("default", "l4-refresh", "default");
+    }
+
+    #[tokio::test]
+    async fn test_record_refreshes_expiry_generation() {
+        let _ = &*metrics::REGISTRY;
+        let tracker = Arc::new(DemandTracker::new());
+        tracker.record("default", "l4-generation", "default");
+        let key = (
+            "default".to_string(),
+            "l4-generation".to_string(),
+            "default".to_string(),
+        );
+        let before = tracker
+            .entries
+            .get(&key)
+            .expect("entry should exist")
+            .4
+            .load(Ordering::Acquire);
+
+        tracker.record("default", "l4-generation", "default");
+
+        let after = tracker
+            .entries
+            .get(&key)
+            .expect("entry should still exist")
+            .4
+            .load(Ordering::Acquire);
+        assert_eq!(after, before + 1);
+        tracker.clear("default", "l4-generation", "default");
     }
 
     #[tokio::test]
     async fn test_clear_removes_entry_and_zeros_gauge() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("l4-clear", "default");
-        tracker.clear("l4-clear", "default");
+        tracker.record("default", "l4-clear", "default");
+        tracker.clear("default", "l4-clear", "default");
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-clear", "default"])
+            .with_label_values(&["default", "l4-clear", "default"])
             .get();
         assert!((val - 0.0).abs() < f64::EPSILON);
-        assert!(!tracker
-            .entries
-            .contains_key(&("l4-clear".to_string(), "default".to_string())));
+        assert!(!tracker.entries.contains_key(&(
+            "default".to_string(),
+            "l4-clear".to_string(),
+            "default".to_string()
+        )));
     }
 
     #[tokio::test]
@@ -171,23 +260,23 @@ mod tests {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
         // Should not panic
-        tracker.clear("nonexistent", "nonexistent");
+        tracker.clear("nonexistent", "nonexistent", "nonexistent");
     }
 
     #[tokio::test]
     async fn test_case_insensitive_key_matching() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("L4-Spot", "Premium");
+        tracker.record("Default", "L4-Spot", "Premium");
         // Second record with same case should refresh, not create new
-        tracker.record("L4-Spot", "Premium");
+        tracker.record("Default", "L4-Spot", "Premium");
         assert_eq!(tracker.entries.len(), 1);
         // Gauge was set with the original case labels
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["L4-Spot", "Premium"])
+            .with_label_values(&["Default", "L4-Spot", "Premium"])
             .get();
         assert!((val - 1.0).abs() < f64::EPSILON);
-        tracker.clear("L4-SPOT", "PREMIUM");
+        tracker.clear("DEFAULT", "L4-SPOT", "PREMIUM");
         assert_eq!(tracker.entries.len(), 0);
     }
 
@@ -197,16 +286,16 @@ mod tests {
         let tracker = Arc::new(DemandTracker::new());
 
         // Record demand
-        tracker.record("l4-timer", "default-timer");
+        tracker.record("default", "l4-timer", "default-timer");
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-timer", "default-timer"])
+            .with_label_values(&["default", "l4-timer", "default-timer"])
             .get();
         assert!((val - 1.0).abs() < f64::EPSILON);
 
         // Advance 100s (< 120s expiry), then refresh.
         tokio::time::advance(Duration::from_secs(100)).await;
         tokio::task::yield_now().await;
-        tracker.record("l4-timer", "default-timer");
+        tracker.record("default", "l4-timer", "default-timer");
 
         // Let the spawned task process the notify and loop back to start
         // a new sleep(120s) before we advance time further.
@@ -220,7 +309,7 @@ mod tests {
 
         // Gauge should STILL be 1.0 because the timer was refreshed
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-timer", "default-timer"])
+            .with_label_values(&["default", "l4-timer", "default-timer"])
             .get();
         assert!(
             (val - 1.0).abs() < f64::EPSILON,
@@ -234,7 +323,7 @@ mod tests {
 
         // Gauge should now be 0.0 (expired)
         let val = metrics::PENDING_DEMAND
-            .with_label_values(&["l4-timer", "default-timer"])
+            .with_label_values(&["default", "l4-timer", "default-timer"])
             .get();
         assert!(
             (val - 0.0).abs() < f64::EPSILON,
@@ -246,14 +335,18 @@ mod tests {
     async fn test_multiple_gpu_bundle_pairs_independent() {
         let _ = &*metrics::REGISTRY;
         let tracker = Arc::new(DemandTracker::new());
-        tracker.record("l4-multi", "default");
-        tracker.record("a100-multi", "premium");
+        tracker.record("default", "l4-multi", "default");
+        tracker.record("tenant-a", "l4-multi", "default");
+        tracker.record("default", "a100-multi", "premium");
+        assert_eq!(tracker.entries.len(), 3);
+        tracker.clear("default", "l4-multi", "default");
         assert_eq!(tracker.entries.len(), 2);
-        tracker.clear("l4-multi", "default");
-        assert_eq!(tracker.entries.len(), 1);
-        assert!(tracker
-            .entries
-            .contains_key(&("a100-multi".to_string(), "premium".to_string())));
-        tracker.clear("a100-multi", "premium");
+        assert!(tracker.entries.contains_key(&(
+            "tenant-a".to_string(),
+            "l4-multi".to_string(),
+            "default".to_string()
+        )));
+        tracker.clear("tenant-a", "l4-multi", "default");
+        tracker.clear("default", "a100-multi", "premium");
     }
 }

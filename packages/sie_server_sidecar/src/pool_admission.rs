@@ -201,12 +201,7 @@ impl PoolAdmissionGate {
 }
 
 fn normalize_pool_name(name: &str) -> String {
-    let value = name.trim().to_ascii_lowercase();
-    if value.is_empty() || value == "_default" {
-        "default".to_string()
-    } else {
-        value
-    }
+    name.trim().to_ascii_lowercase()
 }
 
 fn object_field<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {

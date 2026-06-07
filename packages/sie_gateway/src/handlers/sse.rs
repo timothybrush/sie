@@ -137,47 +137,74 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
     metrics::ROUTING_KEY_SOURCE
         .with_label_values(&[&model_label, &pool_label, resolved_key.source.as_label()])
         .inc();
-    let target = if resolved_key.hash.is_none() {
+    let (target, pool_fallback_lane_worker_count) = if resolved_key.hash.is_none() {
         metrics::ROUTING_FALLBACK_TOTAL
             .with_label_values(&[&model_label, &pool_label, "no_key"])
             .inc();
-        publisher::PublishTarget::Pool {
-            model: model.clone(),
-            pool: pool.clone(),
-        }
+        (
+            publisher::PublishTarget::Pool {
+                pool: pool.clone(),
+                machine_profile: gpu.clone(),
+                bundle: bundle.clone(),
+                model: model.clone(),
+            },
+            0,
+        )
     } else {
-        let ring = state.registry.ring_snapshot_for(&model, &pool);
+        let admitted_worker_names = state
+            .pool_manager
+            .admitted_worker_names_for_capped_lane(&pool, &gpu, &bundle)
+            .await;
+        let fallback_lane_worker_count = state.registry.pool_fallback_lane_worker_count(
+            &pool,
+            &gpu,
+            &bundle,
+            &bundle_config_hash,
+            admitted_worker_names.as_ref(),
+        );
+        let ring = state.registry.ring_snapshot_for_admitted(
+            &model,
+            &pool,
+            &gpu,
+            &bundle,
+            &bundle_config_hash,
+            admitted_worker_names.as_ref(),
+        );
+        let ring_len = ring.len();
         metrics::ROUTING_HRW_RING_SIZE
             .with_label_values(&[&model_label, &pool_label])
-            .set(ring.len() as f64);
+            .set(ring_len as f64);
         match crate::routing::pick_worker(&ring, &resolved_key) {
-            Some(worker_id) => publisher::PublishTarget::Worker {
-                model: model.clone(),
-                pool: pool.clone(),
-                worker_id: worker_id.to_string(),
-            },
+            Some(worker_id) => (
+                publisher::PublishTarget::Worker {
+                    pool: pool.clone(),
+                    machine_profile: gpu.clone(),
+                    bundle: bundle.clone(),
+                    model: model.clone(),
+                    worker_id: worker_id.to_string(),
+                },
+                fallback_lane_worker_count,
+            ),
             None => {
                 metrics::ROUTING_FALLBACK_TOTAL
                     .with_label_values(&[&model_label, &pool_label, "unhealthy_skipped"])
                     .inc();
-                publisher::PublishTarget::Pool {
-                    model: model.clone(),
-                    pool: pool.clone(),
-                }
+                (
+                    publisher::PublishTarget::Pool {
+                        pool: pool.clone(),
+                        machine_profile: gpu.clone(),
+                        bundle: bundle.clone(),
+                        model: model.clone(),
+                    },
+                    fallback_lane_worker_count,
+                )
             }
         }
     };
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
 
     let (request_id, outcome_rx, chunk_rx) = match work_publisher
-        .publish_generate_streaming_sse(
-            target,
-            &bundle,
-            &engine,
-            &gpu,
-            &bundle_config_hash,
-            &work_params,
-        )
+        .publish_generate_streaming_sse(target, &engine, &bundle_config_hash, &work_params)
         .await
     {
         Ok(triple) => triple,
@@ -187,13 +214,18 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
             // for the `PublishFailed` arm).
             let lower = e.to_lowercase();
             let retry_after = if lower.contains("no consumers") {
-                metrics::record_rejected_request(&gpu, &bundle, "no_consumers");
+                metrics::record_rejected_request_for_pool(&pool, &gpu, &bundle, "no_consumers");
                 Some("120")
             } else if lower.contains("backpressure") {
-                metrics::record_rejected_request(&gpu, &bundle, "backpressure");
+                metrics::record_rejected_request_for_pool(&pool, &gpu, &bundle, "backpressure");
                 Some("5")
             } else {
-                metrics::record_rejected_request(&gpu, &bundle, "queue_publish_failed");
+                metrics::record_rejected_request_for_pool(
+                    &pool,
+                    &gpu,
+                    &bundle,
+                    "queue_publish_failed",
+                );
                 None
             };
             return crate::handlers::proxy::build_streaming_publish_failed_for_sse(&e, retry_after);
@@ -268,6 +300,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
             inter_chunk_timeout: timeout_config.inter_chunk,
             overall_timeout: effective_overall,
             was_direct_dispatched,
+            pool_fallback_lane_worker_count,
         })
         .await;
     });
@@ -323,6 +356,7 @@ struct SseDriverArgs {
     inter_chunk_timeout: Duration,
     overall_timeout: Duration,
     was_direct_dispatched: bool,
+    pool_fallback_lane_worker_count: usize,
 }
 
 /// Internal SSE driver — loops on the broadcast tap, forwards
@@ -353,6 +387,7 @@ async fn run_sse_driver(args: SseDriverArgs) {
         inter_chunk_timeout,
         overall_timeout,
         was_direct_dispatched,
+        pool_fallback_lane_worker_count,
     } = args;
 
     // Install the cancel-on-drop guard. Mirrors
@@ -384,6 +419,10 @@ async fn run_sse_driver(args: SseDriverArgs) {
     // ``finish_reason``/``logprobs``.
     let mut multi_candidate_stream = false;
     let mut republished_for_first_chunk = false;
+    let single_consumer_lane_at_dispatch = crate::routing::suppress_first_chunk_republish_for_lane(
+        was_direct_dispatched,
+        pool_fallback_lane_worker_count,
+    );
 
     // The terminal-outcome oneshot. The per-chunk broadcast tap drives
     // the normal forwarding path, but the oneshot is the *only* carrier
@@ -437,7 +476,12 @@ async fn run_sse_driver(args: SseDriverArgs) {
                     "overall",
                 ])
                 .inc();
-            metrics::record_rejected_request(&gpu, &bundle, "generation_overall_timeout");
+            metrics::record_rejected_request_for_pool(
+                &pool,
+                &gpu,
+                &bundle,
+                "generation_overall_timeout",
+            );
             cancel_guard.defuse();
             publisher.publish_cancel(&request_id).await;
             publisher.drop_pending_stream(&request_id);
@@ -448,7 +492,10 @@ async fn run_sse_driver(args: SseDriverArgs) {
             // `run_streaming_generate`). The broadcast receiver is
             // already subscribed, so chunks from the republished
             // attempt flow into this same loop.
-            if was_direct_dispatched && !republished_for_first_chunk {
+            if was_direct_dispatched
+                && !republished_for_first_chunk
+                && !single_consumer_lane_at_dispatch
+            {
                 republished_for_first_chunk = true;
                 // At-least-once-execution hazard (mirrors the non-SSE
                 // `run_streaming_generate` path): a SLOW original
@@ -483,6 +530,21 @@ async fn run_sse_driver(args: SseDriverArgs) {
                     }
                 }
             }
+            if single_consumer_lane_at_dispatch
+                && was_direct_dispatched
+                && !republished_for_first_chunk
+            {
+                republished_for_first_chunk = true;
+                first_chunk_deadline = overall_deadline;
+                tracing::debug!(
+                    request_id = %request_id,
+                    pool = %pool,
+                    machine_profile = %gpu,
+                    bundle = %bundle,
+                    "SSE: first_chunk_timeout - single-worker lane, suppressing republish; continuing on overall_timeout"
+                );
+                continue;
+            }
             send_error_chunk(
                 &event_tx,
                 &endpoint,
@@ -502,7 +564,12 @@ async fn run_sse_driver(args: SseDriverArgs) {
                     "first_chunk",
                 ])
                 .inc();
-            metrics::record_rejected_request(&gpu, &bundle, "generation_first_chunk_timeout");
+            metrics::record_rejected_request_for_pool(
+                &pool,
+                &gpu,
+                &bundle,
+                "generation_first_chunk_timeout",
+            );
             cancel_guard.defuse();
             publisher.publish_cancel(&request_id).await;
             publisher.drop_pending_stream(&request_id);
@@ -529,7 +596,12 @@ async fn run_sse_driver(args: SseDriverArgs) {
                         "inter_chunk",
                     ])
                     .inc();
-                metrics::record_rejected_request(&gpu, &bundle, "generation_inter_chunk_timeout");
+                metrics::record_rejected_request_for_pool(
+                    &pool,
+                    &gpu,
+                    &bundle,
+                    "generation_inter_chunk_timeout",
+                );
                 cancel_guard.defuse();
                 publisher.publish_cancel(&request_id).await;
                 publisher.drop_pending_stream(&request_id);

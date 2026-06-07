@@ -21,13 +21,13 @@ groups:
           description: "All SIE worker pods are down. Requests will fail."
 
       - alert: SIEWorkerHighQueueDepth
-        expr: sie_request_queue_depth > 50
+        expr: sie_gateway_worker_queue_depth > 50
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High queue depth on {{ $labels.pod }}"
-          description: "Worker {{ $labels.pod }} has queue depth {{ $value }} for 5 minutes. Consider scaling up."
+          summary: "High queue depth on {{ $labels.worker }}"
+          description: "Worker {{ $labels.worker }} in {{ $labels.pool }}/{{ $labels.machine_profile }}/{{ $labels.bundle }} has queue depth {{ $value }} for 5 minutes. Consider scaling up."
 
   # GPU alerts
   - name: sie-gpu-health
@@ -114,7 +114,7 @@ groups:
           description: "{{ $value | humanizePercentage }} of requests are failing with non-retryable errors (excludes RESOURCE_EXHAUSTED, MODEL_LOADING, and upstream_lora_loading which the SDK auto-retries)."
 
       - alert: SIEHighLatency
-        expr: histogram_quantile(0.95, sum by (le) (rate(sie_request_duration_seconds_bucket[5m]))) > 5
+        expr: histogram_quantile(0.95, sum by (le) (rate(sie_gateway_request_latency_seconds_bucket[5m]))) > 5
         for: 5m
         labels:
           severity: warning

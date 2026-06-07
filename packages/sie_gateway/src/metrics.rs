@@ -200,7 +200,7 @@ pub static PENDING_DEMAND: LazyLock<GaugeVec> = LazyLock::new(|| {
             "sie_gateway_pending_demand",
             "Pools with unmet demand (KEDA trigger)",
         ),
-        &["machine_profile", "bundle"],
+        &["pool", "machine_profile", "bundle"],
     )
     .unwrap()
 });
@@ -212,7 +212,7 @@ pub static ACTIVE_LEASE_GPUS: LazyLock<GaugeVec> = LazyLock::new(|| {
             "sie_gateway_active_lease_gpus",
             "GPUs from active leases (KEDA trigger)",
         ),
-        &["machine_profile", "bundle"],
+        &["pool", "machine_profile", "bundle"],
     )
     .unwrap()
 });
@@ -223,7 +223,7 @@ pub static REJECTED_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
             "sie_gateway_rejected_requests_total",
             "Requests rejected before reaching a worker",
         ),
-        &["machine_profile", "bundle", "reason"],
+        &["pool", "machine_profile", "bundle", "reason"],
     )
     .unwrap()
 });
@@ -241,7 +241,7 @@ pub static WORKER_COUNT: LazyLock<GaugeVec> = LazyLock::new(|| {
 pub static WORKER_QUEUE_DEPTH: LazyLock<GaugeVec> = LazyLock::new(|| {
     GaugeVec::new(
         Opts::new("sie_gateway_worker_queue_depth", "Per-worker queue depth"),
-        &["worker", "machine_profile", "bundle"],
+        &["pool", "worker", "machine_profile", "bundle"],
     )
     .unwrap()
 });
@@ -921,10 +921,10 @@ pub fn set_nats_connected(connected: bool) {
 pub fn init_metric_families() {
     REQUEST_COUNT.with_label_values(&["", "", ""]).inc_by(0.0);
     PROVISIONING_RESPONSES.with_label_values(&[""]).inc_by(0.0);
-    PENDING_DEMAND.with_label_values(&["", ""]).set(0.0);
-    ACTIVE_LEASE_GPUS.with_label_values(&["", ""]).set(0.0);
+    PENDING_DEMAND.with_label_values(&["", "", ""]).set(0.0);
+    ACTIVE_LEASE_GPUS.with_label_values(&["", "", ""]).set(0.0);
     REJECTED_REQUESTS
-        .with_label_values(&["", "", ""])
+        .with_label_values(&["", "", "", ""])
         .inc_by(0.0);
     // Seed the gauge families that other call sites write to,
     // so they appear in /metrics even before the first real
@@ -980,7 +980,7 @@ pub fn update_worker_metrics(workers: &[WorkerSnapshot]) {
             unhealthy_count += 1;
         }
         WORKER_QUEUE_DEPTH
-            .with_label_values(&[&w.name, &w.machine_profile, &w.bundle])
+            .with_label_values(&[&w.pool_name, &w.name, &w.machine_profile, &w.bundle])
             .set(w.queue_depth as f64);
         WORKER_MEMORY_USED
             .with_label_values(&[&w.name, &w.machine_profile, &w.bundle])
@@ -1017,14 +1017,20 @@ pub fn update_model_metrics(models: &std::collections::HashMap<String, usize>) {
     }
 }
 
-pub fn record_rejected_request(machine_profile: &str, bundle: &str, reason: &str) {
+pub fn record_rejected_request_for_pool(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    reason: &str,
+) {
+    let effective_pool = if pool.is_empty() { "unknown" } else { pool };
     let effective_profile = if machine_profile.is_empty() {
         "unknown"
     } else {
         machine_profile
     };
     REJECTED_REQUESTS
-        .with_label_values(&[effective_profile, bundle, reason])
+        .with_label_values(&[effective_pool, effective_profile, bundle, reason])
         .inc();
 }
 
@@ -1032,7 +1038,7 @@ pub fn record_rejected_request(machine_profile: &str, bundle: &str, reason: &str
 /// Called when worker metrics are updated to cancel stale demand signals.
 /// Uses the DemandTracker to properly cancel expiry timers when clearing.
 pub fn clear_fulfilled_demand(
-    healthy_worker_groups: &std::collections::HashSet<(String, String)>,
+    healthy_worker_groups: &std::collections::HashSet<(String, String, String)>,
     demand_tracker: &crate::state::demand_tracker::DemandTracker,
 ) {
     // Gather current demand label pairs from the metric
@@ -1048,12 +1054,18 @@ pub fn clear_fulfilled_demand(
                 .map(|l| (l.name(), l.value()))
                 .collect();
             if let Some(&gpu) = labels.get("machine_profile") {
+                let pool = labels.get("pool").copied().unwrap_or("default");
                 let bundle = labels.get("bundle").copied().unwrap_or("default");
-                if healthy_worker_groups.contains(&(gpu.to_lowercase(), bundle.to_lowercase())) {
-                    let current = PENDING_DEMAND.with_label_values(&[gpu, bundle]).get();
+                if healthy_worker_groups.contains(&(
+                    pool.to_lowercase(),
+                    gpu.to_lowercase(),
+                    bundle.to_lowercase(),
+                )) {
+                    let current = PENDING_DEMAND.with_label_values(&[pool, gpu, bundle]).get();
                     if current > 0.0 {
-                        demand_tracker.clear(gpu, bundle);
+                        demand_tracker.clear(pool, gpu, bundle);
                         tracing::info!(
+                            pool = pool,
                             gpu = gpu,
                             bundle = bundle,
                             "cleared pending demand — healthy workers available"
@@ -1076,15 +1088,29 @@ pub fn update_pool_metrics(pools: &[crate::types::Pool]) {
     // re-seed the `init_metric_families()` sentinel is wiped on the
     // very first scrape.
     ACTIVE_LEASE_GPUS.reset();
-    ACTIVE_LEASE_GPUS.with_label_values(&["", ""]).set(0.0);
+    ACTIVE_LEASE_GPUS.with_label_values(&["", "", ""]).set(0.0);
 
     for pool in pools {
         if pool.status.state == PoolState::Active && pool.spec.name != DEFAULT_POOL_NAME {
-            let bundle = pool.spec.bundle.as_deref().unwrap_or("default");
-            for (gpu_type, count) in &pool.spec.gpus {
-                ACTIVE_LEASE_GPUS
-                    .with_label_values(&[gpu_type, bundle])
-                    .add(*count as f64);
+            if let Some(bundle) = pool.spec.bundle.as_deref() {
+                for (gpu_type, count) in &pool.spec.gpus {
+                    ACTIVE_LEASE_GPUS
+                        .with_label_values(&[&pool.spec.name, gpu_type, bundle])
+                        .add(*count as f64);
+                }
+            } else {
+                let mut assigned_by_lane: std::collections::HashMap<(&str, &str), usize> =
+                    std::collections::HashMap::new();
+                for worker in &pool.status.assigned_workers {
+                    *assigned_by_lane
+                        .entry((&worker.gpu, &worker.bundle))
+                        .or_default() += 1;
+                }
+                for ((gpu_type, bundle), count) in assigned_by_lane {
+                    ACTIVE_LEASE_GPUS
+                        .with_label_values(&[&pool.spec.name, gpu_type, bundle])
+                        .add(count as f64);
+                }
             }
         }
     }
@@ -1093,7 +1119,7 @@ pub fn update_pool_metrics(pools: &[crate::types::Pool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::pool::{Pool, PoolSpec, PoolState, PoolStatus};
+    use crate::types::pool::{AssignedWorker, Pool, PoolSpec, PoolState, PoolStatus};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1151,9 +1177,45 @@ mod tests {
         update_pool_metrics(&pools);
 
         let val = ACTIVE_LEASE_GPUS
-            .with_label_values(&["l4-spot", "premium"])
+            .with_label_values(&["eval-pool", "l4-spot", "premium"])
             .get();
         assert!((val - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_pool_metrics_unfiltered_pool_uses_assigned_worker_bundles() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("rtx6000".to_string(), 2);
+        let mut pool = make_pool("customer-acme", PoolState::Active, gpus, None);
+        pool.status.assigned_workers = vec![
+            AssignedWorker {
+                name: "worker-default".to_string(),
+                url: "http://worker-default:8080".to_string(),
+                gpu: "rtx6000".to_string(),
+                bundle: "default".to_string(),
+            },
+            AssignedWorker {
+                name: "worker-sglang".to_string(),
+                url: "http://worker-sglang:8080".to_string(),
+                gpu: "rtx6000".to_string(),
+                bundle: "sglang".to_string(),
+            },
+        ];
+
+        update_pool_metrics(&[pool]);
+
+        let default_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["customer-acme", "rtx6000", "default"])
+            .get();
+        let sglang_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["customer-acme", "rtx6000", "sglang"])
+            .get();
+        assert!((default_val - 1.0).abs() < f64::EPSILON);
+        assert!((sglang_val - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1170,7 +1232,7 @@ mod tests {
 
         // Default pool should not contribute to active lease GPUs
         let val = ACTIVE_LEASE_GPUS
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .get();
         assert!((val - 0.0).abs() < f64::EPSILON);
     }
@@ -1193,7 +1255,7 @@ mod tests {
         update_pool_metrics(&pools);
 
         let val = ACTIVE_LEASE_GPUS
-            .with_label_values(&["a100", "default"])
+            .with_label_values(&["pending-pool", "a100", "default"])
             .get();
         assert!((val - 0.0).abs() < f64::EPSILON);
     }
@@ -1205,7 +1267,7 @@ mod tests {
         reset_test_metrics();
 
         ACTIVE_LEASE_GPUS
-            .with_label_values(&["stale-gpu", "stale-bundle"])
+            .with_label_values(&["stale-pool", "stale-gpu", "stale-bundle"])
             .set(10.0);
 
         update_pool_metrics(&[]);
@@ -1308,7 +1370,7 @@ mod tests {
         }];
         update_worker_metrics(&first);
         let d = WORKER_QUEUE_DEPTH
-            .with_label_values(&["ghost-worker", "l4-spot", "default"])
+            .with_label_values(&["default-pool", "ghost-worker", "l4-spot", "default"])
             .get();
         assert!((d - 42.0).abs() < f64::EPSILON);
 
@@ -1327,7 +1389,7 @@ mod tests {
 
         // The new worker is visible.
         let d2 = WORKER_QUEUE_DEPTH
-            .with_label_values(&["other-worker", "a100", "premium"])
+            .with_label_values(&["premium-pool", "other-worker", "a100", "premium"])
             .get();
         assert!((d2 - 7.0).abs() < f64::EPSILON);
 
@@ -1395,17 +1457,21 @@ mod tests {
 
         // Set demand for l4-spot
         PENDING_DEMAND
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .set(1.0);
 
-        // Healthy workers include l4-spot/default.
+        // Healthy workers include default/l4-spot/default.
         let mut worker_groups = std::collections::HashSet::new();
-        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
+        worker_groups.insert((
+            "default".to_string(),
+            "l4-spot".to_string(),
+            "default".to_string(),
+        ));
 
         clear_fulfilled_demand(&worker_groups, &tracker);
 
         let val = PENDING_DEMAND
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .get();
         assert!((val - 0.0).abs() < f64::EPSILON);
     }
@@ -1420,17 +1486,23 @@ mod tests {
 
         // Set demand for h100 (no healthy workers)
         PENDING_DEMAND
-            .with_label_values(&["h100", "default"])
+            .with_label_values(&["default", "h100", "default"])
             .set(1.0);
 
-        // Only l4-spot/default is healthy.
+        // Only default/l4-spot/default is healthy.
         let mut worker_groups = std::collections::HashSet::new();
-        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
+        worker_groups.insert((
+            "default".to_string(),
+            "l4-spot".to_string(),
+            "default".to_string(),
+        ));
 
         clear_fulfilled_demand(&worker_groups, &tracker);
 
         // h100 demand should remain
-        let val = PENDING_DEMAND.with_label_values(&["h100", "default"]).get();
+        let val = PENDING_DEMAND
+            .with_label_values(&["default", "h100", "default"])
+            .get();
         assert!((val - 1.0).abs() < f64::EPSILON);
     }
 
@@ -1444,26 +1516,38 @@ mod tests {
 
         // Same machine profile has demand in two bundles.
         PENDING_DEMAND
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .set(1.0);
         PENDING_DEMAND
-            .with_label_values(&["l4-spot", "sglang"])
+            .with_label_values(&["default", "l4-spot", "sglang"])
+            .set(1.0);
+        PENDING_DEMAND
+            .with_label_values(&["tenant-a", "l4-spot", "default"])
             .set(1.0);
 
-        // A healthy default worker must not clear sglang demand.
+        // A healthy default-pool default-bundle worker must not clear
+        // sglang demand or another pool's default-bundle demand.
         let mut worker_groups = std::collections::HashSet::new();
-        worker_groups.insert(("l4-spot".to_string(), "default".to_string()));
+        worker_groups.insert((
+            "default".to_string(),
+            "l4-spot".to_string(),
+            "default".to_string(),
+        ));
 
         clear_fulfilled_demand(&worker_groups, &tracker);
 
         let default_val = PENDING_DEMAND
-            .with_label_values(&["l4-spot", "default"])
+            .with_label_values(&["default", "l4-spot", "default"])
             .get();
         let sglang_val = PENDING_DEMAND
-            .with_label_values(&["l4-spot", "sglang"])
+            .with_label_values(&["default", "l4-spot", "sglang"])
+            .get();
+        let tenant_val = PENDING_DEMAND
+            .with_label_values(&["tenant-a", "l4-spot", "default"])
             .get();
         assert!((default_val - 0.0).abs() < f64::EPSILON);
         assert!((sglang_val - 1.0).abs() < f64::EPSILON);
+        assert!((tenant_val - 1.0).abs() < f64::EPSILON);
     }
 
     // ------------------------------------------------------------------

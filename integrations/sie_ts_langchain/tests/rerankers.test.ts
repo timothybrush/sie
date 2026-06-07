@@ -15,7 +15,9 @@ vi.mock("@superlinked/sie-sdk", async (importOriginal) => {
 
   return {
     ...actual,
-    SIEClient: vi.fn().mockImplementation(() => mockClient),
+    SIEClient: vi.fn().mockImplementation(function () {
+      return mockClient;
+    }),
   };
 });
 
@@ -55,10 +57,12 @@ describe("SIEReranker", () => {
         { itemId: "2", score: 0.31, rank: 2 },
       ],
     });
-    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(function () {
+      return {
       score: mockScore,
       close: vi.fn(),
-    }));
+    };
+    });
 
     const documents = [
       { pageContent: "First document", metadata: { source: "a" } },
@@ -97,10 +101,12 @@ describe("SIEReranker", () => {
         { itemId: "2", score: 0.31, rank: 2 },
       ],
     });
-    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(function () {
+      return {
       score: mockScore,
       close: vi.fn(),
-    }));
+    };
+    });
 
     const documents = [
       { pageContent: "Doc A", metadata: {} },
@@ -121,10 +127,12 @@ describe("SIEReranker", () => {
     const mockScore = vi.fn().mockResolvedValue({
       scores: [{ itemId: "0", score: 0.9, rank: 0 }],
     });
-    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+    (SIEClient as unknown as ReturnType<typeof vi.fn>).mockImplementation(function () {
+      return {
       score: mockScore,
       close: vi.fn(),
-    }));
+    };
+    });
 
     const documents = [{ pageContent: "Doc", metadata: {}, id: "doc-123" }];
 

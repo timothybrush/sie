@@ -299,7 +299,8 @@ async def build_status_message(
     # The pull loop owns the canonical resolution
     # (``SIE_WORKER_ID > HOSTNAME > POD_NAME > uuid4``); we mirror that
     # value here so the gateway's WorkerRegistry keys its dispatch
-    # subject (``sie.work.{model}.{pool}.{name}``) on the *same*
+    # subject (``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{name}``)
+    # on the *same*
     # identifier the worker is subscribed to. Falling back to the
     # legacy ``HOSTNAME``/``POD_NAME`` lookup when the pull loop is
     # absent keeps the non-queue path working unchanged.

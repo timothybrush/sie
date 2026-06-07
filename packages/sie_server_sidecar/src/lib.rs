@@ -512,7 +512,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     //
     // In `health_mode=nats` the gateway's `WorkerRegistry` is built
     // exclusively from `sie.health.>` messages — no publisher means
-    // no registered workers, which makes `resolve_queue_pool`
+    // no registered workers, which makes `resolve_queue_route`
     // return `None` and every inbound request `202 provisioning`.
     //
     // Skipped silently when `SIE_HEALTH_PUBLISH_ENABLED=false` (or

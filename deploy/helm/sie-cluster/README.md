@@ -27,7 +27,7 @@ helm install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
 
 - **Gateway**: Stateless request proxy that routes to workers based on GPU type and model affinity. Consumes config via GET/NATS from `sie-config`.
 - **sie-config**: Authoritative control plane for model/bundle configuration. Serves `/v1/configs/*` writes and publishes NATS deltas to the gateway and workers. Deployed as a singleton (`replicas: 1`, `strategy: Recreate`).
-- **Worker Pools**: StatefulSets per GPU type, each with KEDA autoscaling.
+- **Worker Pools**: StatefulSets per enabled worker group, each with KEDA autoscaling. Routing, metrics, and KEDA scale on the full `(queuePool, machineProfile, bundle)` lane.
 
 ## Cold Start Expectations
 
@@ -95,17 +95,21 @@ autoscaling:
 
 ### Scale-from-Zero Trigger
 
-The gateway exposes `sie_gateway_pending_demand{gpu="..."}` metric when requests
-arrive for GPU types with no available workers. KEDA uses this to trigger scale-up
-even when there are 0 workers (and thus no worker metrics).
+The gateway exposes `sie_gateway_pending_demand{pool="...",machine_profile="...",bundle="..."}`
+when requests arrive for queue lanes with no available workers. KEDA uses this
+to trigger scale-up even when there are 0 workers (and thus no worker metrics).
+For `X-SIE-Pool` requests that omit `X-SIE-MACHINE-PROFILE`, the gateway can
+emit a lane-specific signal only when the registered pool spec contains exactly
+one machine profile. Multi-profile tenant pools should send both headers.
 
 ### Scaling Metrics
 
 | Metric | Source | Purpose |
 |--------|--------|---------|
 | `sie_gateway_pending_demand` | Gateway | Trigger scale from 0 |
-| `sie_request_queue_depth` | Workers | Scale up on load |
-| `sie_active_requests` | Workers | Scale up on concurrent requests |
+| `sie_gateway_worker_queue_depth` | Gateway worker registry | Scale up on queued work in the exact pool/profile/bundle lane |
+| `sie_gateway_active_lease_gpus` | Gateway pool manager | Hold capacity for active pool leases in the exact pool/profile/bundle lane |
+| `sie_gateway_rejected_requests_total` | Gateway | Scale up on sustained capacity/no-worker rejections after retryable cold-load reasons are excluded |
 
 ### Worker-sidecar Metrics
 
@@ -139,9 +143,13 @@ rtx6000 default bundle scales 3–10 — see
 
 ```yaml
 # Worker pool configuration (must explicitly enable pools)
-# Pool naming: <machineProfile> (e.g. l4, a100-40gb, cpu)
-# Each pool can serve multiple bundles. Each (pool, bundle) renders its
-# own StatefulSet + ScaledObject named worker-<pool>-<bundle>.
+# The map key is the Kubernetes capacity family/resource name. When
+# machineProfile is omitted, it defaults to that map key. machineProfile is the
+# runtime lane label used by routing and metrics. queuePool is the logical queue
+# namespace / tenant boundary; when omitted it inherits workers.common.queuePool,
+# then falls back to the worker group key.
+# Each worker group renders its own StatefulSet + ScaledObject named
+# worker-<pool>-<bundle>.
 workers:
   pools:
     l4:

@@ -51,7 +51,7 @@ the colocated adapter over a Unix domain socket.
 
 ## Request Path
 
-1. Gateway publishes a msgpack `WorkItem` on `sie.work.{model}.{pool}`.
+1. Gateway publishes a msgpack `WorkItem` on `sie.work.{pool}.{machine_profile}.{bundle}.{model}`.
 2. The sidecar's long-lived JetStream pull stream receives messages from
    stream `WORK_POOL_{pool}`.
 3. The dispatcher extracts the model from the subject and rejects malformed
@@ -84,14 +84,22 @@ Worker stream and consumer settings must stay aligned with the gateway and SDK:
 | Field | Value |
 | --- | --- |
 | Stream | `WORK_POOL_{pool}` |
-| Subject filter | `sie.work.*.{pool}` |
+| Stream subjects | `sie.work.{pool}.*.*.*` |
+| Consumer filter | `sie.work.{pool}.{machine_profile}.{bundle}.*` |
 | Retention | WorkQueue |
 | Storage | Memory |
-| Consumer | `{bundle}_{pool}` |
+| Consumer | `{pool}_{machine_profile}_{bundle}` |
 | Ack policy | Explicit |
 | Ack wait | 30 s |
 | Max deliver | `SIE_MAX_DELIVER`, default 20 |
 | Max ack pending | `SIE_MAX_ACK_PENDING`, default 1000 |
+
+On existing streams, the gateway and sidecar reconcile the subject list to
+exactly `sie.work.{pool}.*.*.*`. Legacy subjects such as `sie.work.*.{pool}` are
+intentionally removed from stream configuration. This release is a cutover to
+the lane-aware subject shape, not a mixed-version bridge: all gateways and
+workers in the cluster must use the new shape, and any old queued work should be
+drained or purged before rollout.
 
 The pull stream must be long-lived. Dropping and recreating pull streams inside
 the fetch loop can make async-nats mark unread messages as delivered, causing
@@ -101,17 +109,17 @@ Integration tests guard this with concurrent and sustained-load scenarios that
 watch `sie_worker_nats_redelivery_total`.
 
 The sidecar also runs a slow stream/durable reconciler. It periodically
-re-ensures `WORK_POOL_{pool}` and `{bundle}_{pool}` so NATS metadata drift can
-self-heal without adding reconnect-event work or locks to the fetch loop. It
-does not rebuild the active pull stream; terminal pull-stream errors still use
-the normal pull-loop recovery path.
+re-ensures `WORK_POOL_{pool}` and `{pool}_{machine_profile}_{bundle}` so NATS
+metadata drift can self-heal without adding reconnect-event work or locks to
+the fetch loop. It does not rebuild the active pull stream; terminal
+pull-stream errors still use the normal pull-loop recovery path.
 
 Generation models use a worker-specific JetStream subject
-`sie.work.{model}.{pool}.{worker_id}`. The sidecar creates and polls that
-worker stream only after Python `WorkerCapabilities` reports at least one
-generation model. If live config reconciliation later adds a generation model
-to an already-running sidecar, a capability reconciler activates the direct
-stream and cancel subscriber exactly once.
+`sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`. The sidecar
+creates and polls that worker stream only after Python `WorkerCapabilities`
+reports at least one generation model. If live config reconciliation later adds
+a generation model to an already-running sidecar, a capability reconciler
+activates the direct stream and cancel subscriber exactly once.
 
 When `SIE_GATEWAY_URL` is set, the sidecar runs the pool admission gate before
 pulling from either the pool stream or the generation worker stream. Capped
@@ -119,12 +127,6 @@ named pools fail closed unless `/v1/pools/{pool}` lists this pod in
 `status.assigned_workers`; uncapped pools and profile-uncapped workers continue
 pulling. The default pool fails open during transient gateway/status errors so
 baseline capacity remains available.
-
-On startup the sidecar also performs a best-effort cleanup of empty per-model
-`WORK_<model>` streams whose subjects overlap `sie.work.*.{pool}`. This
-preserves upgrade safety without dropping queued work; non-empty streams must be
-drained or migrated explicitly, and unrelated streams and other pool streams are
-ignored.
 
 ## IPC Contract
 
@@ -240,8 +242,9 @@ sidecar container itself.
 | Variable | Purpose |
 | --- | --- |
 | `SIE_NATS_URL` | NATS endpoint; required |
-| `SIE_POOL` | pool segment in `sie.work.*.{pool}` |
-| `SIE_BUNDLE` | consumer-name segment |
+| `SIE_POOL` | pool segment in `sie.work.{pool}.{machine_profile}.{bundle}.{model}` |
+| `SIE_MACHINE_PROFILE` | machine-profile segment; required and set explicitly by Helm |
+| `SIE_BUNDLE` | bundle/runtime segment and consumer-name segment |
 | `SIE_IPC_SOCKET_PATH` | UDS path to the adapter |
 | `SIE_IPC_POOL_SIZE` | concurrent IPC connections, default matches dispatch concurrency |
 | `SIE_NATS_FETCH_BUDGET` | pull-stream credit and fallback model budget |
@@ -313,7 +316,8 @@ task, then creates the worker-specific generation stream.
   a matching `sie-config`/worker image rollout; the running sidecar can only
   apply configs for adapters already present in the co-located Python image.
 - **Subject shape coupling.** The worker extracts the model from subject token
-  `parts[2]`. Gateway subject changes must update worker parsing in lock-step.
+  `parts[5]` in `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. Gateway
+  subject changes must update worker parsing in lock-step.
 - **Unit integration scope.** Rust integration tests use real NATS and a stub
   Python IPC server; local Tilt E2E covers the real gateway-to-worker path.
 - **Sidecar enablement changes deployment behavior.** Keeping

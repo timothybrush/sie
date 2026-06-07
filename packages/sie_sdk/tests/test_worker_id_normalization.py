@@ -1,8 +1,8 @@
 """Cross-language fixture for worker_id NATS subject normalization.
 
 The gateway (Rust) publishes direct-dispatch work items to
-``sie.work.{model}.{pool}.{worker_id}`` and applies its
-``normalize_model_id`` to the worker_id before publishing. The Python SDK
+``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`` and
+applies its ``normalize_model_id`` to the worker_id before publishing. The Python SDK
 helpers (``work_worker_subject``, ``work_worker_stream_subjects``,
 ``work_worker_stream_name``, ``work_worker_consumer_name``) and the worker
 init (``NatsPullLoop.__init__``) now route worker IDs through
@@ -94,13 +94,13 @@ def test_subject_helpers_route_through_normalize() -> None:
     assert normalized == "pod-0_dot_svc"
 
     # per-worker publish subject
-    subj = work_worker_subject("BAAI/bge-m3", "default", raw)
-    assert subj == f"sie.work.BAAI__bge-m3.default.{normalized}"
-    assert subj.count(".") == 4, "exactly 4 dots → 5 tokens after split"
+    subj = work_worker_subject("default", "rtx6000", "sglang", "BAAI/bge-m3", raw)
+    assert subj == f"sie.work.default.rtx6000.sglang.BAAI__bge-m3.{normalized}"
+    assert subj.count(".") == 6, "exactly 6 dots -> 7 tokens after split"
 
     # per-worker stream subjects (consumer-side filter)
-    subjects = work_worker_stream_subjects("default", raw)
-    assert subjects == [f"sie.work.*.default.{normalized}"]
+    subjects = work_worker_stream_subjects("default", "rtx6000", "sglang", raw)
+    assert subjects == [f"sie.work.default.rtx6000.sglang.*.{normalized}"]
 
     # per-worker stream name (no dots — uses an underscore prefix)
     assert work_worker_stream_name(raw) == f"WORK_WORKER_{normalized}"
@@ -114,9 +114,9 @@ def test_subject_helpers_reject_empty_worker_id() -> None:
     silently substituting a default.
     """
     with pytest.raises(ValueError, match="empty"):
-        work_worker_subject("m", "p", "")
+        work_worker_subject("p", "m", "b", "m", "")
     with pytest.raises(ValueError, match="empty"):
-        work_worker_stream_subjects("p", "")
+        work_worker_stream_subjects("p", "m", "b", "")
     with pytest.raises(ValueError, match="empty"):
         work_worker_stream_name("")
     with pytest.raises(ValueError, match="empty"):

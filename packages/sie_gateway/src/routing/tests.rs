@@ -14,7 +14,7 @@ use super::key::{
 };
 #[cfg(feature = "raw-routing-logs")]
 use super::RAW_LOGGING_ENV;
-use super::{fmt_key_hash, log_raw_keys_enabled};
+use super::{fmt_key_hash, log_raw_keys_enabled, suppress_first_chunk_republish_for_lane};
 
 fn workers(n: usize) -> RingSnapshot {
     RingSnapshot::new((0..n).map(|i| format!("worker-{i}")))
@@ -121,6 +121,21 @@ fn empty_snapshot_returns_none() {
     let snap = RingSnapshot::default();
     let key = resolve(Some("x"), None, None, None);
     assert!(pick_worker(&snap, &key).is_none());
+}
+
+#[test]
+fn first_chunk_republish_is_suppressed_for_single_direct_lane() {
+    assert!(suppress_first_chunk_republish_for_lane(true, 1));
+}
+
+#[test]
+fn first_chunk_republish_is_not_suppressed_when_lane_has_failover() {
+    assert!(!suppress_first_chunk_republish_for_lane(true, 2));
+}
+
+#[test]
+fn first_chunk_republish_guard_ignores_pool_fallback_dispatch() {
+    assert!(!suppress_first_chunk_republish_for_lane(false, 0));
 }
 
 #[test]

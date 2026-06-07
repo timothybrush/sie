@@ -963,7 +963,7 @@ mod tests {
     fn test_collector_latches_attempt_and_concatenates_text() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
 
         assert_eq!(
             collector.apply(_make_chunk("att-A", 0, "Hello", false)),
@@ -989,7 +989,7 @@ mod tests {
     fn test_collector_drops_stale_attempt_chunks() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
 
         assert_eq!(
             collector.apply(_make_chunk("att-A", 0, "first", false)),
@@ -1034,7 +1034,7 @@ mod tests {
     fn test_collector_without_tap_no_op() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
         assert!(collector.chunk_tap.is_none());
         // apply works exactly as before — no panic, no fan-out side
         // effect (the broadcast send is gated by the `Some` arm).
@@ -1052,7 +1052,7 @@ mod tests {
     async fn test_collector_tap_skips_stale_chunks() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
         let mut tap = collector.install_chunk_tap();
 
         collector.apply(_make_chunk("att-A", 0, "first", false));
@@ -1080,7 +1080,7 @@ mod tests {
     fn test_collector_drops_duplicate_seq_redelivery() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
 
         assert_eq!(
             collector.apply(_make_chunk("att-A", 0, "Hello", false)),
@@ -1120,7 +1120,7 @@ mod tests {
     fn test_streaming_gap_rejected_as_stream_error() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
 
         assert_eq!(
             collector.apply(_make_chunk("att-A", 1, "first", false)),
@@ -1154,7 +1154,7 @@ mod tests {
     fn test_streaming_gap_check_does_not_apply_to_terminal() {
         let (tx, _rx) = oneshot::channel();
         let mut collector =
-            StreamCollector::new(tx, "test/model".to_string(), "_default".to_string());
+            StreamCollector::new(tx, "test/model".to_string(), "default".to_string());
 
         assert_eq!(
             collector.apply(_make_chunk("att-A", 0, "hi", false)),

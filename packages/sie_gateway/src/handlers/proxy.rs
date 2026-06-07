@@ -22,8 +22,8 @@ use crate::queue::publisher;
 
 use crate::server::AppState;
 use crate::state::model_registry::ResolveError;
-use crate::state::pool_manager::DEFAULT_POOL_NAME;
-use crate::state::worker_registry::WorkerRegistry;
+use crate::state::pool_manager::{PoolManager, DEFAULT_POOL_NAME};
+use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
 use crate::types::AuditEntry;
 
 use super::models::{extract_bearer_token, mask_token};
@@ -191,41 +191,50 @@ fn parse_engine_pin(headers: &HeaderMap) -> EnginePinParse {
 #[derive(Debug, PartialEq, Eq)]
 enum PoolResolution {
     /// A healthy worker is registered and this is the pool to publish to.
-    Pool(String),
-    /// No healthy worker matches `(bundle, gpu)` and the caller did not
-    /// pin a specific pool — the caller should emit `202 provisioning`
-    /// and record pending demand so KEDA scales up.
+    Route(QueueRoute),
+    /// No healthy worker matches the requested `(pool, machine_profile,
+    /// bundle)` lane — the caller should emit `202 provisioning` and record
+    /// pending demand so KEDA scales up.
     Provisioning,
 }
 
 /// Result of `resolve_effective_pool` — bundles the routing decision
 /// with a flag telling the caller whether the registry had an exact
-/// `(bundle, gpu)` worker match *before* any bundle-only fallback.
+/// `(bundle, machine_profile)` worker match.
 ///
 /// The gateway records pending demand (for KEDA auto-scale) whenever
-/// the caller expressed a GPU preference but the exact tuple has no
+/// the caller expressed a machine-profile preference but the exact tuple has no
 /// healthy worker. By reporting `exact_gpu_match` here we can fold
 /// that probe into the same registry load the routing decision already
-/// does, instead of doing a separate `resolve_queue_pool` call on the
-/// hot path.
+/// does, instead of doing a separate route lookup on the hot path.
 #[derive(Debug, PartialEq, Eq)]
 struct PoolLookup {
     resolution: PoolResolution,
-    /// `true` iff a healthy worker with a non-empty pool name existed
-    /// for the exact `(bundle, gpu)` tuple at lookup time.
+    /// `true` iff a healthy worker with a non-empty pool name and
+    /// machine-profile existed for the exact `(bundle, gpu)` tuple at
+    /// lookup time.
     ///
     /// Always `false` when `gpu.is_empty()` (no exact tuple to match).
     /// Caller-pinned pools still probe the registry when a GPU is
     /// present so demand tracking can avoid spurious scale-up signals.
     exact_gpu_match: bool,
+    /// Concrete machine-profile label that should receive pending demand
+    /// even when the caller did not send `X-SIE-MACHINE-PROFILE`.
+    ///
+    /// This is populated only when route resolution can name a cold lane
+    /// safely (for example explicit pool+GPU, or a pool spec with exactly
+    /// one profile). KEDA queries are exact `pool/profile/bundle` matches,
+    /// so recording `machine_profile=""` does not scale a specific lane.
+    pending_demand_profile: Option<String>,
 }
 
-/// Strict allowlist for caller-supplied pool names (`[A-Za-z0-9._-]`).
+/// Strict allowlist for caller-supplied pool names (`[A-Za-z0-9_-]`).
 ///
 /// The pool flows verbatim into the JetStream work subject
-/// `sie.work.{model}.{pool}` (see `queue::publisher::work_subject`).
+/// `sie.work.{pool}.{machine_profile}.{bundle}.{model}` (see
+/// `queue::publisher::work_subject`).
 /// `model` / `worker_id` are scrubbed via `normalize_model_id`, but the
-/// pool was not — a pool containing `*`, `>`, or whitespace would
+/// pool was not — a pool containing `.`, `*`, `>`, or whitespace would
 /// produce an illegal / re-tokenised subject (subject injection). Unlike
 /// the model scrub (which degrades wonky chars to deterministic
 /// underscores), silently mangling the pool would mis-route the request
@@ -235,9 +244,10 @@ struct PoolLookup {
 fn is_valid_pool_name(pool: &str) -> bool {
     !pool.is_empty()
         && pool.len() <= 128
+        && !pool.eq_ignore_ascii_case("_default")
         && pool
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 /// Pure decision logic for the scale-from-zero branch of `proxy_request`.
@@ -245,16 +255,18 @@ fn is_valid_pool_name(pool: &str) -> bool {
 /// an `AppState` / `WorkPublisher`.
 ///
 /// Rules:
-/// - If the caller pinned a pool via `X-SIE-Pool`, trust them and publish
-///   there unconditionally. This preserves the "power user" path where
-///   the client knows exactly which pool it wants (including cold ones
-///   that are expected to scale up on demand). The worker-side hash guard
-///   still rejects deliveries whose expected hash is unknown locally.
+/// - If the caller pinned a pool via `X-SIE-Pool` and supplied a GPU,
+///   route only when a healthy worker exists in that exact lane. Otherwise
+///   return `Provisioning` and record pending demand for the pinned lane. If
+///   they pinned only a pool, prefer a healthy worker to infer the concrete
+///   machine-profile token; when none exists, use the pool spec only if it
+///   contains exactly one machine profile so pending demand can still target a
+///   concrete KEDA lane.
 /// - Otherwise look up a healthy default-pool worker for `(bundle, gpu)`.
 ///   The worker must also report the gateway's expected bundle config hash.
-///   If GPU was specified and the exact tuple has no worker, fall back to
-///   any default-pool worker on `bundle` (covers single-GPU clusters where
-///   the profile-level distinction is cosmetic).
+///   If GPU was specified and the exact tuple has no worker, return
+///   provisioning for that cold lane; the gateway must not silently route to
+///   another machine profile.
 /// - If nothing resolves, return `Provisioning` so the caller can emit
 ///   `202 + Retry-After` — regardless of whether the caller sent
 ///   `X-SIE-MACHINE-PROFILE`. Before the fix this branch only fired when
@@ -262,60 +274,87 @@ fn is_valid_pool_name(pool: &str) -> bool {
 ///   timeout for default-routing clients.
 async fn resolve_effective_pool(
     registry: &WorkerRegistry,
+    pool_manager: Option<&PoolManager>,
     bundle: &str,
     gpu: &str,
     pool_name: &str,
     bundle_config_hash: &str,
 ) -> PoolLookup {
     if !pool_name.is_empty() {
-        // Caller pinned a pool. We still try one registry probe inside
-        // that same pool to report whether its WorkerGroup is actually
-        // online. Looking at any pool here would hide demand for a
-        // scaled-to-zero isolation pool when default-pool workers happen
-        // to exist for the same machine profile.
-        let exact_gpu_match = if gpu.is_empty() {
-            false
-        } else {
-            registry
-                .resolve_queue_pool_in_pool(bundle, gpu, pool_name, bundle_config_hash)
-                .await
-                .is_some()
-        };
+        // Caller pinned a pool. With the new subject shape, a pool-only
+        // pin is not enough to publish cold unless we can infer a single
+        // machine-profile token from the pool spec. A pool+GPU pin names the
+        // exact cold lane KEDA is expected to scale, but we still return 202
+        // until a healthy worker is present so the gateway does not publish to
+        // a stream with no active consumer.
+        if gpu.is_empty() {
+            let route = registry
+                .resolve_queue_route_in_pool(bundle, "", pool_name, bundle_config_hash)
+                .await;
+            let pending_demand_profile = if route.is_none() {
+                infer_single_pool_profile(pool_manager, pool_name).await
+            } else {
+                None
+            };
+            return PoolLookup {
+                resolution: match route {
+                    Some(route) => PoolResolution::Route(route),
+                    None => PoolResolution::Provisioning,
+                },
+                exact_gpu_match: false,
+                pending_demand_profile,
+            };
+        }
+
+        let route = registry
+            .resolve_queue_route_in_pool(bundle, gpu, pool_name, bundle_config_hash)
+            .await;
+        let exact_gpu_match = route.is_some();
         return PoolLookup {
-            resolution: PoolResolution::Pool(pool_name.to_string()),
+            resolution: match route {
+                Some(route) => PoolResolution::Route(route),
+                None => PoolResolution::Provisioning,
+            },
             exact_gpu_match,
+            pending_demand_profile: if exact_gpu_match {
+                None
+            } else {
+                Some(gpu.to_string())
+            },
         };
     }
 
     // Primary lookup. Folds the "was the exact tuple routable?"
     // question into the same registry load we use to pick a pool.
     let primary = registry
-        .resolve_queue_pool_in_pool(bundle, gpu, DEFAULT_POOL_NAME, bundle_config_hash)
+        .resolve_queue_route_in_pool(bundle, gpu, DEFAULT_POOL_NAME, bundle_config_hash)
         .await;
     let exact_gpu_match = !gpu.is_empty() && primary.is_some();
 
-    // Fallback: caller expressed a GPU preference but nothing matches;
-    // try any healthy default-pool worker on the bundle. This covers
-    // single-GPU clusters where the profile-level distinction is cosmetic
-    // without leaking traffic into caller-created isolation pools.
-    let resolved = match primary {
-        Some(p) => Some(p),
-        None if !gpu.is_empty() => {
-            registry
-                .resolve_queue_pool_in_pool(bundle, "", DEFAULT_POOL_NAME, bundle_config_hash)
-                .await
-        }
-        None => None,
-    };
-
-    let resolution = match resolved {
-        Some(p) => PoolResolution::Pool(p),
+    let resolution = match primary {
+        Some(route) => PoolResolution::Route(route),
         None => PoolResolution::Provisioning,
+    };
+    let pending_demand_profile = if !gpu.is_empty() && !exact_gpu_match {
+        Some(gpu.to_string())
+    } else if matches!(resolution, PoolResolution::Provisioning) {
+        infer_single_pool_profile(pool_manager, DEFAULT_POOL_NAME).await
+    } else {
+        None
     };
     PoolLookup {
         resolution,
         exact_gpu_match,
+        pending_demand_profile,
     }
+}
+
+async fn infer_single_pool_profile(
+    pool_manager: Option<&PoolManager>,
+    pool_name: &str,
+) -> Option<String> {
+    let manager = pool_manager?;
+    manager.single_machine_profile_for_pool(pool_name).await
 }
 
 fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
@@ -363,6 +402,48 @@ fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
         HeaderValue::from_static(GATEWAY_VERSION),
     );
     resp
+}
+
+async fn capped_lane_admission_response(
+    state: &AppState,
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+) -> Option<Response> {
+    let admission = state
+        .pool_manager
+        .capped_lane_status(pool, machine_profile, bundle)
+        .await?;
+
+    if admission.cap == 0 {
+        metrics::record_rejected_request_for_pool(pool, machine_profile, bundle, "pool_cap_zero");
+        let mut m = Map::new();
+        m.insert("pool".to_string(), json!(pool));
+        m.insert("gpu".to_string(), json!(machine_profile));
+        m.insert("bundle".to_string(), json!(bundle));
+        m.insert("cap".to_string(), json!(admission.cap));
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json_detail_merge(
+                    err_code::POOL_CAPACITY_UNAVAILABLE,
+                    format!(
+                        "Pool '{}' admits zero workers for GPU type '{}' and bundle '{}'.",
+                        pool, machine_profile, bundle
+                    ),
+                    m,
+                )),
+            )
+                .into_response(),
+        );
+    }
+
+    if admission.assigned_count == 0 {
+        state.demand_tracker.record(pool, machine_profile, bundle);
+        return Some(build_provisioning_response(machine_profile, bundle));
+    }
+
+    None
 }
 
 #[utoipa::path(
@@ -592,7 +673,7 @@ async fn proxy_request(
         // placeholder labels. `record_rejected_request` normalizes
         // empty `machine_profile` to `"unknown"` internally; `bundle`
         // gets the same treatment here for cardinality discipline.
-        metrics::record_rejected_request("", "unknown", "model_required");
+        metrics::record_rejected_request_for_pool("unknown", "", "unknown", "model_required");
         return endpoint_error_response(
             endpoint,
             StatusCode::BAD_REQUEST,
@@ -743,13 +824,14 @@ async fn proxy_request(
 
     // Validate the caller-supplied pool against a strict allowlist
     // BEFORE it can flow into the JetStream work subject
-    // `sie.work.{model}.{pool}`. An out-of-charset pool would otherwise
+    // `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. An
+    // out-of-charset pool would otherwise
     // re-tokenise the subject (subject injection) and silently mis-route
     // the request, so reject with an OpenAI-shaped 400 rather than
     // mangle. Empty pool means "router picks the default pool" and is
     // left untouched.
     if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
-        metrics::record_rejected_request(&gpu, &bundle, "invalid_pool");
+        metrics::record_rejected_request_for_pool("unknown", &gpu, &bundle, "invalid_pool");
         return endpoint_error_response(
             endpoint,
             StatusCode::BAD_REQUEST,
@@ -757,7 +839,7 @@ async fn proxy_request(
             oai_type::INVALID_REQUEST,
             oai_code::INVALID_REQUEST,
             Some("pool"),
-            "Invalid pool name: only [A-Za-z0-9._-] are allowed (max 128 chars)",
+            "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
         );
     }
 
@@ -807,7 +889,17 @@ async fn proxy_request(
         // Bucket the rejected GPU under a fixed sentinel for the
         // metric; the actual value is still surfaced in the response
         // body below for operator debugging.
-        metrics::record_rejected_request("invalid", &bundle, "gpu_not_configured");
+        let metric_pool = if pool_name.is_empty() {
+            DEFAULT_POOL_NAME
+        } else {
+            pool_name.as_str()
+        };
+        metrics::record_rejected_request_for_pool(
+            metric_pool,
+            "invalid",
+            &bundle,
+            "gpu_not_configured",
+        );
         let mut m = Map::new();
         m.insert("gpu".to_string(), json!(&gpu));
         m.insert(
@@ -826,7 +918,12 @@ async fn proxy_request(
     }
 
     let Some(work_publisher) = state.work_publisher.as_ref() else {
-        metrics::record_rejected_request(&gpu, &bundle, "queue_unavailable");
+        let metric_pool = if pool_name.is_empty() {
+            DEFAULT_POOL_NAME
+        } else {
+            pool_name.as_str()
+        };
+        metrics::record_rejected_request_for_pool(metric_pool, &gpu, &bundle, "queue_unavailable");
         return endpoint_error_response(
             endpoint,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -841,28 +938,34 @@ async fn proxy_request(
     let bundle_config_hash = state.model_registry.compute_bundle_config_hash(&bundle);
 
     // Resolve the effective pool in one shot. `resolve_effective_pool`
-    // folds the demand-tracking probe ("was there an exact (bundle,
-    // gpu) match?") into the same registry load it uses to pick a
-    // pool, so we don't make two `resolve_queue_pool` calls on the
-    // hot path. The `exact_gpu_match` flag is what drives pending
-    // demand for KEDA — we record whenever the caller expressed a GPU
-    // preference but no exact-tuple worker was registered, regardless
-    // of whether we still serve this request via bundle-fallback or a
-    // pinned pool (see `test_scaling.py::test_pending_demand_*`).
+    // folds the demand-tracking probe ("was there an exact
+    // (bundle, machine_profile) match?") into the same registry load it uses to pick a
+    // route, so we don't make two registry route-resolution calls on the
+    // hot path. The `pending_demand_profile` field is what drives KEDA:
+    // it is set when the caller expressed a GPU preference but no
+    // exact-tuple worker was registered, or when a cold pool-only request
+    // can be mapped to a single machine profile from the pool spec.
     let lookup = resolve_effective_pool(
         &state.registry,
+        Some(&state.pool_manager),
         &bundle,
         &gpu,
         &pool_name,
         &bundle_config_hash,
     )
     .await;
-    if !gpu.is_empty() && !lookup.exact_gpu_match {
-        state.demand_tracker.record(&gpu, &bundle);
+    let demand_pool = if pool_name.is_empty() {
+        DEFAULT_POOL_NAME
+    } else {
+        pool_name.as_str()
+    };
+    let pending_demand_profile = lookup.pending_demand_profile.clone();
+    if let Some(profile) = pending_demand_profile.as_deref() {
+        state.demand_tracker.record(demand_pool, profile, &bundle);
     }
 
-    let effective_pool = match lookup.resolution {
-        PoolResolution::Pool(p) => p,
+    let effective_route = match lookup.resolution {
+        PoolResolution::Route(route) => route,
         PoolResolution::Provisioning => {
             let gpu_label = if gpu.is_empty() { "any" } else { gpu.as_str() };
             info!(
@@ -874,77 +977,24 @@ async fn proxy_request(
             metrics::PROVISIONING_RESPONSES
                 .with_label_values(&[gpu_label])
                 .inc();
-            // Note: if the caller expressed a GPU preference, demand
-            // was already recorded above via `exact_gpu_match = false`.
-            // We still record here (idempotent — see
-            // `DemandTracker::record`) so the empty-GPU case also
-            // gets a pending-demand entry, matching the prior
-            // behavior exactly.
-            state.demand_tracker.record(&gpu, &bundle);
+            // If route resolution named a concrete cold lane, demand was
+            // recorded above with that machine-profile label. Otherwise keep
+            // the legacy empty/unknown-profile series for observability even
+            // though KEDA cannot scale a lane without a profile token.
+            if pending_demand_profile.is_none() {
+                state.demand_tracker.record(demand_pool, &gpu, &bundle);
+            }
             return build_provisioning_response(&gpu, &bundle);
         }
     };
+    let effective_pool = &effective_route.pool_name;
+    let effective_machine_profile = &effective_route.machine_profile;
 
-    if !pool_name.is_empty() {
-        if gpu.is_empty() {
-            if let Some(admission) = state.pool_manager.capped_pool_status(&effective_pool).await {
-                let all_capped_profiles_zero = !admission.capped_profiles.is_empty()
-                    && admission.capped_profiles.len() == admission.zero_cap_profiles.len();
-                if !admission.has_uncapped_profiles && all_capped_profiles_zero {
-                    metrics::record_rejected_request(&gpu, &bundle, "pool_cap_zero");
-                    let mut m = Map::new();
-                    m.insert("pool".to_string(), json!(&effective_pool));
-                    m.insert("gpu".to_string(), json!(&gpu));
-                    m.insert("profiles".to_string(), json!(admission.zero_cap_profiles));
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json_detail_merge(
-                            err_code::POOL_CAPACITY_UNAVAILABLE,
-                            format!(
-                                "Pool '{}' admits zero workers for all capped GPU profiles.",
-                                effective_pool
-                            ),
-                            m,
-                        )),
-                    )
-                        .into_response();
-                }
-
-                if admission.total_assigned_count == 0 {
-                    state.demand_tracker.record(&gpu, &bundle);
-                    return build_provisioning_response(&gpu, &bundle);
-                }
-            }
-        } else if let Some(admission) = state
-            .pool_manager
-            .capped_profile_status(&effective_pool, &gpu)
+    if let Some(resp) =
+        capped_lane_admission_response(&state, effective_pool, effective_machine_profile, &bundle)
             .await
-        {
-            if admission.cap == 0 {
-                metrics::record_rejected_request(&gpu, &bundle, "pool_cap_zero");
-                let mut m = Map::new();
-                m.insert("pool".to_string(), json!(&effective_pool));
-                m.insert("gpu".to_string(), json!(&gpu));
-                m.insert("cap".to_string(), json!(admission.cap));
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json_detail_merge(
-                        err_code::POOL_CAPACITY_UNAVAILABLE,
-                        format!(
-                            "Pool '{}' admits zero workers for GPU type '{}'.",
-                            effective_pool, gpu
-                        ),
-                        m,
-                    )),
-                )
-                    .into_response();
-            }
-
-            if admission.assigned_count == 0 {
-                state.demand_tracker.record(&gpu, &bundle);
-                return build_provisioning_response(&gpu, &bundle);
-            }
-        }
+    {
+        return resp;
     }
 
     let token_id = extract_bearer_token(req.headers())
@@ -987,7 +1037,12 @@ async fn proxy_request(
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, limit = body_limit, "request body too large or read error");
-            metrics::record_rejected_request(&gpu, &bundle, "body_too_large");
+            metrics::record_rejected_request_for_pool(
+                effective_pool,
+                &gpu,
+                &bundle,
+                "body_too_large",
+            );
             return endpoint_error_response(
                 endpoint,
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1007,8 +1062,8 @@ async fn proxy_request(
         &model_name,
         &bundle,
         &engine,
-        &gpu,
-        &effective_pool,
+        effective_machine_profile,
+        effective_pool,
         &body_bytes,
         is_msgpack_in,
         use_msgpack_out,
@@ -1029,11 +1084,11 @@ fn should_trace_proxy_request(endpoint: &str) -> bool {
 /// `pool` is always pre-resolved by the caller via
 /// [`resolve_effective_pool`] and is guaranteed non-empty: the
 /// `PoolResolution::Provisioning` branch returns `202` before we get
-/// here, and every `PoolResolution::Pool(_)` path produces a non-empty
+/// here, and every `PoolResolution::Route(_)` path produces a non-empty
 /// string (either the caller-pinned `X-SIE-Pool`, or a `pool_name`
-/// harvested from the registry snapshot — `resolve_queue_pool` filters
-/// out empty pool names). We therefore don't need to re-query the
-/// registry inside this function.
+/// harvested from the registry snapshot — route resolution filters out
+/// empty pool names and machine profiles). We therefore don't need to
+/// re-query the registry inside this function.
 #[allow(clippy::too_many_arguments)]
 async fn queue_mode_proxy(
     state: &AppState,
@@ -1056,7 +1111,7 @@ async fn queue_mode_proxy(
     let (items, params) = match parse_queue_request(body_bytes, is_msgpack_in, endpoint) {
         Ok(r) => r,
         Err(QueueParseError::Generic(e)) => {
-            metrics::record_rejected_request(gpu, bundle, "body_parse_error");
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "body_parse_error");
             return endpoint_error_response(
                 endpoint,
                 StatusCode::BAD_REQUEST,
@@ -1072,13 +1127,13 @@ async fn queue_mode_proxy(
             // — surface a precise rejection reason so dashboards can
             // separate it from generic body-parse failures. Future
             // pre-built paths should pick their own reason code.
-            metrics::record_rejected_request(gpu, bundle, "grammar_invalid");
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "grammar_invalid");
             return resp;
         }
     };
 
     if items.is_empty() && endpoint != "score" && endpoint != "generate" {
-        metrics::record_rejected_request(gpu, bundle, "empty_items");
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "empty_items");
         return endpoint_error_response(
             endpoint,
             StatusCode::BAD_REQUEST,
@@ -1095,7 +1150,7 @@ async fn queue_mode_proxy(
     // and we translate that to a 400 with an instructive message here. This
     // is the gateway-side enforcement called out in §4.5.1.1 of the POC plan.
     if endpoint == "generate" && params.generate.is_none() {
-        metrics::record_rejected_request(gpu, bundle, "invalid_generate_body");
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "invalid_generate_body");
         return (
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
@@ -1122,7 +1177,7 @@ async fn queue_mode_proxy(
                 .as_ref()
                 .and_then(|m| m.info_extras.grammar_capabilities.clone());
             if let Err(resp) = super::grammar::check_capability(g, caps.as_deref(), model) {
-                metrics::record_rejected_request(gpu, bundle, "grammar_capability");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "grammar_capability");
                 return resp;
             }
         }
@@ -1150,7 +1205,12 @@ async fn queue_mode_proxy(
                 match validate_lora_for_profile(&info, profile_name, req_lora) {
                     LoraValidation::Ok => {}
                     LoraValidation::UnknownProfile => {
-                        metrics::record_rejected_request(gpu, bundle, "unknown_profile");
+                        metrics::record_rejected_request_for_pool(
+                            pool,
+                            gpu,
+                            bundle,
+                            "unknown_profile",
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(json_openai_error(
@@ -1163,7 +1223,12 @@ async fn queue_mode_proxy(
                             .into_response();
                     }
                     LoraValidation::UnknownAdapter => {
-                        metrics::record_rejected_request(gpu, bundle, "unknown_lora_adapter");
+                        metrics::record_rejected_request_for_pool(
+                            pool,
+                            gpu,
+                            bundle,
+                            "unknown_lora_adapter",
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(json_openai_error(
@@ -1186,7 +1251,7 @@ async fn queue_mode_proxy(
         // Take an Arc clone so the cancel-on-drop guard can outlive the
         // borrow checker without a 'static lifetime tangle.
         let Some(work_publisher_arc) = state.work_publisher.clone() else {
-            metrics::record_rejected_request(gpu, bundle, "queue_unavailable");
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "queue_unavailable");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json_openai_error(
@@ -1265,7 +1330,7 @@ async fn queue_mode_proxy(
             error!(error = %e, "failed to publish work");
             let lower = e.to_lowercase();
             if lower.contains("score request missing query item") {
-                metrics::record_rejected_request(gpu, bundle, "score_missing_query");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "score_missing_query");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json_detail(err_code::INVALID_REQUEST, e)),
@@ -1283,19 +1348,24 @@ async fn queue_mode_proxy(
                 .into_response();
 
             if lower.contains("no consumers") {
-                metrics::record_rejected_request(gpu, bundle, "no_consumers");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
                 response.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
                     HeaderValue::from_static(DEFAULT_RETRY_AFTER),
                 );
             } else if lower.contains("backpressure") {
-                metrics::record_rejected_request(gpu, bundle, "backpressure");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
                 response.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
                     HeaderValue::from_static(BACKPRESSURE_RETRY_AFTER),
                 );
             } else {
-                metrics::record_rejected_request(gpu, bundle, "queue_publish_failed");
+                metrics::record_rejected_request_for_pool(
+                    pool,
+                    gpu,
+                    bundle,
+                    "queue_publish_failed",
+                );
             }
 
             response.headers_mut().insert(
@@ -1317,7 +1387,7 @@ async fn queue_mode_proxy(
     let results = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(results)) => results,
         Ok(Err(_)) => {
-            metrics::record_rejected_request(gpu, bundle, "result_channel_closed");
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "result_channel_closed");
             return (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json_detail(
@@ -1342,7 +1412,12 @@ async fn queue_mode_proxy(
             // and a generic `result_timeout` for the same event would
             // double-count the timeout on the error-rate dashboards
             // and break rate alerts that sum across reasons.
-            metrics::record_rejected_request(gpu, bundle, "upstream_timeout_model_loading");
+            metrics::record_rejected_request_for_pool(
+                pool,
+                gpu,
+                bundle,
+                "upstream_timeout_model_loading",
+            );
             return build_model_loading_timeout_response(model, timeout_secs);
         }
     };
@@ -1364,7 +1439,12 @@ async fn queue_mode_proxy(
                 .first()
                 .and_then(|r| r.error.as_deref())
                 .unwrap_or("Model load failed");
-            metrics::record_rejected_request(gpu, bundle, "model_load_failed_terminal");
+            metrics::record_rejected_request_for_pool(
+                pool,
+                gpu,
+                bundle,
+                "model_load_failed_terminal",
+            );
             return build_model_load_failed_response(model, first_msg);
         }
         // Translate retryable worker error codes into the SDK-expected 503
@@ -1378,7 +1458,12 @@ async fn queue_mode_proxy(
                 .first()
                 .and_then(|r| r.error.as_deref())
                 .unwrap_or("Worker reported a retryable error");
-            metrics::record_rejected_request(gpu, bundle, retryable_metric_reason(code));
+            metrics::record_rejected_request_for_pool(
+                pool,
+                gpu,
+                bundle,
+                retryable_metric_reason(code),
+            );
             return build_retryable_error_response(code, first_msg);
         }
 
@@ -1395,7 +1480,7 @@ async fn queue_mode_proxy(
                 entry
             })
             .collect();
-        metrics::record_rejected_request(gpu, bundle, "all_items_failed");
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "all_items_failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "all_items_failed", "details": error_details})),
@@ -1710,19 +1795,43 @@ pub(crate) async fn run_streaming_generate(
     // distinguish it from capacity/health-driven fallbacks. We also
     // skip the gauge update here — the ring isn't consulted, so
     // recording a size for it would be misleading.
-    let target = if resolved_key.hash.is_none() {
+    let (target, pool_fallback_lane_worker_count) = if resolved_key.hash.is_none() {
         metrics::ROUTING_FALLBACK_TOTAL
             .with_label_values(&[&model_label, &pool_label, "no_key"])
             .inc();
-        publisher::PublishTarget::Pool {
-            model: model.to_string(),
-            pool: pool.to_string(),
-        }
+        (
+            publisher::PublishTarget::Pool {
+                pool: pool.to_string(),
+                machine_profile: gpu.to_string(),
+                bundle: bundle.to_string(),
+                model: model.to_string(),
+            },
+            0,
+        )
     } else {
-        let ring = state.registry.ring_snapshot_for(model, pool);
+        let admitted_worker_names = state
+            .pool_manager
+            .admitted_worker_names_for_capped_lane(pool, gpu, bundle)
+            .await;
+        let fallback_lane_worker_count = state.registry.pool_fallback_lane_worker_count(
+            pool,
+            gpu,
+            bundle,
+            bundle_config_hash,
+            admitted_worker_names.as_ref(),
+        );
+        let ring = state.registry.ring_snapshot_for_admitted(
+            model,
+            pool,
+            gpu,
+            bundle,
+            bundle_config_hash,
+            admitted_worker_names.as_ref(),
+        );
+        let ring_len = ring.len();
         metrics::ROUTING_HRW_RING_SIZE
             .with_label_values(&[&model_label, &pool_label])
-            .set(ring.len() as f64);
+            .set(ring_len as f64);
         let picked = crate::routing::pick_worker(&ring, &resolved_key);
         match picked {
             Some(worker_id) => {
@@ -1734,11 +1843,16 @@ pub(crate) async fn run_streaming_generate(
                     source = resolved_key.source.as_label(),
                     "HRW pick"
                 );
-                publisher::PublishTarget::Worker {
-                    model: model.to_string(),
-                    pool: pool.to_string(),
-                    worker_id: worker_id.to_string(),
-                }
+                (
+                    publisher::PublishTarget::Worker {
+                        pool: pool.to_string(),
+                        machine_profile: gpu.to_string(),
+                        bundle: bundle.to_string(),
+                        model: model.to_string(),
+                        worker_id: worker_id.to_string(),
+                    },
+                    fallback_lane_worker_count,
+                )
             }
             None => {
                 // We had a key but the ring is empty. The registry-side
@@ -1750,17 +1864,22 @@ pub(crate) async fn run_streaming_generate(
                 metrics::ROUTING_FALLBACK_TOTAL
                     .with_label_values(&[&model_label, &pool_label, "unhealthy_skipped"])
                     .inc();
-                publisher::PublishTarget::Pool {
-                    model: model.to_string(),
-                    pool: pool.to_string(),
-                }
+                (
+                    publisher::PublishTarget::Pool {
+                        pool: pool.to_string(),
+                        machine_profile: gpu.to_string(),
+                        bundle: bundle.to_string(),
+                        model: model.to_string(),
+                    },
+                    fallback_lane_worker_count,
+                )
             }
         }
     };
     // Capture this before the move into `publish_generate_streaming`.
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
     let (request_id, rx, activity) = match work_publisher
-        .publish_generate_streaming(target, bundle, engine, gpu, bundle_config_hash, params)
+        .publish_generate_streaming(target, engine, bundle_config_hash, params)
         .await
     {
         Ok(r) => r,
@@ -1768,13 +1887,18 @@ pub(crate) async fn run_streaming_generate(
             error!(error = %e, "failed to publish generate work");
             let lower = e.to_lowercase();
             let retry_after = if lower.contains("no consumers") {
-                metrics::record_rejected_request(gpu, bundle, "no_consumers");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
                 Some(DEFAULT_RETRY_AFTER)
             } else if lower.contains("backpressure") {
-                metrics::record_rejected_request(gpu, bundle, "backpressure");
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
                 Some(BACKPRESSURE_RETRY_AFTER)
             } else {
-                metrics::record_rejected_request(gpu, bundle, "queue_publish_failed");
+                metrics::record_rejected_request_for_pool(
+                    pool,
+                    gpu,
+                    bundle,
+                    "queue_publish_failed",
+                );
                 None
             };
             return Err(StreamingDriverErr::PublishFailed {
@@ -1833,20 +1957,18 @@ pub(crate) async fn run_streaming_generate(
     // `republished` field on `StreamCollector`) so the two paths
     // cannot double-publish.
     let mut republished_for_first_chunk = false;
-    // Capture the pool's consumer count at dispatch time so the H9
-    // single-worker suppression below uses the topology we actually
-    // dispatched against. Re-reading at timeout could see a count of 1
-    // after a 2-worker pool lost its chosen worker mid-flight, and
-    // suppress a republish that could have failed over to the
-    // remaining worker. (We accept the inverse hazard — a worker
-    // joining mid-flight in a single-worker pool keeps the suppression
-    // active — because the cancel-tombstone race that motivates this
-    // guard cannot fire on a worker that wasn't registered at
-    // dispatch.)
-    let single_consumer_pool_at_dispatch = was_direct_dispatched
-        && work_publisher
-            .pool_consumer_count(pool)
-            .is_some_and(|n| n <= 1);
+    // Capture the exact pool-fallback lane size at dispatch time so
+    // the H9 single-worker suppression below is scoped to
+    // `(pool,machine_profile,bundle)` and still counts healthy cold
+    // workers that can lazy-load after a pool republish. The old
+    // JetStream pool-wide consumer count could be inflated by another
+    // bundle or machine profile in the same logical pool, incorrectly
+    // enabling a first-chunk fallback that had no alternate worker in
+    // this lane.
+    let single_consumer_lane_at_dispatch = crate::routing::suppress_first_chunk_republish_for_lane(
+        was_direct_dispatched,
+        pool_fallback_lane_worker_count,
+    );
 
     // Drive the wait loop. We hold a single pinned receiver across
     // iterations and re-arm the inter-chunk timer on every chunk
@@ -1891,7 +2013,7 @@ pub(crate) async fn run_streaming_generate(
             // overall_timeout path will surface that.
             if was_direct_dispatched
                 && !republished_for_first_chunk
-                && !single_consumer_pool_at_dispatch
+                && !single_consumer_lane_at_dispatch
             {
                 republished_for_first_chunk = true;
                 // At-least-once-execution hazard: the original
@@ -1934,7 +2056,7 @@ pub(crate) async fn run_streaming_generate(
                     }
                 }
             }
-            if single_consumer_pool_at_dispatch
+            if single_consumer_lane_at_dispatch
                 && was_direct_dispatched
                 && !republished_for_first_chunk
             {
@@ -1951,7 +2073,9 @@ pub(crate) async fn run_streaming_generate(
                 tracing::debug!(
                     request_id = %request_id,
                     pool = %pool,
-                    "first_chunk_timeout — single-worker pool, suppressing republish; continuing on overall_timeout"
+                    machine_profile = %gpu,
+                    bundle = %bundle,
+                    "first_chunk_timeout - single-worker lane, suppressing republish; continuing on overall_timeout"
                 );
                 continue;
             }
@@ -2008,7 +2132,7 @@ pub(crate) async fn run_streaming_generate(
         }
         Err("result_channel_closed") => {
             cancel_guard.defuse();
-            metrics::record_rejected_request(gpu, bundle, "result_channel_closed");
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "result_channel_closed");
             work_publisher.drop_pending_stream(&request_id);
             return Err(StreamingDriverErr::ResultChannelClosed);
         }
@@ -2022,7 +2146,8 @@ pub(crate) async fn run_streaming_generate(
             metrics::GENERATION_TIMEOUTS
                 .with_label_values(&[&model_label, &metrics::sanitize_label(pool), kind])
                 .inc();
-            metrics::record_rejected_request(
+            metrics::record_rejected_request_for_pool(
+                pool,
                 gpu,
                 bundle,
                 match kind {
@@ -2041,7 +2166,7 @@ pub(crate) async fn run_streaming_generate(
     // If the worker emitted an error terminal, surface it as a typed
     // failure. The caller chooses the HTTP status / wire envelope.
     if let Some(err) = outcome.error.as_ref() {
-        metrics::record_rejected_request(gpu, bundle, "generate_worker_error");
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "generate_worker_error");
         return Err(StreamingDriverErr::WorkerError {
             code: err.code.clone(),
             message: err.message.clone(),
@@ -4081,7 +4206,12 @@ pub(crate) fn resolve_model_and_bundle(
         {
             Ok(b) => b,
             Err(ResolveError::ModelNotFound(e)) => {
-                metrics::record_rejected_request("", "unknown", "model_not_found");
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    "unknown",
+                    "model_not_found",
+                );
                 return Err((
                     StatusCode::NOT_FOUND,
                     Json(json_openai_error(
@@ -4094,7 +4224,12 @@ pub(crate) fn resolve_model_and_bundle(
                     .into_response());
             }
             Err(ResolveError::BundleConflict(e)) => {
-                metrics::record_rejected_request("", "unknown", "bundle_routing_conflict");
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    "unknown",
+                    "bundle_routing_conflict",
+                );
                 return Err((
                     StatusCode::CONFLICT,
                     Json(json_openai_error(
@@ -4108,7 +4243,7 @@ pub(crate) fn resolve_model_and_bundle(
             }
         }
     } else if state.model_registry.has_any_models() {
-        metrics::record_rejected_request("", "unknown", "model_not_found");
+        metrics::record_rejected_request_for_pool("unknown", "", "unknown", "model_not_found");
         return Err((
             StatusCode::NOT_FOUND,
             Json(json_openai_error(
@@ -4128,12 +4263,13 @@ pub(crate) fn resolve_model_and_bundle(
 }
 
 /// The routing context resolved from request headers + the model's bundle:
-/// machine profile (GPU), effective pool, bundle config hash, the bound work
+/// machine profile, effective pool, bundle config hash, the bound work
 /// publisher, plus audit fields. Produced by [`resolve_generation_route`].
 struct ResolvedRoute {
     gpu: String,
     engine: String,
     effective_pool: String,
+    effective_machine_profile: String,
     bundle_config_hash: String,
     work_publisher: Arc<publisher::WorkPublisher>,
     token_id: String,
@@ -4168,11 +4304,11 @@ async fn resolve_generation_route(
     }
 
     if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
-        metrics::record_rejected_request(&gpu, bundle, "invalid_pool");
+        metrics::record_rejected_request_for_pool("unknown", &gpu, bundle, "invalid_pool");
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
-                "Invalid pool name: only [A-Za-z0-9._-] are allowed (max 128 chars)".to_string(),
+                "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)".to_string(),
                 oai_type::INVALID_REQUEST,
                 Some("X-SIE-Pool"),
                 oai_code::INVALID_REQUEST,
@@ -4192,7 +4328,17 @@ async fn resolve_generation_route(
             .iter()
             .any(|cg| cg.eq_ignore_ascii_case(&gpu));
         if !found {
-            metrics::record_rejected_request(&gpu, bundle, "gpu_not_configured");
+            let metric_pool = if pool_name.is_empty() {
+                DEFAULT_POOL_NAME
+            } else {
+                pool_name.as_str()
+            };
+            metrics::record_rejected_request_for_pool(
+                metric_pool,
+                "invalid",
+                bundle,
+                "gpu_not_configured",
+            );
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json_openai_error(
@@ -4207,7 +4353,12 @@ async fn resolve_generation_route(
     }
 
     let Some(work_publisher_arc) = state.work_publisher.clone() else {
-        metrics::record_rejected_request(&gpu, bundle, "queue_unavailable");
+        let metric_pool = if pool_name.is_empty() {
+            DEFAULT_POOL_NAME
+        } else {
+            pool_name.as_str()
+        };
+        metrics::record_rejected_request_for_pool(metric_pool, &gpu, bundle, "queue_unavailable");
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json_openai_error(
@@ -4228,42 +4379,40 @@ async fn resolve_generation_route(
         .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
     let lookup = resolve_effective_pool(
         &state.registry,
+        Some(&state.pool_manager),
         bundle,
         &gpu,
         &pool_name,
         &bundle_config_hash,
     )
     .await;
-    if !gpu.is_empty() && !lookup.exact_gpu_match {
-        state.demand_tracker.record(&gpu, bundle);
+    let demand_pool = if pool_name.is_empty() {
+        DEFAULT_POOL_NAME
+    } else {
+        pool_name.as_str()
+    };
+    let pending_demand_profile = lookup.pending_demand_profile.clone();
+    if let Some(profile) = pending_demand_profile.as_deref() {
+        state.demand_tracker.record(demand_pool, profile, bundle);
     }
-    let effective_pool = match lookup.resolution {
-        PoolResolution::Pool(p) => p,
+    let effective_route = match lookup.resolution {
+        PoolResolution::Route(route) => route,
         PoolResolution::Provisioning => {
-            state.demand_tracker.record(&gpu, bundle);
-            let message = if gpu.is_empty() {
-                format!("No worker available for bundle '{bundle}'. Provisioning in progress.")
-            } else {
-                format!("No worker available for GPU type '{gpu}'. Provisioning in progress.")
-            };
-            let mut resp = (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "status": "provisioning",
-                    "gpu": gpu,
-                    "bundle": bundle,
-                    "estimated_wait_s": ESTIMATED_WAIT_S,
-                    "message": message,
-                })),
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                HeaderName::from_static("retry-after"),
-                HeaderValue::from_static(DEFAULT_RETRY_AFTER),
-            );
-            return Err(resp);
+            if pending_demand_profile.is_none() {
+                state.demand_tracker.record(demand_pool, &gpu, bundle);
+            }
+            return Err(build_provisioning_response(&gpu, bundle));
         }
     };
+    let effective_pool = effective_route.pool_name;
+    let effective_machine_profile = effective_route.machine_profile;
+
+    if let Some(resp) =
+        capped_lane_admission_response(state, &effective_pool, &effective_machine_profile, bundle)
+            .await
+    {
+        return Err(resp);
+    }
 
     let token_id = extract_bearer_token(hdr)
         .map(|t| mask_token(&t))
@@ -4278,6 +4427,7 @@ async fn resolve_generation_route(
         gpu,
         engine,
         effective_pool,
+        effective_machine_profile,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
         token_id,
@@ -4350,7 +4500,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             // matching the ``model_required`` precedent in
             // ``proxy_request``. The rejection-reasons dashboard groups
             // these under the explicit reason string.
-            metrics::record_rejected_request("", "unknown", "body_too_large");
+            metrics::record_rejected_request_for_pool("unknown", "", "unknown", "body_too_large");
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json_openai_error(
@@ -4367,7 +4517,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            metrics::record_rejected_request("", "unknown", "chat_invalid_body");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "chat_invalid_body",
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json_openai_error(
@@ -4388,7 +4543,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             // modes (unsupported field, invalid role, missing field) to
             // one bucket so the dashboards stay low-cardinality; the
             // response body still carries the precise ``param``/``code``.
-            metrics::record_rejected_request("", "unknown", "chat_invalid_params");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "chat_invalid_params",
+            );
             return resp;
         }
     };
@@ -4425,7 +4585,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
                 // rejection arms into the same ``unknown_lora_adapter``
                 // response that's been the chat-gate contract since A.
                 LoraValidation::UnknownProfile | LoraValidation::UnknownAdapter => {
-                    metrics::record_rejected_request("", &bundle, "unknown_lora_adapter");
+                    metrics::record_rejected_request_for_pool(
+                        "unknown",
+                        "",
+                        &bundle,
+                        "unknown_lora_adapter",
+                    );
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(json_openai_error(
@@ -4441,7 +4606,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         }
         if let Some(cap) = info.info_extras.max_output_tokens {
             if cap > 0 && params.max_new_tokens > cap {
-                metrics::record_rejected_request("", &bundle, "chat_max_tokens_exceeded");
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    &bundle,
+                    "chat_max_tokens_exceeded",
+                );
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json_openai_error(
@@ -4463,7 +4633,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
                 info.info_extras.grammar_capabilities.as_deref(),
                 &model_name,
             ) {
-                metrics::record_rejected_request("", &bundle, "grammar_capability");
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    &bundle,
+                    "grammar_capability",
+                );
                 return resp;
             }
         }
@@ -4476,7 +4651,12 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         if params.tools.is_some() {
             let supported = info.info_extras.tools_supported.unwrap_or(false);
             if !supported {
-                metrics::record_rejected_request("", &bundle, "tools_capability");
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    &bundle,
+                    "tools_capability",
+                );
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json_openai_error(
@@ -4492,7 +4672,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     } else if params.grammar.is_some() {
         // No model info means we cannot determine grammar capabilities;
         // safer to reject than to publish work the model cannot honour.
-        metrics::record_rejected_request("", &bundle, "grammar_capability");
+        metrics::record_rejected_request_for_pool("unknown", "", &bundle, "grammar_capability");
         return (
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
@@ -4507,7 +4687,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         // Same defensive rejection for ``tools`` when the model is
         // unknown — safer than publishing work the model cannot
         // honour.
-        metrics::record_rejected_request("", &bundle, "tools_capability");
+        metrics::record_rejected_request_for_pool("unknown", "", &bundle, "tools_capability");
         return (
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
@@ -4526,6 +4706,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         gpu,
         engine,
         effective_pool,
+        effective_machine_profile,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
         token_id,
@@ -4591,7 +4772,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             model: model_name.clone(),
             bundle: bundle.clone(),
             engine: engine.clone(),
-            gpu: gpu.clone(),
+            gpu: effective_machine_profile.clone(),
             pool: effective_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
             work_params,
@@ -4608,7 +4789,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         &model_name,
         &bundle,
         &engine,
-        &gpu,
+        &effective_machine_profile,
         &effective_pool,
         &bundle_config_hash,
         &work_params,
@@ -5078,7 +5259,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
     let body_bytes = match to_bytes(req.into_body(), MAX_COMPLETIONS_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            metrics::record_rejected_request("", "unknown", "body_too_large");
+            metrics::record_rejected_request_for_pool("unknown", "", "unknown", "body_too_large");
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json_openai_error(
@@ -5094,7 +5275,12 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
     let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            metrics::record_rejected_request("", "unknown", "completions_invalid_body");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "completions_invalid_body",
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json_openai_error(
@@ -5111,7 +5297,12 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
     let params = match completions_params_from_json(&body_json) {
         CompletionsParamsResult::Ok(p) => p,
         CompletionsParamsResult::Err(resp) => {
-            metrics::record_rejected_request("", "unknown", "completions_invalid_params");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "completions_invalid_params",
+            );
             return resp;
         }
     };
@@ -5125,6 +5316,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         gpu,
         engine,
         effective_pool,
+        effective_machine_profile,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
         token_id,
@@ -5161,7 +5353,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
             model: model_name.clone(),
             bundle: bundle.clone(),
             engine: engine.clone(),
-            gpu: gpu.clone(),
+            gpu: effective_machine_profile.clone(),
             pool: effective_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
             work_params,
@@ -5176,7 +5368,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         &model_name,
         &bundle,
         &engine,
-        &gpu,
+        &effective_machine_profile,
         &effective_pool,
         &bundle_config_hash,
         &work_params,
@@ -5643,7 +5835,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
     let body_bytes = match to_bytes(req.into_body(), MAX_RESPONSES_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            metrics::record_rejected_request("", "unknown", "body_too_large");
+            metrics::record_rejected_request_for_pool("unknown", "", "unknown", "body_too_large");
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json_openai_error(
@@ -5659,7 +5851,12 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
     let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            metrics::record_rejected_request("", "unknown", "responses_invalid_body");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "responses_invalid_body",
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json_openai_error(
@@ -5676,7 +5873,12 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
     let params = match responses_params_from_json(&body_json) {
         ResponsesParamsResult::Ok(p) => p,
         ResponsesParamsResult::Err(resp) => {
-            metrics::record_rejected_request("", "unknown", "responses_invalid_params");
+            metrics::record_rejected_request_for_pool(
+                "unknown",
+                "",
+                "unknown",
+                "responses_invalid_params",
+            );
             return resp;
         }
     };
@@ -5689,6 +5891,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         gpu,
         engine,
         effective_pool,
+        effective_machine_profile,
         bundle_config_hash,
         work_publisher: work_publisher_arc,
         token_id,
@@ -5717,7 +5920,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         &model_name,
         &bundle,
         &engine,
-        &gpu,
+        &effective_machine_profile,
         &effective_pool,
         &bundle_config_hash,
         &work_params,
@@ -9138,11 +9341,118 @@ mod tests {
         );
     }
 
+    fn admission_test_state(pool_manager: Arc<PoolManager>) -> AppState {
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            bundles_dir.path().join("default.yaml"),
+            "name: default\nadapters:\n  - module\ndefault: true\n",
+        )
+        .unwrap();
+        let mut gpu_profile_map = std::collections::HashMap::new();
+        gpu_profile_map.insert("l4".to_string(), "l4".to_string());
+        let config = crate::config::Config {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            metrics_port: None,
+            worker_urls: Vec::new(),
+            use_kubernetes: false,
+            k8s_namespace: "default".to_string(),
+            k8s_service: String::new(),
+            k8s_port: 0,
+            health_mode: "http".to_string(),
+            nats_url: String::new(),
+            nats_config_trusted_producers: Vec::new(),
+            auth_mode: "none".to_string(),
+            auth_tokens: Vec::new(),
+            admin_token: String::new(),
+            auth_exempt_operational: false,
+            log_level: "info".to_string(),
+            json_logs: false,
+            enable_pools: true,
+            hot_reload: false,
+            watch_polling: false,
+            multi_router: false,
+            request_timeout: 30.0,
+            max_stream_pending: 1024,
+            stream_max_age_s: 300,
+            configured_gpus: vec!["l4".to_string()],
+            gpu_profile_map,
+            model_aliases: std::collections::HashMap::new(),
+            bundles_dir: bundles_dir.path().to_string_lossy().to_string(),
+            models_dir: models_dir.path().to_string_lossy().to_string(),
+            config_service_url: None,
+            config_service_token: None,
+            payload_store_url: String::new(),
+        };
+        AppState {
+            registry: Arc::new(WorkerRegistry::new(Duration::from_secs(30), None)),
+            config: Arc::new(config),
+            model_registry: Arc::new(crate::state::model_registry::ModelRegistry::new(
+                bundles_dir.path(),
+                models_dir.path(),
+                true,
+            )),
+            pool_manager,
+            work_publisher: None,
+            demand_tracker: Arc::new(crate::state::demand_tracker::DemandTracker::new()),
+            config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_capped_lane_admission_zero_cap_returns_pool_unavailable() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("l4".to_string(), 0);
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+            .await
+            .unwrap();
+        let state = admission_test_state(Arc::clone(&pm));
+
+        let resp = capped_lane_admission_response(&state, "tenant", "l4", "default")
+            .await
+            .expect("zero-cap lane should fail fast");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["detail"]["code"], err_code::POOL_CAPACITY_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_capped_lane_admission_zero_assigned_returns_provisioning() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("l4".to_string(), 1);
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+            .await
+            .unwrap();
+        let state = admission_test_state(Arc::clone(&pm));
+
+        let resp = capped_lane_admission_response(&state, "tenant", "l4", "default")
+            .await
+            .expect("capped lane with no admitted workers should provision");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let pending_demand = metrics::PENDING_DEMAND
+            .with_label_values(&["tenant", "l4", "default"])
+            .get();
+        assert!((pending_demand - 1.0).abs() < f64::EPSILON);
+        state.demand_tracker.clear("tenant", "l4", "default");
+        let cleared_demand = metrics::PENDING_DEMAND
+            .with_label_values(&["tenant", "l4", "default"])
+            .get();
+        assert!((cleared_demand - 0.0).abs() < f64::EPSILON);
+    }
+
     // ── is_valid_pool_name (pool subject-injection guard) ──────────
 
     #[test]
     fn test_is_valid_pool_name_accepts_allowlisted() {
-        for ok in ["default", "_default", "eval-l4", "pool.1", "A-b_C.9", "x"] {
+        for ok in ["default", "eval-l4", "A-b_C-9", "x"] {
             assert!(is_valid_pool_name(ok), "{ok} should be valid");
         }
     }
@@ -9150,16 +9460,19 @@ mod tests {
     #[test]
     fn test_is_valid_pool_name_rejects_subject_injection() {
         // Any of these would re-tokenise / break the
-        // `sie.work.{model}.{pool}` subject or inject a wildcard.
+        // `sie.work.{pool}.{machine_profile}.{bundle}.{model}` subject
+        // or inject a wildcard.
         for bad in [
             "",          // empty
             "a b",       // whitespace
             "pool/evil", // slash (subject separator after normalize)
+            "pool.1",    // dot (subject separator)
             "pool>evil", // `>` full-wildcard
             "pool*",     // `*` token-wildcard
             "a.>",       // wildcard tail
             "pool\nx",   // control char
             "pää",       // non-ascii
+            "_default",  // removed legacy sentinel spelling
         ] {
             assert!(!is_valid_pool_name(bad), "{bad:?} should be rejected");
         }
@@ -11367,6 +11680,13 @@ mod tests {
         }
     }
 
+    fn route(pool: &str, gpu: &str) -> PoolResolution {
+        PoolResolution::Route(QueueRoute {
+            pool_name: pool.to_string(),
+            machine_profile: gpu.to_string(),
+        })
+    }
+
     #[tokio::test]
     async fn test_resolve_effective_pool_returns_provisioning_when_empty_and_no_gpu() {
         // No workers at all. Caller sends no `X-SIE-MACHINE-PROFILE`.
@@ -11375,7 +11695,7 @@ mod tests {
         // `Provisioning` so the caller returns `202 + Retry-After` and
         // records pending demand for KEDA.
         let reg = pool_registry();
-        let out = resolve_effective_pool(&reg, "default", "", "", "").await;
+        let out = resolve_effective_pool(&reg, None, "default", "", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         // No GPU expressed → exact_gpu_match is definitionally false.
         assert!(!out.exact_gpu_match);
@@ -11388,7 +11708,7 @@ mod tests {
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "premium", "l4", "", "").await;
+        let out = resolve_effective_pool(&reg, None, "premium", "l4", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
     }
@@ -11405,25 +11725,24 @@ mod tests {
         )
         .await;
 
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "").await;
+        let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
     }
 
     #[tokio::test]
-    async fn test_resolve_effective_pool_bundle_only_fallback_when_gpu_mismatch() {
+    async fn test_resolve_effective_pool_provisions_when_gpu_mismatch() {
         // Client pinned `l4` but the cluster only has an `a100` worker on
-        // the same bundle. We still route (the profile distinction is
-        // cosmetic here) rather than forcing a scale-up.
+        // the same bundle. Machine profile is now part of the queue lane, so
+        // the gateway must return provisioning for the exact cold lane rather
+        // than silently routing to a different profile.
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "default"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4", "", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
-        // Exact tuple (default, l4) had no worker — even though we
-        // still routed via the bundle-only fallback, the caller must
-        // record demand so KEDA scales up the l4 pool.
+        let out = resolve_effective_pool(&reg, None, "default", "l4", "", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
     }
 
     #[tokio::test]
@@ -11436,8 +11755,8 @@ mod tests {
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "", "", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "", "", "").await;
+        assert_eq!(out.resolution, route("default", "l4-spot"));
         // No GPU preference → no demand tracking applicable.
         assert!(!out.exact_gpu_match);
     }
@@ -11452,34 +11771,72 @@ mod tests {
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("default".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "", "").await;
+        assert_eq!(out.resolution, route("default", "l4-spot"));
         assert!(out.exact_gpu_match);
     }
 
     #[tokio::test]
     async fn test_resolve_effective_pool_honours_explicit_pool_name() {
-        // Caller pinned a pool. Trust them unconditionally — even an
-        // empty registry must route there so a known cold pool can be
-        // targeted (worker will scale up independently).
+        // Caller pinned only a pool. The new subject shape also needs a
+        // concrete machine-profile token, so an empty registry cannot be
+        // published to safely.
         let reg = pool_registry();
-        let out = resolve_effective_pool(&reg, "default", "", "my-bench", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile, None);
     }
 
     #[tokio::test]
-    async fn test_resolve_effective_pool_honours_explicit_pool_even_when_worker_exists() {
-        // Explicit pool overrides the registry lookup entirely, but we
-        // only count an exact match inside the pinned pool. A default
-        // or unrelated isolation worker cannot consume the pinned
-        // pool's stream and must not hide scale-up demand.
+    async fn test_resolve_effective_pool_infers_cold_profile_from_single_profile_pool() {
+        // A tenant pool with exactly one configured machine profile can scale
+        // from a pool-only request: the gateway still returns provisioning, but
+        // pending_demand gets the concrete profile label KEDA queries.
+        let reg = pool_registry();
+        let pm = PoolManager::new(vec!["l4".into()]);
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        pm.create_pool("my-bench", gpus, None, None, 0)
+            .await
+            .unwrap();
+
+        let out = resolve_effective_pool(&reg, Some(&pm), "default", "", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_does_not_guess_ambiguous_pool_profile() {
+        let reg = pool_registry();
+        let pm = PoolManager::new(vec!["l4".into(), "a100".into()]);
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        gpus.insert("a100".to_string(), 0);
+        pm.create_pool("my-bench", gpus, None, None, 0)
+            .await
+            .unwrap();
+
+        let out = resolve_effective_pool(&reg, Some(&pm), "default", "", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_provisions_explicit_pool_when_only_other_pool_exists() {
+        // Explicit pool + GPU names a cold lane. A default or unrelated
+        // isolation worker cannot consume the pinned pool's stream, so the
+        // gateway must return 202 instead of publishing to a lane with no
+        // active consumer.
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "l4-spot", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
     }
 
     #[tokio::test]
@@ -11490,23 +11847,23 @@ mod tests {
             worker_msg("default", "l4-spot", "my-bench"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "").await;
+        assert_eq!(out.resolution, route("my-bench", "l4-spot"));
         assert!(out.exact_gpu_match);
     }
 
     #[tokio::test]
     async fn test_resolve_effective_pool_pinned_pool_with_missing_gpu_tuple_reports_no_match() {
         // Caller pinned a pool AND expressed a GPU preference, but no
-        // worker matches the exact tuple. We still route to the pin,
-        // and `exact_gpu_match=false` tells the caller to record
-        // demand for KEDA.
+        // worker matches the exact tuple. Return provisioning and record
+        // demand for KEDA instead of publishing into a cold stream.
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "a100", "pool-a"))
             .await;
-        let out = resolve_effective_pool(&reg, "default", "l4", "my-bench", "").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        let out = resolve_effective_pool(&reg, None, "default", "l4", "my-bench", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
     }
 
     #[tokio::test]
@@ -11517,22 +11874,24 @@ mod tests {
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "", "new-hash").await;
+        let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "", "new-hash").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
     }
 
     #[tokio::test]
-    async fn test_resolve_effective_pool_pinned_pool_still_overrides_stale_hash() {
+    async fn test_resolve_effective_pool_pinned_pool_provisions_when_hash_mismatch() {
         let reg = pool_registry();
         reg.update_worker(
             "http://w1:8080",
             worker_msg("default", "l4-spot", "default"),
         )
         .await;
-        let out = resolve_effective_pool(&reg, "default", "l4-spot", "my-bench", "new-hash").await;
-        assert_eq!(out.resolution, PoolResolution::Pool("my-bench".to_string()));
+        let out =
+            resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "new-hash").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
     }
 
     // ── /v1/chat/completions parsing + body composition ────────────

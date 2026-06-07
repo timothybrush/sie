@@ -15,7 +15,7 @@ data:
   {{- $gpuAliases := dict }}
   {{- range $poolName, $pool := .Values.workers.pools }}
   {{- if $pool.enabled }}
-  {{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
+  {{- $machineProfile := default $poolName $pool.machineProfile }}
   {{- $gpuTypes = append $gpuTypes $machineProfile }}
   {{- $_ := set $gpuAliases $machineProfile $machineProfile }}
   {{- if and $pool.gpuType (ne $pool.gpuType $machineProfile) (not (hasKey $gpuAliases $pool.gpuType)) }}

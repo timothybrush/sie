@@ -102,9 +102,10 @@ impl DlqListener {
             // Extract the model token from the advisory's original subject.
             //
             // The publisher constructs work subjects as
-            // `sie.work.{normalize_model_id(model)}.{pool}` — exactly four
-            // dot-separated tokens, with the 3rd token already safe to use as
-            // a single NATS token (no `.`, `*`, `>`, or whitespace).  We keep
+            // `sie.work.{pool}.{machine_profile}.{bundle}.{normalize_model_id(model)}`
+            // — exactly six dot-separated tokens, with the 6th token already
+            // safe to use as a single NATS token (no `.`, `*`, `>`, or whitespace).
+            // We keep
             // the `/` -> `_` belt-and-suspenders replacement as a no-op for
             // correctly-normalized subjects and a fallback for any legacy
             // un-normalized messages still in-flight at the time of upgrade.
@@ -112,9 +113,9 @@ impl DlqListener {
                 .get("subject")
                 .and_then(|v| v.as_str())
                 .and_then(|s| {
-                    let parts: Vec<&str> = s.splitn(4, '.').collect();
-                    if parts.len() >= 3 {
-                        Some(parts[2].replace('/', "_"))
+                    let parts: Vec<&str> = s.split('.').collect();
+                    if parts.len() >= 6 {
+                        Some(parts[5].replace('/', "_"))
                     } else {
                         None
                     }

@@ -1,12 +1,14 @@
 //! NATS subject helpers — model-id normalisation + extraction.
 //!
-//! Work subject format: `sie.work.{normalized_model_id}.{pool_name}`.
+//! Work subject format:
+//! `sie.work.{pool_name}.{machine_profile}.{bundle}.{normalized_model_id}`.
 
-/// Subject token index of the normalized model id (`sie.work.<MODEL>.pool`).
-const MODEL_TOKEN_INDEX: usize = 2;
+/// Subject token index of the normalized model id
+/// (`sie.work.<POOL>.<MACHINE>.<BUNDLE>.<MODEL>`).
+const MODEL_TOKEN_INDEX: usize = 5;
 
 /// Minimum number of dot-delimited tokens a valid work subject must have.
-const MIN_SUBJECT_PARTS: usize = 4;
+const MIN_SUBJECT_PARTS: usize = 6;
 
 /// Inverse of [`normalize_model_id`]. Best-effort: `__` → `/`, `_dot_` → `.`.
 pub fn denormalize_model_id(normalized: &str) -> String {
@@ -22,7 +24,7 @@ pub fn normalize_model_id(model_id: &str) -> String {
 }
 
 /// Extract and denormalise the model id from a work subject.
-/// Returns `None` for malformed subjects (fewer than 4 tokens).
+/// Returns `None` for malformed subjects (fewer than 6 tokens).
 pub fn extract_model_id(subject: &str) -> Option<String> {
     let parts: Vec<&str> = subject.split('.').collect();
     if parts.len() < MIN_SUBJECT_PARTS {
@@ -101,11 +103,11 @@ mod tests {
     #[test]
     fn extract_from_valid_subject() {
         assert_eq!(
-            extract_model_id("sie.work.BAAI__bge-m3.l4"),
+            extract_model_id("sie.work.default.rtx6000.default.BAAI__bge-m3"),
             Some("BAAI/bge-m3".to_string())
         );
         assert_eq!(
-            extract_model_id("sie.work.a_dot_b.default"),
+            extract_model_id("sie.work.eval-l4.l4.sglang.a_dot_b"),
             Some("a.b".to_string())
         );
     }
@@ -115,28 +117,28 @@ mod tests {
         assert_eq!(extract_model_id(""), None);
         assert_eq!(extract_model_id("sie.work"), None);
         assert_eq!(extract_model_id("sie.work.model"), None);
+        assert_eq!(extract_model_id("sie.work.default.l4.default"), None);
     }
 
     // ----- subjects_overlap ---------------------------------------------------
 
     #[test]
     fn overlap_identical_filters_with_wildcard_overlap() {
-        // The exact case that wedged the GKE worker on bundle flips:
-        // two consumers (e.g. `default_l4` from a new deploy and a
-        // stale durable left behind by a previous bundle) both
-        // filtered on this string.
-        assert!(subjects_overlap("sie.work.*.l4", "sie.work.*.l4"));
+        assert!(subjects_overlap(
+            "sie.work.default.rtx6000.sglang.*",
+            "sie.work.default.rtx6000.sglang.*"
+        ));
     }
 
     #[test]
     fn overlap_wildcard_vs_literal_in_same_slot() {
         assert!(subjects_overlap(
-            "sie.work.*.l4",
-            "sie.work.BAAI__bge-m3.l4"
+            "sie.work.default.rtx6000.sglang.*",
+            "sie.work.default.rtx6000.sglang.BAAI__bge-m3"
         ));
         assert!(subjects_overlap(
-            "sie.work.BAAI__bge-m3.l4",
-            "sie.work.*.l4"
+            "sie.work.default.rtx6000.sglang.BAAI__bge-m3",
+            "sie.work.default.rtx6000.sglang.*"
         ));
     }
 
@@ -145,23 +147,41 @@ mod tests {
         // Different pools → distinct streams in practice, but the
         // predicate must still report no overlap so it's safe to call
         // even on cross-stream listings.
-        assert!(!subjects_overlap("sie.work.*.l4", "sie.work.*.h100"));
-        assert!(!subjects_overlap("sie.work.foo.l4", "sie.work.foo.eval-l4"));
+        assert!(!subjects_overlap(
+            "sie.work.default.l4.default.*",
+            "sie.work.default.h100.default.*"
+        ));
+        assert!(!subjects_overlap(
+            "sie.work.default.rtx6000.default.*",
+            "sie.work.default.rtx6000.sglang.*"
+        ));
     }
 
     #[test]
     fn overlap_different_lengths_without_gt_do_not_overlap() {
-        assert!(!subjects_overlap("sie.work.*.l4", "sie.work.*.l4.extra"));
-        assert!(!subjects_overlap("sie.work.*", "sie.work.*.l4"));
+        assert!(!subjects_overlap(
+            "sie.work.default.l4.default.*",
+            "sie.work.default.l4.default.*.extra"
+        ));
+        assert!(!subjects_overlap(
+            "sie.work.default.*",
+            "sie.work.default.l4.default.*"
+        ));
     }
 
     #[test]
     fn overlap_gt_swallows_trailing_tokens() {
         // `>` must match AT LEAST one trailing token, so it overlaps
         // with longer filters but not with one of equal length.
-        assert!(subjects_overlap("sie.work.>", "sie.work.foo.l4"));
-        assert!(subjects_overlap("sie.work.foo.l4", "sie.work.>"));
-        assert!(subjects_overlap("sie.>", "sie.work.*.l4"));
+        assert!(subjects_overlap(
+            "sie.work.>",
+            "sie.work.default.l4.default.foo"
+        ));
+        assert!(subjects_overlap(
+            "sie.work.default.l4.default.foo",
+            "sie.work.>"
+        ));
+        assert!(subjects_overlap("sie.>", "sie.work.default.l4.default.*"));
         assert!(!subjects_overlap("sie.work.>", "sie.work"));
         assert!(!subjects_overlap("sie.>", "nats.work.*.l4"));
     }
@@ -174,7 +194,7 @@ mod tests {
 
     #[test]
     fn overlap_empty_inputs_are_safe() {
-        assert!(!subjects_overlap("", "sie.work.*.l4"));
-        assert!(!subjects_overlap("sie.work.*.l4", ""));
+        assert!(!subjects_overlap("", "sie.work.default.l4.default.*"));
+        assert!(!subjects_overlap("sie.work.default.l4.default.*", ""));
     }
 }

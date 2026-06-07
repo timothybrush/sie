@@ -1094,7 +1094,7 @@ class StreamingProcessor:
         # as stale even if the terminal races), then ACK so JetStream does
         # not redeliver indefinitely.
         if self._check_and_consume_tombstone(request_id):
-            pool_label = str(wi.get("pool_name") or "_default")
+            pool_label = str(wi.get("pool_name") or "default")
             _metrics.GENERATION_FALLBACK_DUPLICATE_TOTAL.labels(model=model_id, pool=pool_label).inc()
             logger.warning(
                 "cancel-tombstone hit: refusing to decode request_id=%s model=%s pool=%s "

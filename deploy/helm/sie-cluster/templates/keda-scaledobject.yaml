@@ -6,7 +6,7 @@
 */ -}}
 {{- $promAddr := .Values.autoscaling.prometheusAddress }}
 {{- if index .Values "kube-prometheus-stack" "install" }}
-{{- $promAddr = printf "http://prometheus-operated.%s.svc.cluster.local:9090" (include "sie-cluster.namespace" .) }}
+{{- $promAddr = include "sie-cluster.kubePrometheusStack.prometheusAddress" . }}
 {{- end }}
 {{- /*
   ScaledObjects are rendered into a ConfigMap and applied by a post-install/post-upgrade
@@ -76,10 +76,11 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation
     helm.sh/hook-weight: "1"
 data:
-  # Worker pool ScaledObjects (one per enabled (pool, bundle))
+  # Worker pool ScaledObjects (one per enabled queuePool/machineProfile/bundle lane)
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
-{{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
+{{- $machineProfile := default $poolName $pool.machineProfile }}
+{{- $queuePool := default (default $poolName $root.Values.workers.common.queuePool) $pool.queuePool }}
 {{- range $bundleName, $bundleCfg := $pool.bundles }}
 {{- if dig "enabled" true $bundleCfg }}
 {{- $bundle := $bundleName }}
@@ -95,6 +96,7 @@ data:
         sie.superlinked.com/bundle: {{ $bundle | quote }}
     spec:
       scaleTargetRef:
+        apiVersion: apps/v1
         kind: StatefulSet
         name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}
       minReplicaCount: {{ $bundleCfg.minReplicas }}
@@ -132,27 +134,27 @@ data:
           metadata:
             serverAddress: {{ $promAddr }}
             metricName: sie_gateway_pending_demand_{{ $poolName }}_{{ $bundleName }}
-            query: sum(sie_gateway_pending_demand{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
+            query: sum(sie_gateway_pending_demand{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: "1"
             activationThreshold: "0"
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
             metricName: sie_gateway_queue_depth_{{ $poolName }}_{{ $bundleName }}
-            query: sum(sie_gateway_worker_queue_depth{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
+            query: sum(sie_gateway_worker_queue_depth{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: {{ $root.Values.autoscaling.queueDepthThreshold | quote }}
             activationThreshold: {{ $root.Values.autoscaling.queueDepthActivation | quote }}
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
             metricName: sie_gateway_active_lease_gpus_{{ $poolName }}_{{ $bundleName }}
-            query: sum(sie_gateway_active_lease_gpus{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
+            query: sum(sie_gateway_active_lease_gpus{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
             threshold: "1"
             activationThreshold: "0"
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
-            metricName: sie_gateway_rejected_rate_{{ $poolName }}
+            metricName: sie_gateway_rejected_rate_{{ $poolName }}_{{ $bundleName }}
             # Filter out reasons the SDK already retries against the same
             # worker pool; they are per-request transient signals, not
             # "we need more workers" signals:
@@ -182,7 +184,7 @@ data:
             # ``resource_exhausted_extended`` would NOT be excluded and
             # would drive scale-up. If new retryable reasons are added in
             # ``proxy.rs::record_rejected_request``, append them here.
-            query: sum(rate(sie_gateway_rejected_requests_total{machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}", reason!~"resource_exhausted|upstream_model_loading|upstream_timeout_model_loading|upstream_lora_loading"}[2m])) or vector(0)
+            query: sum(rate(sie_gateway_rejected_requests_total{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}", reason!~"resource_exhausted|upstream_model_loading|upstream_timeout_model_loading|upstream_lora_loading"}[2m])) or vector(0)
             threshold: "1"
             activationThreshold: "0"
 {{- end }}
@@ -200,6 +202,7 @@ data:
         {{- include "sie-cluster.gateway.labels" . | nindent 8 }}
     spec:
       scaleTargetRef:
+        apiVersion: apps/v1
         kind: Deployment
         name: {{ include "sie-cluster.gateway.serviceName" . }}
       minReplicaCount: {{ .Values.gateway.replicas }}

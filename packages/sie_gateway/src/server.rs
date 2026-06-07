@@ -133,17 +133,21 @@ pub(crate) async fn metrics_handler(
         .collect();
     metrics::update_worker_metrics(&snapshots);
 
-    // Clear PENDING_DEMAND only for WorkerGroups that now have healthy workers.
-    let healthy_worker_groups: std::collections::HashSet<(String, String)> = snapshots
+    // Clear PENDING_DEMAND only for queue lanes that now have healthy workers.
+    let healthy_worker_groups: std::collections::HashSet<(String, String, String)> = snapshots
         .iter()
-        .filter(|w| w.healthy && !w.machine_profile.is_empty())
+        .filter(|w| w.healthy && !w.pool_name.is_empty() && !w.machine_profile.is_empty())
         .map(|w| {
             let bundle = if w.bundle.is_empty() {
                 "default"
             } else {
                 w.bundle.as_str()
             };
-            (w.machine_profile.to_lowercase(), bundle.to_lowercase())
+            (
+                w.pool_name.to_lowercase(),
+                w.machine_profile.to_lowercase(),
+                bundle.to_lowercase(),
+            )
         })
         .collect();
     metrics::clear_fulfilled_demand(&healthy_worker_groups, &state.demand_tracker);

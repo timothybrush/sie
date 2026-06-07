@@ -31,6 +31,16 @@ mod tests;
 // remain available for code that needs the rest of the type surface.
 pub use hrw::pick_worker;
 
+/// Whether a direct-dispatched generation request should skip the
+/// first-chunk timeout republish because the pool-fallback lane had no
+/// alternate worker at dispatch time.
+pub(crate) fn suppress_first_chunk_republish_for_lane(
+    was_direct_dispatched: bool,
+    pool_fallback_lane_worker_count: usize,
+) -> bool {
+    was_direct_dispatched && pool_fallback_lane_worker_count <= 1
+}
+
 /// Environment variable that opts in to raw routing-key logging.
 /// Default (unset / not "1") emits only the `xxh:` prefix.
 ///

@@ -95,7 +95,8 @@ def _make_work_item(
         "operation": "generate",
         "model_id": "test/model",
         "profile_id": "default",
-        "pool_name": "_default",
+        "pool_name": "default",
+        "machine_profile": "default",
         "router_id": "router-1",
         "reply_subject": "_INBOX.router-1.req-1",
         "timestamp": time.time(),
@@ -2140,12 +2141,12 @@ async def test_duplicate_execution_metric_increments_on_refusal() -> None:
     # Cancel before any decode → tombstone.
     proc.signal_cancel("req-1")
 
-    before = worker_metrics.GENERATION_FALLBACK_DUPLICATE_TOTAL.labels(model="test/model", pool="_default")._value.get()
+    before = worker_metrics.GENERATION_FALLBACK_DUPLICATE_TOTAL.labels(model="test/model", pool="default")._value.get()
 
     msg = _make_msg(_make_work_item())
     await proc.process(msg, "test/model")
 
-    after = worker_metrics.GENERATION_FALLBACK_DUPLICATE_TOTAL.labels(model="test/model", pool="_default")._value.get()
+    after = worker_metrics.GENERATION_FALLBACK_DUPLICATE_TOTAL.labels(model="test/model", pool="default")._value.get()
 
     assert after - before == 1.0, f"counter did not increment: before={before} after={after}"
 

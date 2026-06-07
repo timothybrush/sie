@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.0
+
+- chore(main): release 0.6.0
+- fix(helm): preserve worker-group queue defaults
+- test(gateway): assert capped lane pending demand
+- docs: align queue lane naming
+- fix(helm): align lane defaults and tilt e2e
+- fix(gateway): harden queue lane admission
+- feat(gateway)!: route work by queue pool lanes
+- feat(helm)!: default SIE_POOL to pool name (not "default")
+- fix(deps): bump vitest 2.1.9 -> 4.1.0 (CVE-2026-47429)
+
 ## v0.5.0
 
 - chore(main): release 0.5.0
