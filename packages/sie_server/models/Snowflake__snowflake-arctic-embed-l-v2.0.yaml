@@ -1,0 +1,28 @@
+sie_id: Snowflake/snowflake-arctic-embed-l-v2.0
+hf_id: Snowflake/snowflake-arctic-embed-l-v2.0
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  encode:
+    dense:
+      dim: 1024
+    sparse: null
+    multivector: null
+  score: null
+  extract: null
+max_sequence_length: 8192
+profiles:
+  default:
+    max_batch_tokens: 16384
+    compute_precision: null
+    adapter_path: sie_server.adapters.xlm_roberta_flash:XLMRobertaFlashAdapter
+    adapter_options:
+      loadtime: {}
+      runtime:
+        pooling: cls
+        normalize: true
+        query_template: 'query: {text}'
+        doc_template: '{text}'

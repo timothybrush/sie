@@ -200,6 +200,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   opencv-python wheel unconditionally dlopens an X11 + libGL + glib chain at
 #   import even in headless usage. Without these, every docling extract crashes
 #   with "ImportError: libxcb.so.1: cannot open shared object file" (issue #1028).
+# ninja-build: flashinfer invokes ninja during first-use SGLang kernel JIT.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -213,6 +214,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libnuma1 \
     libsm6 \
     libspatialindex-c6 \
+    ninja-build \
     libx11-6 \
     libxcb1 \
     libxext6

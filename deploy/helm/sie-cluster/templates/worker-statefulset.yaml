@@ -125,9 +125,10 @@ spec:
             - name: SIE_PRELOAD_MODELS
               value: {{ join "," $root.Values.workers.common.preloadModels | quote }}
             {{- end }}
-            # Logging configuration
+            {{- $workerLogLevel := trim ($root.Values.logging.workerLevel | default "") }}
+            # Logging configuration (``logging.workerLevel`` overrides workers when non-empty)
             - name: SIE_LOG_LEVEL
-              value: {{ $root.Values.logging.level | quote }}
+              value: {{ if ne $workerLogLevel "" }}{{ $workerLogLevel | quote }}{{ else }}{{ $root.Values.logging.level | quote }}{{ end }}
             {{- if $root.Values.logging.json }}
             - name: SIE_LOG_JSON
               value: "true"

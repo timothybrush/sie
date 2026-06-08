@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.2
+
+- chore(main): release 0.6.2
+- fix(server): consolidate runtime ninja install
+- fix(server): install ninja in cuda runtime
+- fix(helm): scale single-profile bundles on gpu-agnostic demand
+- fix(dev): address KEDA Tilt PR review
+- feat(dev): refresh KEDA Tilt local dev branch
+- fix: accept dense dim in qwen3 vl embedding adapter
+- feat(models): add M4 dense encoders mxbai-embed-large-v1, arctic-embed-l-v2.0, modernbert-embed-base
+
 ## v0.6.1
 
 - chore(main): release 0.6.1

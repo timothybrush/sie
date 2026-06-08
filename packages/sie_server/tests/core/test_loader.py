@@ -311,6 +311,20 @@ class TestLoadAdapter:
 
         assert type(adapter).__name__ == "BGEM3FlagAdapter"
 
+    def test_load_qwen3_vl_embedding_accepts_dense_dim(self, tmp_path: Path) -> None:
+        """Qwen3 VL embedding adapter accepts dense_dim supplied by loader."""
+        config = _make_config(
+            sie_id="Qwen/Qwen3-VL-Embedding-2B",
+            hf_id="Qwen/Qwen3-VL-Embedding-2B",
+            adapter_path="sie_server.adapters.qwen3_vl_embedding:Qwen3VLEmbeddingAdapter",
+            dense_dim=2048,
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        assert type(adapter).__name__ == "Qwen3VLEmbeddingAdapter"
+        assert adapter.dims.dense == 2048
+
     def test_load_custom_adapter(self, tmp_path: Path) -> None:
         """Can load a custom adapter from file."""
         # Create custom adapter file

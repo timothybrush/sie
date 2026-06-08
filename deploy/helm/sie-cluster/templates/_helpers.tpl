@@ -445,3 +445,41 @@ store enabled" and an empty result as "off".
 {{- printf "%s/payloads" $base -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Distinct machine profiles serving a bundle within a queue pool.
+
+Drives the KEDA pending_demand trigger's scale-from-zero matcher. When a
+gpu-agnostic request (e.g. /v1/chat/completions without an X-SIE-MACHINE-PROFILE
+or a model `:profile` suffix) cannot be served, the gateway records pending
+demand with an EMPTY machine_profile label, because a multi-profile queue pool
+gives it no single cold lane to name (proxy.rs PoolLookup.pending_demand_profile).
+A per-lane scaler keyed on machine_profile="<profile>" never sees that demand, so
+the lane stays at zero and the model is stuck "provisioning". A lane whose bundle
+maps to exactly one machine profile in the pool is unambiguous and can safely also
+count the empty-label demand.
+
+Args (dict): root, queuePool, bundle.
+Returns a comma-joined, sorted list of distinct machine profiles.
+*/}}
+{{- define "sie-cluster.bundle.machineProfiles" -}}
+{{- $root := .root -}}
+{{- $queuePool := .queuePool -}}
+{{- $bundle := .bundle -}}
+{{- $defaultQueuePool := default "default" $root.Values.workers.common.queuePool -}}
+{{- $profiles := dict -}}
+{{- range $poolName, $pool := $root.Values.workers.pools -}}
+{{- if $pool.enabled -}}
+{{- $mp := default $poolName $pool.machineProfile -}}
+{{- $qp := default $defaultQueuePool $pool.queuePool -}}
+{{- if eq $qp $queuePool -}}
+{{- range $bundleName, $bundleCfg := $pool.bundles -}}
+{{- if and (eq $bundleName $bundle) (dig "enabled" true $bundleCfg) -}}
+{{- $_ := set $profiles $mp true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- keys $profiles | sortAlpha | join "," -}}
+{{- end }}

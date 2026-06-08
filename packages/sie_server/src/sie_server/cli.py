@@ -16,6 +16,7 @@ os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 import hashlib
 import logging
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from sie_sdk.bundle_utils import find_bundle_for_models, match_bundle_models
@@ -230,6 +231,15 @@ def serve(
     tracing: bool = typer.Option(default=False, help="Enable OpenTelemetry tracing (exports to localhost:4317)"),
     instrumentation: bool = typer.Option(False, "--instrumentation", "-i", help="Enable batch instrumentation logging"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    log_level: Annotated[
+        str,
+        typer.Option(
+            "--log-level",
+            "-l",
+            envvar="SIE_LOG_LEVEL",
+            help="Log level (DEBUG, INFO, WARNING, ERROR). Helm sets SIE_LOG_LEVEL for workers.",
+        ),
+    ] = "info",
     preload: str | None = typer.Option(None, "--preload", help="Comma-separated model names to preload at startup"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Enable structured JSON logging (for Loki)"),
 ) -> None:
@@ -239,7 +249,7 @@ def serve(
     from sie_server.core.logging import configure_logging
 
     # Configure logging (supports JSON format for Loki compatibility)
-    configure_logging(verbose=verbose, json_format=json_logs or None)
+    configure_logging(verbose=verbose, json_format=json_logs or None, level_name=log_level)
 
     # Handle models directory - cloud URLs pass through, local paths resolve
     if is_cloud_path(models_dir):
@@ -334,6 +344,7 @@ def serve(
         typer.echo("Start Jaeger with: mise run jaeger")
 
     typer.echo(f"Starting SIE server on {host}:{port}")
+
     typer.echo(f"Models directory: {models_dir_resolved}")
     typer.echo(f"Device: {resolved_device}")
     if cluster_cache:
@@ -370,7 +381,11 @@ def serve(
         preload_models=preload_models,
     )
 
-    run_server(host=host, port=port, reload=reload, config=config)
+    uvicorn_log = "debug" if verbose else log_level.strip().lower()
+    if uvicorn_log not in ("critical", "error", "warning", "info", "debug", "trace"):
+        uvicorn_log = "info"
+
+    run_server(host=host, port=port, reload=reload, config=config, uvicorn_log_level=uvicorn_log)
 
 
 if __name__ == "__main__":

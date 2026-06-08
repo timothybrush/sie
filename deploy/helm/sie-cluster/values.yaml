@@ -974,10 +974,16 @@ telemetry:
   # -- Deployment environment: production | staging | development | ci
   deploymentEnv: production
 
-# -- Logging configuration
+# -- Logging configuration. Gateway and sie-config receive ``SIE_LOG_LEVEL`` from
+# ``logging.level``. Workers use ``logging.workerLevel`` when set (non-empty);
+# otherwise they use ``logging.level`` as well. Workers also honor ``SIE_LOG_JSON``.
+# For extra Rust tracing filters in the gateway, set ``RUST_LOG`` via
+# ``gateway.extraEnv`` (``EnvFilter::try_from_default_env`` runs first).
 logging:
-  # -- Log level (DEBUG, INFO, WARNING, ERROR)
+  # -- Log level (DEBUG, INFO, WARNING, ERROR) for gateway and sie-config
   level: INFO
+  # -- Optional worker-only log level. Empty string: workers use ``level`` too.
+  workerLevel: ""
   # -- Enable structured JSON logging (required for Loki)
   json: true
 

@@ -69,15 +69,29 @@ class TextFormatter(logging.Formatter):
         )
 
 
-def configure_logging(*, verbose: bool = False, json_format: bool | None = None) -> None:
+def _resolve_log_level(*, verbose: bool, level_name: str | None) -> int:
+    """Pick root log level: ``--verbose`` wins, then explicit name, then ``SIE_LOG_LEVEL`` env."""
+    if verbose:
+        return logging.DEBUG
+    raw = (level_name or os.environ.get("SIE_LOG_LEVEL") or "INFO").strip()
+    mapping = logging.getLevelNamesMapping()
+    return mapping.get(raw.upper(), logging.INFO)
+
+
+def configure_logging(
+    *,
+    verbose: bool = False,
+    json_format: bool | None = None,
+    level_name: str | None = None,
+) -> None:
     """Configure logging for SIE server.
 
     Args:
-        verbose: Enable DEBUG level logging.
+        verbose: Enable DEBUG level logging (overrides ``level_name`` / ``SIE_LOG_LEVEL``).
         json_format: Use JSON format. If None, reads from SIE_LOG_JSON env var.
+        level_name: Log level name (e.g. ``DEBUG``, ``INFO``). When None, uses ``SIE_LOG_LEVEL``.
     """
-    # Determine log level
-    log_level = logging.DEBUG if verbose else logging.INFO
+    log_level = _resolve_log_level(verbose=verbose, level_name=level_name)
 
     # Determine format (env var takes precedence if json_format not explicitly set)
     if json_format is None:
