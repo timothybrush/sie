@@ -423,14 +423,14 @@ Resolve the effective payload-store URL.
 Resolution order:
   1. .Values.payloadStore.url set explicitly -> use it verbatim.
   2. .Values.workers.common.clusterCache.enabled and .url set -> derive a
-     sibling /payloads path at the same bucket root. Terraform exposes the
-     cache URL as "<scheme>://<bucket>/models" by convention, so the
-     auto-derivation strips a trailing "/models" segment before appending
-     "/payloads". The resulting layout is:
-       <bucket>/models/...    weights (managed by sie-admin cache)
-       <bucket>/payloads/...  large work-item refs (managed by gateway)
-     These siblings live at the bucket root, which is what the workload
-     IAM grants are scoped to in both the AWS and GCP terraform modules.
+     sibling /payloads path at the same bucket/container root. Terraform
+     exposes the cache URL as "<scheme>://<bucket-or-container>/models" by
+     convention, so the auto-derivation strips a trailing "/models" segment
+     before appending "/payloads". The resulting layout is:
+       <bucket-or-container>/models/...    weights (managed by sie-admin cache)
+       <bucket-or-container>/payloads/...  large work-item refs (managed by gateway)
+     These siblings live at the bucket/container root, which is what supported
+     cloud workload IAM grants are scoped to.
   3. Otherwise -> empty string (payload store is off, no env vars rendered).
 
 Templates that consume this should treat a non-empty result as "payload

@@ -143,7 +143,7 @@ spec:
                   name: {{ $root.Values.workers.common.hfCache.tokenSecret }}
                   key: {{ $root.Values.workers.common.hfCache.tokenSecretKey }}
             {{- end }}
-            # Cluster cache (S3/GCS)
+            # Cluster cache (object storage)
             {{- if $root.Values.workers.common.clusterCache.enabled }}
             - name: SIE_CLUSTER_CACHE
               value: {{ $root.Values.workers.common.clusterCache.url | quote }}

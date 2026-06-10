@@ -1118,7 +1118,7 @@ class TestExtractRuntimeOptions:
         )
 
     def test_owlv2_reads_score_threshold_from_options(self) -> None:
-        """OWLv2 adapter reads score_threshold from options."""
+        """OWLv2 adapter reads score_threshold and threshold from options."""
         import inspect
 
         from sie_server.adapters.owlv2 import Owlv2Adapter
@@ -1126,6 +1126,9 @@ class TestExtractRuntimeOptions:
         source = inspect.getsource(Owlv2Adapter.extract)
         assert 'opts.get("score_threshold"' in source, (
             "Owlv2Adapter.extract() does not read score_threshold from options."
+        )
+        assert 'opts.get("threshold"' in source or "opts.get('threshold'" in source, (
+            "Owlv2Adapter.extract() does not read threshold alias from options."
         )
 
     def test_florence2_reads_task_from_options(self) -> None:

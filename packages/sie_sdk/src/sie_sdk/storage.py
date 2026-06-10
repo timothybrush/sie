@@ -1,7 +1,7 @@
-"""Cloud storage abstraction for S3/GCS/local paths.
+"""Cloud storage abstraction for S3/GCS/Azure/local paths.
 
 Provides a unified interface for:
-- Detecting storage type from URL (s3://, gs://, local path)
+- Detecting storage type from URL (s3://, gs://, abfs://, abfss://, local path)
 - Listing objects/files in a location
 - Downloading files to local cache
 - Checking if a path exists
@@ -13,18 +13,24 @@ Used by:
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import logging
 import os
 import shutil
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+CLOUD_SCHEMES = ("s3://", "gs://", "abfs://", "abfss://")
+AZURE_SCHEMES = ("abfs", "abfss")
 
 
 class StorageBackend(ABC):
@@ -135,6 +141,25 @@ class StorageBackend(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} must override write_text_if_match with an atomic implementation"
         )
+
+    def try_server_side_copy(self, src: str, dst: str) -> bool:
+        """Attempt a provider-native server-side copy between two URLs.
+
+        Backends that support it (same-provider src/dst, compatible
+        accounts/credentials) copy the object inside the provider without
+        relaying bytes through this host. The base implementation reports
+        "not supported" so callers fall back to download + upload.
+
+        Args:
+            src: Source URL.
+            dst: Destination URL.
+
+        Returns:
+            True if the object was copied server-side. False when no
+            native copy applies to this src/dst pair; the caller must
+            fall back to a download + upload relay.
+        """
+        return False
 
     @abstractmethod
     def upload_file(self, src: Path, dst: str) -> None:
@@ -535,6 +560,39 @@ class S3Backend(StorageBackend):
                     return False
                 raise
 
+    def try_server_side_copy(self, src: str, dst: str) -> bool:
+        """Server-side S3 copy via boto3 managed copy.
+
+        ``client.copy`` issues CopyObject (or UploadPartCopy for objects
+        above the multipart threshold), so bytes never leave AWS. Requires
+        the same s3:GetObject / s3:PutObject permissions as the relay path.
+        """
+        if not (src.startswith("s3://") and dst.startswith("s3://")):
+            return False
+        # If boto3/botocore is missing the relay path cannot work either,
+        # so let the ImportError propagate rather than masking it.
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        client = self._get_client()
+        src_bucket, src_key = self._parse_s3_url(src)
+        dst_bucket, dst_key = self._parse_s3_url(dst)
+        logger.debug("Server-side copy s3://%s/%s to s3://%s/%s", src_bucket, src_key, dst_bucket, dst_key)
+        config = self._get_transfer_config()
+        copy_source = {"Bucket": src_bucket, "Key": src_key}
+        try:
+            if config:
+                client.copy(copy_source, dst_bucket, dst_key, Config=config)
+            else:
+                client.copy(copy_source, dst_bucket, dst_key)
+        except (BotoCoreError, ClientError) as e:
+            logger.warning(
+                "S3 server-side copy of %s failed (%s); falling back to download+upload",
+                src,
+                e,
+            )
+            return False
+        return True
+
     def upload_file(self, src: Path, dst: str) -> None:
         """Upload file to S3 with multipart for large files."""
         client = self._get_client()
@@ -548,8 +606,6 @@ class S3Backend(StorageBackend):
 
     def upload_directory(self, src: Path, dst: str) -> int:
         """Upload directory recursively to S3 with parallel file uploads."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         client = self._get_client()
         bucket, base_key = self._parse_s3_url(dst)
         config = self._get_transfer_config()
@@ -765,6 +821,43 @@ class GCSBackend(StorageBackend):
             except PreconditionFailed:
                 return False
 
+    def try_server_side_copy(self, src: str, dst: str) -> bool:
+        """Server-side GCS copy via the rewrite API.
+
+        ``Blob.rewrite`` copies inside GCS (cross-bucket included) and
+        chunks arbitrarily large objects through rewrite tokens, so bytes
+        never transit this host.
+        """
+        if not (src.startswith("gs://") and dst.startswith("gs://")):
+            return False
+        from google.api_core.exceptions import GoogleAPICallError
+
+        client = self._get_client()
+        src_bucket_name, src_path = self._parse_gcs_url(src)
+        dst_bucket_name, dst_path = self._parse_gcs_url(dst)
+        logger.debug(
+            "Server-side copy gs://%s/%s to gs://%s/%s",
+            src_bucket_name,
+            src_path,
+            dst_bucket_name,
+            dst_path,
+        )
+        src_blob = client.bucket(src_bucket_name).blob(src_path)
+        dst_blob = client.bucket(dst_bucket_name).blob(dst_path)
+        token = None
+        try:
+            while True:
+                token, _bytes_rewritten, _total_bytes = dst_blob.rewrite(src_blob, token=token)
+                if token is None:
+                    return True
+        except GoogleAPICallError as e:
+            logger.warning(
+                "GCS server-side copy of %s failed (%s); falling back to download+upload",
+                src,
+                e,
+            )
+            return False
+
     def upload_file(self, src: Path, dst: str) -> None:
         """Upload file to GCS."""
         client = self._get_client()
@@ -776,8 +869,6 @@ class GCSBackend(StorageBackend):
 
     def upload_directory(self, src: Path, dst: str) -> int:
         """Upload directory recursively to GCS with parallel file uploads."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         client = self._get_client()
         bucket_name, base_path = self._parse_gcs_url(dst)
         bucket = client.bucket(bucket_name)
@@ -815,11 +906,376 @@ class GCSBackend(StorageBackend):
         return count
 
 
+class AzureBlobBackend(StorageBackend):
+    """Azure Blob / ADLS Gen2 backend with parallel uploads."""
+
+    MAX_CONCURRENCY = 16
+
+    # Same-account server-side copies are usually instantaneous, but the
+    # Copy Blob operation is asynchronous by contract: poll, then abort and
+    # fall back to the download + upload relay if it never settles.
+    SERVER_COPY_POLL_INTERVAL_S = 2.0
+    SERVER_COPY_TIMEOUT_S = 900.0
+
+    def __init__(self) -> None:
+        self._container_clients: dict[tuple[str, str], Any] = {}
+        # account -> ("key" | "sas" | "token", credential) describing how the
+        # account was authorized; consulted to authorize the *source* blob of
+        # a server-side copy (the destination credential never carries over).
+        self._account_auth: dict[str, tuple[str, Any]] = {}
+
+    def _parse_azure_url(self, url: str) -> tuple[str, str, str, str]:
+        """Parse abfs(s)://container@account.dfs.core.windows.net/path.
+
+        Returns:
+            Tuple of (container, account, blob_path, account_url).
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in AZURE_SCHEMES:
+            msg = f"Not an Azure Blob URL: {url}"
+            raise ValueError(msg)
+
+        authority = parsed.netloc
+        if "@" not in authority:
+            msg = "Azure Blob URL must use <container>@<account>.dfs.core.windows.net"
+            raise ValueError(msg)
+
+        container, host = authority.split("@", 1)
+        if not container or not host:
+            msg = "Azure Blob URL container and account must be non-empty"
+            raise ValueError(msg)
+
+        account = host
+        if account.endswith(".dfs.core.windows.net"):
+            account = account[: -len(".dfs.core.windows.net")]
+        elif account.endswith(".blob.core.windows.net"):
+            account = account[: -len(".blob.core.windows.net")]
+
+        if not account:
+            msg = "Azure Blob URL account must be non-empty"
+            raise ValueError(msg)
+
+        account_url = f"https://{account}.blob.core.windows.net"
+        blob_path = parsed.path.lstrip("/")
+        return container, account, blob_path, account_url
+
+    @staticmethod
+    def _connection_string_account_name(connection_string: str) -> str | None:
+        """Extract the storage account name from an Azure connection string."""
+        parts = dict(part.split("=", 1) for part in connection_string.split(";") if "=" in part)
+        account = parts.get("AccountName")
+        if account:
+            return account
+
+        blob_endpoint = parts.get("BlobEndpoint")
+        if not blob_endpoint:
+            return None
+
+        host = urlparse(blob_endpoint).netloc
+        if host.endswith(".blob.core.windows.net"):
+            return host[: -len(".blob.core.windows.net")]
+        return host.split(".", 1)[0] if host else None
+
+    def _build_container_client(self, container: str, account: str, account_url: str) -> Any:
+        """Build an Azure container client from standard environment credentials."""
+        try:
+            from azure.storage.blob import BlobServiceClient
+        except ImportError as e:
+            msg = (
+                "azure-storage-blob is required for Azure Blob storage. "
+                "Install with: pip install azure-storage-blob azure-identity"
+            )
+            raise ImportError(msg) from e
+
+        connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        if connection_string:
+            conn_account = self._connection_string_account_name(connection_string)
+            if conn_account and conn_account.lower() != account.lower():
+                msg = (
+                    "AZURE_STORAGE_CONNECTION_STRING AccountName "
+                    f"({conn_account}) does not match URL account ({account})"
+                )
+                raise ValueError(msg)
+            service_client = BlobServiceClient.from_connection_string(connection_string)
+            self._account_auth[account] = ("key", None)
+            return service_client.get_container_client(container)
+
+        credential: Any
+        account_key = (
+            os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
+            or os.environ.get("AZURE_STORAGE_ACCESS_KEY")
+            or os.environ.get("AZURE_STORAGE_KEY")
+        )
+        sas_token = os.environ.get("AZURE_STORAGE_SAS_TOKEN")
+        if account_key:
+            credential = account_key
+            self._account_auth[account] = ("key", None)
+        elif sas_token:
+            credential = sas_token.lstrip("?")
+            self._account_auth[account] = ("sas", credential)
+        else:
+            try:
+                from azure.identity import DefaultAzureCredential
+            except ImportError as e:
+                msg = (
+                    "azure-identity is required for Azure Blob storage without "
+                    "AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_ACCOUNT_KEY, "
+                    "or AZURE_STORAGE_SAS_TOKEN"
+                )
+                raise ImportError(msg) from e
+            credential = DefaultAzureCredential()
+            self._account_auth[account] = ("token", credential)
+
+        service_client = BlobServiceClient(account_url=account_url, credential=credential)
+        return service_client.get_container_client(container)
+
+    def _get_container_client(self, url: str) -> tuple[Any, str, str, str]:
+        """Return (container client, container, account, blob path) for an abfs(s) URL."""
+        container, account, blob_path, account_url = self._parse_azure_url(url)
+        key = (account, container)
+        if key not in self._container_clients:
+            self._container_clients[key] = self._build_container_client(container, account, account_url)
+        return self._container_clients[key], container, account, blob_path
+
+    @staticmethod
+    def _ensure_prefix(path: str) -> str:
+        if path and not path.endswith("/"):
+            return f"{path}/"
+        return path
+
+    def list_dirs(self, path: str) -> Iterator[str]:
+        """List immediate virtual directories in an Azure container."""
+        container_client, _, _, prefix = self._get_container_client(path)
+        prefix = self._ensure_prefix(prefix)
+
+        for item in container_client.walk_blobs(name_starts_with=prefix, delimiter="/"):
+            name = getattr(item, "name", "")
+            if not name.endswith("/"):
+                continue
+            relative = name[len(prefix) :].strip("/")
+            if relative and "/" not in relative:
+                yield relative
+
+    def list_files(self, path: str, pattern: str = "*") -> Iterator[str]:
+        """List files in an Azure container matching pattern."""
+        container_client, _, _, prefix = self._get_container_client(path)
+        prefix = self._ensure_prefix(prefix)
+
+        for blob in container_client.list_blobs(name_starts_with=prefix):
+            name = blob.name
+            relative = name[len(prefix) :]
+            if "/" not in relative and relative and fnmatch.fnmatch(relative, pattern):
+                yield relative
+
+    def download_file(self, src: str, dst: Path) -> None:
+        """Download a file from Azure Blob storage."""
+        container_client, container, account, blob_path = self._get_container_client(src)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug("Downloading abfs://%s@%s/%s to %s", container, account, blob_path, dst)
+        blob_client = container_client.get_blob_client(blob_path)
+        with dst.open("wb") as file:
+            blob_client.download_blob().readinto(file)
+
+    def exists(self, path: str) -> bool:
+        """Check if an Azure blob exists."""
+        container_client, _, _, blob_path = self._get_container_client(path)
+        return container_client.get_blob_client(blob_path).exists()
+
+    def has_children(self, path: str) -> bool:
+        """Check if an Azure virtual directory has at least one blob beneath it."""
+        container_client, _, _, prefix = self._get_container_client(path)
+        prefix = self._ensure_prefix(prefix)
+
+        for seen, blob in enumerate(container_client.list_blobs(name_starts_with=prefix, results_per_page=2), start=1):
+            if blob.name != prefix:
+                return True
+            if seen >= 2:
+                break
+        return False
+
+    def read_text(self, path: str) -> str:
+        """Read text content from Azure Blob storage."""
+        container_client, _, _, blob_path = self._get_container_client(path)
+        return container_client.get_blob_client(blob_path).download_blob().readall().decode("utf-8")
+
+    def write_text(self, path: str, content: str) -> None:
+        """Write text content to Azure Blob storage."""
+        container_client, _, _, blob_path = self._get_container_client(path)
+        container_client.get_blob_client(blob_path).upload_blob(content.encode("utf-8"), overwrite=True)
+
+    def write_text_if_match(self, path: str, content: str, expected_content: str) -> bool:
+        """Conditional write to Azure Blob storage using ETags for compare-and-swap."""
+        try:
+            from azure.core import MatchConditions
+            from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
+        except ImportError as e:
+            msg = "azure-core is required for Azure Blob conditional writes"
+            raise ImportError(msg) from e
+
+        container_client, _, _, blob_path = self._get_container_client(path)
+        blob_client = container_client.get_blob_client(blob_path)
+
+        if not expected_content.strip():
+            try:
+                blob_client.upload_blob(content.encode("utf-8"), overwrite=False)
+                return True
+            except ResourceExistsError:
+                return False
+
+        try:
+            properties = blob_client.get_blob_properties()
+            current = blob_client.download_blob().readall().decode("utf-8")
+        except ResourceNotFoundError:
+            return False
+
+        if current.strip() != expected_content.strip():
+            return False
+
+        try:
+            blob_client.upload_blob(
+                content.encode("utf-8"),
+                overwrite=True,
+                etag=properties.etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return True
+        except ResourceModifiedError:
+            return False
+
+    def try_server_side_copy(self, src: str, dst: str) -> bool:
+        """Server-side Azure copy within a single storage account.
+
+        Uses the asynchronous Copy Blob From URL operation and polls until
+        it settles. Cross-account copies need source SAS provisioning, so
+        they report unsupported and take the download + upload relay. Any
+        copy-specific failure (e.g. CannotVerifyCopySource) also falls back
+        rather than failing the sync.
+        """
+        azure_url_schemes = ("abfs://", "abfss://")
+        if not (src.startswith(azure_url_schemes) and dst.startswith(azure_url_schemes)):
+            return False
+        _, src_account, _, _ = self._parse_azure_url(src)
+        _, dst_account, _, _ = self._parse_azure_url(dst)
+        if src_account.lower() != dst_account.lower():
+            return False
+
+        from azure.core.exceptions import HttpResponseError
+
+        src_container_client, src_container, _, src_path = self._get_container_client(src)
+        dst_container_client, dst_container, _, dst_path = self._get_container_client(dst)
+        src_blob = src_container_client.get_blob_client(src_path)
+        dst_blob = dst_container_client.get_blob_client(dst_path)
+
+        # Authorize the service-side read of the source. Shared-key /
+        # connection-string auth covers same-account sources implicitly;
+        # SAS must ride on the source URL; OAuth needs an explicit bearer
+        # via x-ms-copy-source-authorization.
+        source_url = src_blob.url
+        copy_kwargs: dict[str, Any] = {}
+        kind, credential = self._account_auth.get(src_account, ("key", None))
+        if kind == "sas":
+            # BlobClient.url already carries the SAS when the client was
+            # built from a SAS credential; only append when it does not.
+            if "?" not in source_url:
+                source_url = f"{source_url}?{credential}"
+        elif kind == "token":
+            token = credential.get_token("https://storage.azure.com/.default")
+            copy_kwargs["source_authorization"] = f"Bearer {token.token}"
+
+        logger.debug(
+            "Server-side copy abfs://%s@%s/%s to abfs://%s@%s/%s",
+            src_container,
+            src_account,
+            src_path,
+            dst_container,
+            dst_account,
+            dst_path,
+        )
+        copy_started: Any = None
+        try:
+            copy_started = dst_blob.start_copy_from_url(source_url, **copy_kwargs)
+            deadline = time.monotonic() + self.SERVER_COPY_TIMEOUT_S
+            while True:
+                copy_props = dst_blob.get_blob_properties().copy
+                if copy_props.status == "success":
+                    return True
+                if copy_props.status != "pending":
+                    logger.warning(
+                        "Azure server-side copy of %s ended with status %r; falling back to download+upload",
+                        src,
+                        copy_props.status,
+                    )
+                    return False
+                if time.monotonic() >= deadline:
+                    dst_blob.abort_copy(copy_props.id)
+                    logger.warning(
+                        "Azure server-side copy of %s timed out after %.0fs; falling back to download+upload",
+                        src,
+                        self.SERVER_COPY_TIMEOUT_S,
+                    )
+                    return False
+                time.sleep(self.SERVER_COPY_POLL_INTERVAL_S)
+        except HttpResponseError as e:
+            # A copy that is still pending blocks the relay's overwrite, so
+            # abort it best-effort before falling back.
+            copy_id = copy_started.get("copy_id") if copy_started else None
+            if copy_id:
+                with contextlib.suppress(HttpResponseError):
+                    dst_blob.abort_copy(copy_id)
+            logger.warning(
+                "Azure server-side copy of %s failed (%s); falling back to download+upload",
+                src,
+                e,
+            )
+            return False
+
+    def upload_file(self, src: Path, dst: str) -> None:
+        """Upload file to Azure Blob storage."""
+        container_client, container, account, blob_path = self._get_container_client(dst)
+        logger.debug("Uploading %s to abfs://%s@%s/%s", src, container, account, blob_path)
+        with src.open("rb") as file:
+            container_client.get_blob_client(blob_path).upload_blob(file, overwrite=True)
+
+    def upload_directory(self, src: Path, dst: str) -> int:
+        """Upload directory recursively to Azure Blob storage with parallel file uploads."""
+        container_client, container, account, base_path = self._get_container_client(dst)
+
+        files_to_upload = []
+        for file in src.rglob("*"):
+            if file.is_file():
+                rel_path = file.relative_to(src)
+                blob_path = f"{base_path}/{rel_path}" if base_path else str(rel_path)
+                files_to_upload.append((file, blob_path))
+
+        if not files_to_upload:
+            return 0
+
+        def upload_one(item: tuple[Path, str]) -> bool:
+            file_path, blob_path = item
+            logger.debug("Uploading %s to abfs://%s@%s/%s", file_path, container, account, blob_path)
+            try:
+                with file_path.open("rb") as file:
+                    container_client.get_blob_client(blob_path).upload_blob(file, overwrite=True)
+                return True
+            except OSError as e:
+                logger.error("Failed to upload %s: %s", file_path, e)
+                return False
+
+        count = 0
+        with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENCY) as executor:
+            futures = {executor.submit(upload_one, f): f for f in files_to_upload}
+            for future in as_completed(futures):
+                if future.result():
+                    count += 1
+
+        return count
+
+
 def get_storage_backend(path: str) -> StorageBackend:
     """Get the appropriate storage backend for a path.
 
     Args:
-        path: A local path, S3 URL (s3://...), or GCS URL (gs://...).
+        path: A local path, S3 URL (s3://...), GCS URL (gs://...), or Azure URL (abfs(s)://...).
 
     Returns:
         The appropriate StorageBackend instance.
@@ -828,26 +1284,28 @@ def get_storage_backend(path: str) -> StorageBackend:
         return S3Backend()
     if path.startswith("gs://"):
         return GCSBackend()
+    if path.startswith(("abfs://", "abfss://")):
+        return AzureBlobBackend()
     return LocalBackend()
 
 
 def is_cloud_path(path: str) -> bool:
-    """Check if a path is a cloud URL (S3 or GCS).
+    """Check if a path is a cloud URL (S3, GCS, or Azure Blob).
 
     Args:
         path: Path to check.
 
     Returns:
-        True if path is an S3 or GCS URL.
+        True if path is an S3, GCS, or Azure Blob URL.
     """
-    return path.startswith(("s3://", "gs://"))
+    return path.startswith(CLOUD_SCHEMES)
 
 
 def join_path(base: str, *parts: str) -> str:
     """Join path components, handling both local and cloud paths.
 
     Args:
-        base: Base path (local, S3, or GCS).
+        base: Base path (local, S3, GCS, or Azure Blob).
         *parts: Path components to join.
 
     Returns:

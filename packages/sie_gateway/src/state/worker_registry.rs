@@ -69,6 +69,12 @@ pub type OnWorkerHealthy = Arc<dyn Fn(&WorkerState) + Send + Sync>;
 /// ring snapshots and (optionally) to log a structured trace.
 pub type OnWorkerDegraded = Arc<dyn Fn(&WorkerState) + Send + Sync>;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HeartbeatSweep {
+    pub unhealthy: Vec<String>,
+    pub evicted: Vec<String>,
+}
+
 /// Concrete queue lane resolved from the worker registry.
 ///
 /// `pool_name` is the logical tenant/capacity pool. `machine_profile`
@@ -117,6 +123,7 @@ impl RegistrySnapshot {
 pub struct WorkerRegistry {
     workers: RwLock<HashMap<String, WorkerState>>,
     heartbeat_timeout: Duration,
+    stale_evict_after: Duration,
     on_worker_healthy: Option<OnWorkerHealthy>,
     on_worker_degraded: Option<OnWorkerDegraded>,
     /// Pre-computed snapshot for lock-free select_worker lookups.
@@ -155,9 +162,11 @@ impl WorkerRegistry {
         on_worker_healthy: Option<OnWorkerHealthy>,
         on_worker_degraded: Option<OnWorkerDegraded>,
     ) -> Self {
+        let stale_evict_after = heartbeat_timeout.checked_mul(20).unwrap_or(Duration::MAX);
         Self {
             workers: RwLock::new(HashMap::new()),
             heartbeat_timeout,
+            stale_evict_after,
             on_worker_healthy,
             on_worker_degraded,
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::default()),
@@ -300,10 +309,11 @@ impl WorkerRegistry {
         became_healthy
     }
 
-    pub async fn remove_worker(&self, url: &str) {
+    pub async fn remove_worker(&self, url: &str) -> bool {
         let mut workers = self.workers.write().await;
-        workers.remove(url);
+        let removed = workers.remove(url).is_some();
         self.rebuild_snapshot(&workers);
+        removed
     }
 
     pub async fn mark_unhealthy(&self, url: &str) {
@@ -509,20 +519,29 @@ impl WorkerRegistry {
         RingSnapshot::new(workers.into_iter().map(|w| w.name))
     }
 
-    pub async fn check_heartbeats(&self) -> Vec<String> {
+    pub async fn check_heartbeats(&self) -> HeartbeatSweep {
         let mut workers = self.workers.write().await;
         let now = Instant::now();
-        let mut unhealthy = Vec::new();
+        let mut sweep = HeartbeatSweep::default();
+        let mut evict = Vec::new();
         for (url, w) in workers.iter_mut() {
-            if w.healthy() && now.duration_since(w.last_heartbeat) > self.heartbeat_timeout {
+            let age = now.duration_since(w.last_heartbeat);
+            if age > self.stale_evict_after {
+                evict.push(url.clone());
+            } else if w.healthy() && age > self.heartbeat_timeout {
                 w.health = WorkerHealth::Unhealthy;
-                unhealthy.push(url.clone());
+                sweep.unhealthy.push(url.clone());
             }
         }
-        if !unhealthy.is_empty() {
+        for url in evict {
+            if workers.remove(&url).is_some() {
+                sweep.evicted.push(url);
+            }
+        }
+        if !sweep.unhealthy.is_empty() || !sweep.evicted.is_empty() {
             self.rebuild_snapshot(&workers);
         }
-        unhealthy
+        sweep
     }
 
     /// Resolve the NATS pool name for queue mode routing.
@@ -777,6 +796,7 @@ mod tests {
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
+            terminated: false,
         }
     }
 
@@ -1005,6 +1025,7 @@ mod tests {
             memory_used_bytes: Some(2000),
             memory_total_bytes: Some(8000),
             saturated: false,
+            terminated: false,
         };
         reg.update_worker("http://w1:8080", msg).await;
 
@@ -1032,6 +1053,7 @@ mod tests {
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
+            terminated: false,
         };
         reg.update_worker("http://w1:8080", msg).await;
 
@@ -1106,19 +1128,56 @@ mod tests {
         let reg = registry();
         reg.update_worker("http://w1:8080", make_msg(true)).await;
 
-        let unhealthy = reg.check_heartbeats().await;
-        assert!(unhealthy.is_empty());
+        let sweep = reg.check_heartbeats().await;
+        assert!(sweep.unhealthy.is_empty());
+        assert!(sweep.evicted.is_empty());
     }
 
     #[tokio::test]
     async fn test_check_heartbeats_expired() {
         let reg = WorkerRegistry::new(Duration::from_millis(1), None);
         reg.update_worker("http://w1:8080", make_msg(true)).await;
+        {
+            let mut workers = reg.workers.write().await;
+            workers.get_mut("http://w1:8080").unwrap().last_heartbeat =
+                Instant::now() - Duration::from_millis(10);
+        }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let sweep = reg.check_heartbeats().await;
+        assert_eq!(sweep.unhealthy, vec!["http://w1:8080"]);
+        assert!(sweep.evicted.is_empty());
+        assert_eq!(
+            reg.workers().await["http://w1:8080"].health,
+            WorkerHealth::Unhealthy
+        );
+    }
 
-        let unhealthy = reg.check_heartbeats().await;
-        assert_eq!(unhealthy, vec!["http://w1:8080"]);
+    #[tokio::test]
+    async fn test_check_heartbeats_evicts_stale_worker() {
+        let reg = WorkerRegistry::new(Duration::from_millis(1), None);
+        reg.update_worker("http://w1:8080", make_msg(true)).await;
+        {
+            let mut workers = reg.workers.write().await;
+            workers.get_mut("http://w1:8080").unwrap().last_heartbeat =
+                Instant::now() - Duration::from_millis(25);
+        }
+
+        let sweep = reg.check_heartbeats().await;
+        assert!(sweep.unhealthy.is_empty());
+        assert_eq!(sweep.evicted, vec!["http://w1:8080"]);
+        assert!(reg.workers().await.is_empty());
+        assert!(reg.healthy_workers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_heartbeats_keeps_not_ready_worker_with_fresh_heartbeat() {
+        let reg = WorkerRegistry::new(Duration::from_millis(1), None);
+        reg.update_worker("http://w1:8080", make_msg(true)).await;
+        reg.update_worker("http://w1:8080", make_msg(false)).await;
+
+        let sweep = reg.check_heartbeats().await;
+        assert!(sweep.unhealthy.is_empty());
+        assert!(sweep.evicted.is_empty());
         assert_eq!(
             reg.workers().await["http://w1:8080"].health,
             WorkerHealth::Unhealthy
@@ -1499,6 +1558,7 @@ mod tests {
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated,
+            terminated: false,
         }
     }
 

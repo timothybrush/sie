@@ -186,10 +186,10 @@
         "type": "object"
       },
       "ChatCompletionMessage": {
-        "description": "One chat message in an OpenAI chat-completions request.\n\nPer the strict allow-list parser, ``content`` is either a\nplain string OR a list of text-only content parts (``{type:\"text\"|\"input_text\",\ntext:\"...\"}``); ``image_url`` and ``input_image`` parts reject with 400\n``unsupported_field`` until a vision-capable model ships. Assistant\nmessages that carry ``tool_calls`` may set ``content: null``.\n\n``tool_calls`` is accepted only on ``role:\"assistant\"`` messages; each\nentry has the validated shape ``{id, type:\"function\", function:{name, arguments}}``\nwhere ``arguments`` is a JSON-encoded string (OpenAI convention).\n``tool_call_id`` is required on ``role:\"tool\"`` messages and rejected\non every other role.",
+        "description": "One chat message in an OpenAI chat-completions request.\n\nPer the strict allow-list parser, ``content`` is either a\nplain string OR a list of content parts (``{type:\"text\"|\"input_text\",\ntext:\"...\"}``). ``image_url`` / ``input_image`` parts carrying a base64\n``data:`` URI are accepted for generation models declaring ``inputs.image`` (non-vision\nmodels reject 400 ``unsupported_field``; remote URLs reject 400\n``invalid_request``). Assistant messages that carry ``tool_calls`` may set\n``content: null``.\n\n``tool_calls`` is accepted only on ``role:\"assistant\"`` messages; each\nentry has the validated shape ``{id, type:\"function\", function:{name, arguments}}``\nwhere ``arguments`` is a JSON-encoded string (OpenAI convention).\n``tool_call_id`` is required on ``role:\"tool\"`` messages and rejected\non every other role.",
         "properties": {
           "content": {
-            "description": "Either a string or an array of text-only content parts (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image content parts (`image_url` / `input_image`) reject with 400 unsupported_field until a vision-capable model ships. May be `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
+            "description": "Either a string or an array of content parts (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image parts (`image_url` / `input_image`) carrying a base64 `data:` URI are accepted for generation models that declare `inputs.image`; non-vision models reject with 400 unsupported_field and remote (non-`data:`) URLs reject with 400 invalid_request. May be `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
             "oneOf": [
               {
                 "type": "string"
@@ -197,13 +197,31 @@
               {
                 "items": {
                   "properties": {
+                    "image_url": {
+                      "description": "Image payload for `image_url` / `input_image` parts: a base64 `data:` URI, either as a bare string or as `{ \"url\": \"data:...\" }`. Remote (non-`data:`) URLs reject with 400 invalid_request.",
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "properties": {
+                            "url": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ]
+                    },
                     "text": {
                       "type": "string"
                     },
                     "type": {
                       "enum": [
                         "text",
-                        "input_text"
+                        "input_text",
+                        "image_url",
+                        "input_image"
                       ],
                       "type": "string"
                     }
@@ -2550,7 +2568,7 @@
         "type": "object"
       },
       "ResponsesRequest": {
-        "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field`` until a VL profile ships.",
+        "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field``: the Responses surface is\n  text-only. (Vision input is supported on ``/v1/chat/completions``.)",
         "properties": {
           "input": {
             "description": "Either a string prompt OR an array of `{role, content}` messages (array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of text-only content parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
@@ -2890,7 +2908,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.2"
+    "version": "0.6.3"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3096,7 +3114,7 @@
     },
     "/v1/chat/completions": {
       "post": {
-        "description": "OpenAI-compatible chat completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. Streaming (`stream: true`) is supported and emits SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates out as per-`choice_index` delta chunks with per-choice closure chunks (each carrying `finish_reason`) before the single global `[DONE]`. Content is either a string or an array of text-only content parts; image content parts (`image_url` / `input_image`) reject with 400 `unsupported_field`. `lora_adapter` is forwarded to the worker as a top-level `lora_path` generation kwarg.",
+        "description": "OpenAI-compatible chat completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. Streaming (`stream: true`) is supported and emits SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates out as per-`choice_index` delta chunks with per-choice closure chunks (each carrying `finish_reason`) before the single global `[DONE]`. Content is either a string or an array of content parts; image parts (`image_url` / `input_image`) with a base64 `data:` URI are accepted for generation models declaring `inputs.image` (non-vision/encode-only models reject 400 `unsupported_field`; remote URLs reject 400 `invalid_request`). `lora_adapter` is forwarded to the worker as a top-level `lora_path` generation kwarg.",
         "operationId": "proxy_chat",
         "parameters": [
           {

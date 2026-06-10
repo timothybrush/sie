@@ -361,8 +361,9 @@ Backend selection is URL-driven (`sie_sdk.storage.get_storage_backend`):
 - Local filesystem (default).
 - `s3://bucket/prefix` — S3.
 - `gs://bucket/prefix` — GCS.
+- `abfs(s)://container@account.dfs.core.windows.net/prefix` — Azure Blob / ADLS Gen2.
 
-The **local** backend's `write_text` is atomic: it writes via `tempfile.mkstemp` in the same directory as the destination, `fsync`s, then `Path.replace`s. A mid-write crash cannot leave the destination truncated or empty. The cloud backends (`S3Backend`, `GCSBackend`) implement `write_text` as a single `put_object` / `upload_from_string`; object-store PUTs are last-writer-wins and observably atomic at the object level, but they do not use the tempfile + replace pattern. The atomicity property matters most for the `epoch` file: `ConfigStore.read_epoch` silently maps a malformed or empty integer to `0`, so a zero-byte epoch file would collapse the drift-detection mechanism (`remote == local == 0` would read as "in sync forever").
+The **local** backend's `write_text` is atomic: it writes via `tempfile.mkstemp` in the same directory as the destination, `fsync`s, then `Path.replace`s. A mid-write crash cannot leave the destination truncated or empty. The cloud backends (`S3Backend`, `GCSBackend`, `AzureBlobBackend`) implement `write_text` as a single-object write; object-store writes are last-writer-wins and observably atomic at the object level, but they do not use the tempfile + replace pattern. The atomicity property matters most for the `epoch` file: `ConfigStore.read_epoch` silently maps a malformed or empty integer to `0`, so a zero-byte epoch file would collapse the drift-detection mechanism (`remote == local == 0` would read as "in sync forever").
 
 `ConfigStore.increment_epoch` is a naive read-modify-write. Its single-writer assumption is enforced at the FastAPI layer by the per-app write lock (§3).
 

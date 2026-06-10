@@ -521,8 +521,8 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     // ignore. Default is enabled because the sidecar pod has no
     // `/ws/status` endpoint (that endpoint lives on the Python
     // container) and therefore forces the gateway into `health_mode=nats`.
-    let health_publisher_handle = if health_publish_enabled() {
-        let pub_cfg = crate::health_publisher::HealthPublisherConfig {
+    let health_publisher_config = if health_publish_enabled() {
+        Some(crate::health_publisher::HealthPublisherConfig {
             worker_id: config.worker_id.clone(),
             bundle: config.bundle.clone(),
             pool_name: config.pool.clone(),
@@ -530,17 +530,19 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
             gpu_count: config.gpu_count,
             bundle_config_hash: config_apply_state.bundle_config_hash(),
             interval: Duration::from_millis(config.health_publish_interval_ms),
-        };
-        Some(crate::health_publisher::spawn(
-            nats_client.clone(),
-            pub_cfg,
-            Arc::clone(&readiness),
-            shutdown.clone(),
-        ))
+        })
     } else {
         info!("nats-health: SIE_HEALTH_PUBLISH_ENABLED=false; skipping heartbeat publisher");
         None
     };
+    let health_publisher_handle = health_publisher_config.as_ref().map(|pub_cfg| {
+        crate::health_publisher::spawn(
+            nats_client.clone(),
+            pub_cfg.clone(),
+            Arc::clone(&readiness),
+            shutdown.clone(),
+        )
+    });
 
     // --- Main pull loop
     run_pull_loop(
@@ -569,16 +571,32 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     heartbeat_handle.abort();
     let _ = heartbeat_handle.await; // best-effort join
 
-    // Stop the NATS health publisher AFTER `mark_draining`. The
-    // publisher reads `Readiness::snapshot().is_ready()` on every
-    // tick, so the now-draining flag means whatever heartbeat it
-    // sends from here onwards already announces `ready=false`. We
-    // still abort it explicitly because shutdown raced past the
-    // tick interval; without the abort it'd run for one more cycle
-    // before observing the shutdown signal.
+    // Let the periodic NATS health publisher observe shutdown and emit
+    // its tombstone before we move on. Aborting it immediately here can
+    // cut off that publish during Kubernetes termination, leaving the
+    // gateway with a stale unhealthy registry row until the fallback TTL.
     if let Some(h) = health_publisher_handle {
-        h.abort();
-        let _ = h.await;
+        let mut h = h;
+        tokio::select! {
+            res = &mut h => {
+                if let Err(e) = res {
+                    warn!(error = %e, "nats-health: heartbeat publisher task failed during shutdown");
+                }
+            }
+            _ = sleep(Duration::from_secs(2)) => {
+                warn!("nats-health: heartbeat publisher did not stop before tombstone deadline");
+                h.abort();
+                let _ = h.await;
+            }
+        }
+    }
+    // Idempotent fallback: the publisher emits the first tombstone as
+    // soon as shutdown fires; this second publish covers the case where
+    // that task had already exited or hit a transient publish error.
+    if let Some(pub_cfg) = &health_publisher_config {
+        if let Err(e) = crate::health_publisher::publish_tombstone(&nats_client, pub_cfg).await {
+            warn!(error = %e, "nats-health: shutdown tombstone publish failed");
+        }
     }
     if let Some(h) = nats_consumer_reconciler_handle {
         h.abort();

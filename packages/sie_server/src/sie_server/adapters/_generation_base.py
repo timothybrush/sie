@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Literal, cast
 
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
+from sie_server.types.inputs import ImageInput
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,7 @@ class GenerationAdapter(ModelAdapter):
         logit_bias: dict[str, float] | None = None,
         logprobs: bool = False,
         top_logprobs: int | None = None,
+        images: list[ImageInput] | None = None,
     ) -> AsyncIterator[GenerationChunk]:
         """Stream generation chunks from a prompt.
 
@@ -279,6 +281,13 @@ class GenerationAdapter(ModelAdapter):
                 with per-token log-probabilities.
             top_logprobs: How many alternates per position; only
                 consulted when ``logprobs`` is True.
+            images: Optional list of wire-format :class:`ImageInput`
+                entries for vision-language models. The ``prompt`` is
+                expected to already carry the model's image placeholder
+                tokens (rendered by the chat template upstream); the
+                adapter forwards the image bytes to the engine. ``None``
+                or empty for text-only generation. Text-only adapters may
+                ignore this argument.
 
         Yields:
             :class:`GenerationChunk` instances. At least one terminal

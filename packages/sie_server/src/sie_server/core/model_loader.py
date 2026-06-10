@@ -561,11 +561,16 @@ class ModelLoader:
         Returns:
             LoadedModel containing the loaded state.
         """
-        # Get preprocessor from adapter - all adapters implement get_preprocessor()
-        preprocessor = adapter.get_preprocessor()
-
-        # Register the preprocessor based on its modality
-        if preprocessor is not None:
+        # Get preprocessor(s) from adapter - all adapters implement get_preprocessor().
+        # Most return a single preprocessor; multi-modal adapters (e.g. NemoColEmbed v1,
+        # which needs a text preprocessor for queries AND an image preprocessor for
+        # documents) may return a list. Register each by its modality.
+        preprocessors = adapter.get_preprocessor()
+        if not isinstance(preprocessors, list):
+            preprocessors = [preprocessors]
+        for preprocessor in preprocessors:
+            if preprocessor is None:
+                continue
             modality = getattr(preprocessor, "modality", None)
             if modality == "text":
                 self._preprocessor_registry._register(name, preprocessor)

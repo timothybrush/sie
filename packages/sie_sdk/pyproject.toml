@@ -1,6 +1,6 @@
 [project]
 name = "sie-sdk"
-version = "0.6.2"
+version = "0.6.3"
 description = "Search Inference Engine - Python SDK"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -27,6 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 storage = [
+    "azure-identity>=1.17,<2",
+    "azure-storage-blob>=12.20,<13",
     "boto3>=1.35,<2",
     "google-cloud-storage>=2.18,<3",
     "huggingface_hub[hf_transfer]>=0.26",

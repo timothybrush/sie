@@ -2585,6 +2585,64 @@ enum ChatParamsResult {
     Err(Response),
 }
 
+/// Extract an inline OpenAI ``image_url`` value into ``(base64, format)``.
+///
+/// Only base64 ``data:`` URIs are accepted — the gateway never fetches
+/// remote ``http(s)`` URLs (SSRF surface + a blocking network call on the
+/// request path; clients inline images as data URIs, which the SDK does).
+/// The ``url`` may be a bare string or the ``{"url": "data:..."}`` object
+/// shape.
+///
+/// Returns the **base64 payload string** (validated to decode and be
+/// non-empty) plus the format hint parsed from the MIME subtype. We keep
+/// the base64 *string* rather than raw bytes because the work item travels
+/// through the sidecar's ``serde_json::Value``, which can't carry a msgpack
+/// ``bin`` — see :struct:`ChatImage`. The worker base64-decodes it.
+fn decode_image_data_uri(value: &serde_json::Value) -> Result<(String, Option<String>), String> {
+    use base64::Engine as _;
+
+    let url = match value {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(o) => o
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "image_url.url must be a non-empty string".to_string())?,
+        _ => return Err("image_url must be a string or an object with a 'url'".to_string()),
+    };
+    if url.is_empty() {
+        return Err("image_url.url must be a non-empty string".to_string());
+    }
+    let rest = url
+        .strip_prefix("data:")
+        .ok_or_else(|| "image content must be an inline base64 'data:' URI; remote URL fetching is not supported".to_string())?;
+    let (header, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| "malformed image data URI (missing ',')".to_string())?;
+    let mut params = header.split(';');
+    let mime = params.next().unwrap_or("");
+    if !mime.starts_with("image/") {
+        // Reject ``data:text/...`` and ``data:;base64,...`` — only image media types.
+        return Err("image data URI must have an image/* media type".to_string());
+    }
+    if !params.any(|p| p == "base64") {
+        return Err("image data URI must be base64-encoded".to_string());
+    }
+    let format = mime
+        .split_once('/')
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let payload = payload.trim();
+    // Validate at the edge (reject malformed base64 / empty image) so the
+    // client gets a clean 400, but transport the base64 string itself.
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("invalid base64 image data: {e}"))?;
+    if decoded.is_empty() {
+        return Err("image data URI decoded to empty bytes".to_string());
+    }
+    Ok((payload.to_string(), format))
+}
+
 /// Validate an OpenAI ``/v1/chat/completions`` request body against
 /// the chat-completions supported subset.
 ///
@@ -2688,6 +2746,11 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
         }
     };
     let mut messages: Vec<publisher::ChatMessage> = Vec::with_capacity(messages_arr.len());
+    // Cap total images per request so an oversized vision request fails here —
+    // before decoding every part and publishing the work — rather than at the
+    // worker. Mirrors the worker's ``_MAX_IMAGES_PER_REQUEST``.
+    const MAX_IMAGES_PER_REQUEST: usize = 16;
+    let mut total_images: usize = 0;
     // ``tool`` is allowed so the multi-turn tool-use loop works: the
     // caller replays the assistant's tool_call request and the tool
     // result back into ``messages`` for the model's final answer.
@@ -2876,11 +2939,23 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
         // ``content`` is required EXCEPT on an assistant message that
         // carries tool_calls (OpenAI sends content:null there). Tool and
         // normal messages still require a string content.
+        // Images decoded from this message's ``image_url`` content parts.
+        // Whether the model may actually accept them is gated after model
+        // resolution (mirrors the grammar/tools capability gates) — parsing
+        // here is capability-agnostic because the model isn't resolved yet.
+        let mut message_images: Vec<publisher::ChatImage> = Vec::new();
+        // Ordered text↔image layout, preserving the parts' original order so
+        // the worker can interleave placeholders (vs. images-first). Only the
+        // placeholder positions depend on this; bytes still ride
+        // ``message_images`` in order. Populated only for the Array branch and
+        // only forwarded when the message has ≥1 image (#1294).
+        let mut content_parts: Vec<publisher::ContentPart> = Vec::new();
         let content = match item_obj.get("content") {
             Some(serde_json::Value::String(c)) => c.clone(),
-            // OpenAI multimodal content-parts. Concatenate ``text`` parts;
-            // ``image_url`` is rejected because no vision-capable generation
-            // model is configured (the contract is ready for when one lands).
+            // OpenAI multimodal content-parts. Concatenate ``text`` parts and
+            // decode ``image_url`` parts into ``message_images`` (the vision
+            // capability gate runs after model resolution); record the ordered
+            // layout in ``content_parts`` so interleaving survives to the worker.
             //
             // M13: parts with missing/non-string ``text`` (or no ``type``)
             // previously slipped through via ``filter_map`` — they now
@@ -2909,7 +2984,11 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
                     };
                     match ptype {
                         "text" | "input_text" => match part_obj.get("text") {
-                            Some(serde_json::Value::String(t)) => text.push_str(t),
+                            Some(serde_json::Value::String(t)) => {
+                                text.push_str(t);
+                                content_parts
+                                    .push(publisher::ContentPart::Text { text: t.clone() });
+                            }
                             Some(_) => {
                                 return bad(
                                     &format!("messages[{idx}].content[{pi}].text must be a string"),
@@ -2928,13 +3007,41 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
                             }
                         },
                         "image_url" | "input_image" => {
-                            return bad(
-                                &format!(
-                                    "messages[{idx}].content[{pi}]: image content is not supported (no vision-capable model is configured)"
-                                ),
-                                Some(&format!("messages[{idx}].content[{pi}].type")),
-                                oai_code::UNSUPPORTED_FIELD,
-                            );
+                            let Some(image_url) = part_obj.get("image_url") else {
+                                return bad(
+                                    &format!(
+                                        "messages[{idx}].content[{pi}].image_url is required for image content parts"
+                                    ),
+                                    Some(&format!("messages[{idx}].content[{pi}].image_url")),
+                                    oai_code::INVALID_REQUEST,
+                                );
+                            };
+                            total_images += 1;
+                            if total_images > MAX_IMAGES_PER_REQUEST {
+                                return bad(
+                                    &format!(
+                                        "too many images ({total_images}); maximum is {MAX_IMAGES_PER_REQUEST} per request"
+                                    ),
+                                    Some(&format!("messages[{idx}].content[{pi}].image_url")),
+                                    oai_code::INVALID_REQUEST,
+                                );
+                            }
+                            match decode_image_data_uri(image_url) {
+                                Ok((data, format)) => {
+                                    // Large work items (multi-MB images) are offloaded to
+                                    // the object store by ``publish_generate`` and bounded
+                                    // by the request body cap, so no inline-size gate here.
+                                    message_images.push(publisher::ChatImage { data, format });
+                                    content_parts.push(publisher::ContentPart::Image);
+                                }
+                                Err(reason) => {
+                                    return bad(
+                                        &format!("messages[{idx}].content[{pi}]: {reason}"),
+                                        Some(&format!("messages[{idx}].content[{pi}].image_url")),
+                                        oai_code::INVALID_REQUEST,
+                                    );
+                                }
+                            }
                         }
                         other => {
                             return bad(
@@ -2962,11 +3069,25 @@ fn chat_params_from_json(body: &serde_json::Value) -> ChatParamsResult {
                 );
             }
         };
+        let has_images = !message_images.is_empty();
         messages.push(publisher::ChatMessage {
             role,
             content,
             tool_calls,
             tool_call_id,
+            images: if has_images {
+                Some(message_images)
+            } else {
+                None
+            },
+            // Forward the ordered layout only for multimodal messages — a
+            // text-only message keeps ``content_parts: None`` and renders from
+            // ``content`` as before (no wire bloat, no behavior change).
+            content_parts: if has_images {
+                Some(content_parts)
+            } else {
+                None
+            },
         });
     }
 
@@ -4669,6 +4790,38 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
                     .into_response();
             }
         }
+        // Vision capability gate. ``image_url`` content parts were decoded
+        // into ``ChatMessage.images`` capability-agnostically (the model
+        // wasn't resolved yet); reject here unless the model YAML declares
+        // ``inputs.image: true``. Mirrors the tools/grammar gates.
+        let has_images = params
+            .messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        if has_images {
+            // Vision *generation* requires both image input AND a generation
+            // task — ``inputs.image`` alone is also set by encode-only image
+            // models (CLIP/SigLIP), which must not accept a chat image request.
+            let image_supported = info.info_extras.supports_vision_generation();
+            if !image_supported {
+                metrics::record_rejected_request_for_pool(
+                    "unknown",
+                    "",
+                    &bundle,
+                    "vision_capability",
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_openai_error(
+                        format!("Model '{model_name}' does not support image input"),
+                        oai_type::INVALID_REQUEST,
+                        Some("messages"),
+                        oai_code::UNSUPPORTED_FIELD,
+                    )),
+                )
+                    .into_response();
+            }
+        }
     } else if params.grammar.is_some() {
         // No model info means we cannot determine grammar capabilities;
         // safer to reject than to publish work the model cannot honour.
@@ -4694,6 +4847,24 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
                 format!("Model '{model_name}' does not support tool calling (no model info)"),
                 oai_type::INVALID_REQUEST,
                 Some("tools"),
+                oai_code::UNSUPPORTED_FIELD,
+            )),
+        )
+            .into_response();
+    } else if params
+        .messages
+        .iter()
+        .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+    {
+        // Same defensive rejection for image input when the model is
+        // unknown — safer than publishing vision work the model can't honour.
+        metrics::record_rejected_request_for_pool("unknown", "", &bundle, "vision_capability");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_openai_error(
+                format!("Model '{model_name}' does not support image input (no model info)"),
+                oai_type::INVALID_REQUEST,
+                Some("messages"),
                 oai_code::UNSUPPORTED_FIELD,
             )),
         )
@@ -5639,6 +5810,10 @@ fn responses_params_from_json(body: &serde_json::Value) -> ResponsesParamsResult
                     content,
                     tool_calls: None,
                     tool_call_id: None,
+                    // Responses-API path is text-only for now; vision arrives
+                    // via /v1/chat/completions (the cut-your-bill skill surface).
+                    images: None,
+                    content_parts: None,
                 });
             }
             publisher::GenerateInput::Messages { messages }
@@ -11678,6 +11853,7 @@ mod tests {
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
+            terminated: false,
         }
     }
 
@@ -12797,7 +12973,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chat_params_rejects_image_content_part() {
+    async fn test_chat_params_rejects_remote_image_url() {
+        // Remote (http/https) image URLs are not fetched at the gateway —
+        // clients must inline images as base64 data URIs.
         let mut body = _chat_body_min("m");
         body["messages"] = serde_json::json!([
             {"role": "user", "content": [
@@ -12806,10 +12984,125 @@ mod tests {
             ]}
         ]);
         let v = _expect_chat_err(body).await;
-        assert_eq!(v["error"]["code"], "unsupported_field");
-        // M13: the rejection point is now precise — the offending part's
-        // ``.type`` rather than the whole content array.
-        assert_eq!(v["error"]["param"], "messages[0].content[1].type");
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert_eq!(v["error"]["param"], "messages[0].content[1].image_url");
+    }
+
+    #[test]
+    fn test_chat_params_accepts_image_data_uri() {
+        // A base64 ``data:`` URI is decoded into ``ChatMessage.images``; the
+        // text part lands in ``content``. (Capability gating happens later in
+        // ``proxy_chat`` after model resolution, not here.)
+        let mut body = _chat_body_min("m");
+        body["messages"] = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            ]}
+        ]);
+        let p = _expect_chat_ok(body);
+        assert_eq!(p.messages[0].content, "what is this?");
+        let images = p.messages[0].images.as_ref().expect("images populated");
+        assert_eq!(images.len(), 1);
+        // ``data`` is the base64 payload string (decodes to b"hello"); kept as
+        // a string so it survives the sidecar's serde_json::Value.
+        assert_eq!(images[0].data, "aGVsbG8=");
+        assert_eq!(images[0].format.as_deref(), Some("png"));
+    }
+
+    #[test]
+    fn test_chat_params_preserves_interleaved_content_parts() {
+        // #1294: text↔image interleaving must survive into ``content_parts`` in
+        // the original order, while ``images`` stays a flat in-order list and
+        // ``content`` stays the concatenated text (back-compat).
+        let mut body = _chat_body_min("m");
+        body["messages"] = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "Page 1:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1nQQ=="}},
+                {"type": "text", "text": "Page 2:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1nQg=="}},
+                {"type": "text", "text": "which has a cat?"},
+            ]}
+        ]);
+        let p = _expect_chat_ok(body);
+        // Flat fields unchanged: concatenated text + in-order image bytes.
+        assert_eq!(p.messages[0].content, "Page 1:Page 2:which has a cat?");
+        let images = p.messages[0].images.as_ref().expect("images populated");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].data, "aW1nQQ==");
+        assert_eq!(images[1].data, "aW1nQg==");
+        // Ordered layout records the interleaving the worker renders in place.
+        let parts = p.messages[0]
+            .content_parts
+            .as_ref()
+            .expect("content_parts populated for vision msg");
+        assert_eq!(parts.len(), 5);
+        assert!(matches!(&parts[0], publisher::ContentPart::Text { text } if text == "Page 1:"));
+        assert!(matches!(parts[1], publisher::ContentPart::Image));
+        assert!(matches!(&parts[2], publisher::ContentPart::Text { text } if text == "Page 2:"));
+        assert!(matches!(parts[3], publisher::ContentPart::Image));
+        assert!(
+            matches!(&parts[4], publisher::ContentPart::Text { text } if text == "which has a cat?")
+        );
+    }
+
+    #[test]
+    fn test_chat_params_text_only_has_no_content_parts() {
+        // Text-only messages must NOT carry content_parts (no wire bloat, no
+        // behavior change) — the images-first/legacy render path stays in use.
+        let mut body = _chat_body_min("m");
+        body["messages"] = serde_json::json!([{"role": "user", "content": "hello"}]);
+        let p = _expect_chat_ok(body);
+        assert!(p.messages[0].content_parts.is_none());
+        // A multipart array with NO image also stays content_parts-free.
+        let mut body2 = _chat_body_min("m");
+        body2["messages"] = serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        ]);
+        let p2 = _expect_chat_ok(body2);
+        assert_eq!(p2.messages[0].content, "ab");
+        assert!(p2.messages[0].content_parts.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_chat_params_rejects_too_many_images() {
+        let mut body = _chat_body_min("m");
+        let mut parts = vec![serde_json::json!({"type": "text", "text": "describe"})];
+        for _ in 0..17 {
+            parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aGk="}
+            }));
+        }
+        body["messages"] = serde_json::json!([{"role": "user", "content": parts}]);
+        let v = _expect_chat_err(body).await;
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too many images"));
+    }
+
+    #[test]
+    fn test_decode_image_data_uri_variants() {
+        // Returns the base64 payload string + format. Bare-string url form +
+        // object form both work.
+        let (data, fmt) =
+            decode_image_data_uri(&serde_json::json!("data:image/jpeg;base64,aGk=")).unwrap();
+        assert_eq!(data, "aGk="); // decodes to b"hi"
+        assert_eq!(fmt.as_deref(), Some("jpeg"));
+        let (data2, _) =
+            decode_image_data_uri(&serde_json::json!({"url": "data:image/png;base64,aGVsbG8="}))
+                .unwrap();
+        assert_eq!(data2, "aGVsbG8="); // decodes to b"hello"
+                                       // Remote URL, missing base64 marker, and bad base64 all reject.
+        assert!(decode_image_data_uri(&serde_json::json!("https://x/y.png")).is_err());
+        assert!(decode_image_data_uri(&serde_json::json!("data:image/png,aGk=")).is_err());
+        assert!(decode_image_data_uri(&serde_json::json!("data:image/png;base64,!!!")).is_err());
+        // Non-image media types reject (must be image/*).
+        assert!(decode_image_data_uri(&serde_json::json!("data:text/plain;base64,aGk=")).is_err());
+        assert!(decode_image_data_uri(&serde_json::json!("data:;base64,aGk=")).is_err());
     }
 
     #[test]

@@ -512,7 +512,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             match nats_manager.get_client().await {
                 Some(client) => {
                     let jetstream = async_nats::jetstream::new(client.clone());
-                    let payload_store = create_payload_store(&config.payload_store_url).await;
+                    let payload_store = create_payload_store(&config.payload_store_url).await?;
                     let publisher = Arc::new(queue::publisher::WorkPublisher::new(
                         jetstream,
                         nats_manager.router_id().to_string(),

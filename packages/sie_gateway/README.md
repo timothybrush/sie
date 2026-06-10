@@ -20,7 +20,7 @@ See [`docs/architecture-guide.md`](docs/architecture-guide.md) for the authorita
 - **Auth** — static-token auth via `SIE_AUTH_TOKEN[S]`; config write idempotency belongs to `sie-config`
 - **Demand tracking and readiness** — provisioning responses, pending-demand metrics, and worker ack checks after config changes
 - **Observability** — Prometheus metrics, structured logging, audit middleware, and HTML/WebSocket status surfaces
-- **Optional cloud storage** — `cloud-storage` feature enables S3/GCS payload backends; the Docker build enables it
+- **Optional cloud storage** — `cloud-storage` feature enables S3/GCS/Azure Blob payload backends; the Docker build enables it
 
 ## Quick Start
 
@@ -111,7 +111,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_GATEWAY_GPU_ALIASES` | | JSON map of request aliases to canonical machine profiles |
 | `SIE_BUNDLES_DIR` | `bundles` | Optional bundle filesystem seed. Unset in default Helm deploys: the gateway pulls bundles from `sie-config` via `GET /v1/configs/bundles{,/{id}}` at startup and the registry's filesystem reload is a no-op. Only set by the `gateway.embeddedConfigs` / `gateway.configMap` overlays which mount a ConfigMap at `/configs/bundles`. |
 | `SIE_MODELS_DIR` | `models` | Optional model filesystem seed. Same semantics as `SIE_BUNDLES_DIR`: unset in default deploys, runtime model writes always go to `sie-config` and the gateway replays them via `GET /v1/configs/export`. |
-| `SIE_PAYLOAD_STORE_URL` | unset | Shared payload offload store path. When unset, large-payload offload is disabled. Queue deployments should use `s3://` or `gs://`; local filesystem paths only work when gateway and workers share the same path |
+| `SIE_PAYLOAD_STORE_URL` | unset | Shared payload offload store path. When unset, large-payload offload is disabled. Queue deployments should use `s3://`, `gs://`, `abfs://`, or `abfss://`; local filesystem paths only work when gateway and workers share the same path |
 
 ## API Endpoints
 

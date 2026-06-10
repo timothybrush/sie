@@ -42,7 +42,7 @@ When scaling from zero, expect the following latencies:
 
 ### Reducing Cold Start Time
 
-1. **Use cluster cache**: Pre-populate S3/GCS with model weights (`--cluster-cache`)
+1. **Use cluster cache**: Pre-populate object storage with model weights (`--cluster-cache`)
 2. **Set minReplicas=1**: Keep one warm replica per critical GPU type
 3. **Use reserved capacity**: Avoid spot for latency-sensitive workloads
 4. **Pre-warm models**: Call `/v1/encode/{model}` on startup to load weights
@@ -55,9 +55,9 @@ When a pool is scaling from zero, the gateway returns:
 
 The SDK handles this automatically with configurable retries.
 
-## Cluster model cache (S3/GCS)
+## Cluster model cache
 
-Pre-populate a shared bucket with model weights so worker pods don't re-download from HuggingFace on every cold start. The Python SDK pulls from the bucket first and falls back to HF on miss.
+Pre-populate shared object storage with model weights so worker pods don't re-download from HuggingFace on every cold start. The Python SDK pulls from the cache first and falls back to HF on miss.
 
 **AWS (Terraform-managed bucket):**
 
@@ -78,7 +78,7 @@ helm upgrade --install sie-cluster . \
 
 The Terraform output already includes the `/models` prefix, so the same URL is used for both `sie-admin --target` and `clusterCache.url`.
 
-**Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...` or `gs://...` URL the workload Service Account can read; populate it with the same `sie-admin cache weights sync --dest ...` command.
+**Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...`, `gs://...`, `abfs://...`, or `abfss://...` URL the workload identity can read; populate it with the same `sie-admin cache weights sync --dest ...` command.
 
 ## Autoscaling
 

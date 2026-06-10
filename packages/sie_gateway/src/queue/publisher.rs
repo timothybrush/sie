@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures_util::future::try_join_all;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -154,10 +154,43 @@ impl Default for GenerateInput {
     }
 }
 
+/// One image attached to a chat message, extracted from an OpenAI
+/// ``image_url`` data URI at the gateway.
+///
+/// ``data`` is the **base64 payload string**, NOT raw bytes. This is
+/// deliberate: the generate work item travels through the sidecar's
+/// ``WorkItem.generate: serde_json::Value``, and ``serde_json::Value``
+/// cannot hold a msgpack ``bin`` (rmp_serde rejects it with "invalid type:
+/// byte array"). A base64 string round-trips cleanly through
+/// ``serde_json::Value`` with no sidecar changes. The worker base64-decodes
+/// it back to bytes (see ``_parse_message_images_field``).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImage {
+    /// Base64-encoded image bytes (standard alphabet, no ``data:`` prefix).
+    pub data: String,
+    /// Format hint parsed from the data-URI MIME subtype (e.g. ``"png"``).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+/// One ordered content part of a multimodal chat message — either a text
+/// fragment or an image placeholder (the bytes ride the message's flat
+/// ``images`` list, consumed in order as ``Image`` parts are encountered).
+/// Serializes internally-tagged so the worker reads ``{"type":"text",…}`` /
+/// ``{"type":"image"}`` and round-trips through ``serde_json::Value`` on the
+/// sidecar (no msgpack ``bin`` — same constraint as :struct:`ChatImage`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    Image,
+}
+
 /// One chat message in the OpenAI request shape. Role is validated
-/// against the allowed set at the gateway; ``content`` is currently a
-/// plain string (vision / multi-part content is out of scope on this
-/// surface).
+/// against the allowed set at the gateway; ``content`` carries the text
+/// (multi-part text parts are concatenated). Any ``image_url`` parts are
+/// decoded into ``images`` and gated on the model's vision capability
+/// after model resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -171,6 +204,22 @@ pub struct ChatMessage {
     /// tool-call it answers. Required by OpenAI on tool messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Vision input: images decoded from the message's ``image_url`` /
+    /// ``input_image`` content parts. ``None`` on text-only messages. The
+    /// worker renders one placeholder per image, in order, and forwards the
+    /// bytes to the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ChatImage>>,
+    /// Ordered content layout for multimodal messages: the original
+    /// text↔image interleaving from the OpenAI ``content`` parts array.
+    /// ``None`` on text-only / non-interleaved-legacy messages — the worker
+    /// then falls back to the images-first ``content`` + ``images`` render.
+    /// When present, the worker emits one image placeholder per ``Image`` part
+    /// *in place*, pulling bytes from ``images`` in order; only placeholder
+    /// positions change (the flat ``images`` list / ``image_data`` to the
+    /// engine is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_parts: Option<Vec<ContentPart>>,
 }
 
 /// Structured-output grammar.
@@ -503,6 +552,13 @@ pub struct WorkPublisher {
     /// generation request. Populated by ``publish_generate_streaming``
     /// and drained by ``handle_inbox`` when chunk envelopes arrive.
     pending_streams: DashMap<String, StreamCollector>,
+    /// Request ids whose generate work item was offloaded to the object
+    /// store (``payload_ref`` set, ``generate`` blanked). The blob lives at
+    /// ``{request_id}_0.bin`` and must be deleted once the stream finishes —
+    /// promptly at the terminal funnel (``handle_chunk``) and, as a backstop
+    /// for failure/timeout terminations, reconciled against ``pending_streams``
+    /// by the periodic ``cleanup_expired`` sweep.
+    offloaded_streams: DashSet<String>,
     /// Core NATS client (cancel publishes use core NATS, not
     /// JetStream). Populated lazily by
     /// :meth:`start_inbox_subscription`; reads on the cancel path
@@ -1048,6 +1104,7 @@ impl WorkPublisher {
             stream_info_cache: DashMap::new(),
             pending_results: DashMap::new(),
             pending_streams: DashMap::new(),
+            offloaded_streams: DashSet::new(),
             nats_client: tokio::sync::RwLock::new(None),
             inbox_handle: tokio::sync::Mutex::new(None),
             fallback_buckets: DashMap::new(),
@@ -1827,7 +1884,7 @@ impl WorkPublisher {
         }
 
         let work_item_id = format!("{}.0", shared.request_id);
-        let ref_item = WorkItemRef {
+        let mut ref_item = WorkItemRef {
             work_item_id: &work_item_id,
             request_id: shared.request_id,
             item_index: 0,
@@ -1860,8 +1917,36 @@ impl WorkPublisher {
             tracestate: shared.tracestate,
         };
 
-        let encoded =
+        let mut encoded =
             rmp_serde::to_vec_named(&ref_item).map_err(|e| format!("msgpack encode: {}", e))?;
+
+        // Offload large generate work items (e.g. multi-MB document images) to
+        // the object store so they don't exceed NATS's max payload — mirrors
+        // the encode/score paths. The blob is the ``generate`` params alone
+        // (base64-string image data, so it stays serde_json::Value-decodable on
+        // the sidecar). ``payload_ref`` lives at ``{request_id}_0.bin``; the
+        // sidecar fetches + inlines it before handing the work item to Python.
+        let offload_key;
+        if encoded.len() > PAYLOAD_OFFLOAD_THRESHOLD {
+            let generate = shared
+                .params
+                .generate
+                .as_ref()
+                .ok_or_else(|| "generate request missing params for offload".to_string())?;
+            let gen_blob = rmp_serde::to_vec_named(generate)
+                .map_err(|e| format!("msgpack encode offloaded generate: {}", e))?;
+            offload_key = format!("{}_0.bin", shared.request_id);
+            if let Err(e) = self.payload_store.put(&offload_key, &gen_blob).await {
+                warn!(error = %e, "failed to offload generate payload, sending inline");
+            } else {
+                ref_item.generate = None;
+                ref_item.payload_ref = Some(&offload_key);
+                encoded = rmp_serde::to_vec_named(&ref_item)
+                    .map_err(|e| format!("msgpack encode offloaded generate item: {}", e))?;
+                self.offloaded_streams.insert(shared.request_id.to_string());
+                metrics::QUEUE_PAYLOAD_OFFLOADS.inc();
+            }
+        }
 
         // Defense-in-depth dedup: stamp `Nats-Msg-Id` = request_id so a
         // gateway-side retry (or a duplicate publish racing on the same
@@ -2435,6 +2520,9 @@ impl WorkPublisher {
                     metrics::QUEUE_RESULT_WAIT
                         .with_label_values(&["generate"])
                         .observe(wait_secs);
+                    // Stream finished — drop any offloaded generate blob now
+                    // (the periodic reconcile is only the failure-path backstop).
+                    self.cleanup_offloaded_generate(&request_id).await;
                 }
             }
             ChunkApplied::SeqGap => {
@@ -2515,6 +2603,57 @@ impl WorkPublisher {
             }
             self.cleanup_offloaded_payloads(key, *total).await;
         }
+
+        // Reconcile offloaded generate blobs: any tracked request whose stream
+        // is no longer pending has terminated (success cleans up at the
+        // terminal funnel; this is the backstop for failure/timeout paths,
+        // including the sync ``fail_pending_stream`` which can't await).
+        //
+        // Check BOTH in-flight maps: ``publish_generate`` is shared with the
+        // batch generate arm (``publish_work``), which tracks requests in
+        // ``pending_results`` rather than ``pending_streams``. Excluding only
+        // ``pending_streams`` would let this sweep delete a batch request's
+        // offloaded blob mid-flight and break redelivery. (That arm is dead
+        // today — all generate goes through the streaming path — but this keeps
+        // the reconcile correct if it's ever wired up.)
+        let orphaned: Vec<String> = self
+            .offloaded_streams
+            .iter()
+            .filter(|id| {
+                !self.pending_streams.contains_key(id.key())
+                    && !self.pending_results.contains_key(id.key())
+            })
+            .map(|id| id.key().clone())
+            .collect();
+        for request_id in orphaned {
+            self.cleanup_offloaded_generate(&request_id).await;
+        }
+    }
+
+    /// Delete an offloaded generate blob (``{request_id}_0.bin``) and drop its
+    /// tracking entry. Best-effort + idempotent: a no-op when the request had
+    /// no offload, so it is safe to call on every stream termination.
+    async fn cleanup_offloaded_generate(&self, request_id: &str) {
+        // No-op for non-offloaded requests.
+        if !self.offloaded_streams.contains(request_id) {
+            return;
+        }
+        let key = format!("{request_id}_0.bin");
+        // Delete the blob FIRST and only drop the tracker on success, so a
+        // transient delete failure leaves the entry for the next periodic
+        // reconcile to retry instead of leaking the blob.
+        match self.payload_store.delete(&key).await {
+            Ok(()) => {
+                self.offloaded_streams.remove(request_id);
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "failed to delete offloaded generate payload; will retry on next reconcile"
+                );
+            }
+        }
     }
 
     async fn cleanup_pending_streams(&self) {
@@ -2554,6 +2693,10 @@ impl WorkPublisher {
                 metrics::QUEUE_RESULT_WAIT
                     .with_label_values(&["generate"])
                     .observe(wait_secs);
+                // Drop any offloaded blob for this shutdown-dropped stream. The
+                // periodic reconcile filters against ``pending_streams``, so an
+                // entry removed here would otherwise be missed at shutdown.
+                self.cleanup_offloaded_generate(&key).await;
             }
         }
     }
@@ -3299,6 +3442,102 @@ mod tests {
             GenerateInput::Prompt { .. } => panic!("expected Messages variant"),
         }
         assert_eq!(decoded.max_new_tokens, 8);
+    }
+
+    /// CRITICAL transport invariant: a generate work item carrying images
+    /// must decode as ``serde_json::Value`` — that's the type the sidecar's
+    /// ``WorkItem.generate`` uses, and ``serde_json::Value`` CANNOT hold a
+    /// msgpack ``bin`` (rmp_serde errors "invalid type: byte array"). Image
+    /// bytes therefore travel as a base64 *string* in ``ChatImage.data``.
+    /// This test pins that contract: had ``ChatImage.data`` been
+    /// ``#[serde(with = "serde_bytes")]`` (bin), the serde_json decode below
+    /// would fail and the feature would break through the real
+    /// NATS→sidecar→worker path.
+    #[test]
+    fn test_chat_message_images_survive_sidecar_serde_json_value() {
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "what is this?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![ChatImage {
+                data: "aGVsbG8=".to_string(), // base64 of b"hello"
+                format: Some("png".to_string()),
+            }]),
+            content_parts: None,
+        };
+        let mp = rmp_serde::to_vec_named(&msg).unwrap();
+        // (1) sidecar step: decode as serde_json::Value — MUST succeed.
+        let as_value: serde_json::Value = rmp_serde::from_slice(&mp)
+            .expect("ChatMessage with images must decode as serde_json::Value (no msgpack bin)");
+        assert_eq!(as_value["images"][0]["data"], "aGVsbG8=");
+        // (2) sidecar re-encode → worker typed decode: base64 survives.
+        let mp2 = rmp_serde::to_vec_named(&as_value).unwrap();
+        let back: ChatMessage = rmp_serde::from_slice(&mp2).unwrap();
+        let imgs = back.images.expect("images survive round-trip");
+        assert_eq!(imgs[0].data, "aGVsbG8=");
+        assert_eq!(imgs[0].format.as_deref(), Some("png"));
+    }
+
+    /// ``content_parts`` (the #1294 interleaving layout) must survive the same
+    /// NATS→sidecar(``serde_json::Value``)→worker round-trip, preserving the
+    /// text↔image ORDER and the internally-tagged shape the worker parses
+    /// (``{"type":"text","text":…}`` / ``{"type":"image"}``).
+    #[test]
+    fn test_content_parts_ordering_survives_sidecar_round_trip() {
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "Page 1:Page 2:which has a cat?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![
+                ChatImage {
+                    data: "aW1nQQ==".to_string(),
+                    format: Some("png".to_string()),
+                },
+                ChatImage {
+                    data: "aW1nQg==".to_string(),
+                    format: Some("png".to_string()),
+                },
+            ]),
+            content_parts: Some(vec![
+                ContentPart::Text {
+                    text: "Page 1:".to_string(),
+                },
+                ContentPart::Image,
+                ContentPart::Text {
+                    text: "Page 2:".to_string(),
+                },
+                ContentPart::Image,
+                ContentPart::Text {
+                    text: "which has a cat?".to_string(),
+                },
+            ]),
+        };
+        let mp = rmp_serde::to_vec_named(&msg).unwrap();
+        // (1) sidecar step: decode as serde_json::Value — MUST succeed.
+        let as_value: serde_json::Value = rmp_serde::from_slice(&mp).expect(
+            "ChatMessage with content_parts must decode as serde_json::Value (no msgpack bin)",
+        );
+        let parts = as_value["content_parts"]
+            .as_array()
+            .expect("content_parts is an array");
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Page 1:");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[3]["type"], "image");
+        assert_eq!(parts[4]["text"], "which has a cat?");
+        // (2) sidecar re-encode → worker typed decode: order survives.
+        let mp2 = rmp_serde::to_vec_named(&as_value).unwrap();
+        let back: ChatMessage = rmp_serde::from_slice(&mp2).unwrap();
+        let back_parts = back
+            .content_parts
+            .expect("content_parts survive round-trip");
+        assert!(matches!(&back_parts[0], ContentPart::Text { text } if text == "Page 1:"));
+        assert!(matches!(back_parts[1], ContentPart::Image));
+        assert!(matches!(back_parts[3], ContentPart::Image));
+        assert!(matches!(&back_parts[4], ContentPart::Text { text } if text == "which has a cat?"));
     }
 
     /// A round-trip through msgpack must preserve the shape — verifies

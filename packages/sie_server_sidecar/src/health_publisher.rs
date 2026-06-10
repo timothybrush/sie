@@ -126,6 +126,7 @@ impl HealthPublisherConfig {
 struct WorkerStatusPayload<'a> {
     name: &'a str,
     ready: bool,
+    terminated: bool,
     gpu_count: i32,
     machine_profile: &'a str,
     pool_name: &'a str,
@@ -136,6 +137,41 @@ struct WorkerStatusPayload<'a> {
     /// new IPC round-trip per heartbeat which isn't worth the
     /// cost for an informational field.
     loaded_models: &'a [&'a str],
+}
+
+fn encode_payload(
+    config: &HealthPublisherConfig,
+    ready: bool,
+    terminated: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let hash = config
+        .bundle_config_hash
+        .read()
+        .expect("bundle config hash lock poisoned");
+    let payload = WorkerStatusPayload {
+        name: &config.worker_id,
+        ready,
+        terminated,
+        gpu_count: config.gpu_count,
+        machine_profile: &config.machine_profile,
+        pool_name: &config.pool_name,
+        bundle: &config.bundle,
+        bundle_config_hash: hash.as_str(),
+        loaded_models: &[],
+    };
+    serde_json::to_vec(&payload)
+}
+
+pub async fn publish_tombstone(
+    nats: &Client,
+    config: &HealthPublisherConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let subject = config.subject();
+    let bytes = encode_payload(config, false, true)?;
+    nats.publish(subject.clone(), bytes.into()).await?;
+    nats.flush().await?;
+    info!(subject = %subject, "nats-health: shutdown tombstone published");
+    Ok(())
 }
 
 /// Spawn the heartbeat-publisher loop. The returned [`JoinHandle`]
@@ -176,36 +212,27 @@ pub fn spawn(
             tokio::select! {
                 biased;
                 _ = wait => {
-                    debug!(subject = %subject, "nats-health: shutdown observed; stopping publisher");
+                    debug!(subject = %subject, "nats-health: shutdown observed; publishing tombstone");
+                    if let Err(e) = publish_tombstone(&nats, &config).await {
+                        warn!(
+                            subject = %subject,
+                            error = %e,
+                            "nats-health: shutdown tombstone publish failed"
+                        );
+                    }
                     return;
                 }
                 _ = tick.tick() => {
                     let snap = readiness.snapshot();
                     let ready = snap.is_ready();
-                    let bytes = {
-                        let hash = config
-                            .bundle_config_hash
-                            .read()
-                            .expect("bundle config hash lock poisoned");
-                        let payload = WorkerStatusPayload {
-                            name: &config.worker_id,
-                            ready,
-                            gpu_count: config.gpu_count,
-                            machine_profile: &config.machine_profile,
-                            pool_name: &config.pool_name,
-                            bundle: &config.bundle,
-                            bundle_config_hash: hash.as_str(),
-                            loaded_models: &[],
-                        };
-                        match serde_json::to_vec(&payload) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "nats-health: serde_json encode failed (unexpected for static shape)"
-                                );
-                                continue;
-                            }
+                    let bytes = match encode_payload(&config, ready, false) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "nats-health: serde_json encode failed (unexpected for static shape)"
+                            );
+                            continue;
                         }
                     };
                     match nats.publish(subject.clone(), bytes.into()).await {
@@ -289,6 +316,7 @@ mod tests {
             let payload = WorkerStatusPayload {
                 name: &c.worker_id,
                 ready: true,
+                terminated: false,
                 gpu_count: c.gpu_count,
                 machine_profile: &c.machine_profile,
                 pool_name: &c.pool_name,
@@ -300,6 +328,7 @@ mod tests {
         };
         assert_eq!(json["name"], "worker-l4-0");
         assert_eq!(json["ready"], true);
+        assert_eq!(json["terminated"], false);
         assert_eq!(json["gpu_count"], 1);
         assert_eq!(json["machine_profile"], "l4");
         assert_eq!(json["pool_name"], "l4");
@@ -320,6 +349,7 @@ mod tests {
             let payload = WorkerStatusPayload {
                 name: &c.worker_id,
                 ready: true,
+                terminated: false,
                 gpu_count: c.gpu_count,
                 machine_profile: &c.machine_profile,
                 pool_name: &c.pool_name,
@@ -330,6 +360,23 @@ mod tests {
             serde_json::to_value(&payload).unwrap()
         };
         assert_eq!(json["bundle_config_hash"], "hash-next");
+    }
+
+    #[test]
+    fn tombstone_payload_marks_not_ready_and_terminated() {
+        let c = cfg();
+        let json: serde_json::Value =
+            serde_json::from_slice(&encode_payload(&c, false, true).unwrap()).unwrap();
+
+        assert_eq!(json["name"], "worker-l4-0");
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["terminated"], true);
+        assert_eq!(json["gpu_count"], 1);
+        assert_eq!(json["machine_profile"], "l4");
+        assert_eq!(json["pool_name"], "l4");
+        assert_eq!(json["bundle"], "default");
+        assert_eq!(json["bundle_config_hash"], "hash-abc");
+        assert_eq!(json["loaded_models"], serde_json::json!([]));
     }
 
     #[test]

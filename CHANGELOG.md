@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.6.3
+
+- chore(main): release 0.6.3
+- test: stabilize SDK timeout retry assertion
+- fix: fall back to relay on S3/GCS server-side copy failure
+- feat: add server-side copy fast path for cloud weight sync
+- fix: address final cloud storage review issues
+- fix: harden cloud cache sync paths
+- fix: address azure cache review feedback
+- feat: support azure blob cluster cache
+- feat: add azure blob payload store support
+- fix(generate): reject both-present image-bearing content layouts
+- fix(generate): image-free content_parts field must not shadow layout
+- feat(generate): preserve text/image content-part ordering
+- fix(nemo_colembed): trim left-padding rows from v1 conformant doc embeddings (#1163)
+- perf(nemo_colembed): engage conformant image preprocessing for v1 (#1163)
+- fix: evict stale gateway workers on shutdown
+- fix(generate): address huronat review on vision input (F2-F8)
+- fix(generate): address CodeRabbit review on vision input
+- feat(generate): add vision (image) input to generate()
+- fix(deps): clear HIGH Dependabot alerts (docling, rustls-webpki)
+- fix(bench): address CodeRabbit — accurate classification comment + quote-agnostic test
+- fix: align extraction quality evals with source baselines
+- feat: add m4 extraction model configs
+
 ## v0.6.2
 
 - chore(main): release 0.6.2

@@ -1,6 +1,6 @@
 [package]
 name = "sie-server-sidecar"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "SIE worker sidecar: NATS JetStream consumer, scheduler, IPC client, and GPU-independent prep for sie-server pods."
 
@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-async-nats = "0.38"
+async-nats = "0.49"
 futures-util = "0.3"
 
 serde = { version = "1", features = ["derive"] }
@@ -51,7 +51,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
 # Cloud payload store backends (opt-in, same shape as gateway)
-object_store = { version = "0.11", optional = true, features = ["aws", "gcp"] }
+object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "azure"] }
 url = { version = "2", optional = true }
 
 # HF fast-tokenizers. Used by `src/tokenize/` to verify the

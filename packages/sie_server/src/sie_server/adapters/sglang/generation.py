@@ -19,6 +19,7 @@ HTTP connection, which SGLang treats as a cancel signal. A best-effort
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import dataclasses
 import json
@@ -47,6 +48,7 @@ from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters.sglang import _server
 from sie_server.observability.metrics import GenerationStreamTimer
 from sie_server.types.grammar import GrammarSpec
+from sie_server.types.inputs import ImageInput, media_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,47 @@ def _resolve_read_timeout() -> float | None:
 
 
 _GENERATE_READ_TIMEOUT_S: float | None = _resolve_read_timeout()
+
+
+# Format hints we re-embed into the SGLang ``image_data`` MIME type. Anything
+# else falls back to ``jpeg`` (the engine sniffs the real format from bytes).
+_ALLOWED_IMAGE_FORMATS = frozenset({"png", "jpeg", "jpg", "webp", "gif"})
+
+
+def _encode_image_data(images: list[ImageInput] | None) -> list[str] | None:
+    """Translate wire ``ImageInput`` entries into SGLang ``image_data`` URIs.
+
+    SGLang's ``/generate`` accepts a top-level ``image_data`` field — a list of
+    images, each as a base64 string, an ``http(s)`` URL, or a local file path.
+    We emit ``data:image/<fmt>;base64,<...>`` data URIs so the format hint
+    travels with the bytes and SGLang's image loader can decode without
+    sniffing. Bytes are validated through :func:`media_bytes`, the single
+    enforcement point for the wire contract (raises :class:`InvalidMediaError`
+    on a non-bytes ``data``, e.g. an un-decoded base64 JSON string).
+
+    Returns ``None`` when there are no images so the request body stays
+    byte-identical to the text-only path — vision plumbing is inert for the
+    text-only models that share this adapter.
+    """
+    if not images:
+        return None
+    encoded: list[str] = []
+    for image in images:
+        raw = media_bytes(image, kind="image")
+        fmt = (image.get("format") or "jpeg").strip().lower() or "jpeg"
+        # Clamp the client-controlled format hint to a known set before
+        # re-embedding it in the data-URI MIME type — an arbitrary subtype
+        # would produce a malformed URI for SGLang's loader. The engine
+        # sniffs the real format from the bytes regardless, so an unknown
+        # hint safely falls back to jpeg.
+        if fmt not in _ALLOWED_IMAGE_FORMATS:
+            fmt = "jpeg"
+        elif fmt == "jpg":
+            # ``image/jpg`` is not a registered MIME type; normalise to jpeg.
+            fmt = "jpeg"
+        b64 = base64.b64encode(raw).decode("ascii")
+        encoded.append(f"data:image/{fmt};base64,{b64}")
+    return encoded
 
 
 def _tail_file(path: str, *, max_lines: int = 200) -> str:
@@ -764,8 +807,16 @@ class SGLangGenerationAdapter(GenerationAdapter):
         best_of: int | None = None,
         stream: bool = False,
         lora_path: str | None = None,
+        images: list[ImageInput] | None = None,
     ) -> AsyncIterator[GenerationChunk]:
         self._check_loaded()
+
+        # Vision input: encode any images into SGLang's top-level ``image_data``
+        # field once, then attach to whichever request body we build below. The
+        # ``prompt`` is expected to already carry the model's image placeholder
+        # tokens (the chat template renders them worker-side). ``None`` when
+        # there are no images, keeping the text-only request body unchanged.
+        image_data = _encode_image_data(images)
 
         # Guard verdict thresholding only runs on the single-candidate (n=1)
         # path, so reject multi-candidate sampling up front — otherwise a guard
@@ -892,6 +943,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
             }
             if lora_path:
                 sbody["lora_path"] = lora_path
+            if image_data:
+                sbody["image_data"] = image_data
             if logprobs:
                 sbody["return_logprob"] = True
                 # Without this SGLang omits the decoded token TEXT from
@@ -1023,6 +1076,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
             nbody: dict[str, Any] = {"text": prompt, "sampling_params": sp, "stream": False}
             if lora_path:
                 nbody["lora_path"] = lora_path
+            if image_data:
+                nbody["image_data"] = image_data
             if logprobs or rank:
                 nbody["return_logprob"] = True
                 # Surface decoded token text (see streaming body below) so the
@@ -1125,6 +1180,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # verified on L4). Empirically applies the adapter in-batch per request.
         if lora_path:
             body["lora_path"] = lora_path
+        if image_data:
+            body["image_data"] = image_data
         # OpenAI ``logprobs`` → SGLang ``return_logprob`` (top-level body
         # flag, not under sampling_params). ``top_logprobs`` →
         # ``top_logprobs_num``. SGLang surfaces them under

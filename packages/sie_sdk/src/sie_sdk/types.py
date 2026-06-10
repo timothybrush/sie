@@ -397,17 +397,40 @@ ChatRole = Literal["system", "user", "assistant", "tool", "developer"]
 ChatFinishReason = Literal["stop", "length", "tool_calls", "content_filter"] | None
 
 
+class ChatImageURL(TypedDict, total=False):
+    """``image_url`` payload of an image content part — a base64 ``data:`` URI.
+
+    May also be supplied as a bare string (the URI) on ``input_image`` parts.
+    """
+
+    url: str
+
+
+class ChatContentPart(TypedDict, total=False):
+    """One part of a multimodal ``messages[*].content`` array.
+
+    Text parts (``text`` / ``input_text``) carry ``text``; image parts
+    (``image_url`` / ``input_image``) carry ``image_url`` as a base64 ``data:``
+    URI and are accepted for vision-capable generation models.
+    """
+
+    type: Literal["text", "input_text", "image_url", "input_image"]
+    text: str
+    image_url: str | ChatImageURL
+
+
 class ChatMessage(TypedDict, total=False):
     """A single chat message.
 
-    The gateway accepts ``system | user | assistant | tool`` with string
-    ``content``; ``tool_calls`` / ``tool_call_id`` are honoured on the
-    multi-turn tool-replay path. See the gateway schema for the canonical
-    accepted subset.
+    The gateway accepts ``system | user | assistant | tool`` roles.
+    ``content`` is a string OR an array of :class:`ChatContentPart` (text and,
+    for vision-capable generation models, base64 ``data:`` image parts);
+    ``tool_calls`` / ``tool_call_id`` are honoured on the multi-turn tool-replay
+    path. See the gateway schema for the canonical accepted subset.
     """
 
     role: ChatRole
-    content: str | None
+    content: str | list[ChatContentPart] | None
     name: str
     tool_call_id: str
     tool_calls: list[dict[str, Any]]

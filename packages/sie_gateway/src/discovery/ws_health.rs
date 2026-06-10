@@ -36,9 +36,12 @@ impl WsHealthManager {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                let unhealthy = registry.check_heartbeats().await;
-                for url in &unhealthy {
+                let sweep = registry.check_heartbeats().await;
+                for url in &sweep.unhealthy {
                     warn!(url = %url, "worker missed heartbeat");
+                }
+                for url in &sweep.evicted {
+                    info!(url = %url, "evicted stale worker after missed heartbeats");
                 }
             }
         });

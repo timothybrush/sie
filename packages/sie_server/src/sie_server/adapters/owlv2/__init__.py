@@ -189,7 +189,7 @@ class Owlv2Adapter(BaseAdapter):
 
         # Extract options once
         opts = options or {}
-        score_threshold = opts.get("score_threshold", self._score_threshold)
+        score_threshold = opts.get("score_threshold", opts.get("threshold", self._score_threshold))
 
         # Build text queries once (shared across batch)
         # OWL-v2 format: list of prompts per image

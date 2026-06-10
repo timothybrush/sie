@@ -93,7 +93,8 @@ pub struct Config {
     // share one admin secret in-cluster.
     pub config_service_token: Option<String>,
 
-    // Payload store (local path, s3://bucket/prefix, or gs://bucket/prefix)
+    // Payload store (local path, s3://bucket/prefix, gs://bucket/prefix, or
+    // abfs(s)://container@account.dfs.core.windows.net/prefix)
     pub payload_store_url: String,
 }
 

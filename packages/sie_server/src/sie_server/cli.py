@@ -220,12 +220,18 @@ def serve(
     host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),  # noqa: S104 — intentional bind to all interfaces for server
     device: str = typer.Option("auto", "--device", "-d", help="Device to use (auto, cuda, mps, cpu)"),
     models_dir: str = typer.Option(
-        DEFAULT_MODELS_DIR, "--models-dir", help="Models directory (local path, s3://, or gs://)"
+        DEFAULT_MODELS_DIR,
+        "--models-dir",
+        help="Models directory (local path, s3://, gs://, abfs://, or abfss://)",
     ),
     bundle: str | None = typer.Option(None, "--bundle", "-b", help="Bundle name to load (from bundles/ dir)"),
     models: str | None = typer.Option(None, "--models", "-m", help="Comma-separated model names to load"),
     local_cache: str | None = typer.Option(None, "--local-cache", help="Local cache directory (default: HF_HOME)"),
-    cluster_cache: str | None = typer.Option(None, "--cluster-cache", help="Cluster cache URL (s3:// or gs://)"),
+    cluster_cache: str | None = typer.Option(
+        None,
+        "--cluster-cache",
+        help="Cluster cache URL (s3://, gs://, abfs://, or abfss://)",
+    ),
     hf_fallback: bool = typer.Option(True, "--hf-fallback/--no-hf-fallback", help="Enable HuggingFace Hub fallback"),
     reload: bool = typer.Option(default=False, help="Enable auto-reload for development"),
     tracing: bool = typer.Option(default=False, help="Enable OpenTelemetry tracing (exports to localhost:4317)"),

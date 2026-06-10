@@ -31,8 +31,8 @@ pub struct WorkerConfig {
 
     /// Optional payload store URL — if unset, workers expect items inline
     /// (large items will be rejected by the gateway's offload). Local paths
-    /// point at a shared directory; `s3://…` / `gs://…` use cloud stores
-    /// when built with `--features cloud-storage`.
+    /// point at a shared directory; `s3://…` / `gs://…` / `abfs://…` /
+    /// `abfss://…` use cloud stores when built with `--features cloud-storage`.
     pub payload_store_url: Option<String>,
 
     /// Optional gateway URL used by the worker-side pool admission gate.

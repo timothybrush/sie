@@ -50,9 +50,12 @@ impl NatsHealthManager {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let unhealthy = registry.check_heartbeats().await;
-                        for url in &unhealthy {
+                        let sweep = registry.check_heartbeats().await;
+                        for url in &sweep.unhealthy {
                             warn!(url = %url, "worker missed heartbeat (NATS)");
+                        }
+                        for url in &sweep.evicted {
+                            info!(url = %url, "evicted stale worker after missed heartbeats (NATS)");
                         }
                     }
                     _ = cancel_rx.changed() => {
@@ -113,6 +116,14 @@ async fn handle_nats_message(registry: &WorkerRegistry, msg: async_nats::Message
         return;
     };
 
+    handle_status_message(registry, subject, status).await;
+}
+
+async fn handle_status_message(
+    registry: &WorkerRegistry,
+    subject: &str,
+    status: WorkerStatusMessage,
+) {
     // Extract worker URL from the message or subject
     // The subject format is sie.health.<worker_identifier>
     // The worker URL should be in the message payload or derivable from the worker name
@@ -125,6 +136,15 @@ async fn handle_nats_message(registry: &WorkerRegistry, msg: async_nats::Message
         );
         return;
     };
+
+    if status.terminated {
+        if registry.remove_worker(&worker_url).await {
+            info!(url = %worker_url, subject = %subject, "worker removed via NATS tombstone");
+        } else {
+            info!(url = %worker_url, subject = %subject, "NATS tombstone for unknown worker ignored");
+        }
+        return;
+    }
 
     let became_healthy = registry.update_worker(&worker_url, status).await;
     if became_healthy {
@@ -155,4 +175,45 @@ fn extract_worker_url_from_status(status: &WorkerStatusMessage, subject: &str) -
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn status(ready: bool) -> WorkerStatusMessage {
+        WorkerStatusMessage {
+            name: "worker-1".into(),
+            ready,
+            gpu_count: 1,
+            machine_profile: "rtx6000".into(),
+            pool_name: "default".into(),
+            bundle: "sglang".into(),
+            bundle_config_hash: "hash".into(),
+            loaded_models: vec![],
+            models: vec![],
+            gpus: vec![],
+            queue_depth: None,
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            saturated: false,
+            terminated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_removes_registered_worker() {
+        let registry = WorkerRegistry::new(Duration::from_secs(15), None);
+        handle_status_message(&registry, "sie.health.worker-1", status(true)).await;
+        assert_eq!(registry.workers().await.len(), 1);
+
+        let mut tombstone = status(false);
+        tombstone.terminated = true;
+        handle_status_message(&registry, "sie.health.worker-1", tombstone).await;
+
+        assert!(registry.workers().await.is_empty());
+        assert!(registry.healthy_workers().await.is_empty());
+    }
 }

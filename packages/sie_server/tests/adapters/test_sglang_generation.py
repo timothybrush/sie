@@ -12,6 +12,7 @@ Mocks the subprocess + httpx layer to exercise:
 from __future__ import annotations
 
 import asyncio
+import base64
 from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,10 +21,13 @@ from sie_server.adapters._generation_base import GenerationChunk, collect_genera
 from sie_server.adapters.sglang.generation import (
     SGLangGenerationAdapter,
     _chunk_from_sglang_event,
+    _encode_image_data,
     _p_unsafe_from_verdict_logprobs,
     _parse_sglang_generate_response,
     _thresholded_verdict,
 )
+from sie_server.types.grammar import GrammarSpec
+from sie_server.types.inputs import InvalidMediaError
 
 
 @pytest.fixture
@@ -329,6 +333,110 @@ def test_generate_forwards_lora_path(mock_async_client: MagicMock, adapter) -> N
 
 def client_instance_stream_body(mock_async_client: MagicMock) -> dict:
     return mock_async_client.return_value.stream.call_args.kwargs["json"]
+
+
+def test_encode_image_data_builds_data_uris() -> None:
+    # Bytes → base64 data URI carrying the format hint; order preserved.
+    out = _encode_image_data(
+        [
+            {"data": b"\xff\xd8\xff\xe0jpegbytes", "format": "jpeg"},
+            {"data": b"\x89PNGpngbytes", "format": "PNG"},
+        ]
+    )
+    assert out is not None
+    assert len(out) == 2
+    assert out[0].startswith("data:image/jpeg;base64,")
+    # Format hint is lower-cased.
+    assert out[1].startswith("data:image/png;base64,")
+    # Round-trips back to the original bytes.
+    payload = out[0].split(",", 1)[1]
+    assert base64.b64decode(payload) == b"\xff\xd8\xff\xe0jpegbytes"
+
+
+def test_encode_image_data_defaults_format_and_handles_empty() -> None:
+    # Missing/blank format defaults to jpeg.
+    out = _encode_image_data([{"data": b"raw"}])
+    assert out is not None
+    assert out[0].startswith("data:image/jpeg;base64,")
+    # No images → None so the request body is byte-identical to text-only.
+    assert _encode_image_data(None) is None
+    assert _encode_image_data([]) is None
+
+
+def test_encode_image_data_rejects_non_bytes() -> None:
+    # The wire contract: ``data`` must be bytes (un-decoded base64 strings raise).
+    with pytest.raises(InvalidMediaError):
+        _encode_image_data([{"data": "not-bytes", "format": "jpeg"}])
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_forwards_image_data(mock_async_client: MagicMock, adapter) -> None:
+    """Images are forwarded as SGLang's top-level ``image_data`` field
+    (list of data URIs), leaving ``sampling_params`` untouched.
+    """
+    sse_lines = [
+        'data: {"text": "a cat", "meta_info": {"prompt_tokens": 5, "completion_tokens": 2, "finish_reason": {"type": "stop"}}}',
+    ]
+    stream = _FakeStreamingResponse(sse_lines)
+    mock_async_client.return_value = _make_client_with_stream(stream)
+    adapter._server_url = "http://localhost:30005"
+
+    images = [{"data": b"\xff\xd8\xff\xe0fakejpeg", "format": "jpeg"}]
+    asyncio.run(collect_generation(adapter.generate(prompt="<image>describe this", max_new_tokens=8, images=images)))
+
+    body = client_instance_stream_body(mock_async_client)
+    assert isinstance(body["image_data"], list)
+    assert body["image_data"][0].startswith("data:image/jpeg;base64,")
+    # image_data is a TOP-LEVEL /generate field, not a sampling param.
+    assert "image_data" not in body["sampling_params"]
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_omits_image_data_without_images(mock_async_client: MagicMock, adapter) -> None:
+    """Text-only generation never sets ``image_data`` — the body stays
+    byte-identical for the models that share this adapter without vision.
+    """
+    sse_lines = [
+        'data: {"text": "hi", "meta_info": {"prompt_tokens": 1, "completion_tokens": 1, "finish_reason": {"type": "stop"}}}',
+    ]
+    stream = _FakeStreamingResponse(sse_lines)
+    mock_async_client.return_value = _make_client_with_stream(stream)
+    adapter._server_url = "http://localhost:30005"
+
+    asyncio.run(collect_generation(adapter.generate(prompt="Hi", max_new_tokens=8)))
+    body = client_instance_stream_body(mock_async_client)
+    assert "image_data" not in body
+
+
+@patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")
+def test_generate_grammar_and_images_coexist(mock_async_client: MagicMock, adapter) -> None:
+    """Structured output (Outlines) still applies on a vision request: a
+    request carrying BOTH images and a json_schema grammar forwards
+    ``image_data`` (top-level) AND ``json_schema`` (sampling_params). The two
+    are orthogonal on the ``/generate`` body, so grammar-constrained decoding
+    is unaffected by the presence of an image.
+    """
+    sse_lines = [
+        'data: {"text": "{\\"color\\":\\"red\\"}", "meta_info": {"prompt_tokens": 5, "completion_tokens": 4, "finish_reason": {"type": "stop"}}}',
+    ]
+    mock_async_client.return_value = _make_client_with_stream(_FakeStreamingResponse(sse_lines))
+    adapter._server_url = "http://localhost:30005"
+
+    images = [{"data": b"\xff\xd8\xff\xe0fakejpeg", "format": "jpeg"}]
+    grammar = GrammarSpec(
+        kind="json_schema",
+        value={"type": "object", "properties": {"color": {"type": "string"}}, "required": ["color"]},
+    )
+    asyncio.run(
+        collect_generation(
+            adapter.generate(prompt="<image>what colour?", max_new_tokens=16, images=images, grammar=grammar)
+        )
+    )
+
+    body = client_instance_stream_body(mock_async_client)
+    # Vision payload (top-level) AND grammar constraint (sampling_params) both present.
+    assert body["image_data"][0].startswith("data:image/jpeg;base64,")
+    assert "json_schema" in body["sampling_params"]
 
 
 @patch("sie_server.adapters.sglang.generation.httpx.AsyncClient")

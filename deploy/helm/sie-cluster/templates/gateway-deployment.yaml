@@ -39,8 +39,8 @@
      and rejects local paths so misconfigured queue clusters fail fast. */}}
 {{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" . }}
 {{- if $payloadStoreUrl }}
-  {{- if not (or (hasPrefix "s3://" $payloadStoreUrl) (hasPrefix "gs://" $payloadStoreUrl)) }}
-    {{- fail (printf "payloadStore.url must be an object-store URL (s3://bucket/prefix or gs://bucket/prefix), not a local path; got %q" $payloadStoreUrl) }}
+  {{- if not (or (hasPrefix "s3://" $payloadStoreUrl) (hasPrefix "gs://" $payloadStoreUrl) (hasPrefix "abfs://" $payloadStoreUrl) (hasPrefix "abfss://" $payloadStoreUrl)) }}
+    {{- fail (printf "payloadStore.url must be an object-store URL (s3://bucket/prefix, gs://bucket/prefix, or abfs(s)://container@account.dfs.core.windows.net/prefix), not a local path; got %q" $payloadStoreUrl) }}
   {{- end }}
 {{- end }}
 apiVersion: apps/v1

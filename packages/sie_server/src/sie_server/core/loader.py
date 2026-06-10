@@ -48,7 +48,7 @@ def load_model_configs(models_dir: Path | str) -> dict[str, ModelConfig]:
     """Load all model configs from a directory (local or cloud).
 
     Args:
-        models_dir: Path to the models directory (local path, s3://, or gs://).
+        models_dir: Path to the models directory (local path, s3://, gs://, abfs://, or abfss://).
 
     Returns:
         Dictionary mapping model names to their ModelConfig objects.
@@ -141,7 +141,7 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
 
 
 def _load_configs_from_cloud(models_dir: str) -> dict[str, ModelConfig]:
-    """Load model configs from S3/GCS.
+    """Load model configs from cloud object storage.
 
     Discovers YAML files via LIST operation, downloads them to local cache, and parses them.
     Model configs are flat YAML files (e.g., gs://bucket/models/BAAI__bge-m3.yaml).

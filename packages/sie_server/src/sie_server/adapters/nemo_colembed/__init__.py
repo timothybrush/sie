@@ -346,6 +346,31 @@ class NemoColEmbedAdapter(BaseAdapter):
             num_image_token,
         )
 
+    def get_preprocessor(self) -> Any:
+        """Register BOTH a text and an image preprocessor for v1 (#1163).
+
+        v1 documents must take the conformant ``_encode_images_preprocessed`` path,
+        which requires an *image* preprocessor to be registered so the encode pipeline
+        produces a ``NemoColEmbedPayload`` (with ``pixel_values``) instead of a
+        passthrough ``ImagePayload``. Without it every doc batch falls back to the
+        model's ``forward_passages`` — which re-tiles each page inline on one thread,
+        ~3x slower than running the tiling upstream in the preprocessing thread pool.
+
+        But v1 *queries* (text) still go through ``model.forward_queries`` and rely on
+        the batched worker path; registering only the image preprocessor de-registers
+        the text one and routes queries to the unbatched direct-call path, which has
+        surfaced ``forward_queries`` failures. So we register both: the base
+        ``CharCountPreprocessor`` (text → worker-batched queries) and the
+        ``NemoColEmbedPreprocessor`` (image → conformant docs). ``model_loader``
+        registers each entry of the returned list by its ``modality``.
+
+        v2 (Qwen3-VL backbone) builds no ``_processor`` (``None``); it keeps just the
+        base text preprocessor and its native ``forward_images`` path (with #1055 fix).
+        """
+        if self._processor is None:
+            return super().get_preprocessor()
+        return [super().get_preprocessor(), self._processor]
+
     def encode(
         self,
         items: list[Item],
@@ -606,14 +631,25 @@ class NemoColEmbedAdapter(BaseAdapter):
             if self._normalize:
                 embeddings = functional.normalize(embeddings, p=2, dim=-1)
 
-            # Store results for this sub-batch (move to CPU immediately to free GPU memory)
+            # Store results for this sub-batch (move to CPU immediately to free GPU
+            # memory). Trim each item's left-padding rows before returning: the batch is
+            # left-padded, so padded positions are zeroed by the attention_mask above —
+            # but emitting them as zero vectors leaks 0-similarity rows into the late-
+            # interaction MaxSim (a 0-floor on every query token's max). Because the
+            # batcher pads inconsistently across docs, identical docs then score
+            # differently by batch and ranking is corrupted on variable-tile batches
+            # (#1163: Vidore3 Hr 0.6532 -> 0.5713). Keep only real tokens, matching the
+            # native forward_passages path (_unpack_embeddings drops zero rows likewise).
             for i in range(len(sub_batch_items)):
-                emb = embeddings[i].float().cpu().numpy()
+                keep = batch["attention_mask"][i].bool()
+                emb = embeddings[i][keep].float().cpu().numpy()
                 all_embeddings.append(emb)
 
-            # Clear GPU memory between sub-batches
-            del outputs, embeddings, batch
-            torch.cuda.empty_cache()
+            # Free this sub-batch's GPU tensors. NOTE: no per-sub-batch
+            # torch.cuda.empty_cache() — repeatedly releasing the allocator's cache and
+            # re-acquiring ~GB blocks fragments the pool and OOMs at scale on big GPUs
+            # (#1163). The sub-batch loop + immediate CPU offload already bound peak VRAM.
+            del outputs, embeddings, attention_mask, batch
 
         return EncodeOutput(
             multivector=all_embeddings,

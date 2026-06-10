@@ -273,6 +273,16 @@ impl ModelInfoExtras {
             },
         }
     }
+
+    /// Whether the model can serve vision *generation* on
+    /// ``/v1/chat/completions``: it must accept image input AND declare a
+    /// generation task. ``inputs.image`` alone is also set by encode-only
+    /// image models (CLIP/SigLIP), which must not accept a chat image
+    /// request; ``outputs`` carries ``"tokens"`` only when a ``generate``
+    /// task is present (see ``from_yaml_raw``).
+    pub fn supports_vision_generation(&self) -> bool {
+        self.inputs.iter().any(|s| s == "image") && self.outputs.iter().any(|s| s == "tokens")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -959,6 +969,35 @@ tasks:
 
         let extras = ModelInfoExtras::from_yaml_raw(&raw);
         assert_eq!(extras.outputs, vec!["tokens"]);
+    }
+
+    #[test]
+    fn test_supports_vision_generation_requires_image_and_generate() {
+        // Vision-capable generation model (image input + generate task).
+        let vlm = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str(
+                "name: m\ninputs:\n  text: true\n  image: true\ntasks:\n  generate: {}\n",
+            )
+            .unwrap(),
+        );
+        assert!(vlm.supports_vision_generation());
+
+        // Encode-only image model (CLIP/SigLIP-style: image input, no generate
+        // task) must NOT pass the vision-generation gate.
+        let encode_only = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str(
+                "name: m\ninputs:\n  text: true\n  image: true\ntasks:\n  encode: {}\n",
+            )
+            .unwrap(),
+        );
+        assert!(!encode_only.supports_vision_generation());
+
+        // Text-only generation model: generates but no image input.
+        let text_gen = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str("name: m\ninputs:\n  text: true\ntasks:\n  generate: {}\n")
+                .unwrap(),
+        );
+        assert!(!text_gen.supports_vision_generation());
     }
 
     #[test]

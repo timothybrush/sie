@@ -485,7 +485,7 @@ impl Dispatcher {
         }
     }
 
-    async fn handle_generate_item(self: Arc<Self>, wi: WorkItem, msg: Message) {
+    async fn handle_generate_item(self: Arc<Self>, mut wi: WorkItem, msg: Message) {
         let model_id = wi.model_id.clone();
         let model_lbl = self.metrics.model_label(&model_id).into_owned();
         let _timer = self
@@ -516,6 +516,57 @@ impl Dispatcher {
             ReadinessState::LoadingInProgress => {
                 nak_one(&msg, base_delay_ms.saturating_mul(2), &self.metrics).await;
                 return;
+            }
+        }
+
+        // Resolve an offloaded generate payload. The gateway offloads large
+        // vision work items to the object store (``payload_ref`` set,
+        // ``generate`` blanked); fetch + inline so the Python worker — which
+        // has no object-store access — receives a self-contained WorkItem. The
+        // blob is base64-string image data, so it decodes cleanly as
+        // ``serde_json::Value`` (msgpack ``bin`` would not).
+        if let Some(payload_ref) = wi.payload_ref.clone() {
+            match self.payload_store.get(&payload_ref).await {
+                Ok(bytes) => match decode_offloaded_generate(&bytes) {
+                    Ok(generate) => {
+                        wi.generate = Some(generate);
+                        wi.payload_ref = None;
+                    }
+                    Err(e) => {
+                        warn!(
+                            work_item_id = %wi.work_item_id,
+                            error = %e,
+                            "failed to decode offloaded generate payload — publishing error + ACK"
+                        );
+                        match self
+                            .publish_error(
+                                &wi,
+                                "internal_error",
+                                "failed to decode offloaded generate payload",
+                            )
+                            .await
+                        {
+                            Ok(_) => match ack(&msg).await {
+                                Ok(()) => self.metrics.messages_acked_total.inc(),
+                                Err(e) => {
+                                    warn!(error = %e, "ack after offload-decode error failed");
+                                    self.metrics.jetstream_ack_failures_total.inc();
+                                }
+                            },
+                            Err(_) => nak_one(&msg, base_delay_ms, &self.metrics).await,
+                        }
+                        return;
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        work_item_id = %wi.work_item_id,
+                        error = %e,
+                        "failed to resolve offloaded generate payload — NAKing"
+                    );
+                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    return;
+                }
             }
         }
 
@@ -2659,6 +2710,15 @@ pub(crate) async fn scheduler_drain_loop(
     );
 }
 
+/// Decode an offloaded generate payload blob (msgpack) into the inline
+/// `generate` value. Extracted so the transport contract is directly
+/// testable: the gateway offloads `generate` carrying **base64-string** image
+/// data, which round-trips through `serde_json::Value`; the original, buggy
+/// msgpack-`bin` (`serde_bytes`) shape does NOT decode here.
+fn decode_offloaded_generate(bytes: &[u8]) -> Result<Json, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2696,6 +2756,73 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
         }
+    }
+
+    #[tokio::test]
+    async fn offloaded_generate_blob_with_base64_images_resolves_via_object_store() {
+        use crate::payload_store::LocalPayloadStore;
+
+        // Gateway offload shape: `generate` params with base64-STRING image data.
+        let generate = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": "what is this?",
+                "images": [{"data": "aGVsbG8=", "format": "png"}], // base64 of b"hello"
+            }],
+            "max_new_tokens": 8,
+        });
+        let blob = rmp_serde::to_vec_named(&generate).unwrap();
+
+        // Real object store (filesystem), the gateway's `{request_id}_0.bin` key.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("req-1_0.bin"), &blob).unwrap();
+        let store = LocalPayloadStore::new(Some(dir.path()));
+
+        // The exact sidecar resolution ops: fetch from the object store + decode.
+        let bytes = store
+            .get("req-1_0.bin")
+            .await
+            .expect("blob fetched from object store");
+        let decoded = decode_offloaded_generate(&bytes)
+            .expect("base64-image generate blob must decode as serde_json::Value");
+        assert_eq!(decoded["messages"][0]["images"][0]["data"], "aGVsbG8=");
+
+        // Inline into a WorkItem and re-encode → decode (the sidecar → Python
+        // worker hop): the base64 image survives the full round trip.
+        let mut work = wi("req-1", 0, "Qwen/Qwen3.5-4B", "generate");
+        work.item = None;
+        work.generate = Some(decoded);
+        let reencoded = rmp_serde::to_vec_named(&work).unwrap();
+        let back: WorkItem = rmp_serde::from_slice(&reencoded).unwrap();
+        let g = back.generate.expect("generate inlined onto the work item");
+        assert_eq!(g["messages"][0]["images"][0]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn bin_generate_blob_fails_to_decode_proving_base64_is_required() {
+        // The original (buggy) shape: image bytes as a msgpack `bin` via
+        // serde_bytes. `serde_json::Value` cannot hold `bin`, so the sidecar
+        // decode fails — this is exactly the transport bug the base64-string
+        // representation fixes.
+        #[derive(serde::Serialize)]
+        struct BinImage {
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct BinGenerate {
+            images: Vec<BinImage>,
+        }
+        let blob = rmp_serde::to_vec_named(&BinGenerate {
+            images: vec![BinImage {
+                data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            }],
+        })
+        .unwrap();
+        assert!(
+            decode_offloaded_generate(&blob).is_err(),
+            "msgpack bin must NOT decode as serde_json::Value — the exact bug base64 transport fixes"
+        );
     }
 
     #[test]

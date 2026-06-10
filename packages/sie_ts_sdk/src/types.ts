@@ -540,8 +540,9 @@ export interface GenerateResult {
  *
  * `content` may be a string OR an array of typed content parts. The gateway
  * concatenates `text` / `input_text` parts; `image_url` / `input_image` parts
- * are rejected with `400 unsupported_field` because no vision-capable
- * generation model is configured today (the contract is forward-ready). See
+ * carrying a base64 `data:` URI are accepted for vision-capable generation
+ * models (non-vision/encode-only models reject with `400 unsupported_field`;
+ * remote (non-`data:`) URLs reject with `400 invalid_request`). See
  * `packages/sie_gateway/src/openapi.rs` and `proxy.rs::chat_params_from_json`
  * for the canonical accepted subset.
  */
@@ -556,11 +557,16 @@ export interface ChatMessage {
 }
 
 /**
- * One content part inside a multimodal `messages[*].content` array. Only the
- * text variants are accepted today; image parts are declared so callers can
- * see the rejection at the type layer instead of at runtime.
+ * One content part inside a multimodal `messages[*].content` array. Text parts
+ * (`text` / `input_text`) are concatenated; image parts (`image_url` /
+ * `input_image`) carry a base64 `data:` URI and are accepted for vision-capable
+ * generation models.
  */
-export type ChatContentPart = { type: "text"; text: string } | { type: "input_text"; text: string };
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "input_text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "input_image"; image_url: string | { url: string } };
 
 /** A tool call emitted by the model. */
 export interface ToolCall {

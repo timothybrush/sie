@@ -190,6 +190,11 @@ pub struct WorkerStatusMessage {
     /// running pre-routing builds.
     #[serde(default)]
     pub saturated: bool,
+    /// Graceful worker shutdown tombstone. When true, the gateway should
+    /// remove this worker from the live registry instead of marking it
+    /// unhealthy. Defaults to false for older workers.
+    #[serde(default)]
+    pub terminated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,6 +250,7 @@ mod tests {
         let json = r#"{"ready": true}"#;
         let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
         assert!(!msg.saturated);
+        assert!(!msg.terminated);
     }
 
     #[test]
@@ -252,6 +258,14 @@ mod tests {
         let json = r#"{"ready": true, "saturated": true}"#;
         let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
         assert!(msg.saturated);
+    }
+
+    #[test]
+    fn test_worker_status_message_deserialize_terminated_true() {
+        let json = r#"{"ready": false, "terminated": true}"#;
+        let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
+        assert!(!msg.ready);
+        assert!(msg.terminated);
     }
 
     #[test]
@@ -296,6 +310,7 @@ mod tests {
         assert!(msg.loaded_models.is_empty());
         assert!(msg.models.is_empty());
         assert!(msg.gpus.is_empty());
+        assert!(!msg.terminated);
     }
 
     #[test]

@@ -9,8 +9,8 @@
 //!     (absolute paths are only accepted when they canonicalize inside
 //!     `base_dir`; relative paths are resolved against it). When no
 //!     `base_dir` is configured the reader is disabled for safety.
-//!   - cloud: `s3://…` / `gs://…` URL (handled when the `cloud-storage`
-//!     feature is enabled)
+//!   - cloud: `s3://…` / `gs://…` / `abfs://…` / `abfss://…` URL
+//!     (handled when the `cloud-storage` feature is enabled)
 //!
 //! Security: we canonicalize the resolved path and reject anything that
 //! escapes `base_dir`. Without this, a compromised gateway could send a
@@ -22,6 +22,15 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use thiserror::Error;
 use tracing::debug;
+
+const OBJECT_STORE_SCHEMES: &[&str] = &["s3://", "gs://", "abfs://", "abfss://"];
+
+fn object_store_scheme(url: &str) -> Option<&'static str> {
+    OBJECT_STORE_SCHEMES
+        .iter()
+        .copied()
+        .find(|scheme| url.starts_with(scheme))
+}
 
 #[derive(Debug, Error)]
 pub enum PayloadError {
@@ -169,6 +178,29 @@ impl ObjectPayloadStore {
         })
     }
 
+    pub fn new_azure(path: &str) -> Result<Self, PayloadError> {
+        Self::new_azure_with_scheme(path, "abfs://")
+    }
+
+    fn new_azure_with_scheme(path: &str, scheme: &'static str) -> Result<Self, PayloadError> {
+        use object_store::azure::MicrosoftAzureBuilder;
+
+        let (container, account, prefix) = Self::parse_azure_path(path)?;
+        let store = MicrosoftAzureBuilder::from_env()
+            .with_account(&account)
+            .with_container_name(&container)
+            .build()
+            .map_err(|e| {
+                PayloadError::Unsupported(format!("failed to build Azure payload store: {e}"))
+            })?;
+        Ok(Self {
+            store: Box::new(store),
+            prefix: object_store::path::Path::from(prefix),
+            url_prefix: format!("{}{}", scheme, path.trim_end_matches('/')),
+            scheme,
+        })
+    }
+
     fn parse_bucket_prefix(path: &str) -> Result<(String, String), PayloadError> {
         let path = path.trim_matches('/');
         let Some((bucket, prefix)) = path.split_once('/') else {
@@ -185,6 +217,40 @@ impl ObjectPayloadStore {
             ));
         }
         Ok((bucket.to_string(), prefix.trim_matches('/').to_string()))
+    }
+
+    fn parse_azure_path(path: &str) -> Result<(String, String, String), PayloadError> {
+        let path = path.trim_matches('/');
+        let Some((authority, prefix)) = path.split_once('/') else {
+            return Self::parse_azure_authority(path)
+                .map(|(container, account)| (container, account, String::new()));
+        };
+        let (container, account) = Self::parse_azure_authority(authority)?;
+        Ok((container, account, prefix.trim_matches('/').to_string()))
+    }
+
+    fn parse_azure_authority(authority: &str) -> Result<(String, String), PayloadError> {
+        let Some((container, host)) = authority.split_once('@') else {
+            return Err(PayloadError::InvalidRef(
+                "Azure payload store URL must use <container>@<account>.dfs.core.windows.net"
+                    .into(),
+            ));
+        };
+        if container.is_empty() || host.is_empty() {
+            return Err(PayloadError::InvalidRef(
+                "Azure payload store container and account must be non-empty".into(),
+            ));
+        }
+        let account = host
+            .strip_suffix(".dfs.core.windows.net")
+            .or_else(|| host.strip_suffix(".blob.core.windows.net"))
+            .unwrap_or(host);
+        if account.is_empty() {
+            return Err(PayloadError::InvalidRef(
+                "Azure payload store account must be non-empty".into(),
+            ));
+        }
+        Ok((container.to_string(), account.to_string()))
     }
 
     fn relative_key<'a>(&self, payload_ref: &'a str) -> Result<&'a str, PayloadError> {
@@ -205,7 +271,7 @@ impl ObjectPayloadStore {
                 )));
             };
             rest
-        } else if payload_ref.starts_with("s3://") || payload_ref.starts_with("gs://") {
+        } else if object_store_scheme(payload_ref).is_some() {
             return Err(PayloadError::InvalidRef(format!(
                 "payload ref {payload_ref} uses a different object-store scheme"
             )));
@@ -327,14 +393,14 @@ impl PayloadStore for MeteredPayloadStore {
 /// URL handling:
 /// * `None` or an empty string → local store with no base_dir (disabled,
 ///   rejects all reads). Pods without offload configured stay safe.
-/// * `s3://…` / `gs://…` with the `cloud-storage` feature → object
-///   storage reader.
-/// * `s3://…` / `gs://…` without the feature → we can't read from
+/// * `s3://…` / `gs://…` / `abfs://…` / `abfss://…` with the
+///   `cloud-storage` feature → object storage reader.
+/// * Those object-store URLs without the feature → we can't read from
 ///   object storage, and we MUST NOT silently treat the URL string as a
 ///   filesystem path (`LocalPayloadStore::new(Some("s3://…"))` canonicalizes
 ///   to a broken, confusing error on every request). Return an explicit
-///   `Unsupported` so the worker fails fast at startup instead of
-///   NAKing every item at runtime.
+///   `Unsupported` so the worker fails fast at startup instead of NAKing
+///   every item at runtime.
 /// * `file://path` → strip scheme, treat as local filesystem.
 /// * Anything else → treated as a local filesystem path.
 pub async fn create_payload_store(
@@ -344,7 +410,7 @@ pub async fn create_payload_store(
         return Ok(std::sync::Arc::new(LocalPayloadStore::new(None::<PathBuf>)));
     };
 
-    if url.starts_with("s3://") || url.starts_with("gs://") {
+    if let Some(scheme) = object_store_scheme(url) {
         #[cfg(feature = "cloud-storage")]
         {
             if let Some(rest) = url.strip_prefix("s3://") {
@@ -353,11 +419,16 @@ pub async fn create_payload_store(
             if let Some(rest) = url.strip_prefix("gs://") {
                 return Ok(std::sync::Arc::new(ObjectPayloadStore::new_gcs(rest)?));
             }
+            if let Some(rest) = url.strip_prefix(scheme) {
+                return Ok(std::sync::Arc::new(
+                    ObjectPayloadStore::new_azure_with_scheme(rest, scheme)?,
+                ));
+            }
         }
         #[cfg(not(feature = "cloud-storage"))]
         {
             return Err(PayloadError::Unsupported(format!(
-                "payload store URL {url} requires the 'cloud-storage' feature; \
+                "payload store URL {url} with scheme {scheme} requires the 'cloud-storage' feature; \
                  rebuild the worker with --features cloud-storage or point \
                  SIE_PAYLOAD_STORE_URL at a local path"
             )));
@@ -371,7 +442,67 @@ pub async fn create_payload_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cloud-storage")]
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[cfg(feature = "cloud-storage")]
+    const AZURE_ENV_KEYS: &[&str] = &[
+        "AZURE_STORAGE_ACCOUNT_NAME",
+        "AZURE_STORAGE_ACCOUNT_KEY",
+        "AZURE_STORAGE_ACCESS_KEY",
+        "AZURE_STORAGE_CLIENT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_STORAGE_CLIENT_SECRET",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_STORAGE_TENANT_ID",
+        "AZURE_TENANT_ID",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_STORAGE_AUTHORITY_HOST",
+        "AZURE_AUTHORITY_HOST",
+        "AZURE_STORAGE_TOKEN",
+        "AZURE_USE_AZURE_CLI",
+    ];
+
+    #[cfg(feature = "cloud-storage")]
+    fn azure_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, String)]) -> Self {
+            let saved = AZURE_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect();
+            for key in AZURE_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn local_get_absolute_path_inside_base_dir() {
@@ -544,6 +675,144 @@ mod tests {
 
     #[cfg(feature = "cloud-storage")]
     #[tokio::test]
+    async fn object_store_get_accepts_azure_full_ref_inside_prefix() {
+        use object_store::path::Path;
+        use object_store::{ObjectStore, PutPayload};
+
+        let memory = object_store::memory::InMemory::new();
+        memory
+            .put(
+                &Path::from("payloads/pay.bin"),
+                PutPayload::from(b"cloud".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let store = ObjectPayloadStore {
+            store: Box::new(memory),
+            prefix: Path::from("payloads"),
+            url_prefix: "abfss://container@account.dfs.core.windows.net/payloads".into(),
+            scheme: "abfss://",
+        };
+        let got = store
+            .get("abfss://container@account.dfs.core.windows.net/payloads/pay.bin")
+            .await
+            .unwrap();
+        assert_eq!(got, b"cloud");
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[tokio::test]
+    async fn object_store_get_rejects_different_azure_scheme() {
+        use object_store::path::Path;
+
+        let store = ObjectPayloadStore {
+            store: Box::new(object_store::memory::InMemory::new()),
+            prefix: Path::from("payloads"),
+            url_prefix: "s3://bucket/payloads".into(),
+            scheme: "s3://",
+        };
+        let err = store
+            .get("abfs://container@account.dfs.core.windows.net/payloads/pay.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PayloadError::InvalidRef(_)));
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[test]
+    fn new_azure_parses_container_account_and_prefix() {
+        let (container, account, prefix) =
+            ObjectPayloadStore::parse_azure_path("payloads@sieacct.dfs.core.windows.net/prefix")
+                .unwrap();
+        assert_eq!(container, "payloads");
+        assert_eq!(account, "sieacct");
+        assert_eq!(prefix, "prefix");
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[test]
+    fn new_azure_accepts_blob_endpoint_suffix() {
+        let (container, account, prefix) =
+            ObjectPayloadStore::parse_azure_path("payloads@sieacct.blob.core.windows.net/prefix")
+                .unwrap();
+        assert_eq!(container, "payloads");
+        assert_eq!(account, "sieacct");
+        assert_eq!(prefix, "prefix");
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[test]
+    fn new_azure_rejects_missing_container_account_separator() {
+        let err = ObjectPayloadStore::parse_azure_path("payloads/prefix").unwrap_err();
+        assert!(matches!(err, PayloadError::InvalidRef(_)));
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[test]
+    fn new_azure_builds_from_workload_identity_env() {
+        let _lock = azure_env_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "token").unwrap();
+        let _env = EnvGuard::set(&[
+            ("AZURE_STORAGE_ACCOUNT_NAME", "env-account".to_string()),
+            ("AZURE_CLIENT_ID", "client-id".to_string()),
+            ("AZURE_TENANT_ID", "tenant-id".to_string()),
+            (
+                "AZURE_FEDERATED_TOKEN_FILE",
+                token_file.to_string_lossy().to_string(),
+            ),
+            (
+                "AZURE_AUTHORITY_HOST",
+                "https://login.microsoftonline.com/".to_string(),
+            ),
+        ]);
+
+        let store =
+            ObjectPayloadStore::new_azure("payloads@sieacct.dfs.core.windows.net/path/to/payloads")
+                .unwrap();
+
+        assert_eq!(store.scheme, "abfs://");
+        assert_eq!(
+            store.url_prefix,
+            "abfs://payloads@sieacct.dfs.core.windows.net/path/to/payloads"
+        );
+        assert_eq!(store.prefix.as_ref(), "path/to/payloads");
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[test]
+    fn new_azure_with_abfss_preserves_scheme() {
+        let _lock = azure_env_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "token").unwrap();
+        let _env = EnvGuard::set(&[
+            ("AZURE_CLIENT_ID", "client-id".to_string()),
+            ("AZURE_TENANT_ID", "tenant-id".to_string()),
+            (
+                "AZURE_FEDERATED_TOKEN_FILE",
+                token_file.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        let store = ObjectPayloadStore::new_azure_with_scheme(
+            "payloads@sieacct.dfs.core.windows.net/path/to/payloads",
+            "abfss://",
+        )
+        .unwrap();
+
+        assert_eq!(store.scheme, "abfss://");
+        assert_eq!(
+            store.url_prefix,
+            "abfss://payloads@sieacct.dfs.core.windows.net/path/to/payloads"
+        );
+        assert_eq!(store.prefix.as_ref(), "path/to/payloads");
+    }
+
+    #[cfg(feature = "cloud-storage")]
+    #[tokio::test]
     async fn object_store_get_accepts_plain_key_under_configured_prefix() {
         use object_store::path::Path;
         use object_store::{ObjectStore, PutPayload};
@@ -579,6 +848,20 @@ mod tests {
             Err(e) => assert!(
                 matches!(e, PayloadError::Unsupported(_)),
                 "expected Unsupported for s3://, got {e:?}"
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "cloud-storage"))]
+    #[tokio::test]
+    async fn factory_abfs_without_feature_errors_loudly() {
+        match create_payload_store(Some("abfs://container@account.dfs.core.windows.net/prefix"))
+            .await
+        {
+            Ok(_) => panic!("expected Unsupported for abfs:// without cloud-storage feature"),
+            Err(e) => assert!(
+                matches!(e, PayloadError::Unsupported(_)),
+                "expected Unsupported for abfs://, got {e:?}"
             ),
         }
     }

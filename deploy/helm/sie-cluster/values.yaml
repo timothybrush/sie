@@ -357,10 +357,12 @@ workers:
     # -- Model cache size limit (emptyDir - ephemeral, no zone-lock issues)
     cacheStorageSize: 300Gi
 
-    # -- Cluster cache (S3/GCS) configuration
+    # -- Cluster cache (object storage) configuration
     clusterCache:
       enabled: false
-      # -- S3/GCS bucket URL with the /models prefix (e.g., s3://my-bucket/models or gs://my-bucket/models).
+      # -- Object-store URL with the /models prefix (for example,
+      # s3://my-bucket/models, gs://my-bucket/models, or
+      # abfs(s)://container@account.dfs.core.windows.net/models).
       # AWS users: get this from `terraform output -raw model_cache_bucket_url`.
       # Pre-populate the bucket once with `sie-admin cache weights sync --bundle default --dest <url>/`.
       url: ""
@@ -1099,32 +1101,35 @@ queueRouting:
 # -- Payload store for large work item payloads (images, long documents).
 # When a work item exceeds 1MB, the payload is offloaded to this store.
 # IMPORTANT: payloadStore.url must point to shared storage accessible by both
-# gateway and worker pods. Use s3://bucket/prefix or gs://bucket/prefix.
+# gateway and worker pods. Use s3://bucket/prefix, gs://bucket/prefix, or
+# abfs(s)://container@account.dfs.core.windows.net/prefix.
 # Local filesystem paths (e.g., /tmp/payloads) will NOT work in queue mode
 # because gateway and worker pods have different filesystems.
 #
 # Auto-derivation: when workers.common.clusterCache.enabled=true and
 # workers.common.clusterCache.url is set, the chart enables the payload store
 # automatically and points it at the sibling /payloads prefix of the same
-# bucket. By convention the terraform modules expose the cache URL as
-# "<scheme>://<bucket>/models", and the chart strips a trailing "/models"
-# segment before appending "/payloads" so the two features live at top-level
-# sibling prefixes:
+# bucket/container. By convention the terraform modules expose the cache URL as
+# "<scheme>://<bucket-or-container>/models", and the chart strips a trailing
+# "/models" segment before appending "/payloads" so the two features live at
+# top-level sibling prefixes:
 #   <bucket>/models/...    model weights (managed by sie-admin)
 #   <bucket>/payloads/...  large work-item refs (managed by gateway)
-# The AWS and GCP terraform modules scope their workload IAM grants to these
-# top-level prefixes, so the auto-derived URL aligns with the permissions
+# The supported cloud modules scope their workload IAM grants to
+# these top-level prefixes, so the auto-derived URL aligns with the permissions
 # out of the box. Set payloadStore.url explicitly only to override the
 # default (e.g., a separate bucket); leaving it empty is the right call
 # for most clusters.
 payloadStore:
-  # -- Payload store URL. Must be an S3 or GCS URL (s3://bucket/prefix or gs://bucket/prefix).
+  # -- Payload store URL. Must be an S3, GCS, or Azure Blob URL
+  # (s3://bucket/prefix, gs://bucket/prefix, or abfs(s)://container@account.dfs.core.windows.net/prefix).
   # Local paths are rejected when clusterRouting=queue (see gateway-deployment.yaml validation).
   # Leave empty to auto-derive from workers.common.clusterCache.url (recommended).
   url: ""
   # -- TTL for stored payloads in seconds.
   # For S3: configure via S3 lifecycle rules on the bucket.
   # For GCS: configure via GCS lifecycle rules on the bucket.
+  # For Azure Blob: configure via lifecycle management rules on the storage account.
   # This value is passed as SIE_PAYLOAD_STORE_TTL env var to the gateway.
   ttlSeconds: 300
 

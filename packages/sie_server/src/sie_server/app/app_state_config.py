@@ -20,7 +20,7 @@ class AppStateConfig:
     """
 
     models_dir: Path | str | None = None
-    """Path to models directory (local path, s3://, or gs://). If None, registry starts empty."""
+    """Path to models directory (local path, s3://, gs://, abfs://, or abfss://). If None, registry starts empty."""
 
     device: str = "cpu"
     """Device to load models on (e.g., "cuda:0", "cpu", "mps")."""

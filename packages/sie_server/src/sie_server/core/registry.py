@@ -82,7 +82,7 @@ class ModelRegistry:
         """Initialize the registry.
 
         Args:
-            models_dir: Path to models directory (local path, s3://, or gs://).
+            models_dir: Path to models directory (local path, s3://, gs://, abfs://, or abfss://).
                        If None, registry starts empty and configs must be added manually.
             memory_config: Configuration for memory management. If None, uses defaults.
             drain_timeout_s: Timeout in seconds to wait for worker drain before unload.
@@ -1396,7 +1396,7 @@ class ModelRegistry:
             logger.debug("No models_dir, skipping hot reload")
             return
 
-        # Don't watch cloud URLs (s3://, gs://)
+        # Don't watch cloud URLs (s3://, gs://, abfs(s)://)
         if is_cloud_path(self._models_dir):
             logger.debug("Cloud models_dir, skipping hot reload (not supported)")
             return

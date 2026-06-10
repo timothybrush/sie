@@ -14,6 +14,7 @@ Exercises the chunk-publishing path with a fake :class:`GenerationAdapter`:
 from __future__ import annotations
 
 import asyncio
+import base64
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -2188,3 +2189,482 @@ async def test_tombstone_lazy_cleanup_evicts_when_over_cap(
     assert "req-live-0" not in proc._cancel_tombstones
     assert "req-live-1" not in proc._cancel_tombstones
     assert len(proc._cancel_tombstones) <= 4
+
+
+# -----------------------------------------------------------------------------
+# Vision input (#1233): image content parsing + plumbing to the adapter
+# -----------------------------------------------------------------------------
+
+
+def _png_data_uri(payload: bytes = b"PNGDATA") -> str:
+    return "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+
+
+def test_decode_data_uri_image_parses_bytes_and_format() -> None:
+    from sie_server.processors.streaming import _decode_data_uri_image
+
+    data, fmt = _decode_data_uri_image(_png_data_uri(b"hello-png"))
+    assert data == b"hello-png"
+    assert fmt == "png"
+
+
+def test_decode_data_uri_image_rejects_remote_and_malformed() -> None:
+    from sie_server.processors.streaming import _decode_data_uri_image
+
+    with pytest.raises(ValueError, match="inline base64 'data:' URI"):
+        _decode_data_uri_image("https://example.com/cat.png")
+    with pytest.raises(ValueError, match="base64-encoded"):
+        # data URI without ;base64
+        _decode_data_uri_image("data:image/png,rawbytes")
+    with pytest.raises(ValueError, match="invalid base64"):
+        _decode_data_uri_image("data:image/png;base64,!!!notbase64!!!")
+    with pytest.raises(ValueError, match="empty bytes"):
+        _decode_data_uri_image("data:image/png;base64,")
+    # Non-image media types reject (mirrors the gateway's image/* check).
+    with pytest.raises(ValueError, match="media type"):
+        _decode_data_uri_image("data:text/plain;base64," + base64.b64encode(b"hi").decode())
+    with pytest.raises(ValueError, match="media type"):
+        _decode_data_uri_image("data:;base64," + base64.b64encode(b"hi").decode())
+
+
+def test_parse_chat_content_accepts_input_text() -> None:
+    # ``input_text`` is accepted alongside ``text`` (gateway/OpenAPI accept both).
+    from sie_server.processors.streaming import _parse_chat_content
+
+    text, images, parts = _parse_chat_content([{"type": "input_text", "text": "hi"}], 0)
+    assert text == "hi"
+    assert images == ()
+    assert parts is None  # no image → no ordered layout (renders from ``content``)
+
+
+def test_parse_chat_content_string_passthrough() -> None:
+    from sie_server.processors.streaming import _parse_chat_content
+
+    text, images, parts = _parse_chat_content("plain text", 0)
+    assert text == "plain text"
+    assert images == ()
+    assert parts is None
+
+
+def test_parse_chat_content_extracts_text_and_images_in_order() -> None:
+    from sie_server.processors.streaming import _parse_chat_content
+
+    content = [
+        {"type": "text", "text": "describe "},
+        {"type": "image_url", "image_url": {"url": _png_data_uri(b"img1")}},
+        {"type": "text", "text": "and this"},
+        # ``input_image`` alias + bare-string url form.
+        {"type": "input_image", "image_url": _png_data_uri(b"img2")},
+    ]
+    text, images, parts = _parse_chat_content(content, 0)
+    assert text == "describe and this"
+    assert [img["data"] for img in images] == [b"img1", b"img2"]
+    # #1294: the ordered layout preserves the text↔image interleaving.
+    assert parts is not None
+    assert [p["type"] for p in parts] == ["text", "image", "text", "image"]
+    assert parts[0] == {"type": "text", "text": "describe "}
+    assert parts[2] == {"type": "text", "text": "and this"}
+
+
+def test_parse_chat_content_rejects_unknown_part_and_bad_text() -> None:
+    from sie_server.processors.streaming import _parse_chat_content, _ValidationError
+
+    bad_type = _parse_chat_content([{"type": "audio_url", "audio_url": {"url": "x"}}], 2)
+    assert isinstance(bad_type, _ValidationError)
+    assert bad_type.code == "invalid_request"
+    assert "messages[2].content[0].type" in bad_type.message
+
+    bad_text = _parse_chat_content([{"type": "text", "text": 123}], 0)
+    assert isinstance(bad_text, _ValidationError)
+    assert "must be a string" in bad_text.message
+
+    bad_url = _parse_chat_content([{"type": "image_url", "image_url": {"url": ""}}], 0)
+    assert isinstance(bad_url, _ValidationError)
+    assert "image_url.url" in bad_url.message
+
+
+def test_render_chat_template_builds_image_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sie_server.processors.streaming import _ChatMessage
+
+    captured: dict[str, Any] = {}
+
+    class _FakeTok:
+        def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+            captured["dicts"] = message_dicts
+            return "RENDERED"
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        return _FakeTok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    proc = StreamingProcessor(nc=AsyncMock(), registry=_make_registry(_FakeGenAdapter([])), worker_id="w1")
+
+    messages = (
+        _ChatMessage(role="system", content="be helpful"),
+        _ChatMessage(
+            role="user",
+            content="what is this?",
+            images=({"data": b"img1", "format": "png"}, {"data": b"img2", "format": "png"}),
+        ),
+    )
+
+    async def _run() -> Any:
+        return await proc._render_chat_template("test/model", messages)
+
+    rendered = asyncio.run(_run())
+    assert rendered == "RENDERED"
+    dicts = captured["dicts"]
+    # Text-only system message stays a plain string.
+    assert dicts[0]["content"] == "be helpful"
+    # Vision user message becomes a parts list: 2 image placeholders + text.
+    user_content = dicts[1]["content"]
+    assert [p["type"] for p in user_content] == ["image", "image", "text"]
+    assert user_content[2] == {"type": "text", "text": "what is this?"}
+
+
+def test_render_chat_template_interleaves_content_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1294: with an ordered layout, placeholders render in their original
+    # positions (text↔image interleaved), NOT all-images-first.
+    from sie_server.processors.streaming import _ChatMessage
+
+    captured: dict[str, Any] = {}
+
+    class _FakeTok:
+        def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+            captured["dicts"] = message_dicts
+            return "RENDERED"
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        return _FakeTok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    proc = StreamingProcessor(nc=AsyncMock(), registry=_make_registry(_FakeGenAdapter([])), worker_id="w1")
+
+    messages = (
+        _ChatMessage(
+            role="user",
+            content="Page 1:Page 2:which has a cat?",
+            images=({"data": b"imgA", "format": "png"}, {"data": b"imgB", "format": "png"}),
+            content_parts=(
+                {"type": "text", "text": "Page 1:"},
+                {"type": "image"},
+                {"type": "text", "text": "Page 2:"},
+                {"type": "image"},
+                {"type": "text", "text": "which has a cat?"},
+            ),
+        ),
+    )
+
+    async def _run() -> Any:
+        return await proc._render_chat_template("test/model", messages)
+
+    rendered = asyncio.run(_run())
+    assert rendered == "RENDERED"
+    user_content = captured["dicts"][0]["content"]
+    assert [p["type"] for p in user_content] == ["text", "image", "text", "image", "text"]
+    assert user_content[0] == {"type": "text", "text": "Page 1:"}
+    assert user_content[2] == {"type": "text", "text": "Page 2:"}
+    assert user_content[4] == {"type": "text", "text": "which has a cat?"}
+
+
+def test_parse_content_parts_field() -> None:
+    from sie_server.processors.streaming import _parse_content_parts_field, _ValidationError
+
+    assert _parse_content_parts_field(None, 0) is None
+    ok = _parse_content_parts_field([{"type": "text", "text": "a"}, {"type": "image"}], 0)
+    assert ok == ({"type": "text", "text": "a"}, {"type": "image"})
+    bad_type = _parse_content_parts_field([{"type": "audio"}], 1)
+    assert isinstance(bad_type, _ValidationError)
+    assert "content_parts[0].type" in bad_type.message
+    bad_text = _parse_content_parts_field([{"type": "text", "text": 5}], 0)
+    assert isinstance(bad_text, _ValidationError)
+    assert "content_parts[0].text" in bad_text.message
+
+
+def test_validate_rejects_content_parts_image_count_mismatch() -> None:
+    # Gateway path: 2 image placeholders but only 1 image byte would desync
+    # placeholders from ``image_data`` at the engine — the validator rejects it.
+    from sie_server.processors.streaming import _ValidationError
+
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "a b",
+                    "images": [{"data": base64.b64encode(b"img").decode(), "format": "png"}],
+                    "content_parts": [
+                        {"type": "text", "text": "a"},
+                        {"type": "image"},
+                        {"type": "image"},
+                        {"type": "text", "text": "b"},
+                    ],
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    result = StreamingProcessor._validate_generate_params(wi)
+    assert isinstance(result, _ValidationError)
+    assert "image placeholder" in result.message
+
+
+def test_validate_threads_matching_gateway_content_parts() -> None:
+    # Gateway path with consistent counts: the ordered layout reaches the
+    # decoded message in order so the worker can interleave placeholders.
+    from sie_server.processors.streaming import _MessagesInput, _ValidationError
+
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Page 1:Page 2:",
+                    "images": [
+                        {"data": base64.b64encode(b"A").decode(), "format": "png"},
+                        {"data": base64.b64encode(b"B").decode(), "format": "png"},
+                    ],
+                    "content_parts": [
+                        {"type": "text", "text": "Page 1:"},
+                        {"type": "image"},
+                        {"type": "text", "text": "Page 2:"},
+                        {"type": "image"},
+                    ],
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    result = StreamingProcessor._validate_generate_params(wi)
+    assert not isinstance(result, _ValidationError)
+    assert isinstance(result.input, _MessagesInput)
+    parts = result.input.messages[0].content_parts
+    assert parts is not None
+    assert [p["type"] for p in parts] == ["text", "image", "text", "image"]
+
+
+def test_validate_rejects_both_image_bearing_layout_sources() -> None:
+    # A malformed/internal producer can send an image-bearing ``content`` array
+    # (the real parsed layout) AND an image-bearing ``content_parts`` field whose
+    # layout differs. The field would override the layout ``content`` was parsed
+    # from, so the validated text ("REAL") and the rendered layout ("FAKE") would
+    # diverge. Exactly one image-bearing layout source is allowed — reject it.
+    from sie_server.processors.streaming import _ValidationError
+
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "REAL"},
+                        {"type": "image_url", "image_url": {"url": _png_data_uri(b"x")}},
+                    ],
+                    "content_parts": [
+                        {"type": "text", "text": "FAKE"},
+                        {"type": "image"},
+                    ],
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    result = StreamingProcessor._validate_generate_params(wi)
+    assert isinstance(result, _ValidationError)
+    assert "exactly one layout source" in result.message
+
+
+def test_validate_image_free_content_parts_field_does_not_shadow_layout() -> None:
+    # Defensive: a request carrying BOTH an array content (direct-path layout
+    # with an image) AND an image-free content_parts field must keep the real
+    # layout — the image-free field must not shadow it.
+    from sie_server.processors.streaming import _ValidationError
+
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "a"},
+                        {"type": "image_url", "image_url": {"url": _png_data_uri(b"x")}},
+                    ],
+                    "content_parts": [{"type": "text", "text": "ignore me"}],  # image-free
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    result = StreamingProcessor._validate_generate_params(wi)
+    assert not isinstance(result, _ValidationError)
+    parts = result.input.messages[0].content_parts
+    assert parts is not None
+    assert [p["type"] for p in parts] == ["text", "image"]
+
+
+def test_parse_message_images_field() -> None:
+    from sie_server.processors.streaming import _parse_message_images_field, _ValidationError
+
+    # Missing field → no images.
+    assert _parse_message_images_field(None, 0) == ()
+    # Valid gateway base64 string → decoded to bytes.
+    out = _parse_message_images_field([{"data": base64.b64encode(b"catbytes").decode(), "format": "png"}], 0)
+    assert not isinstance(out, _ValidationError)
+    assert out[0]["data"] == b"catbytes"
+    assert out[0]["format"] == "png"
+    # Non-list rejects.
+    assert isinstance(_parse_message_images_field({"data": "x"}, 1), _ValidationError)
+    # Non-string data rejects (gateway sends a base64 string).
+    bad = _parse_message_images_field([{"data": 123}], 2)
+    assert isinstance(bad, _ValidationError)
+    assert "messages[2].images[0]" in bad.message
+    # Invalid base64 rejects.
+    bad_b64 = _parse_message_images_field([{"data": "!!!notbase64!!!"}], 0)
+    assert isinstance(bad_b64, _ValidationError)
+    assert "invalid base64" in bad_b64.message
+    # Empty data rejects.
+    empty = _parse_message_images_field([{"data": ""}], 0)
+    assert isinstance(empty, _ValidationError)
+    assert "non-empty base64" in empty.message
+
+
+@pytest.mark.asyncio
+async def test_images_rejected_on_text_only_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Worker-side defense-in-depth gate: a model whose config says
+    ``inputs.image`` is False rejects an image request (queue-path bypass of
+    the gateway gate) with a clean ``invalid_request`` instead of a broken
+    prompt / opaque SGLang error.
+    """
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        class _Tok:
+            def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+                return "rendered"
+
+        return _Tok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    nc = AsyncMock()
+    adapter = _FakeGenAdapter([GenerationChunk(text_delta="", done=True, finish_reason="stop")])
+    registry = _make_registry(adapter)
+    # Model config declares text-only input.
+    registry.get_config.return_value.inputs.image = False
+    proc = StreamingProcessor(nc=nc, registry=registry, worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "what is this?",
+                    "images": [{"data": base64.b64encode(b"img").decode(), "format": "png"}],
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    await proc.process(_make_msg(wi), "test/model")
+    terminal = _decode_chunks(nc)[-1]
+    assert terminal["done"] is True
+    assert terminal["error"]["code"] == "invalid_request"
+    assert "does not support image input" in terminal["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_messages_images_field_reaches_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway path: a message-level ``images`` field of decoded bytes is
+    threaded to ``adapter.generate(images=...)``. ``content`` is plain text.
+    """
+
+    class _RecordingAdapter(_FakeGenAdapter):
+        def __init__(self, script: list[GenerationChunk]) -> None:
+            super().__init__(script)
+            self.received_images: Any = "UNSET"
+
+        async def generate(self, prompt: str, *, max_new_tokens: int, **kwargs: Any) -> AsyncIterator[GenerationChunk]:
+            self.received_images = kwargs.get("images")
+            for chunk in self._script:
+                yield chunk
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        class _Tok:
+            def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+                return "rendered prompt"
+
+        return _Tok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+    script = [
+        GenerationChunk(text_delta="a cat", is_first=True),
+        GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=5, completion_tokens=2),
+    ]
+    adapter = _RecordingAdapter(script)
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(adapter), worker_id="w1")
+    wi = _make_work_item(
+        generate={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "what is this?",
+                    "images": [{"data": base64.b64encode(b"catbytes").decode(), "format": "png"}],
+                }
+            ],
+            "max_new_tokens": 8,
+        }
+    )
+    await proc.process(_make_msg(wi), "test/model")
+    assert isinstance(adapter.received_images, list)
+    assert len(adapter.received_images) == 1
+    assert adapter.received_images[0]["data"] == b"catbytes"
+
+
+@pytest.mark.asyncio
+async def test_messages_image_reaches_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end: a generate work item carrying an OpenAI image part is
+    decoded and forwarded to ``adapter.generate(images=...)`` as bytes.
+    """
+
+    class _RecordingAdapter(_FakeGenAdapter):
+        def __init__(self, script: list[GenerationChunk]) -> None:
+            super().__init__(script)
+            self.received_images: Any = "UNSET"
+
+        async def generate(self, prompt: str, *, max_new_tokens: int, **kwargs: Any) -> AsyncIterator[GenerationChunk]:
+            self.received_images = kwargs.get("images")
+            for chunk in self._script:
+                yield chunk
+
+    async def _fake_get_tokenizer(self: Any, model_id: str) -> Any:
+        class _Tok:
+            def apply_chat_template(self, message_dicts: Any, **_kw: Any) -> str:
+                return "rendered prompt"
+
+        return _Tok()
+
+    monkeypatch.setattr(StreamingProcessor, "_get_tokenizer", _fake_get_tokenizer)
+
+    script = [
+        GenerationChunk(text_delta="a cat", is_first=True),
+        GenerationChunk(text_delta="", done=True, finish_reason="stop", prompt_tokens=5, completion_tokens=2),
+    ]
+    adapter = _RecordingAdapter(script)
+    nc = AsyncMock()
+    proc = StreamingProcessor(nc=nc, registry=_make_registry(adapter), worker_id="w1")
+
+    wi = _make_work_item(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": _png_data_uri(b"catbytes")}},
+                ],
+            }
+        ]
+    )
+    await proc.process(_make_msg(wi), "test/model")
+
+    assert isinstance(adapter.received_images, list)
+    assert len(adapter.received_images) == 1
+    assert adapter.received_images[0]["data"] == b"catbytes"
+    assert adapter.received_images[0]["format"] == "png"

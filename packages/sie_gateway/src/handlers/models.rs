@@ -554,6 +554,7 @@ mod route_tests {
             gpus: Vec::new(),
             pool_name: String::new(),
             saturated: false,
+            terminated: false,
         }
     }
 

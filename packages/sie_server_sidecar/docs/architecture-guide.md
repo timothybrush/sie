@@ -252,7 +252,7 @@ sidecar container itself.
 | `SIE_NATS_CONSUMER_RECONCILE_INTERVAL_MS` | slow stream/durable reconcile interval, default 30000; non-zero values below 10000 are clamped; `0` disables |
 | `SIE_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS` | generation direct-dispatch activation check interval after startup reports no generation models, default 30000; non-zero values below 5000 are clamped; `0` disables |
 | `SIE_STREAM_MAX_AGE_S` | worker stream max age if worker creates the stream first |
-| `SIE_PAYLOAD_STORE_URL` | optional shared payload-store backend (`s3://`, `gs://`, or a local path shared with the gateway) |
+| `SIE_PAYLOAD_STORE_URL` | optional shared payload-store backend (`s3://`, `gs://`, `abfs://`, `abfss://`, or a local path shared with the gateway) |
 | `SIE_GATEWAY_URL` | optional gateway base URL used by the pool admission gate |
 | `SIE_GATEWAY_API_KEY` | optional bearer token for gateway pool-status reads |
 | `SIE_POOL_ADMISSION_ENABLED` | pool admission gate toggle, default true when `SIE_GATEWAY_URL` is set |
@@ -343,8 +343,8 @@ What is covered:
 - Rust unit tests for scheduler, adaptive controller, IPC framing/retry,
   payload confinement, metrics, output framing, tokenizer registry, publisher,
   shutdown, and NATS helpers. `mise run server-sidecar-test` runs the crate once with
-  default features and once with `cloud-storage` so S3/GCS payload-store code is
-  compiled and tested in the normal worker path.
+  default features and once with `cloud-storage` so S3/GCS/Azure payload-store
+  code is compiled and tested in the normal worker path.
 - Rust integration smoke tests with real `nats-server`, real `sie-server-sidecar`, and
   a Python IPC harness.
 - Python parity tests for `RunBatch` fixtures under `tests/parity/`.

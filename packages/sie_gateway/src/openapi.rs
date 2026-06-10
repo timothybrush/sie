@@ -617,10 +617,12 @@ fn patch_chat_message_schema(value: &mut Value) {
     properties.insert(
         "content".to_string(),
         json!({
-            "description": "Either a string or an array of text-only content parts \
-                            (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image content \
-                            parts (`image_url` / `input_image`) reject with 400 \
-                            unsupported_field until a vision-capable model ships. May be \
+            "description": "Either a string or an array of content parts \
+                            (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image parts \
+                            (`image_url` / `input_image`) carrying a base64 `data:` URI are \
+                            accepted for generation models that declare `inputs.image`; non-vision models \
+                            reject with 400 unsupported_field and remote (non-`data:`) URLs \
+                            reject with 400 invalid_request. May be \
                             `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
             "oneOf": [
                 {"type": "string"},
@@ -630,8 +632,15 @@ fn patch_chat_message_schema(value: &mut Value) {
                         "type": "object",
                         "required": ["type"],
                         "properties": {
-                            "type": {"type": "string", "enum": ["text", "input_text"]},
+                            "type": {"type": "string", "enum": ["text", "input_text", "image_url", "input_image"]},
                             "text": {"type": "string"},
+                            "image_url": {
+                                "description": "Image payload for `image_url` / `input_image` parts: a base64 `data:` URI, either as a bare string or as `{ \"url\": \"data:...\" }`. Remote (non-`data:`) URLs reject with 400 invalid_request.",
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "object", "properties": {"url": {"type": "string"}}},
+                                ],
+                            },
                         },
                     },
                 },
@@ -842,9 +851,11 @@ fn patch_chat_completion_paths(value: &mut Value) {
                  SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates \
                  out as per-`choice_index` delta chunks with per-choice closure chunks \
                  (each carrying `finish_reason`) before the single global `[DONE]`. \
-                 Content is either a string or an array of text-only content parts; image \
-                 content parts (`image_url` / `input_image`) reject with 400 \
-                 `unsupported_field`. `lora_adapter` is forwarded to the worker as a \
+                 Content is either a string or an array of content parts; image parts \
+                 (`image_url` / `input_image`) with a base64 `data:` URI are accepted for \
+                 generation models declaring `inputs.image` (non-vision/encode-only models reject 400 \
+                 `unsupported_field`; remote URLs reject 400 `invalid_request`). \
+                 `lora_adapter` is forwarded to the worker as a \
                  top-level `lora_path` generation kwarg."
             ),
         );
@@ -1441,10 +1452,12 @@ pub struct GenerateResponse {
 /// One chat message in an OpenAI chat-completions request.
 ///
 /// Per the strict allow-list parser, ``content`` is either a
-/// plain string OR a list of text-only content parts (``{type:"text"|"input_text",
-/// text:"..."}``); ``image_url`` and ``input_image`` parts reject with 400
-/// ``unsupported_field`` until a vision-capable model ships. Assistant
-/// messages that carry ``tool_calls`` may set ``content: null``.
+/// plain string OR a list of content parts (``{type:"text"|"input_text",
+/// text:"..."}``). ``image_url`` / ``input_image`` parts carrying a base64
+/// ``data:`` URI are accepted for generation models declaring ``inputs.image`` (non-vision
+/// models reject 400 ``unsupported_field``; remote URLs reject 400
+/// ``invalid_request``). Assistant messages that carry ``tool_calls`` may set
+/// ``content: null``.
 ///
 /// ``tool_calls`` is accepted only on ``role:"assistant"`` messages; each
 /// entry has the validated shape ``{id, type:"function", function:{name, arguments}}``
@@ -1458,8 +1471,10 @@ pub struct ChatCompletionMessage {
     /// newer alias for ``system`` and is normalized to ``system``. Any other
     /// role rejects with 400 ``invalid_request``.
     pub role: String,
-    /// Either a string or an array of text-only content parts. Image content
-    /// parts (``image_url`` / ``input_image``) reject with 400 ``unsupported_field``.
+    /// Either a string or an array of content parts. ``image_url`` /
+    /// ``input_image`` parts with a base64 ``data:`` URI are accepted for
+    /// vision-capable generation models (``inputs.image`` + a generate task); non-vision/encode-only models reject 400
+    /// ``unsupported_field`` and remote URLs reject 400 ``invalid_request``.
     /// May be ``null`` on an assistant message that carries ``tool_calls``.
     pub content: Value,
     /// OpenAI tool-call replay on ``role:"assistant"`` messages.
@@ -1759,7 +1774,8 @@ pub struct CompletionsRequest {
 /// - ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on
 ///   Responses is deferred; use ``stream: false`` or omit).
 /// - Multimodal ``image_url`` / ``input_image`` content parts on the array
-///   form — rejected with 400 ``unsupported_field`` until a VL profile ships.
+///   form — rejected with 400 ``unsupported_field``: the Responses surface is
+///   text-only. (Vision input is supported on ``/v1/chat/completions``.)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ResponsesRequest {
     pub model: String,

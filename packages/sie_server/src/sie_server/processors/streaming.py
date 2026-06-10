@@ -29,6 +29,8 @@ The chunk envelope uses a discriminated streaming wire shape:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import json
 import logging
@@ -65,6 +67,7 @@ from sie_server.processors.tool_call_grammar import (
 )
 from sie_server.processors.tool_call_parser import ToolCallFormat, parse_tool_call_stream
 from sie_server.types.grammar import GrammarSpec, GrammarValidationError, hash_grammar
+from sie_server.types.inputs import ImageInput
 
 # Module-level shim around :func:`asyncio.wait_for`. Tests monkey-patch
 # this attribute (not the global ``asyncio.wait_for``) so the override
@@ -232,6 +235,271 @@ _MAX_PROMPT_CHARS = 4_000_000
 # the offending ``messages[i].role`` path in ``param``.
 _ALLOWED_CHAT_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool", "developer"})
 
+# Hard cap on images per generate request. Bounds the worker-side decode +
+# the engine's vision-encoder cost so one request can't pin a GPU. Vision
+# requests over this are rejected with ``invalid_request`` rather than
+# silently truncated. Mirrored at the gateway so oversized requests fail
+# before decode/publish.
+_MAX_IMAGES_PER_REQUEST = 16
+
+# Coarse per-image token estimate for the context-length guard and the
+# admission reservation. The chat template renders each image as a short
+# placeholder, but the vision encoder expands it into many tokens (Qwen-VL:
+# up to ~1280 at max_pixels). Exact counts need the image dimensions + the
+# model's vision tokenizer, which we don't have at this layer — so we use a
+# conservative constant. Over-reserving is safe; under-counting risks a
+# context-window overflow (opaque SGLang error) and admission over-admit.
+_VISION_TOKENS_PER_IMAGE_ESTIMATE = 1024
+
+# Hard ceiling on a single decoded image's bytes. Bounds worker memory on the
+# decode path even for the direct-queue caller that bypasses the gateway's
+# request-body cap. Checked from the base64 length BEFORE decoding (so a huge
+# payload never allocates) and again on the decoded bytes (padding/edge cases).
+_MAX_DECODE_IMAGE_BYTES = 16 * 1024 * 1024
+
+# OpenAI content-part ``type`` values that carry an image. ``image_url`` is the
+# chat-completions shape; ``input_image`` is the Responses-API alias some
+# clients send. Both are decoded from an inline ``data:`` URI.
+_IMAGE_CONTENT_PART_TYPES: frozenset[str] = frozenset({"image_url", "input_image"})
+
+
+def _decode_data_uri_image(url: str) -> tuple[bytes, str | None]:
+    """Decode an inline ``data:`` image URI into ``(bytes, format)``.
+
+    Only base64-encoded ``data:`` URIs are supported — the worker never
+    fetches remote ``http(s)`` URLs (that would be an SSRF surface and a
+    blocking network call on the hot path; clients inline images as data
+    URIs, which the SDK/gateway already do). Returns the raw bytes plus the
+    format hint parsed from the MIME subtype (e.g. ``"png"``), or ``None``
+    when the MIME type is absent/uninformative.
+
+    Raises:
+        ValueError: on a non-``data:`` URI, a malformed URI, a non-base64
+            payload, or undecodable base64.
+    """
+    if not url.startswith("data:"):
+        raise ValueError("image content must be an inline base64 'data:' URI; remote URL fetching is not supported")
+    header, sep, payload = url[len("data:") :].partition(",")
+    if not sep:
+        raise ValueError("malformed image data URI (missing ',')")
+    params = header.split(";")
+    if "base64" not in params[1:]:
+        raise ValueError("image data URI must be base64-encoded")
+    mime = params[0]
+    # Mirror the gateway: only image media types (rejects data:text/... and
+    # data:;base64,... for direct queue callers too).
+    if not mime.startswith("image/"):
+        raise ValueError("image data URI must have an image/* media type")
+    fmt: str | None = None
+    if "/" in mime:
+        subtype = mime.split("/", 1)[1].strip().lower()
+        fmt = subtype or None
+    stripped = payload.strip()
+    # Reject oversized images from the base64 length before allocating.
+    if (len(stripped) * 3) // 4 > _MAX_DECODE_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large: exceeds the {_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit "
+            "(_decode_data_uri_image)"
+        )
+    try:
+        # ``.strip()`` mirrors the gateway's ``payload.trim()`` so both ends
+        # accept the same data URIs (some clients pad base64 with whitespace).
+        data = base64.b64decode(stripped, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid base64 image data: {exc}") from exc
+    if not data:
+        raise ValueError("image data URI decoded to empty bytes")
+    if len(data) > _MAX_DECODE_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large: {len(data)} bytes exceeds the "
+            f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit (_decode_data_uri_image)"
+        )
+    return data, fmt
+
+
+def _parse_message_images_field(raw: object, idx: int) -> tuple[ImageInput, ...] | _ValidationError:
+    """Parse a message-level ``images`` field of gateway-forwarded images.
+
+    The gateway extracts OpenAI ``image_url`` data URIs and forwards them as
+    ``messages[i].images = [{"data": <base64-str>, "format": <str?>}, ...]``.
+    ``data`` is the **base64 payload string**, not raw bytes — that's what
+    survives the sidecar's ``WorkItem.generate: serde_json::Value`` (msgpack
+    ``bin`` does not; see the gateway ``ChatImage`` doc). We base64-decode here
+    into the ``bytes`` the adapter expects. Missing/``None`` → no images.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        return _ValidationError(code="invalid_request", message=f"messages[{idx}].images must be an array")
+    out: list[ImageInput] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].images[{i}] must be an object",
+            )
+        entry_dict = cast("dict[str, Any]", entry)
+        b64 = entry_dict.get("data")
+        if not isinstance(b64, str) or not b64:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].images[{i}].data must be a non-empty base64 string",
+            )
+        stripped = b64.strip()
+        if (len(stripped) * 3) // 4 > _MAX_DECODE_IMAGE_BYTES:
+            return _ValidationError(
+                code="invalid_request",
+                message=(
+                    f"messages[{idx}].images[{i}]: image too large; exceeds the "
+                    f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+                ),
+            )
+        try:
+            data = base64.b64decode(stripped, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].images[{i}]: invalid base64 image data: {exc}",
+            )
+        if not data:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].images[{i}]: image data is empty",
+            )
+        if len(data) > _MAX_DECODE_IMAGE_BYTES:
+            return _ValidationError(
+                code="invalid_request",
+                message=(
+                    f"messages[{idx}].images[{i}]: image too large ({len(data)} bytes); exceeds the "
+                    f"{_MAX_DECODE_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+                ),
+            )
+        fmt = entry_dict.get("format")
+        out.append({"data": data, "format": fmt if isinstance(fmt, str) else None})
+    return tuple(out)
+
+
+def _parse_content_parts_field(raw: object, idx: int) -> tuple[dict[str, Any], ...] | None | _ValidationError:
+    """Parse a message-level ``content_parts`` field of gateway-forwarded layout.
+
+    The gateway records the original text↔image ordering (#1294) as
+    ``messages[i].content_parts = [{"type":"text","text":…} | {"type":"image"}, …]``
+    so the worker can place image placeholders in position. Returned in
+    chat-template shape (ready for ``apply_chat_template``). ``None`` when the
+    field is absent — the message then renders images-first from ``content`` +
+    ``images``. The image-marker count is reconciled against the flat ``images``
+    list by the caller.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return _ValidationError(code="invalid_request", message=f"messages[{idx}].content_parts must be an array")
+    out: list[dict[str, Any]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].content_parts[{i}] must be an object",
+            )
+        entry_dict = cast("dict[str, Any]", entry)
+        ptype = entry_dict.get("type")
+        if ptype == "text":
+            text = entry_dict.get("text")
+            if not isinstance(text, str):
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].content_parts[{i}].text must be a string",
+                )
+            out.append({"type": "text", "text": text})
+        elif ptype == "image":
+            out.append({"type": "image"})
+        else:
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].content_parts[{i}].type must be 'text' or 'image', got {ptype!r}",
+            )
+    return tuple(out)
+
+
+def _parse_chat_content(
+    content: object, idx: int
+) -> tuple[str, tuple[ImageInput, ...], tuple[dict[str, Any], ...] | None] | _ValidationError:
+    """Parse an OpenAI message ``content`` into ``(text, images, content_parts)``.
+
+    Accepts either the legacy string shape (returned verbatim with no
+    images) or the multimodal list-of-parts shape, where each part is
+    ``{"type": "text", "text": ...}`` or an image part
+    (``{"type": "image_url", "image_url": {"url": "data:..."}}`` — the
+    ``url`` may also be a bare string, and ``input_image`` is accepted as an
+    alias). Text parts are concatenated in order; image parts are decoded to
+    :class:`ImageInput` entries in order so they line up with the
+    placeholders the chat template will render.
+
+    ``content_parts`` is the ordered text↔image layout in chat-template shape
+    (``{"type": "text", "text": …}`` / ``{"type": "image"}``), so
+    :meth:`_render_chat_template` can interleave placeholders in place instead
+    of emitting all images first (#1294). It is ``None`` for string content and
+    for image-free part arrays — those keep the concatenated-``content`` render.
+
+    Returns a :class:`_ValidationError` (not raised) on any malformed part,
+    matching the surrounding validator's error-return contract.
+    """
+    if isinstance(content, str):
+        return content, (), None
+    if not isinstance(content, list):
+        return _ValidationError(
+            code="invalid_request",
+            message=f"messages[{idx}].content must be a string or an array of content parts",
+        )
+    text_parts: list[str] = []
+    images: list[ImageInput] = []
+    layout: list[dict[str, Any]] = []
+    for part_idx, part in enumerate(content):
+        if not isinstance(part, dict):
+            return _ValidationError(
+                code="invalid_request",
+                message=f"messages[{idx}].content[{part_idx}] must be an object",
+            )
+        part_dict = cast("dict[str, Any]", part)
+        part_type = part_dict.get("type")
+        if part_type in ("text", "input_text"):
+            text = part_dict.get("text")
+            if not isinstance(text, str):
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].content[{part_idx}].text must be a string",
+                )
+            text_parts.append(text)
+            layout.append({"type": "text", "text": text})
+        elif part_type in _IMAGE_CONTENT_PART_TYPES:
+            url_field = part_dict.get("image_url")
+            url = url_field.get("url") if isinstance(url_field, dict) else url_field
+            if not isinstance(url, str) or not url:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].content[{part_idx}].image_url.url must be a non-empty string",
+                )
+            try:
+                data, fmt = _decode_data_uri_image(url)
+            except ValueError as exc:
+                return _ValidationError(
+                    code="invalid_request",
+                    message=f"messages[{idx}].content[{part_idx}]: {exc}",
+                )
+            images.append({"data": data, "format": fmt})
+            layout.append({"type": "image"})
+        else:
+            return _ValidationError(
+                code="invalid_request",
+                message=(
+                    f"messages[{idx}].content[{part_idx}].type must be 'text'/'input_text' or an image part "
+                    f"({sorted(_IMAGE_CONTENT_PART_TYPES)!r}), got {part_type!r}"
+                ),
+            )
+    # Only carry the ordered layout when there's an image to place — text-only
+    # arrays render fine from the concatenated ``content`` (no wire/format bloat).
+    return "".join(text_parts), tuple(images), (tuple(layout) if images else None)
+
 
 # Input-token estimate for the admission controller. Delegates
 # to :func:`sie_server.core.text_tokens.estimate_tokens_from_chars` so the
@@ -252,6 +520,18 @@ class _ChatMessage:
     # final answer after a tool returns.
     tool_calls: tuple[dict[str, Any], ...] | None = None
     tool_call_id: str | None = None
+    # Vision input: images attached to this message (decoded from OpenAI
+    # ``image_url`` content parts). ``None`` for text-only messages. The
+    # chat template renders one image placeholder per entry, in order, and
+    # the bytes are forwarded to the engine as ``image_data``.
+    images: tuple[ImageInput, ...] | None = None
+    # Ordered text↔image layout in chat-template shape
+    # (``{"type":"text","text":…}`` / ``{"type":"image"}``) preserving the
+    # original content-part order so :meth:`_render_chat_template` interleaves
+    # placeholders in place (#1294). ``None`` → fall back to images-first
+    # rendering from ``content`` + ``images``. Image markers here line up 1:1
+    # with ``images`` (same order); only placeholder POSITIONS differ.
+    content_parts: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1214,7 +1494,35 @@ class StreamingProcessor:
         # tokenize-via-template before handing the rendered string to
         # the underlying adapter. ``Prompt`` shape goes straight through.
         prompt_str: str
+        # Flat, in-order image list for vision requests — lines up with the
+        # placeholders the chat template renders. ``None`` for the prompt
+        # shape and for text-only message lists.
+        request_images: list[ImageInput] | None = None
         if isinstance(params.input, _MessagesInput):
+            collected = [img for m in params.input.messages for img in (m.images or ())]
+            request_images = collected or None
+            # Worker-side vision capability gate (defense-in-depth for the
+            # queue-bypass path). Run it BEFORE chat-template rendering so a
+            # text-only model handed images fails fast with a clear error
+            # rather than doing — or erroring inside — the CPU-bound render.
+            # Skip only when the config is unavailable (mirrors the
+            # context-length check's defensive skip).
+            if request_images:
+                try:
+                    vision_config = self._registry.get_config(model_id)
+                except KeyError:
+                    vision_config = None
+                if vision_config is not None and not vision_config.inputs.image:
+                    await self._terminal_error_then_settle(
+                        reply_subject,
+                        request_id=request_id,
+                        attempt_id=attempt_id,
+                        seq=0,
+                        code="invalid_request",
+                        message=f"model '{model_id}' does not support image input",
+                        msg=msg,
+                    )
+                    return
             rendered = await self._render_chat_template(
                 model_id,
                 params.input.messages,
@@ -1247,8 +1555,15 @@ class StreamingProcessor:
         # §4.3: worker-side context-length validation. Applies
         # to both Prompt and Messages paths. The rendered string is
         # already in memory; tokenizing is fast on a cached fast
-        # tokenizer (<1ms for typical prompts).
-        ctx_error = await self._check_context_length(model_id, prompt_str, params.max_new_tokens)
+        # tokenizer (<1ms for typical prompts). Vision requests add a coarse
+        # per-image token estimate so placeholder expansion doesn't overflow
+        # the context window unaccounted.
+        ctx_error = await self._check_context_length(
+            model_id,
+            prompt_str,
+            params.max_new_tokens,
+            num_images=len(request_images) if request_images else 0,
+        )
         if ctx_error is not None:
             await self._terminal_error_then_settle(
                 reply_subject,
@@ -1355,7 +1670,11 @@ class StreamingProcessor:
         # rescan_configs discovery) still drive the gate. Falls back to
         # the worker's boot-time default when the lookup fails.
         budget_override, admission_enabled_override = self._resolve_admission_for_model(model_id)
-        reserve_tokens = estimate_tokens_from_chars(prompt_str) + params.max_new_tokens
+        # Include the coarse per-image token estimate so vision requests
+        # reserve KV budget proportional to their real (placeholder-expanded)
+        # footprint instead of just the short placeholder text.
+        image_reserve = (len(request_images) if request_images else 0) * _VISION_TOKENS_PER_IMAGE_ESTIMATE
+        reserve_tokens = estimate_tokens_from_chars(prompt_str) + params.max_new_tokens + image_reserve
         admitted = await self._try_reserve(
             model_id,
             reserve_tokens,
@@ -1422,6 +1741,7 @@ class StreamingProcessor:
                 best_of=params.best_of,
                 stream=params.stream,
                 lora_adapter=params.lora_adapter,
+                images=request_images,
                 cancel_event=cancel_event,
             )
         finally:
@@ -1473,6 +1793,7 @@ class StreamingProcessor:
         best_of: int | None = None,
         stream: bool = False,
         lora_adapter: str | None = None,
+        images: list[ImageInput] | None = None,
         cancel_event: asyncio.Event,
     ) -> None:
         # ``adapter.generate`` is typed as returning ``AsyncIterator`` on
@@ -1538,6 +1859,10 @@ class StreamingProcessor:
             # SGLang selects the adapter by its registered served-name via
             # sampling_params.lora_path; no path resolution needed here.
             gen_kwargs["lora_path"] = lora_adapter
+        # Vision: forward decoded images only when present so text-only
+        # requests (and adapters that don't accept the kwarg) are unaffected.
+        if images:
+            gen_kwargs["images"] = images
         chunks_iter = cast(
             "AsyncGenerator[GenerationChunk, None]",
             adapter.generate(**gen_kwargs),
@@ -2175,6 +2500,7 @@ class StreamingProcessor:
                     message="'messages' must be a non-empty array",
                 )
             decoded: list[_ChatMessage] = []
+            total_images = 0
             for idx, item in enumerate(messages_raw):
                 if not isinstance(item, dict):
                     return _ValidationError(
@@ -2198,17 +2524,79 @@ class StreamingProcessor:
                 # only carries tool_calls (OpenAI sends content:null there).
                 if content is None and role == "assistant" and tool_calls is not None:
                     content = ""
-                if not isinstance(content, str):
+                # Parse the string-or-parts content. Returns concatenated text
+                # plus any inline-decoded images (empty for the common string
+                # shape and for the gateway path, which sends text here and the
+                # images in the message-level ``images`` field below).
+                parsed = _parse_chat_content(content, idx)
+                if isinstance(parsed, _ValidationError):
+                    return parsed
+                content_str, content_images, content_layout = parsed
+                # Gateway-decoded images ride a message-level ``images`` field
+                # (bytes already extracted from the data URI at the edge). Merge
+                # with any inline content-part images; in practice exactly one
+                # source is populated (gateway path vs direct OpenAI caller).
+                field_images = _parse_message_images_field(item_dict.get("images"), idx)
+                if isinstance(field_images, _ValidationError):
+                    return field_images
+                message_images = (*content_images, *field_images)
+                total_images += len(message_images)
+                if total_images > _MAX_IMAGES_PER_REQUEST:
                     return _ValidationError(
                         code="invalid_request",
-                        message=f"messages[{idx}].content must be a string",
+                        message=(f"too many images ({total_images}); maximum is {_MAX_IMAGES_PER_REQUEST} per request"),
                     )
+                # Ordered layout (#1294): gateway forwards it as a message-level
+                # ``content_parts`` field; the direct OpenAI caller's layout comes
+                # back from ``_parse_chat_content``. Exactly one is populated.
+                field_parts = _parse_content_parts_field(item_dict.get("content_parts"), idx)
+                if isinstance(field_parts, _ValidationError):
+                    return field_parts
+                # Prefer the gateway-forwarded layout only when it actually
+                # carries an image marker — an empty or image-free ``content_parts``
+                # field must not shadow a direct-path ``content_layout``. Falling
+                # back to ``content_layout`` (which is None unless it has images)
+                # also keeps an empty tuple off the interleaved render path, so the
+                # render guard (``if m.content_parts``) and the reconcile guard
+                # below agree.
+                field_has_image = field_parts is not None and any(p.get("type") == "image" for p in field_parts)
+                normalized_field_parts = field_parts if field_has_image else None
+                # Exactly one image-bearing layout source is allowed. An image-bearing
+                # ``content_parts`` field alongside an image-bearing ``content`` array
+                # (``content_layout``) would let the field's layout override the layout
+                # that ``content`` — and thus the validated ``content_str`` — was parsed
+                # from, so the checked text and the rendered layout could diverge. Reject
+                # rather than silently honoring one over the other.
+                if normalized_field_parts is not None and content_layout is not None:
+                    return _ValidationError(
+                        code="invalid_request",
+                        message=(
+                            f"messages[{idx}] has both an image-bearing 'content' array and an "
+                            "image-bearing 'content_parts' field; exactly one layout source is allowed"
+                        ),
+                    )
+                message_content_parts = normalized_field_parts or content_layout
+                # Reconcile placeholder count with the flat image list — a
+                # mismatch would desync placeholders from ``image_data`` at the
+                # engine, so reject it here rather than mis-render downstream.
+                if message_content_parts is not None:
+                    image_markers = sum(1 for p in message_content_parts if p.get("type") == "image")
+                    if image_markers != len(message_images):
+                        return _ValidationError(
+                            code="invalid_request",
+                            message=(
+                                f"messages[{idx}].content_parts has {image_markers} image placeholder(s) "
+                                f"but {len(message_images)} image(s) were provided"
+                            ),
+                        )
                 decoded.append(
                     _ChatMessage(
                         role=role,
-                        content=content,
+                        content=content_str,
                         tool_calls=tool_calls,
                         tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
+                        images=message_images or None,
+                        content_parts=message_content_parts,
                     )
                 )
             input_value = _MessagesInput(messages=tuple(decoded))
@@ -2663,7 +3051,26 @@ class StreamingProcessor:
             # defensive for direct worker callers). Qwen's template has no
             # ``developer`` slot.
             role = "system" if m.role == "developer" else m.role
-            d: dict[str, Any] = {"role": role, "content": m.content}
+            d: dict[str, Any]
+            if m.content_parts:
+                # #1294: render text↔image parts in their ORIGINAL order so each
+                # placeholder sits where the client placed it. Already in
+                # chat-template shape; copy each part so ``apply_chat_template``
+                # can't mutate the stored tuple. The bytes ride ``image_data`` in
+                # the same order as the ``"image"`` markers here.
+                d = {"role": role, "content": [dict(p) for p in m.content_parts]}
+            elif m.images:
+                # Legacy / no-layout path: hand the template a content-parts list
+                # so it inserts one image placeholder per image (Qwen-VL templates
+                # key off the ``"image"`` part type; the bytes travel separately
+                # as ``image_data``). Images lead, then the text — the flat image
+                # order the adapter receives.
+                content_parts: list[dict[str, Any]] = [{"type": "image"} for _ in m.images]
+                if m.content:
+                    content_parts.append({"type": "text", "text": m.content})
+                d = {"role": role, "content": content_parts}
+            else:
+                d = {"role": role, "content": m.content}
             if m.tool_calls:
                 d["tool_calls"] = [self._normalise_tool_call(tc) for tc in m.tool_calls]
             if m.tool_call_id is not None:
@@ -2715,6 +3122,7 @@ class StreamingProcessor:
         model_id: str,
         prompt: str,
         max_new_tokens: int,
+        num_images: int = 0,
     ) -> _ValidationError | None:
         """Worker-side ``prompt_tokens + max_new_tokens > context_length``
         guard. Emits a terminal ``code: "context_exceeded"`` chunk when
@@ -2782,12 +3190,18 @@ class StreamingProcessor:
                 exc_info=True,
             )
             return None
-        total = prompt_tokens + max_new_tokens
+        # Account for vision-encoder token expansion: each image placeholder
+        # in ``prompt`` tokenizes to a handful of text tokens but expands to
+        # many tokens at inference. Add a coarse per-image estimate so the
+        # guard fires before SGLang overflows its context window.
+        image_tokens = num_images * _VISION_TOKENS_PER_IMAGE_ESTIMATE
+        total = prompt_tokens + image_tokens + max_new_tokens
         if total > context_length:
+            image_note = f" + ~image_tokens ({image_tokens})" if image_tokens else ""
             return _ValidationError(
                 code="context_exceeded",
                 message=(
-                    f"prompt_tokens ({prompt_tokens}) + max_new_tokens "
+                    f"prompt_tokens ({prompt_tokens}){image_note} + max_new_tokens "
                     f"({max_new_tokens}) = {total} exceeds context_length "
                     f"({context_length}) for model '{model_id}'"
                 ),
