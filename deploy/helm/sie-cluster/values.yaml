@@ -19,6 +19,18 @@ global:
   # -- Namespace override (defaults to release namespace)
   namespace: ""
 
+# -- Pod labels added to every pod template managed by this chart
+# (gateway, config, workers). Selector labels are not affected — these are
+# appended after the selector labels and cannot rename them.
+#
+# Common uses:
+#   AKS Workload Identity:
+#     podLabels:
+#       azure.workload.identity/use: "true"
+#   GKE Workload Identity needs no pod label (annotation-only flow).
+#   EKS IRSA needs no pod label (annotation-only flow).
+podLabels: {}
+
 # -- Filesystem seed paths consumed only by sie-config (the gateway no longer
 # bakes a seed: it pulls bundles+models from sie-config at startup via
 # /v1/configs/bundles and /v1/configs/export; see
@@ -360,10 +372,10 @@ workers:
     # -- Cluster cache (object storage) configuration
     clusterCache:
       enabled: false
-      # -- Object-store URL with the /models prefix (for example,
-      # s3://my-bucket/models, gs://my-bucket/models, or
-      # abfs(s)://container@account.dfs.core.windows.net/models).
-      # AWS users: get this from `terraform output -raw model_cache_bucket_url`.
+      # -- Object-store URL with the /models prefix. Supported schemes:
+      #   - s3://<bucket>/models                                            (AWS — terraform output -raw model_cache_bucket_url)
+      #   - gs://<bucket>/models                                            (GCP — same output name)
+      #   - abfs(s)://<container>@<account>.dfs.core.windows.net/models     (Azure ADLS Gen2 — same output name)
       # Pre-populate the bucket once with `sie-admin cache weights sync --bundle default --dest <url>/`.
       url: ""
 
@@ -916,6 +928,8 @@ serviceAccount:
   create: true
   # -- Service account name. Must match KSA name in Terraform WI/IRSA binding.
   name: "sie-server"
+  # -- Labels (e.g., azure.workload.identity/use=true for Azure Workload Identity)
+  labels: {}
   # -- Annotations (e.g., for Workload Identity)
   annotations: {}
   # Example for GKE Workload Identity:
@@ -1101,8 +1115,11 @@ queueRouting:
 # -- Payload store for large work item payloads (images, long documents).
 # When a work item exceeds 1MB, the payload is offloaded to this store.
 # IMPORTANT: payloadStore.url must point to shared storage accessible by both
-# gateway and worker pods. Use s3://bucket/prefix, gs://bucket/prefix, or
-# abfs(s)://container@account.dfs.core.windows.net/prefix.
+# gateway and worker pods. Supported schemes:
+#   - s3://<bucket>/<prefix>                                          (AWS S3)
+#   - gs://<bucket>/<prefix>                                          (GCP GCS)
+#   - abfs://<container>@<account>.dfs.core.windows.net/<prefix>      (Azure ADLS Gen2)
+#   - abfss://...                                                     (same as abfs, TLS-only enforced by the SDK)
 # Local filesystem paths (e.g., /tmp/payloads) will NOT work in queue mode
 # because gateway and worker pods have different filesystems.
 #
@@ -1115,13 +1132,13 @@ queueRouting:
 # top-level sibling prefixes:
 #   <bucket>/models/...    model weights (managed by sie-admin)
 #   <bucket>/payloads/...  large work-item refs (managed by gateway)
-# The supported cloud modules scope their workload IAM grants to
-# these top-level prefixes, so the auto-derived URL aligns with the permissions
-# out of the box. Set payloadStore.url explicitly only to override the
-# default (e.g., a separate bucket); leaving it empty is the right call
+# All three terraform modules (AWS, GCP, Azure) scope their workload IAM
+# grants to these top-level prefixes, so the auto-derived URL aligns with the
+# permissions out of the box. Set payloadStore.url explicitly only to override
+# the default (e.g., a separate bucket); leaving it empty is the right call
 # for most clusters.
 payloadStore:
-  # -- Payload store URL. Must be an S3, GCS, or Azure Blob URL
+  # -- Payload store URL. Supported schemes: s3://, gs://, abfs://, abfss://
   # (s3://bucket/prefix, gs://bucket/prefix, or abfs(s)://container@account.dfs.core.windows.net/prefix).
   # Local paths are rejected when clusterRouting=queue (see gateway-deployment.yaml validation).
   # Leave empty to auto-derive from workers.common.clusterCache.url (recommended).

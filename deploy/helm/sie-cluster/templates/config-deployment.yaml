@@ -42,6 +42,11 @@ spec:
   template:
     metadata:
       labels:
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- /* Render selectorLabels last so user-supplied podLabels cannot
+               override the Deployment selector contract. */ -}}
         {{- include "sie-cluster.config.selectorLabels" . | nindent 8 }}
       {{- with .Values.config.podAnnotations }}
       annotations:

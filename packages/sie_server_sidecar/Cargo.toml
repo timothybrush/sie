@@ -1,6 +1,6 @@
 [package]
 name = "sie-server-sidecar"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 description = "SIE worker sidecar: NATS JetStream consumer, scheduler, IPC client, and GPU-independent prep for sie-server pods."
 
@@ -32,6 +32,10 @@ rmp-serde = "1"
 # `msgpack_numpy.patch()` decoder sees the same wire shape it gets
 # from the Python adapters.
 rmp = "0.8"
+# Dynamically typed msgpack values for request payloads. User items may
+# contain msgpack bin/ext fields (documents, images, numpy sentinels) that
+# cannot round-trip through serde_json::Value.
+rmpv = { version = "1", features = ["with-serde"] }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
@@ -73,6 +77,3 @@ cloud-storage = ["dep:object_store", "dep:url"]
 
 [dev-dependencies]
 tempfile = "3"
-# Dynamically typed msgpack values for tests that need to walk
-# hand-rolled wire envelopes (e.g. dense-encode numpy sentinel).
-rmpv = "1"

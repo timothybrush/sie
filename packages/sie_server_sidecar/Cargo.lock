@@ -1916,6 +1916,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
 dependencies = [
  "rmp",
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]
@@ -2193,7 +2195,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sie-server-sidecar"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-nats",

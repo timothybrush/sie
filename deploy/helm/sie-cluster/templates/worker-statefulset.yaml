@@ -66,6 +66,11 @@ spec:
   template:
     metadata:
       labels:
+        {{- with $root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- /* Render selectorLabels last so user-supplied podLabels cannot
+               override the StatefulSet selector contract. */ -}}
         {{- include "sie-cluster.worker.selectorLabels" $root | nindent 8 }}
         sie.superlinked.com/gpu-type: {{ $pool.gpuType | quote }}
         sie.superlinked.com/machine-profile: {{ $machineProfile | quote }}

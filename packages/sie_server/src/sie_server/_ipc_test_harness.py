@@ -136,7 +136,7 @@ class _StubExecutor:
 
     async def process_extract_batch(self, req: ProcessExtractBatchRequest) -> BatchOutcome:
         await self._maybe_sleep()
-        return _canned_batch_outcome(req.items)
+        return _canned_extract_batch_outcome(req.items)
 
 
 class _FakeGenerateProcessor:
@@ -177,6 +177,51 @@ def _canned_batch_outcome(items: list[Any]) -> BatchOutcome:
             for item in items
         ]
     )
+
+
+def _extract_document_echo(item: Any) -> dict[str, Any]:
+    document = item.item.get("document") if isinstance(item.item, dict) else None
+    if not isinstance(document, dict):
+        return {
+            "present": False,
+            "data_is_bytes": False,
+            "data": b"",
+            "data_len": 0,
+            "format": None,
+        }
+
+    data = document.get("data")
+    data_is_bytes = isinstance(data, bytes | bytearray)
+    data_bytes = bytes(data) if data_is_bytes else b""
+    return {
+        "present": True,
+        "data_is_bytes": data_is_bytes,
+        "data": data_bytes,
+        "data_len": len(data_bytes),
+        "format": document.get("format"),
+    }
+
+
+def _canned_extract_batch_outcome(items: list[Any]) -> BatchOutcome:
+    outcomes: list[ItemOutcome] = []
+    for item in items:
+        payload = msgpack.packb(
+            {**_CANNED_RESULT, "extract_document": _extract_document_echo(item)},
+            use_bin_type=True,
+        )
+        outcomes.append(
+            ItemOutcome(
+                work_item_id=item.work_item_id,
+                request_id=item.request_id,
+                item_index=item.item_index,
+                disposition="publish_and_ack",
+                result_msgpack=payload,
+                inference_ms=0.1,
+                tokenization_ms=0.05,
+                postprocessing_ms=0.01,
+            )
+        )
+    return BatchOutcome(outcomes=outcomes)
 
 
 def _canned_batch_outcome_echoing_prepared_tokens(items: list[Any]) -> BatchOutcome:

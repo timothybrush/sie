@@ -40,6 +40,66 @@ use tokio::time::{sleep, timeout};
 
 static SMOKE_TEST_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+fn msg_value(value: serde_json::Value) -> rmpv::Value {
+    let bytes = rmp_serde::to_vec_named(&value).expect("msgpack encode fixture value");
+    rmp_serde::from_slice(&bytes).expect("msgpack decode fixture value")
+}
+
+fn text_item(text: impl Into<String>) -> rmpv::Value {
+    let text = text.into();
+    msg_value(serde_json::json!({ "text": text }))
+}
+
+fn document_item(data: Vec<u8>, format: &str) -> rmpv::Value {
+    rmpv::Value::Map(vec![(
+        rmpv::Value::from("document"),
+        rmpv::Value::Map(vec![
+            (rmpv::Value::from("data"), rmpv::Value::Binary(data)),
+            (rmpv::Value::from("format"), rmpv::Value::from(format)),
+        ]),
+    )])
+}
+
+fn msg_value_key_eq(key: &rmpv::Value, expected: &str) -> bool {
+    match key {
+        rmpv::Value::String(s) => s.as_str() == Some(expected),
+        rmpv::Value::Binary(b) => std::str::from_utf8(b).ok() == Some(expected),
+        _ => false,
+    }
+}
+
+fn msg_map_get<'a>(value: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+    let rmpv::Value::Map(entries) = value else {
+        return None;
+    };
+    entries
+        .iter()
+        .find(|(k, _)| msg_value_key_eq(k, key))
+        .map(|(_, v)| v)
+}
+
+fn msg_as_bool(value: &rmpv::Value) -> Option<bool> {
+    match value {
+        rmpv::Value::Boolean(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn msg_as_str(value: &rmpv::Value) -> Option<&str> {
+    match value {
+        rmpv::Value::String(value) => value.as_str(),
+        rmpv::Value::Binary(value) => std::str::from_utf8(value).ok(),
+        _ => None,
+    }
+}
+
+fn msg_as_u64(value: &rmpv::Value) -> Option<u64> {
+    match value {
+        rmpv::Value::Integer(value) => value.as_u64(),
+        _ => None,
+    }
+}
+
 async fn smoke_test_guard() -> OwnedSemaphorePermit {
     SMOKE_TEST_SEMAPHORE
         .get_or_init(|| Arc::new(Semaphore::new(1)))
@@ -616,7 +676,7 @@ async fn smoke_encode_request_round_trips_through_rust_worker() {
         engine: String::new(),
         pool_name: pool.into(),
         machine_profile: pool.into(),
-        item: Some(serde_json::json!({"text": "hello rust worker"})),
+        item: Some(text_item("hello rust worker")),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
         instruction: None,
@@ -1156,6 +1216,177 @@ async fn smoke_payload_ref_request_round_trips_through_rust_worker() {
     sleep(Duration::from_millis(200)).await;
 }
 
+/// Regression: document bytes must remain msgpack `bin` from the offloaded
+/// WorkItem payload through the Rust dispatcher and into the Python IPC item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn smoke_extract_payload_ref_preserves_document_bytes_through_ipc() {
+    if skip_unless_tools_available() {
+        return;
+    }
+    let _guard = smoke_test_guard().await;
+
+    let nats = NatsHarness::start().await;
+    eprintln!("nats: {} (port {})", nats.url, nats.port);
+
+    let sock = ShortSocket::new("ipc.sock");
+    let python = PythonHarness::start(sock.path.clone()).await;
+    eprintln!("python harness: socket={}", python.socket_path.display());
+
+    let payload_dir = tempfile::Builder::new()
+        .prefix("siews-doc-payloads-")
+        .tempdir_in("/tmp")
+        .expect("create payload dir");
+    let payload_store_url = payload_dir
+        .path()
+        .to_str()
+        .expect("payload dir utf-8")
+        .to_string();
+
+    let request_id = "smoke-doc-payload-ref-1";
+    let pdf_bytes = b"%PDF-1.4 tiny sidecar regression".to_vec();
+    let item_path = payload_dir.path().join(format!("{request_id}_0.bin"));
+    let item_body = document_item(pdf_bytes.clone(), "pdf");
+    let item_bytes = rmp_serde::to_vec_named(&item_body).expect("msgpack encode document item");
+    tokio::fs::write(&item_path, &item_bytes)
+        .await
+        .expect("write document payload");
+    let payload_ref = item_path.to_str().expect("payload path utf-8").to_string();
+    eprintln!(
+        "wrote document payload: {payload_ref} ({} bytes)",
+        item_bytes.len()
+    );
+
+    let pool = "smoke-doc";
+    let bundle = "default";
+    let metrics_port = find_free_tcp_port();
+    let _worker = WorkerHarness::spawn(
+        &nats.url,
+        &sock.path,
+        pool,
+        bundle,
+        metrics_port,
+        Some(&payload_store_url),
+    );
+    wait_for_tcp(metrics_port, Duration::from_secs(30))
+        .await
+        .expect("worker metrics port");
+    sleep(Duration::from_millis(500)).await;
+
+    let client = async_nats::connect(&nats.url)
+        .await
+        .expect("client connect");
+    let reply_subject = format!("_INBOX.smoke-doc.{}", uuid::Uuid::new_v4());
+    let mut sub = client
+        .subscribe(reply_subject.clone())
+        .await
+        .expect("subscribe reply");
+
+    let model_id = "docling";
+    let subject = pool_work_subject(pool, pool, bundle, model_id);
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let work_item = WorkItem {
+        work_item_id: format!("{request_id}.0"),
+        request_id: request_id.into(),
+        item_index: 0,
+        total_items: 1,
+        operation: "extract".into(),
+        model_id: model_id.into(),
+        profile_id: String::new(),
+        engine: String::new(),
+        pool_name: pool.into(),
+        machine_profile: pool.into(),
+        item: None,
+        payload_ref: Some(payload_ref.clone()),
+        output_types: None,
+        instruction: None,
+        is_query: false,
+        options: None,
+        query_item: None,
+        query_payload_ref: None,
+        score_items: None,
+        labels: Some(vec!["document".into()]),
+        output_schema: None,
+        generate: None,
+        routing_key: None,
+        prompt_cache_key: None,
+        bundle_config_hash: String::new(),
+        router_id: "smoke-gw".into(),
+        reply_subject: reply_subject.clone(),
+        traceparent: None,
+        tracestate: None,
+        timestamp: now_s,
+    };
+    let payload = rmp_serde::to_vec_named(&work_item).expect("encode extract WorkItem");
+    let js = async_nats::jetstream::new(client.clone());
+    let (stream, sequence) = publish_jetstream_with_retry(&js, &subject, payload).await;
+    eprintln!(
+        "published document payload-ref WorkItem, stream={} seq={}",
+        stream, sequence
+    );
+
+    let reply = timeout(Duration::from_secs(30), sub.next())
+        .await
+        .expect("timed out waiting for extract WorkResult")
+        .expect("reply stream closed");
+    let result: WorkResult = rmp_serde::from_slice(&reply.payload).expect("decode WorkResult");
+    assert!(
+        result.success,
+        "expected success, got error={:?}",
+        result.error
+    );
+    assert_eq!(result.request_id, request_id);
+    assert_eq!(result.work_item_id, format!("{request_id}.0"));
+
+    let echo: rmpv::Value =
+        rmp_serde::from_slice(&result.result_msgpack).expect("decode extract echo");
+    assert_eq!(msg_map_get(&echo, "smoke").and_then(msg_as_str), Some("ok"));
+    assert_eq!(
+        msg_map_get(&echo, "source").and_then(msg_as_str),
+        Some("ipc_test_harness")
+    );
+    let document = msg_map_get(&echo, "extract_document").expect("extract_document echo");
+    assert_eq!(
+        msg_map_get(document, "present").and_then(msg_as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        msg_map_get(document, "data_is_bytes").and_then(msg_as_bool),
+        Some(true),
+        "Python IPC harness did not receive document.data as bytes; echo={echo:?}",
+    );
+    assert_eq!(
+        msg_map_get(document, "data_len").and_then(msg_as_u64),
+        Some(pdf_bytes.len() as u64)
+    );
+    assert_eq!(
+        msg_map_get(document, "format").and_then(msg_as_str),
+        Some("pdf")
+    );
+    assert_eq!(
+        msg_map_get(document, "data"),
+        Some(&rmpv::Value::Binary(pdf_bytes)),
+        "document.data changed before reaching Python IPC; echo={echo:?}",
+    );
+
+    let fetch_ms = result
+        .payload_fetch_ms
+        .expect("payload_fetch_ms should be populated when item is offloaded");
+    assert!(
+        (0.0..5_000.0).contains(&fetch_ms),
+        "payload_fetch_ms out of expected range: {fetch_ms}"
+    );
+
+    drop(_worker);
+    drop(python);
+    drop(nats);
+    let _ = sock;
+    let _ = payload_dir;
+    sleep(Duration::from_millis(200)).await;
+}
+
 // ---------------------------------------------------------------------------
 // Concurrent / stress scenarios for the pull loop
 //
@@ -1249,7 +1480,7 @@ async fn publish_work_item(
         engine: String::new(),
         pool_name: pool.into(),
         machine_profile: pool.into(),
-        item: Some(serde_json::json!({"text": format!("concurrent-{request_id}")})),
+        item: Some(text_item(format!("concurrent-{request_id}"))),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
         instruction: None,
@@ -1949,7 +2180,7 @@ async fn smoke_prepared_tokens_round_trip_through_rust_worker() {
         engine: String::new(),
         pool_name: pool.into(),
         machine_profile: pool.into(),
-        item: Some(serde_json::json!({"text": "hello world"})),
+        item: Some(text_item("hello world")),
         payload_ref: None,
         output_types: Some(vec!["dense".into()]),
         instruction: None,
@@ -2131,9 +2362,9 @@ async fn publish_score_work_item(
         instruction: None,
         is_query: false,
         options: None,
-        query_item: Some(serde_json::json!({"text": "what is the capital of France?"})),
+        query_item: Some(text_item("what is the capital of France?")),
         query_payload_ref: None,
-        score_items: Some(vec![serde_json::json!({"text": "Paris is the capital."})]),
+        score_items: Some(vec![text_item("Paris is the capital.")]),
         labels: None,
         output_schema: None,
         generate: None,
@@ -2175,7 +2406,7 @@ async fn publish_extract_work_item(
         engine: String::new(),
         pool_name: pool.into(),
         machine_profile: pool.into(),
-        item: Some(serde_json::json!({"text": "Barack Obama was born in Hawaii."})),
+        item: Some(text_item("Barack Obama was born in Hawaii.")),
         payload_ref: None,
         output_types: None,
         instruction: None,

@@ -429,9 +429,18 @@ Resolution order:
      before appending "/payloads". The resulting layout is:
        <bucket-or-container>/models/...    weights (managed by sie-admin cache)
        <bucket-or-container>/payloads/...  large work-item refs (managed by gateway)
-     These siblings live at the bucket/container root, which is what supported
-     cloud workload IAM grants are scoped to.
+     These siblings live at the bucket/container root, which is what the
+     workload IAM grants are scoped to in all three (AWS, GCP, Azure)
+     terraform modules.
   3. Otherwise -> empty string (payload store is off, no env vars rendered).
+
+Supported URL schemes: s3:// (AWS), gs:// (GCP), abfs:// + abfss:// (Azure
+Data Lake Storage Gen2 / Blob with hierarchical namespace enabled). The
+Azure scheme variant is treated identically to the AWS/GCP variants for
+the derivation step — the trailing "/models" → "/payloads" swap works
+the same way because Azure URLs follow the same
+"<scheme>://<container>@<account>.dfs.core.windows.net/<prefix>"
+convention exposed by the deploy/terraform/azure module.
 
 Templates that consume this should treat a non-empty result as "payload
 store enabled" and an empty result as "off".

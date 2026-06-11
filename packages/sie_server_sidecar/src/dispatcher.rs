@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use async_nats::jetstream::Message;
 use futures_util::future::join_all;
+use rmpv::Value as MsgValue;
 use serde_json::Value as Json;
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
@@ -90,6 +91,32 @@ pub(crate) fn nak_delay_for_backend_error(err: &BackendError) -> u64 {
 /// check — a malicious producer could otherwise aim results at an
 /// arbitrary subject. Empty reply_subjects are allowed (fire-and-forget).
 const INBOX_PREFIX: &str = "_INBOX.";
+
+fn msg_value_key_eq(key: &MsgValue, expected: &str) -> bool {
+    match key {
+        MsgValue::String(s) => s.as_str() == Some(expected),
+        MsgValue::Binary(b) => std::str::from_utf8(b).ok() == Some(expected),
+        _ => false,
+    }
+}
+
+fn msg_map_get<'a>(value: &'a MsgValue, key: &str) -> Option<&'a MsgValue> {
+    let MsgValue::Map(entries) = value else {
+        return None;
+    };
+    entries
+        .iter()
+        .find(|(k, _)| msg_value_key_eq(k, key))
+        .map(|(_, v)| v)
+}
+
+fn msg_as_str(value: &MsgValue) -> Option<&str> {
+    match value {
+        MsgValue::String(s) => s.as_str(),
+        MsgValue::Binary(b) => std::str::from_utf8(b).ok(),
+        _ => None,
+    }
+}
 
 /// True if `reply_subject` is acceptable for use on a `WorkItem`.
 /// Empty is allowed (fire-and-forget). Non-empty subjects must start
@@ -896,7 +923,7 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "encode"])
             .start_timer();
-        let mut resolved: Vec<(WorkItem, Message, Json, f64)> = Vec::with_capacity(items.len());
+        let mut resolved: Vec<(WorkItem, Message, MsgValue, f64)> = Vec::with_capacity(items.len());
         for (wi, msg) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
@@ -1010,7 +1037,7 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "score"])
             .start_timer();
-        let mut prepared: Vec<(WorkItem, Message, Json, Vec<Json>, f64)> =
+        let mut prepared: Vec<(WorkItem, Message, MsgValue, Vec<MsgValue>, f64)> =
             Vec::with_capacity(items.len());
         for (wi, msg) in items {
             let (query, score_items, fetch_ms) = match self.resolve_score(&wi).await {
@@ -1126,7 +1153,7 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "extract"])
             .start_timer();
-        let mut resolved: Vec<(WorkItem, Message, Json, f64)> = Vec::with_capacity(items.len());
+        let mut resolved: Vec<(WorkItem, Message, MsgValue, f64)> = Vec::with_capacity(items.len());
         for (wi, msg) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
@@ -1729,7 +1756,7 @@ impl Dispatcher {
 
     // -- payload resolution ----------------------------------------------
 
-    async fn resolve_item(&self, wi: &WorkItem) -> Result<(Json, f64), PayloadError> {
+    async fn resolve_item(&self, wi: &WorkItem) -> Result<(MsgValue, f64), PayloadError> {
         if let Some(item) = &wi.item {
             return Ok((item.clone(), 0.0));
         }
@@ -1742,7 +1769,7 @@ impl Dispatcher {
         let start = std::time::Instant::now();
         let bytes = self.payload_store.get(payload_ref).await?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let item: Json = rmp_serde::from_slice(&bytes)
+        let item: MsgValue = rmp_serde::from_slice(&bytes)
             .map_err(|e| PayloadError::InvalidRef(format!("decode payload: {e}")))?;
         Ok((item, ms))
     }
@@ -1755,7 +1782,7 @@ impl Dispatcher {
     //
     //   1. Registry has an entry for `model_id` (the adapter declared
     //      a tokeniser on `EnsureModelReady`).
-    //   2. The `item` JSON payload has a populated string `text`
+    //   2. The msgpack-native `item` payload has a populated string `text`
     //      field. Image / audio / multimodal items fall through to
     //      Python as today.
     //
@@ -1784,7 +1811,7 @@ impl Dispatcher {
         &self,
         model_id: &str,
         wi: &WorkItem,
-        item: &Json,
+        item: &MsgValue,
     ) -> Option<PreparedTokens> {
         let entry = self.tokenizer_registry.get(model_id)?;
 
@@ -1793,9 +1820,8 @@ impl Dispatcher {
         // string would tokenise to a 2-token `[CLS][SEP]` padding
         // sequence — harmless but pure IPC overhead vs letting Python
         // short-circuit on its own empty-text guard.
-        let raw_text = item
-            .get("text")
-            .and_then(|v| v.as_str())
+        let raw_text = msg_map_get(item, "text")
+            .and_then(msg_as_str)
             .filter(|s| !s.is_empty())?;
 
         // Resolve per-request template overrides; fall back to the
@@ -1835,7 +1861,10 @@ impl Dispatcher {
         Some(rag_to_wire(entry.tokenizer_id(), entry.max_seq_len(), rag))
     }
 
-    async fn resolve_score(&self, wi: &WorkItem) -> Result<(Json, Vec<Json>, f64), PayloadError> {
+    async fn resolve_score(
+        &self,
+        wi: &WorkItem,
+    ) -> Result<(MsgValue, Vec<MsgValue>, f64), PayloadError> {
         // Inline path: both query + items provided on the WorkItem.
         if let (Some(q), Some(items)) = (&wi.query_item, &wi.score_items) {
             return Ok((q.clone(), items.clone(), 0.0));
@@ -1852,19 +1881,19 @@ impl Dispatcher {
         let start = std::time::Instant::now();
         let bytes = self.payload_store.get(ref_key).await?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let decoded: Json = rmp_serde::from_slice(&bytes)
+        let decoded: MsgValue = rmp_serde::from_slice(&bytes)
             .map_err(|e| PayloadError::InvalidRef(format!("decode score payload: {e}")))?;
-        let query = decoded
-            .get("query")
+        let query = msg_map_get(&decoded, "query")
             .cloned()
             .ok_or_else(|| PayloadError::InvalidRef("score payload missing 'query'".into()))?;
-        let items = decoded
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .ok_or_else(|| {
-                PayloadError::InvalidRef("score payload missing 'items' array".into())
-            })?;
+        let items = match msg_map_get(&decoded, "items") {
+            Some(MsgValue::Array(items)) => items.clone(),
+            _ => {
+                return Err(PayloadError::InvalidRef(
+                    "score payload missing 'items' array".into(),
+                ));
+            }
+        };
         Ok((query, items, ms))
     }
 }
@@ -2723,6 +2752,10 @@ fn decode_offloaded_generate(bytes: &[u8]) -> Result<Json, rmp_serde::decode::Er
 mod tests {
     use super::*;
 
+    fn text_item(text: &str) -> MsgValue {
+        MsgValue::Map(vec![(MsgValue::from("text"), MsgValue::from(text))])
+    }
+
     fn wi(request: &str, idx: u32, model: &str, op: &str) -> WorkItem {
         WorkItem {
             work_item_id: format!("{}.{}", request, idx),
@@ -2735,7 +2768,7 @@ mod tests {
             engine: String::new(),
             pool_name: "l4".into(),
             machine_profile: String::new(),
-            item: Some(serde_json::json!({"text": "x"})),
+            item: Some(text_item("x")),
             payload_ref: None,
             output_types: None,
             instruction: None,

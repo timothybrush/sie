@@ -74,8 +74,7 @@ fn cost_from_prepared(pt: Option<&PreparedTokens>) -> u64 {
 /// [`crate::ipc_types::RunBatchRequest`] is O(items) moves and zero re-serialisation.
 ///
 /// Named `SchedulerItem` rather than `Item` to avoid collision with
-/// the `item: serde_json::Value` field that lives inside the inner
-/// variants.
+/// the msgpack-native `item` fields that live inside the inner variants.
 #[derive(Debug, Clone)]
 pub enum SchedulerItem {
     Encode(EncodeBatchItem),
@@ -219,6 +218,12 @@ pub fn lora_from_options(options: &Option<serde_json::Value>) -> LoraKey {
 mod tests {
     use super::*;
 
+    use crate::ipc_types::WireValue;
+
+    fn text_item(text: &str) -> WireValue {
+        WireValue::Map(vec![(WireValue::from("text"), WireValue::from(text))])
+    }
+
     fn pt_with_lens(lens: &[usize]) -> PreparedTokens {
         let input_ids: Vec<Vec<u32>> = lens
             .iter()
@@ -240,7 +245,7 @@ mod tests {
             item_index: idx,
             total_items: 1,
             timestamp: 0.0,
-            item: serde_json::json!({"text": "x"}),
+            item: text_item("x"),
             output_types: None,
             instruction: None,
             is_query: false,
@@ -269,8 +274,8 @@ mod tests {
             item_index: 0,
             total_items: 1,
             timestamp: 0.0,
-            query_item: serde_json::json!({"text": "q"}),
-            score_items: vec![serde_json::json!({"text": "d"})],
+            query_item: text_item("q"),
+            score_items: vec![text_item("d")],
             instruction: None,
             options: None,
             profile_id: None,
@@ -304,7 +309,7 @@ mod tests {
             item_index: 0,
             total_items: 1,
             timestamp: 0.0,
-            item: serde_json::json!({"text": "x"}),
+            item: text_item("x"),
             labels: None,
             output_schema: None,
             instruction: None,
@@ -332,7 +337,7 @@ mod tests {
             item_index: 0,
             total_items: 1,
             timestamp: 0.0,
-            query_item: serde_json::json!(null),
+            query_item: WireValue::Nil,
             score_items: vec![],
             instruction: None,
             options: None,
@@ -347,7 +352,7 @@ mod tests {
             item_index: 0,
             total_items: 1,
             timestamp: 0.0,
-            item: serde_json::json!(null),
+            item: WireValue::Nil,
             labels: None,
             output_schema: None,
             instruction: None,

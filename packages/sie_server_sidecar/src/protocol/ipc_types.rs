@@ -18,6 +18,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// User item payloads are msgpack-native so binary fields (`bin` / `ext`) can
+/// reach Python unchanged. Small config fields stay JSON-shaped.
+pub type WireValue = rmpv::Value;
+
 pub const IPC_VERSION: u32 = 1;
 
 pub const METHOD_PING: &str = "Ping";
@@ -547,7 +551,7 @@ pub struct EncodeBatchItem {
     pub item_index: u32,
     pub total_items: u32,
     pub timestamp: f64,
-    pub item: serde_json::Value,
+    pub item: WireValue,
     #[serde(default)]
     pub output_types: Option<Vec<String>>,
     #[serde(default)]
@@ -587,8 +591,8 @@ pub struct ScoreBatchItem {
     pub item_index: u32,
     pub total_items: u32,
     pub timestamp: f64,
-    pub query_item: serde_json::Value,
-    pub score_items: Vec<serde_json::Value>,
+    pub query_item: WireValue,
+    pub score_items: Vec<WireValue>,
     #[serde(default)]
     pub instruction: Option<String>,
     #[serde(default)]
@@ -623,7 +627,7 @@ pub struct ExtractBatchItem {
     pub item_index: u32,
     pub total_items: u32,
     pub timestamp: f64,
-    pub item: serde_json::Value,
+    pub item: WireValue,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
     #[serde(default)]
@@ -849,6 +853,10 @@ pub struct DrainResponse {
 mod tests {
     use super::*;
 
+    fn text_item(text: &str) -> WireValue {
+        WireValue::Map(vec![(WireValue::from("text"), WireValue::from(text))])
+    }
+
     #[test]
     fn readiness_state_serde_matches_python_literal() {
         // Python side uses Literal["ready","loading_started","loading_in_progress","retry_later"].
@@ -989,7 +997,7 @@ mod tests {
             item_index: 0,
             total_items: 1,
             timestamp: 0.0,
-            item: serde_json::json!({"text": "hello"}),
+            item: text_item("hello"),
             output_types: Some(vec!["dense".into()]),
             instruction: None,
             is_query: false,
@@ -1002,6 +1010,94 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&bi).unwrap();
         let back: EncodeBatchItem = rmp_serde::from_slice(&bytes).unwrap();
         assert!(back.prepared_tokens.is_none());
+    }
+
+    #[test]
+    fn process_extract_batch_request_preserves_document_bytes() {
+        let pdf_bytes = b"%PDF-1.4 tiny".to_vec();
+        let req = ProcessExtractBatchRequest {
+            model_id: "docling".into(),
+            items: vec![ExtractBatchItem {
+                work_item_id: "r.0".into(),
+                request_id: "r".into(),
+                item_index: 0,
+                total_items: 1,
+                timestamp: 0.0,
+                item: WireValue::Map(vec![(
+                    WireValue::from("document"),
+                    WireValue::Map(vec![
+                        (
+                            WireValue::from("data"),
+                            WireValue::Binary(pdf_bytes.clone()),
+                        ),
+                        (WireValue::from("format"), WireValue::from("pdf")),
+                    ]),
+                )]),
+                labels: None,
+                output_schema: None,
+                instruction: None,
+                options: None,
+                profile_id: None,
+                bundle_config_hash: None,
+                payload_fetch_ms: 0.0,
+            }],
+        };
+
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let decoded: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let rmpv::Value::Map(root) = decoded else {
+            panic!("request should be a msgpack map");
+        };
+        let items = root
+            .iter()
+            .find_map(|(key, value)| {
+                if matches!(key, rmpv::Value::String(s) if s.as_str() == Some("items")) {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .expect("items field");
+        let rmpv::Value::Array(items) = items else {
+            panic!("items should be an array");
+        };
+        let Some(rmpv::Value::Map(first)) = items.first() else {
+            panic!("first item should be a map");
+        };
+        let document = first
+            .iter()
+            .find_map(|(key, value)| {
+                if matches!(key, rmpv::Value::String(s) if s.as_str() == Some("item")) {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .and_then(|item| match item {
+                rmpv::Value::Map(fields) => fields.iter().find_map(|(key, value)| {
+                    if matches!(key, rmpv::Value::String(s) if s.as_str() == Some("document")) {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .expect("document field");
+        let rmpv::Value::Map(document) = document else {
+            panic!("document should be a map");
+        };
+        let data = document
+            .iter()
+            .find_map(|(key, value)| {
+                if matches!(key, rmpv::Value::String(s) if s.as_str() == Some("data")) {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .expect("document.data");
+        assert_eq!(data, &rmpv::Value::Binary(pdf_bytes));
     }
 
     #[test]

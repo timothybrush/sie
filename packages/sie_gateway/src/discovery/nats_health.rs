@@ -7,6 +7,10 @@ use tracing::{info, warn};
 use crate::state::worker_registry::WorkerRegistry;
 use crate::types::WorkerStatusMessage;
 
+const HEALTH_SUBJECT: &str = "sie.health.>";
+const RESUBSCRIBE_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(30);
+
 pub struct NatsHealthManager {
     registry: Arc<WorkerRegistry>,
     cancel_tx: tokio::sync::watch::Sender<()>,
@@ -28,14 +32,15 @@ impl NatsHealthManager {
         &self,
         client: &async_nats::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sub = client.subscribe("sie.health.>").await?;
-        info!("subscribed to sie.health.>");
+        let sub = subscribe_health(client).await?;
+        info!(subject = HEALTH_SUBJECT, "subscribed to NATS health");
 
         let registry = Arc::clone(&self.registry);
+        let client = client.clone();
         let mut cancel_rx = self.cancel_rx.clone();
 
         tokio::spawn(async move {
-            run_subscription(registry, sub, &mut cancel_rx).await;
+            run_subscription_supervised(registry, client, sub, &mut cancel_rx).await;
         });
 
         Ok(())
@@ -72,29 +77,135 @@ impl NatsHealthManager {
     }
 }
 
-async fn run_subscription(
+async fn subscribe_health(
+    client: &async_nats::Client,
+) -> Result<async_nats::Subscriber, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(client.subscribe(HEALTH_SUBJECT).await?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionExit {
+    Ended { messages: u64 },
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct ResubscribeBackoff {
+    initial: Duration,
+    next: Duration,
+    max: Duration,
+}
+
+impl ResubscribeBackoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            next: initial,
+            max,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.checked_mul(2).unwrap_or(self.max).min(self.max);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = self.initial;
+    }
+}
+
+async fn run_subscription_supervised(
+    registry: Arc<WorkerRegistry>,
+    client: async_nats::Client,
+    initial_sub: async_nats::Subscriber,
+    cancel_rx: &mut tokio::sync::watch::Receiver<()>,
+) {
+    let mut backoff = ResubscribeBackoff::new(RESUBSCRIBE_INITIAL_DELAY, RESUBSCRIBE_MAX_DELAY);
+    let mut next_sub = Some(initial_sub);
+
+    loop {
+        let sub = match next_sub.take() {
+            Some(sub) => sub,
+            None => match subscribe_health(&client).await {
+                Ok(sub) => {
+                    info!(subject = HEALTH_SUBJECT, "resubscribed to NATS health");
+                    sub
+                }
+                Err(error) => {
+                    let delay = backoff.next_delay();
+                    warn!(
+                        subject = HEALTH_SUBJECT,
+                        error = %error,
+                        delay_ms = delay.as_millis() as u64,
+                        "failed to resubscribe to NATS health"
+                    );
+                    if sleep_or_cancel(delay, cancel_rx).await {
+                        info!("NATS health subscription cancelled");
+                        return;
+                    }
+                    continue;
+                }
+            },
+        };
+
+        match run_subscription_until_end(Arc::clone(&registry), sub, cancel_rx).await {
+            SubscriptionExit::Cancelled => return,
+            SubscriptionExit::Ended { messages } => {
+                if messages > 0 {
+                    backoff.reset();
+                }
+                let delay = backoff.next_delay();
+                warn!(
+                    subject = HEALTH_SUBJECT,
+                    messages,
+                    delay_ms = delay.as_millis() as u64,
+                    "NATS health subscription stream ended; resubscribing"
+                );
+                if sleep_or_cancel(delay, cancel_rx).await {
+                    info!("NATS health subscription cancelled");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_or_cancel(
+    delay: Duration,
+    cancel_rx: &mut tokio::sync::watch::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = cancel_rx.changed() => true,
+    }
+}
+
+async fn run_subscription_until_end(
     registry: Arc<WorkerRegistry>,
     mut sub: async_nats::Subscriber,
     cancel_rx: &mut tokio::sync::watch::Receiver<()>,
-) {
+) -> SubscriptionExit {
     info!("NATS health subscription handler started");
+    let mut messages = 0u64;
 
     loop {
         tokio::select! {
             msg = sub.next() => {
                 match msg {
                     Some(msg) => {
+                        messages = messages.saturating_add(1);
                         handle_nats_message(&registry, msg).await;
                     }
                     None => {
-                        warn!("NATS subscription stream ended");
-                        break;
+                        return SubscriptionExit::Ended { messages };
                     }
                 }
             }
             _ = cancel_rx.changed() => {
                 info!("NATS health subscription cancelled");
-                break;
+                return SubscriptionExit::Cancelled;
             }
         }
     }
@@ -215,5 +326,24 @@ mod tests {
 
         assert!(registry.workers().await.is_empty());
         assert!(registry.healthy_workers().await.is_empty());
+    }
+
+    #[test]
+    fn resubscribe_backoff_doubles_to_cap() {
+        let mut backoff = ResubscribeBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(4));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resubscribe_backoff_reset_returns_to_initial_delay() {
+        let mut backoff = ResubscribeBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
     }
 }

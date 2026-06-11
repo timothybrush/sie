@@ -8,6 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// User-supplied item payload carried as msgpack. Do not convert this to
+/// `serde_json::Value`: msgpack `bin` / `ext` fields are valid for documents,
+/// images, and numpy payloads, but JSON has no representation for them.
+pub type WireValue = rmpv::Value;
+
 /// Work item pulled from JetStream. Must stay wire-compatible with the
 /// gateway publisher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +37,7 @@ pub struct WorkItem {
     pub pool_name: String,
     pub machine_profile: String,
     #[serde(default)]
-    pub item: Option<serde_json::Value>,
+    pub item: Option<WireValue>,
     #[serde(default)]
     pub payload_ref: Option<String>,
     #[serde(default)]
@@ -44,11 +49,11 @@ pub struct WorkItem {
     #[serde(default)]
     pub options: Option<serde_json::Value>,
     #[serde(default)]
-    pub query_item: Option<serde_json::Value>,
+    pub query_item: Option<WireValue>,
     #[serde(default)]
     pub query_payload_ref: Option<String>,
     #[serde(default)]
-    pub score_items: Option<Vec<serde_json::Value>>,
+    pub score_items: Option<Vec<WireValue>>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
     #[serde(default)]
@@ -108,6 +113,11 @@ pub struct WorkResult {
 mod tests {
     use super::*;
 
+    fn msg_value(value: serde_json::Value) -> WireValue {
+        let bytes = rmp_serde::to_vec_named(&value).unwrap();
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
     fn sample_work_item() -> WorkItem {
         WorkItem {
             work_item_id: "req-1.0".into(),
@@ -120,7 +130,7 @@ mod tests {
             engine: String::new(),
             pool_name: "l4".into(),
             machine_profile: "l4-spot".into(),
-            item: Some(serde_json::json!({"text": "hello"})),
+            item: Some(msg_value(serde_json::json!({"text": "hello"}))),
             payload_ref: None,
             output_types: Some(vec!["dense".into()]),
             instruction: None,
@@ -154,7 +164,10 @@ mod tests {
         assert_eq!(back.operation, "encode");
         assert_eq!(back.model_id, "BAAI/bge-m3");
         assert_eq!(back.output_types, Some(vec!["dense".to_string()]));
-        assert_eq!(back.item, Some(serde_json::json!({"text": "hello"})));
+        assert_eq!(
+            back.item,
+            Some(msg_value(serde_json::json!({"text": "hello"})))
+        );
     }
 
     #[test]
@@ -176,6 +189,47 @@ mod tests {
         let back: WorkItem = rmp_serde::from_slice(&bytes).unwrap();
         assert!(back.item.is_none());
         assert_eq!(back.payload_ref, Some("req-1_0.bin".into()));
+    }
+
+    #[test]
+    fn work_item_preserves_document_bytes() {
+        let mut item = sample_work_item();
+        let pdf_bytes = b"%PDF-1.4 tiny".to_vec();
+        item.operation = "extract".into();
+        item.model_id = "docling".into();
+        item.item = Some(WireValue::Map(vec![(
+            WireValue::from("document"),
+            WireValue::Map(vec![
+                (
+                    WireValue::from("data"),
+                    WireValue::Binary(pdf_bytes.clone()),
+                ),
+                (WireValue::from("format"), WireValue::from("pdf")),
+            ]),
+        )]));
+
+        let bytes = rmp_serde::to_vec_named(&item).unwrap();
+        let back: WorkItem = rmp_serde::from_slice(&bytes).unwrap();
+        let Some(WireValue::Map(fields)) = back.item else {
+            panic!("item should decode as msgpack map");
+        };
+        let Some((_, WireValue::Map(document))) = fields
+            .iter()
+            .find(|(key, _)| matches!(key, WireValue::String(s) if s.as_str() == Some("document")))
+        else {
+            panic!("document should decode as msgpack map");
+        };
+        let data = document
+            .iter()
+            .find_map(|(key, value)| {
+                if matches!(key, WireValue::String(s) if s.as_str() == Some("data")) {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .expect("document.data");
+        assert_eq!(data, &WireValue::Binary(pdf_bytes));
     }
 
     #[test]

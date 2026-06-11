@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.4
+
+- chore(main): release 0.6.4
+- fix(sidecar): preserve msgpack work item payloads
+- fix(gateway): resubscribe stale NATS health stream
+- feat(helm): ship values-aks.yaml AKS overlay with the Azure module
+- fix(helm): render selectorLabels after podLabels in workload templates
+- feat(helm): expose chart-level podLabels for Workload Identity wiring
+- feat(helm): accept abfs:// and abfss:// payloadStore + clusterCache URLs
+
 ## v0.6.3
 
 - chore(main): release 0.6.3

@@ -296,9 +296,9 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     //
     // `async_nats::Subscriber` survives reconnects transparently, so
     // `start_subscription` is a one-shot and we don't need to wire it
-    // to `reconnect_notify` the way health and inbox do — those two
-    // actually need to rebuild JetStream/request-reply state after a
-    // server restart, but Core pub/sub subscriptions auto-resume.
+    // to `reconnect_notify` the way the inbox does — request-reply state
+    // needs an explicit rebuild after a server restart, while Core pub/sub
+    // subscriptions normally auto-resume.
     // Staleness caused by messages published during a disconnect is
     // covered by `state::config_poller`'s epoch drift detection.
     if !config.nats_url.is_empty() {
@@ -313,8 +313,9 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // worker-sidecar queue path so the registry receives queue pool names and
     // bundle config hashes from `sie.health.>` heartbeats.
     //
-    // Core NATS subscriptions are resumed by the client on reconnect; do not spawn
-    // duplicate `NatsHealthManager::start` loops on `reconnect_notify` (see PR review).
+    // Core NATS subscriptions normally resume on reconnect. The health manager
+    // also supervises a terminated `sie.health.>` stream and resubscribes from
+    // inside its own task, so do not spawn duplicate `start` loops here.
     let mut ws_manager: Option<Arc<WsHealthManager>> = None;
     let mut nats_health_manager: Option<Arc<NatsHealthManager>> = None;
     let mut use_ws = true;

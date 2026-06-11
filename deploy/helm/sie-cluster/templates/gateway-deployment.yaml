@@ -36,7 +36,9 @@
 {{- /* Resolve the effective payload-store URL once (helper applies the
      auto-derivation: explicit url > clusterCache.url + /payloads > empty).
      The chart treats a non-empty resolved URL as "payload store enabled"
-     and rejects local paths so misconfigured queue clusters fail fast. */}}
+     and rejects local paths so misconfigured queue clusters fail fast.
+     Supported schemes: s3:// (AWS), gs:// (GCP), abfs:// + abfss:// (Azure
+     Data Lake Storage Gen2 / Blob via the hierarchical namespace). */}}
 {{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" . }}
 {{- if $payloadStoreUrl }}
   {{- if not (or (hasPrefix "s3://" $payloadStoreUrl) (hasPrefix "gs://" $payloadStoreUrl) (hasPrefix "abfs://" $payloadStoreUrl) (hasPrefix "abfss://" $payloadStoreUrl)) }}
@@ -58,6 +60,11 @@ spec:
   template:
     metadata:
       labels:
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- /* Render selectorLabels last so user-supplied podLabels cannot
+               override the Deployment selector contract. */ -}}
         {{- include "sie-cluster.gateway.selectorLabels" . | nindent 8 }}
       {{- with .Values.gateway.podAnnotations }}
       annotations:
