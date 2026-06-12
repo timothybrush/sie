@@ -113,6 +113,7 @@ class TestConfigureLogging:
     def test_json_format_explicit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test explicit JSON format configuration."""
         monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.delenv("SIE_LOG_LEVEL", raising=False)
 
         configure_logging(json_format=True)
 
@@ -123,6 +124,7 @@ class TestConfigureLogging:
     def test_text_format_explicit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test explicit text format configuration."""
         monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.delenv("SIE_LOG_LEVEL", raising=False)
 
         configure_logging(json_format=False)
 
@@ -133,6 +135,7 @@ class TestConfigureLogging:
     def test_json_format_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test JSON format from environment variable."""
         monkeypatch.setenv("SIE_LOG_JSON", "true")
+        monkeypatch.delenv("SIE_LOG_LEVEL", raising=False)
 
         configure_logging()
 
@@ -143,8 +146,38 @@ class TestConfigureLogging:
     def test_verbose_sets_debug_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test verbose flag sets DEBUG level."""
         monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.setenv("SIE_LOG_LEVEL", "INFO")
 
         configure_logging(verbose=True, json_format=False)
 
         root = logging.getLogger()
         assert root.level == logging.DEBUG
+
+    def test_sie_log_level_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SIE_LOG_LEVEL controls root level when not verbose."""
+        monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.setenv("SIE_LOG_LEVEL", "DEBUG")
+
+        configure_logging(json_format=False)
+
+        root = logging.getLogger()
+        assert root.level == logging.DEBUG
+
+    def test_level_name_param_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit level_name wins over SIE_LOG_LEVEL."""
+        monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.setenv("SIE_LOG_LEVEL", "DEBUG")
+
+        configure_logging(json_format=False, level_name="WARNING")
+
+        root = logging.getLogger()
+        assert root.level == logging.WARNING
+
+    def test_invalid_log_level_falls_back_to_info(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SIE_LOG_JSON", raising=False)
+        monkeypatch.setenv("SIE_LOG_LEVEL", "not-a-real-level")
+
+        configure_logging(json_format=False)
+
+        root = logging.getLogger()
+        assert root.level == logging.INFO

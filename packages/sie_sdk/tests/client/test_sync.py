@@ -5,6 +5,7 @@ import msgpack
 import numpy as np
 import pytest
 from sie_sdk import RequestError, ServerError, SIEClient, SIEConnectionError
+from sie_sdk.types import ModelCapabilities
 
 
 class TestSIEClientInit:
@@ -36,6 +37,30 @@ class TestSIEClientInit:
             call_kwargs = mock_client.call_args.kwargs
             assert call_kwargs["headers"]["Authorization"] == "Bearer secret"
             client.close()
+
+    def test_create_pool_duplicate_posts_update_without_duplicate_renewal(self) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"status": {"state": "active"}}
+        thread = MagicMock()
+
+        with (
+            patch("sie_sdk.client.sync.httpx.Client") as mock_client,
+            patch("sie_sdk.client.sync.threading.Thread", return_value=thread) as thread_cls,
+        ):
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            try:
+                client.create_pool("my-pool", gpus={"l4": 1})
+                client.create_pool("my-pool", gpus={"l4": 1})
+
+                assert mock_client.return_value.post.call_count == 2
+                assert thread_cls.call_count == 1
+                thread.start.assert_called_once()
+                assert len(client._pools) == 1
+            finally:
+                client._pools.clear()
+                client.close()
 
     def test_trailing_slash_removed(self) -> None:
         """Base URL trailing slash is removed."""
@@ -392,6 +417,43 @@ class TestListModels:
             assert models[0]["name"] == "bge-m3"
             assert models[0]["loaded"] is True
             assert "dense" in models[0]["outputs"]
+            client.close()
+
+    def test_list_models_surfaces_capabilities(self) -> None:
+        """Generation models surface the typed ``capabilities`` field."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "models": [
+                {
+                    "name": "qwen3-4b",
+                    "loaded": True,
+                    "inputs": ["text"],
+                    "outputs": ["text"],
+                    "dims": {},
+                    "max_sequence_length": 32768,
+                    "capabilities": {
+                        "grammar": ["json_schema", "regex"],
+                        "tools": True,
+                        "code": True,
+                        "sql": True,
+                        "guard": False,
+                    },
+                }
+            ]
+        }
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.get.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            models = client.list_models()
+
+            caps: ModelCapabilities = models[0]["capabilities"]
+            assert caps["grammar"] == ["json_schema", "regex"]
+            assert caps["tools"] is True
+            assert caps["code"] is True
+            assert caps["sql"] is True
+            assert caps["guard"] is False
             client.close()
 
     def test_get_model_returns_info(self) -> None:

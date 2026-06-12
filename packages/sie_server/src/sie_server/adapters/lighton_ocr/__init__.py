@@ -10,6 +10,7 @@ import torch
 
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
+from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import Entity
 
 if TYPE_CHECKING:
@@ -346,7 +347,7 @@ class LightOnOCRAdapter(ModelAdapter):
         if not images or len(images) == 0:
             raise ValueError(_ERR_NO_IMAGES)
 
-        img_bytes = images[0]["data"]
+        img_bytes = media_bytes(images[0], kind="image")
         pil_img = PILImage.open(io.BytesIO(img_bytes))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")

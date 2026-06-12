@@ -1,0 +1,118 @@
+sie_id: Qwen/Qwen3-0.6B
+hf_id: Qwen/Qwen3-0.6B
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  # Small, fast generation model — a viable PROD pick for simple/short-prompt
+  # tasks (cheap + high throughput; weaker on long-context reasoning). Loads in
+  # ~30s. Also doubles as the transport/walking-skeleton benchmark target.
+  #
+  # ``context_length`` is the standalone PROD serving value (4096): big enough
+  # to fit the full generation benchmark pack (casehold prompts reach ~1.8k
+  # tokens, gpqa ~1.3k) so the model is comparable to the rest of the fleet on
+  # every task, while KV stays trivial at this size (112 KB/token → 4096 ≈
+  # 0.46 GB). The validation/co-residency harness, which packs two SGLang
+  # instances onto a single 22 GiB L4, does NOT depend on this default — it
+  # passes an explicit ``--max-seq-length``/``--context-length`` (see
+  # tools/bench_generation_matrix.py + run_generation_smoke.py) and caps itself
+  # to 1024 for that case.
+  #
+  # ``context_length``, ``max_sequence_length``, and ``max_batch_tokens`` are
+  # three independent knobs (per-request context, SGLang --context-length,
+  # batcher cost budget); see sibling Qwen__Qwen3-4B-Instruct-2507.yaml.
+  generate:
+    context_length: 4096
+    max_output_tokens: 1024
+    capabilities:
+      grammar: []
+      streaming: true
+      tools: false
+max_sequence_length: 4096
+# KV-cache memory math (Qwen3-0.6B, bf16):
+#   layers=28, kv_heads=8, head_dim=128, bytes_per_elem=2
+#   kv_bytes_per_token = 2 × 28 × 8 × 128 × 2 = 114,688 B ≈ 112 KB
+# At ctx=4096 a single request's KV is ~0.46 GB — negligible. The co-residency
+# harness still caps context explicitly when it has to share a card.
+profiles:
+  default:
+    max_batch_tokens: 4096
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        # 0.8 leaves headroom on a 22 GiB L4 for a second SGLang instance
+        # (the validation harness co-residents worker + baseline). If the
+        # 0.6B is the only model on the card, 0.9 is fine.
+        mem_fraction_static: 0.8
+        served_model_name: Qwen/Qwen3-0.6B
+        # Modal sandbox lacks flashinfer's JIT prerequisites; switch backends.
+        disable_cuda_graph: true
+        attention_backend: triton
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        # Aligned with the rest of the generate model fleet (300s).
+        # The previous 132s was an unexplained magic number that
+        # diverged from every other generate config; bumping to the
+        # fleet default keeps long-completion requests from hitting a
+        # premature overall-timeout on the 0.6B model.
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.0
+          top_p: 1.0
+  # Dedicated 0.6B deployments on a100/h100 don't co-resident a baseline,
+  # so mem_fraction_static returns to the standard 0.85 and the KV budget
+  # scales with the larger GPU. kv_budget_tokens stays well below the
+  # theoretical ceiling because the 0.6B's *context_length* (1024) caps
+  # per-request KV consumption — the budget really just sets the upper
+  # bound on concurrent in-flight sequences.
+  a100-40gb:
+    max_batch_tokens: 4096
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-0.6B
+        disable_cuda_graph: true
+        attention_backend: triton
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        # Aligned with the rest of the generate model fleet (300s).
+        # The previous 132s was an unexplained magic number that
+        # diverged from every other generate config; bumping to the
+        # fleet default keeps long-completion requests from hitting a
+        # premature overall-timeout on the 0.6B model.
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.0
+          top_p: 1.0
+  h100:
+    max_batch_tokens: 8192
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-0.6B
+        disable_cuda_graph: true
+        attention_backend: triton
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        # Aligned with the rest of the generate model fleet (300s).
+        # The previous 132s was an unexplained magic number that
+        # diverged from every other generate config; bumping to the
+        # fleet default keeps long-completion requests from hitting a
+        # premature overall-timeout on the 0.6B model.
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.0
+          top_p: 1.0

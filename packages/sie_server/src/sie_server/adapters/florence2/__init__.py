@@ -29,6 +29,8 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
+from sie_server.core.preprocessor.vision import resolve_florence2_prompt
+from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import DetectedObject, Entity
 
 if TYPE_CHECKING:
@@ -246,15 +248,18 @@ class Florence2Adapter(BaseAdapter):
         max_new_tokens = options.get("max_new_tokens", self._max_new_tokens)
         num_beams = options.get("num_beams", self._num_beams)
 
-        # Build task prompt
-        prompt = self._build_prompt(task, labels, instruction)
+        # Resolve the prompt and the effective task token. A free-text instruction
+        # is answered via DocVQA, so the effective task may differ from the
+        # configured one — post-processing must use the effective task to match
+        # what the prompt asked the model to do.
+        prompt, effective_task = resolve_florence2_prompt(task, labels, instruction)
 
         # Use preprocessed items if available
         if prepared_items is not None and len(prepared_items) > 0:
             return self._extract_preprocessed(
                 items=items,
                 prepared_items=prepared_items,
-                task=task,
+                task=effective_task,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
             )
@@ -266,7 +271,7 @@ class Florence2Adapter(BaseAdapter):
             entities, objects = self._extract_single(
                 item,
                 prompt=prompt,
-                task=task,
+                task=effective_task,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
             )
@@ -387,16 +392,8 @@ class Florence2Adapter(BaseAdapter):
         Returns:
             Complete prompt string.
         """
-        # Use instruction as custom prompt if provided
-        if instruction:
-            return f"{task}{instruction}"
-
-        # For phrase grounding, append labels
-        if task == TASK_CAPTION_TO_PHRASE_GROUNDING and labels:
-            label_text = ", ".join(labels)
-            return f"{task}{label_text}"
-
-        return task
+        prompt, _ = resolve_florence2_prompt(task, labels, instruction)
+        return prompt
 
     def _extract_single(
         self,
@@ -427,7 +424,7 @@ class Florence2Adapter(BaseAdapter):
             raise ValueError(_ERR_NO_IMAGES)
 
         # Load image
-        img_bytes = images[0]["data"]
+        img_bytes = media_bytes(images[0], kind="image")
         pil_img = PILImage.open(io.BytesIO(img_bytes))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")

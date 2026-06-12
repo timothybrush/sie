@@ -83,8 +83,64 @@ class TestDoclingExtract:
 
         assert out.data is not None
         assert "error" in out.data[0]
-        assert "document" in out.data[0]["error"].lower()
+        assert out.data[0]["error"]  # non-empty
         # No converter is constructed for a malformed item
+        factory.assert_not_called()
+
+    def test_image_only_item_routes_to_converter(self) -> None:
+        adapter, factory = _make_adapter()
+
+        out = adapter.extract([Item(images=[{"data": b"\x89PNG\r\n\x1a\nfake", "format": "png"}])])
+
+        assert out.data is not None
+        assert out.data[0]["text"] == "text:default"
+        # Stream name should reflect the image format hint
+        assert out.data[0]["document"] == {"name": "document.png"}
+        factory.assert_called_once_with(ocr_enabled=False)
+
+    def test_image_without_format_defaults_to_png_name(self) -> None:
+        adapter, _ = _make_adapter()
+
+        out = adapter.extract([Item(images=[{"data": b"\x89PNG"}])])
+
+        assert out.data is not None
+        # When no format is supplied, the adapter defaults to "png" so Docling
+        # has a usable extension hint.
+        assert out.data[0]["document"] == {"name": "document.png"}
+
+    def test_document_wins_when_both_document_and_image_present(self) -> None:
+        adapter, _ = _make_adapter()
+
+        out = adapter.extract(
+            [
+                Item(
+                    document={"data": b"%PDF-1.4 real", "format": "pdf"},
+                    images=[{"data": b"\x89PNG ignored", "format": "png"}],
+                )
+            ]
+        )
+
+        assert out.data is not None
+        # Document path uses ``document.pdf`` stream name; image path would
+        # have produced ``document.png``.
+        assert out.data[0]["document"] == {"name": "document.pdf"}
+
+    def test_neither_document_nor_image_yields_per_item_error(self) -> None:
+        adapter, factory = _make_adapter()
+
+        out = adapter.extract([Item(text="just text")])
+
+        assert out.data is not None
+        assert "error" in out.data[0]
+        factory.assert_not_called()
+
+    def test_empty_images_list_yields_per_item_error(self) -> None:
+        adapter, factory = _make_adapter()
+
+        out = adapter.extract([Item(images=[])])
+
+        assert out.data is not None
+        assert "error" in out.data[0]
         factory.assert_not_called()
 
     def test_per_item_failure_does_not_poison_batch(self) -> None:
@@ -177,7 +233,7 @@ class TestDoclingExtract:
 class TestDoclingSpec:
     def test_capabilities(self) -> None:
         adapter = DoclingAdapter()
-        assert adapter.capabilities.inputs == ["document"]
+        assert adapter.capabilities.inputs == ["document", "image"]
         assert adapter.capabilities.outputs == ["json"]
 
     def test_unload_clears_converter_cache(self) -> None:
@@ -206,6 +262,7 @@ class TestDoclingMakeConverter:
             patch("docling.document_converter.DocumentConverter") as mock_cls,
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions") as mock_opts,
             patch("docling.document_converter.PdfFormatOption") as mock_fmt_opt,
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             adapter._make_converter(ocr_enabled=False)
 
@@ -221,6 +278,7 @@ class TestDoclingMakeConverter:
             patch("docling.document_converter.DocumentConverter") as mock_cls,
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions") as mock_opts,
             patch("docling.document_converter.PdfFormatOption") as mock_fmt_opt,
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             adapter._make_converter(ocr_enabled=True)
 
@@ -238,6 +296,7 @@ class TestDoclingMakeConverter:
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions") as mock_opts,
             patch("docling.datamodel.accelerator_options.AcceleratorOptions") as mock_accel,
             patch("docling.document_converter.PdfFormatOption") as mock_fmt_opt,
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             adapter._make_converter(ocr_enabled=False)
 
@@ -258,6 +317,7 @@ class TestDoclingMakeConverter:
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions") as mock_opts,
             patch("docling.datamodel.accelerator_options.AcceleratorOptions") as mock_accel,
             patch("docling.document_converter.PdfFormatOption"),
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             adapter._make_converter(ocr_enabled=True)
 
@@ -277,6 +337,7 @@ class TestDoclingMakeConverter:
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions"),
             patch("docling.datamodel.accelerator_options.AcceleratorOptions") as mock_accel,
             patch("docling.document_converter.PdfFormatOption"),
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             adapter._make_converter(ocr_enabled=True)
 
@@ -291,6 +352,7 @@ class TestDoclingMakeConverter:
             patch("docling.datamodel.pipeline_options.PdfPipelineOptions"),
             patch("docling.datamodel.accelerator_options.AcceleratorOptions") as mock_accel,
             patch("docling.document_converter.PdfFormatOption"),
+            patch("docling.document_converter.ImageFormatOption"),
         ):
             mock_accel.side_effect = [ValueError("invalid device"), MagicMock()]
             adapter._make_converter(ocr_enabled=True)

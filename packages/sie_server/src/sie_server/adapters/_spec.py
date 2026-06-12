@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 InputModality = Literal["text", "image", "audio", "video", "document"]
-OutputType = Literal["dense", "sparse", "multivector", "score", "json"]
+OutputType = Literal["dense", "sparse", "multivector", "score", "json", "tokens"]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,0 +1,86 @@
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- if and $tls.enabled (eq (default "byo" $tls.mode) "self-signed") }}
+{{- $fullname := include "sie-cluster.fullname" . }}
+{{- $ns := include "sie-cluster.namespace" . }}
+{{- $self := $tls.selfSigned }}
+{{- /* Root CA lives in cert-manager's --cluster-resource-namespace so the CA ClusterIssuer can find its Secret. */ -}}
+{{- $rootCaNs := default $ns $self.rootCA.namespace }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ printf "%s-selfsigned-bootstrap" $fullname }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ printf "%s-root-ca" $fullname }}
+  namespace: {{ $rootCaNs }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ $self.rootCA.commonName | quote }}
+  secretName: {{ $self.rootCA.secretName | quote }}
+  duration: {{ $self.rootCA.duration | quote }}
+  renewBefore: {{ $self.rootCA.renewBefore | quote }}
+  privateKey:
+    algorithm: {{ upper $self.rootCA.privateKey.algorithm }}
+    size: {{ $self.rootCA.privateKey.size }}
+  usages:
+    - cert sign
+    - crl sign
+  issuerRef:
+    name: {{ printf "%s-selfsigned-bootstrap" $fullname }}
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ $self.caClusterIssuer.name | quote }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ $self.rootCA.secretName | quote }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ printf "%s-ingress-leaf" $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $tls.secretName | quote }}
+  duration: {{ $self.leaf.duration | quote }}
+  renewBefore: {{ $self.leaf.renewBefore | quote }}
+  privateKey:
+    algorithm: {{ upper $self.leaf.privateKey.algorithm }}
+    size: {{ $self.leaf.privateKey.size }}
+  dnsNames:
+    {{- range (include "sie-cluster.ingress.hosts" . | fromJsonArray) }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- range $self.leaf.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- with $self.leaf.ipAddresses }}
+  ipAddresses:
+    {{- range . }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ $self.caClusterIssuer.name | quote }}
+    kind: ClusterIssuer
+    group: cert-manager.io
+{{- end }}

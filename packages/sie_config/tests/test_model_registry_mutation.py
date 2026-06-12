@@ -95,7 +95,25 @@ class TestAddModelConfig:
                 "default": {"adapter_path": "sie_server.adapters.bert_flash:B", "max_batch_tokens": 1},
             },
         }
-        with pytest.raises(ValueError, match="already exists with different config"):
+        with pytest.raises(ValueError, match="already exist with different content"):
+            registry.add_model_config(config)
+
+    def test_add_conflicting_non_hash_profile_field_raises(self) -> None:
+        registry, _ = _setup_registry(
+            self._root / "conflict_non_hash",
+            models={"existing/model": "sie_server.adapters.bert_flash:B"},
+        )
+        config = {
+            "sie_id": "existing/model",
+            "profiles": {
+                "default": {
+                    "adapter_path": "sie_server.adapters.bert_flash:B",
+                    "max_batch_tokens": 8192,
+                    "max_sequence_length": 128,
+                },
+            },
+        }
+        with pytest.raises(ValueError, match="already exist with different content"):
             registry.add_model_config(config)
 
     def test_unroutable_adapter_raises(self) -> None:

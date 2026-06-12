@@ -223,7 +223,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::types::bundle::BundleInfo;
+    use crate::types::bundle::{BundleInfo, DEFAULT_ENGINE};
 
     /// Empty filesystem registry with a pre-installed `default` bundle — the
     /// same shape `BootstrapClient::bootstrap` produces after the bundle
@@ -240,6 +240,7 @@ mod tests {
             name: "default".to_string(),
             priority: 10,
             adapters: vec!["sie_server.adapters.sentence_transformer".to_string()],
+            engine: DEFAULT_ENGINE.to_string(),
         }]);
         (registry, temp)
     }

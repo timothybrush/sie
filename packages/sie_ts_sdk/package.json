@@ -1,6 +1,6 @@
 {
   "name": "@superlinked/sie-sdk",
-  "version": "0.3.4",
+  "version": "0.6.4",
   "description": "Official TypeScript SDK for SIE (Search Inference Engine)",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -67,14 +67,23 @@
     "access": "public"
   },
   "dependencies": {
-    "@msgpack/msgpack": "^3.0.0"
+    "@msgpack/msgpack": "^3.1.3"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@playwright/test": "^1.57.0",
-    "@types/node": "^22.0.0",
-    "tsup": "^8.3.5",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^22.19.19",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "esbuild": ">=0.25.0",
+      "picomatch": ">=4.0.4",
+      "postcss": ">=8.5.10",
+      "rollup": ">=4.59.0",
+      "vite": "^6.4.2"
+    }
   }
 }

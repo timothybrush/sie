@@ -8,7 +8,7 @@
 ARG BUNDLE=default
 
 # =============================================================================
-# Stage 1: Dependencies (pyproject.toml only, cached across code changes)
+# Dependency image: pyproject-only cache seed
 # =============================================================================
 FROM python:3.12-slim-bookworm AS deps
 
@@ -57,11 +57,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -e ".[gpu-metrics]"
 
 # =============================================================================
-# Stage 2: Base - source install + shared-venv finalization (no BUNDLE)
+# Shared runtime base: source install and venv finalization
 # =============================================================================
-# Bundle-agnostic: all base-stage layers are shared across bundles of this
+# Bundle-agnostic: all base image layers are shared across bundles of this
 # platform in local BuildKit cache and in content-addressed registry layers.
 FROM deps AS base
+
+# Source-layer cache key — see Dockerfile.cuda12 for the full rationale.
+# Tie source layers to a per-commit revision arg so a rebuild can't ship
+# stale code via a reused source-COPY layer. Dependency layers in the
+# ``deps`` stage above stay cached.
+ARG SIE_SRC_REV=dev
+RUN echo "sie source revision: ${SIE_SRC_REV}"
 
 COPY packages/sie_sdk/src /tmp/sie_sdk/src
 COPY packages/sie_server/src src/
@@ -100,7 +107,7 @@ RUN set -eux; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 3: Builder - bundle-specific deps
+# Bundle dependency builder: bundle-specific deps
 # =============================================================================
 FROM base AS builder
 
@@ -143,7 +150,7 @@ RUN set -eux; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 4: Runtime
+# Runtime image
 # =============================================================================
 FROM python:3.12-slim-bookworm AS runtime
 
@@ -158,13 +165,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Only the shared libs torch + pillow + rtree actually dlopen at runtime.
 # libspatialindex-c6: rtree (docling dep) dlopens libspatialindex_c.so; the
 # rtree==1.4.1 wheel only bundles the C++ core, not the C wrapper.
+# libgl1 libglib2.0-0 libice6 libsm6 libx11-6 libxcb1 libxext6: docling-ibm-models'
+# TableFormer imports cv2 during DoclingAdapter.load() pre-warm; the opencv-python
+# wheel unconditionally dlopens an X11 + libGL + glib chain at import even in
+# headless usage. Without these, every docling extract crashes with
+# "ImportError: libxcb.so.1: cannot open shared object file" (issue #1028).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
     libgomp1 \
+    libice6 \
     libjpeg62-turbo \
     libpng16-16 \
-    libspatialindex-c6
+    libsm6 \
+    libspatialindex-c6 \
+    libx11-6 \
+    libxcb1 \
+    libxext6
 
 RUN groupadd -g 1000 sie && useradd -u 1000 -g sie -m sie
 
@@ -176,8 +195,10 @@ WORKDIR /app
 # no /etc/passwd visible (the sie user exists in the runtime FS but --link
 # layers are created in isolation).
 COPY --link --from=base --chown=1000:1000 /app/.venv /app/.venv
-COPY --link --from=base --chown=1000:1000 /app/src /app/src
-COPY --link --from=base --chown=1000:1000 /tmp/sie_sdk/src /tmp/sie_sdk/src
+# Source trees WITHOUT --link — see Dockerfile.cuda12 (linked cross-stage
+# copies didn't reliably invalidate on source change).
+COPY --from=base --chown=1000:1000 /app/src /app/src
+COPY --from=base --chown=1000:1000 /tmp/sie_sdk/src /tmp/sie_sdk/src
 COPY --link --from=base --chown=1000:1000 /app/models /app/models
 COPY --link --from=base --chown=1000:1000 /app/bundles /app/bundles
 # Bundle-specific extras — last layer so shared layers above stay cached.

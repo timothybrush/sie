@@ -103,9 +103,16 @@ async def _extract_via_worker(
         except (AttributeError, TypeError):
             pass
 
-    if use_preprocessor:
-        if preprocessor_registry is None:
-            raise RuntimeError("Preprocessor registry is not available")
+    if use_preprocessor and preprocessor_registry is not None:
+        has_images = any(item.images for item in items)
+        try:
+            has_text_preprocessor = preprocessor_registry.has_preprocessor(model, "text") is True
+        except (AttributeError, TypeError):
+            has_text_preprocessor = False
+        if not has_images and not has_text_preprocessor:
+            msg = f"Model '{model}' requires image input for extraction"
+            raise ValueError(msg)
+
         # Vision model: use PreprocessorRegistry for CPU preprocessing in thread pool
         # This uses the shared preprocessing thread pool for better resource utilization
         # Pass instruction and task for models like Florence-2 that need them in the prompt

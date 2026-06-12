@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -7,11 +9,75 @@ from sie_config.nats_publisher import _ALL_SUBJECT, NatsPublisher
 
 class TestNatsPublisherConnect:
     @pytest.mark.asyncio
+    async def test_kickoff_connect_schedules_background_task(self) -> None:
+        publisher = NatsPublisher()
+        started = asyncio.Event()
+
+        async def fake_connect() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(publisher, "connect", side_effect=fake_connect) as connect:
+            publisher.kickoff_connect()
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            assert connect.call_count == 1
+
+            publisher.kickoff_connect()
+            assert connect.call_count == 1
+
+            await publisher.disconnect()
+            assert publisher._boot_connect_task is None
+
+    @pytest.mark.asyncio
     async def test_connect_failure_is_graceful(self) -> None:
         publisher = NatsPublisher(nats_url="nats://nonexistent:4222")
         with patch("nats.connect", side_effect=ConnectionRefusedError("refused")):
             await publisher.connect()
         assert not publisher.connected
+        await publisher.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_invalid_startup_timeout_uses_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC", "not-a-number")
+        publisher = NatsPublisher(nats_url="nats://nonexistent:4222")
+
+        with caplog.at_level(logging.WARNING):
+            with patch("nats.connect", side_effect=ConnectionRefusedError("refused")):
+                await publisher.connect()
+
+        assert "Invalid SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC" in caplog.text
+        assert not publisher.connected
+        await publisher.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_defers_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC", "0.01")
+        publisher = NatsPublisher(nats_url="nats://slow:4222")
+
+        async def never_connect(*_args: object, **_kwargs: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch("nats.connect", side_effect=never_connect):
+            await publisher.connect()
+            assert not publisher.connected
+            assert publisher._deferred_connect_task is not None
+            assert not publisher._deferred_connect_task.done()
+            await publisher.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connection_refused_error_logs_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        publisher = NatsPublisher()
+
+        with caplog.at_level(logging.DEBUG):
+            await publisher._handle_error(ConnectionRefusedError("refused"))
+
+        refused_records = [record for record in caplog.records if "NATS connection refused" in record.message]
+        assert refused_records
+        assert all(record.levelno == logging.DEBUG for record in refused_records)
 
     @pytest.mark.asyncio
     async def test_connected_false_before_connect(self) -> None:

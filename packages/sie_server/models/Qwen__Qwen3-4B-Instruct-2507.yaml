@@ -1,0 +1,167 @@
+sie_id: Qwen/Qwen3-4B-Instruct-2507
+hf_id: Qwen/Qwen3-4B-Instruct-2507
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  # kv_budget_tokens now lives on profiles (below). The KV calibration
+  # follow-up publishes the tuned value; the placeholder here is conservative
+  # and assumes Qwen3-4B's ~150 KB/token KV footprint on an L4 (24 GB,
+  # mem_fraction_static=0.85).
+  generate:
+    context_length: 32768
+    max_output_tokens: 4096
+    capabilities:
+      # Same constraint as Qwen3.5-4B / Qwen3.6-27B: this profile runs the
+      # default ``grammar_backend: outlines``, and SGLang's outlines_backend
+      # does NOT implement ebnf (it logs ``Skip unsupported key_type='ebnf'``
+      # then fails the compile — confirmed on A100 smoke 2026-05-26). Only
+      # advertise ``"ebnf"`` here once a profile pins an EBNF-capable backend
+      # (``grammar_backend: xgrammar``) AND a via-SIE EBNF smoke passes; the
+      # gateway gates requests on this exact list, so advertising ebnf without
+      # an ebnf-capable backend admits requests the worker then fails to serve.
+      # The ``test_advertised_ebnf_requires_capable_backend`` consistency test
+      # guards this invariant. Adding a new ``grammar.kind`` variant requires
+      # both the gateway parser and this list to be updated.
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      # Qwen3-4B-Instruct's chat template emits OpenAI-compatible
+      # ``<tool_call>{...}</tool_call>`` blocks when ``tools`` is
+      # present in the rendered messages; the worker's
+      # ``parse_tool_call_stream`` consumes those blocks and surfaces
+      # them on ``delta.tool_calls`` for SSE and on
+      # ``message.tool_calls`` for non-streaming requests.
+      tools: true
+      # Validated for code generation — MEASURED HumanEval 0.866 / MBPP 0.74 on
+      # Modal A100 (see benchmarks/generation/.../code/measured_baseline.json).
+      # Backs the model="code" alias. Informational (not request-gated).
+      code: true
+      # Backs the model="sql" alias. NOTE: this profile runs the outlines
+      # backend (no ebnf), so SQL output here relies on the model's native
+      # text-to-SQL ability, NOT an EBNF grammar constraint. Re-add ``"ebnf"``
+      # to ``grammar`` above (behind an xgrammar profile + via-SIE EBNF smoke)
+      # to enable grammar-constrained SQL. Informational (not request-gated).
+      sql: true
+    # Forwarded verbatim to ``tokenizer.apply_chat_template(**kwargs)`` when
+    # the worker renders an OpenAI-shaped ``messages`` request.
+    # Qwen3's chat template emits a ``<think>``/``</think>`` reasoning block
+    # unless this flag suppresses it.
+    chat_template_kwargs:
+      enable_thinking: false
+    # Schemas/regexes the worker pre-compiles at model load so the first
+    # request hitting them skips the Outlines compile (cold TTFT win).
+    # Failures here log + bump ``sie_worker_grammar_prewarm_total{outcome="failed"}``
+    # without blocking model load — add entries only for shapes you
+    # know are hot.
+    prewarm_grammars:
+      # Bare pattern, NOT anchored: this model uses the default Outlines
+      # grammar backend, and Outlines regexes are implicitly anchored —
+      # its FSM engine (interegular) rejects ``^``/``$`` with
+      # ``Unsupported``, which crashes SGLang's scheduler. Use ``(yes|no)``.
+      - name: yes_no
+        kind: regex
+        value: "(yes|no)"
+      - name: short_answer
+        kind: json_schema
+        value:
+          type: object
+          properties:
+            answer:
+              type: string
+          required: [answer]
+max_sequence_length: 32768
+# KV-cache memory math (Qwen3-4B-Instruct-2507, bf16):
+#   layers=36, kv_heads=8, head_dim=128, bytes_per_elem=2
+#   kv_bytes_per_token = 2 (k+v) × 36 × 8 × 128 × 2 = 147,456 B ≈ 144 KB
+# Theoretical max KV tokens per GPU (assuming ~8 GB weights, mem_fraction_static=0.85):
+#   l4         (24 GB):  (24 × 0.85 − 8) GB / 144 KB ≈   90,000 tokens
+#   a100-40gb  (40 GB):  (40 × 0.85 − 8) GB / 144 KB ≈  189,000 tokens
+#   h100       (80 GB):  (80 × 0.85 − 8) GB / 144 KB ≈  437,000 tokens
+# kv_budget_tokens is set to ~40% of theoretical max, matching the L4
+# baseline ratio (32768/90000 ≈ 36%). The headroom absorbs batch growth,
+# speculative side-cell, grammar/Outlines compile arena, fragmentation.
+# Final empirical validation should use concurrency and OOM-boundary sweeps.
+profiles:
+  default:
+    # max_batch_tokens is a generic engine knob; generation does not batch
+    # at the SIE layer (SGLang batches internally) but the validator
+    # requires the field to be set.
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # L4 baseline — empirically gated by the speculative-decoding + calibration work.
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-4B-Instruct-2507
+        # speculative decoding (MTP/EAGLE/NGRAM) intentionally absent;
+        # week-1 validation decides whether to promote a side-cell. See §4.9.
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.9
+        stop_tokens:
+          - "<|im_end|>"
+  # Analytical defaults for a100-40gb / h100. Production
+  # capacity also grows: with 2-4× the KV budget the context window can be
+  # widened proportionally so longer-context workloads (RAG with large
+  # retrieved passages) fit comfortably. ``max_output_tokens`` doubles
+  # to 8192/16384 respectively — beyond that, latency hurts more than
+  # quality helps for instruction-style chat traffic.
+  a100-40gb:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Empirically calibrated on Modal A100-SXM4-40GB
+    # (sglang 0.5.9, mem_fraction_static=0.85, context_length=32768).
+    # SGLang's /server_info reports:
+    #   weight=7.71 GB, kvcache=25.42 GB, graph=0.18 GB,
+    #   token_capacity=185,081 tokens
+    # ``kv_budget_tokens`` sized for 4 concurrent admissions:
+    #   185,081 / 4 = 46,270 → round down to 45,056 for headroom.
+    # Re-calibrate if SGLang version or mem_fraction_static changes.
+    kv_budget_tokens: 45056
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-4B-Instruct-2507
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.9
+        stop_tokens:
+          - "<|im_end|>"
+  h100:
+    max_batch_tokens: 65536
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Empirically calibrated on Modal H100 80GB HBM3
+    # (sglang 0.5.9, mem_fraction_static=0.85, context_length=32768).
+    # SGLang's /server_info reports:
+    #   weight=7.71 GB, kvcache=59.0 GB, graph=0.43 GB,
+    #   token_capacity=429,645 tokens
+    # ``kv_budget_tokens`` sized for 4 concurrent admissions:
+    #   429,645 / 4 = 107,411 → round down to 106,496 for headroom.
+    kv_budget_tokens: 106496
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3-4B-Instruct-2507
+      runtime:
+        first_chunk_timeout_s: 30
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.9
+        stop_tokens:
+          - "<|im_end|>"

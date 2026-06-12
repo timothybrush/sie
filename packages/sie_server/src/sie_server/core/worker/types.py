@@ -98,12 +98,37 @@ class AdaptiveBatchingParams:
     calibration_multiplier: float = 1.5
     min_target_p50_ms: float = 5.0
     max_target_p50_ms: float = 500.0
-    min_wait_ms: float = 1.0
+    # min_wait_ms is the floor the PI controller can shrink the first-request
+    # timeout to. It is *not* a mandatory wait — under load the batcher fills
+    # (or the coalesce window fires) well before this timeout trips, so
+    # raising it has no latency cost in steady state. The floor exists
+    # purely to keep the batcher from collapsing to a "flush on every
+    # submit" mode under oscillating headroom, which would shred GPU
+    # batch sizes from 64 down to single-digits.
+    min_wait_ms: float = 15.0
     max_wait_ms: float = 50.0
     gain: float = 0.3
     integral_gain: float = 0.05
     window_size: int = 200
     update_interval: int = 10
+    # -- Starvation detection / deadlock recovery ----------------------------
+    # The PI loop can deadlock in a "batch-of-1" attractor: once observed p50
+    # exceeds the auto-calibrated target, the controller shrinks wait to the
+    # floor and cost to the floor, which collapses GPU batches to 1 item,
+    # which raises p50 further, which keeps the controller pinned at the
+    # floor. Headroom stays negative indefinitely and there is no recovery
+    # path. These knobs arm a self-healing escape hatch. Set
+    # ``starvation_recovery_enabled=False`` to disable (e.g. for synthetic
+    # tests that want bare PI behaviour).
+    starvation_recovery_enabled: bool = True
+    # How many consecutive batches of ``size <= starvation_batch_size`` at
+    # the floor before declaring deadlock. Must be large enough to absorb
+    # genuine idle-tail batches where the next burst's first batch is
+    # naturally tiny, small enough to recover within a few seconds of load.
+    starvation_window: int = 20
+    # Treat any batch with ``size <= this`` as contributing to the starvation
+    # counter. 1 by default — only "forward pass of a single item" counts.
+    starvation_batch_size: int = 1
 
 
 @dataclass
@@ -112,13 +137,33 @@ class WorkerConfig:
 
     max_batch_tokens: int = 16384
     max_batch_requests: int = 256
-    max_batch_wait_ms: float = 10.0
+    max_batch_wait_ms: float = 15.0
+    # Coalescing window: yield the current batch if no new items have been
+    # submitted within this ceiling (capped by ``coalesce_ratio *
+    # max_batch_wait_ms``). The default targets typical IPC burst jitter
+    # so a worker-sidecar batch of ~64 items lands in a single GPU forward
+    # instead of being shredded into several half-full ones.
+    coalesce_ms: float = 15.0
+    coalesce_ratio: float = 0.5
     max_queue_size: int = 1000  # Maximum pending items in queue (0 = unlimited)
     instrumentation: bool = False
     adaptive_batching: AdaptiveBatchingParams = field(default_factory=AdaptiveBatchingParams)
     # Reactive OOM recovery applied inside `_process_batch`. When disabled,
     # OOM exceptions propagate as before (legacy behaviour).
     oom_recovery: OomRecoveryConfig = field(default_factory=OomRecoveryConfig)
+    # When ``True`` the ModelWorker bypasses its internal BatchFormer /
+    # per-LoRA queues / adaptive controller / FCFS process loop, and instead
+    # treats every ``submit*`` call as a fully-formed GPU batch — exactly the
+    # frame that arrived over IPC from the worker-sidecar. Used when the
+    # sidecar already owns batch formation
+    # (its own adaptive batcher) and re-running the batcher here only adds
+    # queue depth and competing controllers (the "dual batching" pathology).
+    # The Python tokenizer / templating / output framing all stay alive as
+    # fallback for items that arrive without ``prepared_tokens``.
+    #
+    # The env var ``SIE_WORKER_PASSTHROUGH=1`` overrides this at construction
+    # time so we can A/B without redeploying with a different config.
+    passthrough_mode: bool = False
 
 
 @dataclass

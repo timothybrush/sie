@@ -9,7 +9,7 @@
 #                 cold start (retried with backoff) and every 30s via
 #                 GET /v1/configs/epoch for drift detection. Live updates flow
 #                 on sie.config.models.* NATS subjects. POST /v1/configs/models
-#                 is not registered on the gateway — axum returns 405.
+#                 is not registered on the gateway; axum returns 405.
 #   - workers:    GPU pods driven by pool manager.
 
 # -- Global settings
@@ -19,11 +19,23 @@ global:
   # -- Namespace override (defaults to release namespace)
   namespace: ""
 
+# -- Pod labels added to every pod template managed by this chart
+# (gateway, config, workers). Selector labels are not affected — these are
+# appended after the selector labels and cannot rename them.
+#
+# Common uses:
+#   AKS Workload Identity:
+#     podLabels:
+#       azure.workload.identity/use: "true"
+#   GKE Workload Identity needs no pod label (annotation-only flow).
+#   EKS IRSA needs no pod label (annotation-only flow).
+podLabels: {}
+
 # -- Filesystem seed paths consumed only by sie-config (the gateway no longer
 # bakes a seed: it pulls bundles+models from sie-config at startup via
-# /v1/configs/bundles and /v1/configs/export — see
+# /v1/configs/bundles and /v1/configs/export; see
 # packages/sie_gateway/src/state/config_bootstrap.rs). Kept under `sharedPaths`
-# for the legacy gateway ConfigMap overlays (gateway.embeddedConfigs /
+# for standalone gateway ConfigMap overlays (gateway.embeddedConfigs /
 # gateway.configMap) which still mount their bundle/model files from disk; in
 # the default deploy these are sie-config-only knobs.
 sharedPaths:
@@ -36,7 +48,7 @@ sharedPaths:
 # image, service, and (optional) persistent config store PVC.
 #
 # Single-replica caveat: running with replicas=1 is a conscious control-plane SPOF.
-# See packages/sie_gateway/docs/architecture-guide.md §11 for the failure model.
+# See packages/sie_gateway/docs/architecture-guide.md section 11 for the failure model.
 config:
   # -- Deploy the sie-config workload. Set false to skip rendering the
   # Deployment, Service, and PVC (useful for dev environments that rely on
@@ -44,11 +56,11 @@ config:
   enabled: true
 
   # NOTE: replica count is intentionally hardcoded to 1 in
-  # templates/config-deployment.yaml — there is no `replicas` key here by
+  # templates/config-deployment.yaml; there is no `replicas` key here by
   # design. Going multi-replica requires leader election + shared
   # idempotency + a single-writer discipline on the epoch file, plus an
   # RWX PVC (or leader-only mount). See the template comment and
-  # packages/sie_gateway/docs/architecture-guide.md §3 and §11.
+  # packages/sie_gateway/docs/architecture-guide.md sections 3 and 11.
 
   image:
     repository: ghcr.io/superlinked/sie-config
@@ -93,8 +105,8 @@ config:
 
   # -- Liveness/readiness/startup probe timing. The httpGet path/port are
   # contracts owned by the template (sie-config exposes /healthz and /readyz);
-  # only the timing fields below are overridable. Defaults match the previous
-  # hardcoded values (modulo the dropped startupProbe.initialDelaySeconds).
+  # only the timing fields below are overridable. Defaults preserve the chart's
+  # existing probe budget.
   probes:
     startup:
       periodSeconds: 5
@@ -129,6 +141,15 @@ config:
 # config deltas. It does not own config persistence or writes;
 # POST /v1/configs/models is not registered on the gateway (axum returns 405).
 gateway:
+  # -- Job/friendly model aliases → canonical model id, optionally bundle-
+  # qualified. Maps a request like `model: "sql"` to a real model, and a
+  # `bundle:/org/model` target pins a precision/profile bundle (e.g. route SQL
+  # to a BF16 27B variant that avoids the FP8 SQL-accuracy regression). Empty by
+  # default (the gateway's built-in code/sql/guard aliases still apply). Example:
+  #   modelAliases:
+  #     sql: "bf16-27b:/Qwen/Qwen3.6-27B"
+  modelAliases: {}
+
   # -- Number of gateway replicas (default 1; bump to 2+ for HA).
   # Also used as KEDA's `minReplicaCount` floor (see
   # templates/keda-scaledobject.yaml). The gateway is stateless on the
@@ -136,6 +157,11 @@ gateway:
   # low-QPS prod. Bump before any environment where a single pod
   # restart is an unacceptable blip on inference traffic.
   replicas: 1
+
+  # -- Worker-health discovery mode. Empty lets the chart choose the
+  # routing-safe default: "nats" when NATS and the worker-sidecar are
+  # enabled, otherwise the gateway binary default.
+  healthMode: ""
 
   image:
     repository: ghcr.io/superlinked/sie-gateway
@@ -198,18 +224,18 @@ gateway:
   # workers); use this for unrelated future tunables or for emergency
   # diagnostics overrides.
   #
-  # Example — bump log verbosity for one pod without touching the chart:
+  # Example: bump log verbosity for one pod without touching the chart:
   #   - name: SIE_LOG_LEVEL
   #     value: "debug"
   #
-  # Do not use extraEnv to set SIE_GATEWAY_HEALTH_MODE=nats unless you also run
-  # a worker-side publisher for sie.health.>. The chart intentionally does not
-  # expose gateway.healthMode until NATS worker health is wired end to end.
+  # Do not use extraEnv to set SIE_GATEWAY_HEALTH_MODE; use
+  # gateway.healthMode above so the template keeps ownership of the
+  # env wiring.
   extraEnv: []
 
   # -- Liveness/readiness/startup probe timing. Mirrors config.probes; httpGet
-  # path/port are owned by the template. Defaults match the previous hardcoded
-  # values (modulo the dropped startupProbe.initialDelaySeconds).
+  # path/port are owned by the template. Defaults preserve the chart's existing
+  # probe budget.
   probes:
     startup:
       periodSeconds: 5
@@ -286,7 +312,7 @@ machineProfiles:
     machineType: ""
     spot: false
 
-# -- Worker pools configuration (one StatefulSet per pool)
+# -- Worker pools configuration (one StatefulSet per enabled queuePool/machineProfile/bundle lane)
 workers:
   # -- Common worker settings
   common:
@@ -313,13 +339,28 @@ workers:
     # -- Models to preload on startup (empty = lazy loading)
     preloadModels: []
 
-    # -- Bundle to use (default)
-    bundle: default
+    # -- Python ModelWorker passthrough mode. When `true` (and the Rust
+    # sidecar is enabled), the Python adapter process bypasses its internal
+    # BatchFormer / FCFS / adaptive controller; every IPC frame from
+    # the worker-sidecar is treated as a fully-formed GPU batch and runs
+    # as exactly one forward pass. In queue mode this keeps a single
+    # batcher in the system: the Rust scheduler. Set to `false` only
+    # for compatibility checks against Python-side batching.
+    # The chart only emits SIE_WORKER_PASSTHROUGH when the worker-sidecar
+    # is enabled; without a sidecar in front, passthrough would leave
+    # the pod with no batcher at all.
+    passthroughMode: true
 
     # -- Logical queue pool consumed by workers in queue-routing mode.
-    # Defaults to "default" so Helm WorkerGroups serve unpinned SDK traffic.
-    # Override per worker pool with workers.pools.<name>.queuePool only for
-    # explicit isolation pools targeted via X-SIE-Pool or gpu="pool/profile".
+    # The default baseline queue pool is `default`, so SDK calls like
+    # `gpu="l4"` route to `(pool=default, machineProfile=l4)` without
+    # requiring callers to spell the pool as `gpu="default/l4"`.
+    # Routing, metrics, and KEDA still stay lane-specific because the
+    # NATS subject and Prometheus labels include machineProfile and bundle.
+    # Set per-pool `workers.pools.<name>.queuePool` only when a worker group
+    # should consume from a dedicated logical queue namespace / tenant pool
+    # such as `customer-acme`, in which case callers must send that pool
+    # explicitly (SDK `gpu="customer-acme/l4"`).
     queuePool: default
 
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
@@ -328,11 +369,13 @@ workers:
     # -- Model cache size limit (emptyDir - ephemeral, no zone-lock issues)
     cacheStorageSize: 300Gi
 
-    # -- Cluster cache (S3/GCS) configuration
+    # -- Cluster cache (object storage) configuration
     clusterCache:
       enabled: false
-      # -- S3/GCS bucket URL with the /models prefix (e.g., s3://my-bucket/models or gs://my-bucket/models).
-      # AWS users: get this from `terraform output -raw model_cache_bucket_url`.
+      # -- Object-store URL with the /models prefix. Supported schemes:
+      #   - s3://<bucket>/models                                            (AWS — terraform output -raw model_cache_bucket_url)
+      #   - gs://<bucket>/models                                            (GCP — same output name)
+      #   - abfs(s)://<container>@<account>.dfs.core.windows.net/models     (Azure ADLS Gen2 — same output name)
       # Pre-populate the bucket once with `sie-admin cache weights sync --bundle default --dest <url>/`.
       url: ""
 
@@ -352,11 +395,11 @@ workers:
     # var at startup; nested settings use the ``__`` delimiter (e.g.
     # ``SIE_OOM_RECOVERY__ENABLED``).
     #
-    # Common knobs (full reference in product/design.md §3.6):
+    # Common worker knobs:
     #
     #   # Convenience kill switch for OOM recovery (incident triage).
-    #   # When set, server returns the legacy 500 INFERENCE_ERROR for OOM
-    #   # instead of attempting cache_clear → evict_lru → split_batch.
+    #   # When set, server returns the compatibility 500 INFERENCE_ERROR for OOM
+    #   # instead of attempting cache_clear -> evict_lru -> split_batch.
     #   - name: SIE_DISABLE_OOM_RECOVERY
     #     value: "1"
     #
@@ -375,15 +418,19 @@ workers:
     extraEnv: []
 
     # -- Liveness/readiness/startup probe timing for worker pods. The httpGet
-    # path/port are contracts owned by the template (workers expose /healthz
-    # and /readyz). Only the timing fields below are overridable.
+    # path/port are contracts owned by the template: startup→/healthz (cheap,
+    # process-alive), liveness→/livez (GPU-aware; restarts a wedged CUDA context,
+    # issue #1025), readiness→/readyz (ready flag + GPU). Only the timing fields
+    # below are overridable. The liveness threshold is deliberately generous
+    # (30s × 3 = 90s, 10s timeout) so a momentarily busy GPU is not mistaken for
+    # a wedge.
     #
     # Defaults are tightened to reduce kubelet probe-poll latency on the
     # cold-start path (issue #814):
-    #   - startupProbe.periodSeconds 10 → 3, failureThreshold 60 → 200
-    #     (preserves the ≥600s budget: 200 × 3s = 600s for model downloads
+    #   - startupProbe.periodSeconds 10 -> 3, failureThreshold 60 -> 200
+    #     (preserves the >=600s budget: 200 x 3s = 600s for model downloads
     #     and GPU loading)
-    #   - readinessProbe.initialDelaySeconds dropped, periodSeconds 10 → 2
+    #   - readinessProbe.initialDelaySeconds dropped, periodSeconds 10 -> 2
     #     so kubelet flips the pod to Ready within ~2s of mark_ready()
     probes:
       startup:
@@ -398,29 +445,205 @@ workers:
         periodSeconds: 2
         timeoutSeconds: 10
         failureThreshold: 3
+    # -- worker-sidecar configuration
+    # When enabled, a Rust worker-sidecar is added to every
+    # worker Pod. The sidecar owns the NATS JetStream consumer and
+    # calls into the Python ``sie_server`` container over a Unix
+    # socket mounted on a shared emptyDir. The chart enforces (via a
+    # template ``fail``) that ``workerSidecar.enabled`` requires
+    # ``nats.enabled: true`` because the sidecar has no default
+    # ``SIE_NATS_URL`` and refuses to start without one.
+    workerSidecar:
+      # -- Enable the worker-sidecar. This is the production
+      # data path (NATS -> Rust -> UDS IPC -> Python). The Python adapter process
+      # does not pull from NATS on its own, so queue-mode worker pools
+      # require this sidecar to provide a JetStream consumer.
+      enabled: true
+      image:
+        repository: ghcr.io/superlinked/sie-server-sidecar
+        # -- Image tag. Leave empty to use .Chart.AppVersion.
+        tag: ""
+        pullPolicy: IfNotPresent
+      # -- Metrics port (Prometheus scrape target on the sidecar).
+      metricsPort: 9095
+      # -- Log level for the worker-sidecar (maps to RUST_LOG).
+      logLevel: info
+      # -- Bound Prometheus model-label cardinality. When set, any
+      # model_id not in this list is reported as "other" on per-model
+      # metrics. Comma-separated list.
+      metricModelAllowlist: ""
+      # -- Per-model-group batch concurrency cap for the dispatcher.
+      # Leave empty to use the binary default (4).
+      maxConcurrentBatches: ""
+      # -- Size of the Rust-to-Python IPC connection pool. Each slot is an
+      # independent Unix-domain socket; concurrent batches check out a
+      # slot, perform their round-trip, and return it to the pool.
+      # Should be >= maxConcurrentBatches so the IPC layer is never
+      # the binding constraint. Leave empty to default to
+      # SIE_MAX_CONCURRENT_BATCHES (or its fallback of 4).
+      ipcPoolSize: ""
+      # -- IPC heartbeat cadence. Must stay comfortably below Python's
+      # SIE_IPC_STALE_AFTER_MS (default 10000); architecture guide
+      # recommends ping < stale/3. Leave empty to use the binary default
+      # (2000ms).
+      pingIntervalMs: ""
+      # -- /readyz freshness-window multiplier. The sidecar's readiness
+      # flips red once the most recent successful Ping is older than
+      # `pingIntervalMs * readyStaleMult`. Leave empty for the binary
+      # default.
+      readyStaleMult: ""
+      # -- NATS health-heartbeat publisher.
+      # With the worker-sidecar data path, the gateway builds its
+      # queue WorkerRegistry from `sie.health.<worker_id>` messages. See
+      # packages/sie_server_sidecar/src/health_publisher.rs and
+      # packages/sie_gateway/src/discovery/nats_health.rs.
+      healthPublish:
+        # -- Whether the sidecar should publish heartbeats. Default
+        # `true`; set to `false` only when another worker-health source
+        # is authoritative for queue routing.
+        enabled: true
+        # -- Heartbeat cadence in milliseconds. Leave empty for the
+        # binary default.
+        intervalMs: ""
+        # -- Machine-profile label echoed in heartbeats. Used only
+        # when an inbound request carries `X-SIE-MACHINE-PROFILE`;
+        # empty uses the resolved pool machineProfile.
+        machineProfile: ""
+      # -- Worker-side config reconciliation against sie-config.
+      # The sidecar already consumes live bundle-scoped NATS deltas; this
+      # poller catches missed deltas by comparing /v1/configs/epoch and
+      # replaying /v1/configs/export through Python IPC.
+      configReconcile:
+        enabled: true
+        # -- Epoch poll cadence in milliseconds.
+        pollIntervalMs: 30000
+        # -- Slow full-export reconcile cadence in milliseconds. Covers
+        # no-config-store clusters where epoch remains 0. Set 0 to disable
+        # after the startup export.
+        fullExportIntervalMs: 300000
+      # -- K8s probes on the worker-sidecar.
+      # Disabled by default while the Python container's existing
+      # /healthz + /readyz remain the K8s contract.
+      probes:
+        enabled: false
+        startup:
+          periodSeconds: 5
+          failureThreshold: 60
+        liveness:
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readiness:
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      # -- Pipeline depth: how many IPC dispatches can be in-flight to
+      # Python concurrently. The Rust binary defaults to 2; making it
+      # explicit here so the helm chart documents production intent.
+      # 1 = strict serial dispatch (regression-bisect knob); 2 = one
+      # batch processing in Python while the next forms/ships in Rust;
+      # > 2 inflates per-batch latency without throughput gain because
+      # Python's executor is single-CUDA-stream.
+      # See `packages/sie_server_sidecar/src/dispatcher.rs::pipeline_depth`.
+      pipelineDepth: 2
+      # -- BatchFormer tuning for queue-mode workers. These defaults
+      # keep Rust-side batch formation responsive while leaving the
+      # adapter to execute each IPC frame as one forward pass.
+      batcher:
+        # -- Coalesce window ceiling in ms. Lower = more responsive
+        # to inflow jitter and bounds tail latency when traffic is
+        # below saturation.
+        coalesceMs: 5
+        # -- Hard cap on items per batch. This gives the scheduler
+        # headroom for short arrival bursts without unbounded
+        # tail-batch growth.
+        maxBatchRequests: 12
+      # -- FetchExpiryController tuning (the client-side batch-coalesce
+      # quantum that drives the NATS pull loop). The narrow 2/15/50
+      # window keeps queue-path coalescing bounded while still allowing
+      # short bursts to batch.
+      adaptive:
+        # -- Quantum floor in ms (`SIE_ADAPTIVE_MIN_QUANTUM_MS`).
+        minQuantumMs: 2
+        # -- Quantum ceiling in ms (`SIE_ADAPTIVE_MAX_QUANTUM_MS`).
+        maxQuantumMs: 15
+        # -- Target queue-path p50 the controller nudges toward in
+        # ms (`SIE_ADAPTIVE_TARGET_P50_MS`).
+        targetP50Ms: 50
+      # -- Slow stream/durable reconcile. This re-ensures the JetStream
+      # stream and durable consumer without touching the hot pull stream.
+      # Set 0 to disable; the binary clamps non-zero values below 10s.
+      natsConsumerReconcile:
+        intervalMs: 30000
+      # -- Extra env vars passed through to the sidecar (rendered AFTER
+      # the typed fields above, so any duplicate name overrides them).
+      extraEnv: []
+      # -- Resource requests/limits for the sidecar. Conservative
+      # defaults; the heavy lifting still happens in the Python pod.
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
 
-  # -- Worker pools (one StatefulSet per pool)
-  # Each map entry creates a WorkerGroup: one StatefulSet + one pre-pull DaemonSet.
+  # -- Worker pools (one StatefulSet per enabled queuePool/machineProfile/bundle lane)
+  # Each map entry creates a WorkerGroup family: one StatefulSet + one
+  # pre-pull DaemonSet per enabled bundle.
   # The map key names the Kubernetes WorkerGroup, not the SDK logical pool.
   # WorkerGroup naming convention: <machineProfile> (e.g. l4, a100-40gb, cpu).
-  # All pools scale to zero by default — enable the ones you need.
+  # All pools scale to zero by default; enable the ones you need.
+  #
+  # Schema (pool = GPU/node class, bundles = workloads served on it):
+  #
+  # Pool-level keys (shared across bundles on this hardware):
+  #   enabled:         bool. Skip rendering the whole pool when false.
+  #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
+  #   gpu.product:     string. nvidia.com/gpu.product node-label match.
+  #   gpuType:         GPU/node label used for node selection and display.
+  #   machineProfile:  Optional queue-lane label used by KEDA scalers,
+  #                    Prometheus, gateway routing, and worker subjects.
+  #                    Defaults to the worker group key.
+  #   nodeSelector:    map. Merged with workers.common.nodeSelector.
+  #   platform:        Optional override (e.g. "cpu"). Used as the
+  #                    image-tag suffix for the worker image
+  #                    (e.g. `<repo>:<tag>-cpu-<bundle>`),
+  #                    NOT propagated to a pod env var.
+  #   queuePool:       string. Optional override of common.queuePool.
+  #                    Defaults to `default` via workers.common.queuePool.
+  #   resources:       requests/limits for the Python ``worker``
+  #                    container (the GPU-bound forward-pass server).
+  #   runtimeClassName: Optional override of common.runtimeClassName.
+  #   tolerations:     extra tolerations on top of the chart defaults.
+  #
+  # bundles: map keyed by bundle name (matches a bundle in sie_config;
+  #   otherwise the sidecar refuses to start). Per-bundle keys:
+  #     enabled:       bool, default true. Skip this bundle on this pool.
+  #     imageBundle:   string. Optional image-tag bundle suffix override.
+  #                    Set only when the logical bundle reuses another
+  #                    bundle's image (e.g. `sglang-embedding` -> `sglang`).
+  #     extraEnv:      list. Extra env vars on the ``worker`` container.
+  #                    Rendered after workers.common.extraEnv so a
+  #                    bundle-level entry wins on duplicate names.
+  #     maxReplicas:   KEDA upper bound.
+  #     minReplicas:   baseline replicas (0 = scale-to-zero).
+  #
+  # Each queuePool/machineProfile/bundle lane renders one StatefulSet +
+  # KEDA ScaledObject + PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
   pools:
 
-    # ── L4 GPU ───────────────────────────────────────────────
+    # L4 GPU
 
     l4:
       enabled: false
-      # -- Minimum replicas (0 for scale-to-zero)
-      minReplicas: 0
-      # -- Maximum replicas
-      maxReplicas: 10
       # -- Machine profile name (key from machineProfiles section)
       # Used for routing, metrics, and KEDA scaling
       machineProfile: l4
       # -- GPU type label for routing (short form used by gateway)
       gpuType: l4
-      # -- Bundle to use (overrides common.bundle if set)
-      bundle: default
       # -- Optional runtime class override for this pool
       # runtimeClassName: "nvidia"
       # -- Node selector for GPU nodes (override per cloud in values-gke/aws.yaml)
@@ -443,16 +666,20 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      # -- Workloads running on this pool. Each key is a bundle name.
+      bundles:
+        default:
+          # -- Minimum replicas (0 for scale-to-zero)
+          minReplicas: 0
+          # -- Maximum replicas
+          maxReplicas: 10
 
-    # ── A100 40GB ────────────────────────────────────────────
+    # A100 40GB
 
     a100-40gb:
       enabled: false
-      minReplicas: 0
-      maxReplicas: 5
       machineProfile: a100-40gb
       gpuType: a100-40gb
-      bundle: default
       nodeSelector: {}
       gpu:
         count: 1
@@ -468,16 +695,17 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 5
 
-    # ── A100 80GB ────────────────────────────────────────────
+    # A100 80GB
 
     a100-80gb:
       enabled: false
-      minReplicas: 0
-      maxReplicas: 3
       machineProfile: a100-80gb
       gpuType: a100-80gb
-      bundle: default
       nodeSelector: {}
       gpu:
         count: 1
@@ -493,16 +721,17 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 3
 
-    # ── CPU (local testing with kind, no GPU) ────────────────
+    # CPU (local testing with kind, no GPU)
 
     cpu:
       enabled: false
-      minReplicas: 1
-      maxReplicas: 3
       machineProfile: cpu
       gpuType: cpu
-      bundle: default
       # -- Platform override for CPU pool
       platform: cpu
       # No node selector - runs on any node
@@ -518,6 +747,10 @@ workers:
           cpu: "4"
           memory: "12Gi"
       tolerations: []
+      bundles:
+        default:
+          minReplicas: 1
+          maxReplicas: 3
 
 # -- Autoscaling configuration using KEDA ScaledObjects.
 # -- Requires KEDA operator. Set keda.install=true to install KEDA as a sub-chart,
@@ -529,7 +762,7 @@ autoscaling:
   enabled: false
 
   # -- Prometheus address for KEDA metrics queries.
-  # Ignored when kube-prometheus-stack.install=true — address is auto-derived from
+  # Ignored when kube-prometheus-stack.install=true; address is auto-derived from
   # the release namespace. Set this when using an externally-managed Prometheus.
   prometheusAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
 
@@ -558,17 +791,31 @@ ingress:
   enabled: false
   className: nginx
   annotations: {}
-  # -- Hostname for ingress
+  # -- Hostnames served by the ingress. Each entry becomes an ingress rule and,
+  # when tls.enabled, a SAN on the TLS cert (all hosts share tls.secretName).
+  # Empty => host-less catch-all ingress.
+  hosts: []
+  # -- DEPRECATED single-hostname form, kept for backward compatibility.
+  # Ignored when `hosts` is non-empty; otherwise treated as a one-element `hosts`.
   host: ""
   # -- TLS configuration
-  tls:
+  # -- SIE ingress TLS configuration. Named tlsConfig instead of tls
+  # to avoid colliding with Loki/Alloy sub-chart ingress.tls values,
+  # which use list-shaped TLS entries. Legacy ingress.tls object values
+  # are still honored by the templates.
+  tlsConfig:
     enabled: false
-    # Mode: byo | cert-manager
+    # Mode: byo | cert-manager | self-signed | disabled (case-sensitive)
     #   byo:          user supplies a kubernetes.io/tls Secret named `secretName`. (default — backward compatible)
     #   cert-manager: chart adds a cert-manager annotation to the main Ingress; cert-manager populates `secretName`.
-    #                 Requires cert-manager to be installed in the cluster (one-time prerequisite).
+    #                 Requires cert-manager to be installed in the cluster (one-time prerequisite), OR set
+    #                 `certManagerBundle.certManager.install: true` to bundle it (single-tenant only — see chart README).
+    #   self-signed:  chart bootstraps a self-signed root CA, a CA ClusterIssuer, and a leaf cert for the Ingress.
+    #                 Requires cert-manager (either pre-existing or `certManagerBundle.certManager.install: true`).
+    #                 Intended for air-gapped / on-prem clusters where Let's Encrypt is unreachable.
+    #   disabled:     no TLS resources rendered. Use with TLS-terminating LB / sidecar / service mesh upstream.
     mode: byo
-    # Name of the kubernetes.io/tls Secret. In cert-manager mode this is where cert-manager writes the cert.
+    # Name of the kubernetes.io/tls Secret. In cert-manager / self-signed modes this is where the leaf cert is written.
     secretName: sie-tls
     # cert-manager-specific knobs (only used when mode=cert-manager)
     certManager:
@@ -581,7 +828,7 @@ ingress:
       # avoids collisions when two SIE releases share a cluster). Override to a static name only when there is
       # known to be no other SIE release on this cluster.
       name: ""
-      # ACME settings (used only when create=true). Flat (no nested `acme:` block) — ACME is the only supported issuer path.
+      # ACME settings (used only when create=true). Flat (no nested `acme:` block); ACME is the only supported issuer path.
       server: https://acme-v02.api.letsencrypt.org/directory
       # Email for ACME account registration. REQUIRED when create=true. Empty value triggers a helm install/upgrade fail.
       email: ""
@@ -590,6 +837,44 @@ ingress:
       # HTTP-01 solver ingress class. Empty => defaults to .Values.ingress.className. Override only if your
       # cert-manager solver needs a different class than your data-plane ingress (rare).
       ingressClassName: ""
+    # Self-signed-specific knobs (only used when mode=self-signed).
+    selfSigned:
+      # Root CA Certificate (cluster-issued via the SelfSigned bootstrap ClusterIssuer).
+      rootCA:
+        # Namespace the root CA Certificate / Secret lives in. MUST equal cert-manager's
+        # --cluster-resource-namespace (cert-manager looks up secrets referenced by
+        # ClusterIssuers only in that namespace). Empty => release namespace, which is
+        # correct for the bundled subchart (cert-manager runs in the release namespace and
+        # --cluster-resource-namespace defaults to POD_NAMESPACE). When pointing at an
+        # external cert-manager, set this to that cert-manager's deployment namespace
+        # (typically "cert-manager"), otherwise the CA ClusterIssuer will report
+        # "secret not found" and leaf issuance will hang.
+        namespace: ""
+        # Secret name where the root CA key/cert pair is stored. Used as ca.secretName for the CA ClusterIssuer
+        # and as the source for the trust-manager Bundle (if enabled).
+        secretName: sie-root-ca-key-pair
+        # X.509 CommonName for the root CA. Surfaces in browsers / clients that inspect the cert chain.
+        commonName: SIE Self-Signed Root CA
+        # Validity. 43800h = 5y. cert-manager renews at duration - renewBefore.
+        duration: 43800h
+        renewBefore: 720h
+        privateKey:
+          algorithm: rsa
+          size: 4096
+      # CA ClusterIssuer that signs leaf certs from the root CA.
+      caClusterIssuer:
+        name: sie-self-signed-ca
+      # Leaf Certificate for the Ingress (consumed via ingress.tlsConfig.secretName).
+      leaf:
+        # 2160h = 90d (Let's Encrypt-style lifetime); cert-manager renews at duration - renewBefore.
+        duration: 2160h
+        renewBefore: 360h
+        privateKey:
+          algorithm: ecdsa
+          size: 256
+        # Extra SANs in addition to ingress.host. Useful for multi-host overlays or internal in-cluster DNS.
+        dnsNames: []
+        ipAddresses: []
 
 # -- Auth configuration (ingress-nginx + oauth2-proxy)
 auth:
@@ -643,6 +928,8 @@ serviceAccount:
   create: true
   # -- Service account name. Must match KSA name in Terraform WI/IRSA binding.
   name: "sie-server"
+  # -- Labels (e.g., azure.workload.identity/use=true for Azure Workload Identity)
+  labels: {}
   # -- Annotations (e.g., for Workload Identity)
   annotations: {}
   # Example for GKE Workload Identity:
@@ -703,10 +990,16 @@ telemetry:
   # -- Deployment environment: production | staging | development | ci
   deploymentEnv: production
 
-# -- Logging configuration
+# -- Logging configuration. Gateway and sie-config receive ``SIE_LOG_LEVEL`` from
+# ``logging.level``. Workers use ``logging.workerLevel`` when set (non-empty);
+# otherwise they use ``logging.level`` as well. Workers also honor ``SIE_LOG_JSON``.
+# For extra Rust tracing filters in the gateway, set ``RUST_LOG`` via
+# ``gateway.extraEnv`` (``EnvFilter::try_from_default_env`` runs first).
 logging:
-  # -- Log level (DEBUG, INFO, WARNING, ERROR)
+  # -- Log level (DEBUG, INFO, WARNING, ERROR) for gateway and sie-config
   level: INFO
+  # -- Optional worker-only log level. Empty string: workers use ``level`` too.
+  workerLevel: ""
   # -- Enable structured JSON logging (required for Loki)
   json: true
 
@@ -727,9 +1020,9 @@ nats:
   # -- Override the NATS service name used to build the default SIE_NATS_URL.
   # Defaults to "<release>-nats" if not set.
   serviceName: ""
-  # -- JetStream configuration for queue-based routing (SIE_CLUSTER_ROUTING=queue).
-  # JetStream is required for the work queue. It is NOT required for config distribution
-  # (which uses plain NATS pub/sub).
+  # -- JetStream configuration for the work queue.
+  # JetStream is required for inference (the gateway is queue-only).
+  # It is NOT required for config distribution (plain NATS pub/sub).
   # NOTE: These keys are passed to the NATS sub-chart (nats/nats) which expects
   # config.jetstream.memoryStore.maxSize (not memStorage/size).
   config:
@@ -760,6 +1053,14 @@ nats:
       # JetStream detailed metrics (streams + consumers)
       NATS_EXPORTER_OPTS: "-connz -routez -subz -jsz=all"
 
+# -- cert-manager/trust-manager subchart install toggles. Default off because
+# most clusters already manage certificate controllers at the platform layer.
+certManagerBundle:
+  certManager:
+    install: false
+  trustManager:
+    install: false
+
 # -- Cluster routing mode. Today the only supported value is "queue": the
 # gateway publishes work items to NATS JetStream and workers pull them.
 # The Rust gateway has no direct-mode code path (queue-only since the
@@ -779,47 +1080,73 @@ queueRouting:
   # -- Maximum age (seconds) for messages in the pool-level stream.
   # Messages older than this are discarded. Set higher for slow model loads.
   streamMaxAgeSec: 120
+  # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
+  # queue namespaces. Keys are queue pool names. Use this when
+  # poolAdmission.enabled=true and a worker group sets a named non-default
+  # workers.pools.<name>.queuePool but the pool is static/deploy-owned rather
+  # than created through the expiring /v1/pools API.
+  #
+  # Example:
+  # staticQueuePools:
+  #   companyA:
+  #     gpus:
+  #       l4: 0
+  #     gpuCaps: {}
+  #     minimumWorkerCount: 0
+  staticQueuePools: {}
   # -- NATS fetch budget: max messages pulled per fetch() call.
-  # This is the primary driver of GPU batch size in queue mode — the worker
+  # This is the primary driver of GPU batch size in queue mode; the worker
   # groups fetched messages by model and dispatches them as a single forward pass.
   # Higher values improve GPU utilization under load but increase per-request latency.
   natsFetchBudget: 64
+  # -- Worker admission gate for capped pools. Workers ask the gateway whether
+  # their pod is in the pool's assigned_workers before pulling from NATS.
+  # The baseline `default` pool fails open. Named non-default queue pools are
+  # runtime pool/admission boundaries: if you set `workers.pools.<name>.queuePool`
+  # to a custom value without declaring the matching `staticQueuePools` entry
+  # or creating the matching `/v1/pools/<queuePool>` object, workers will pause
+  # instead of pulling.
+  poolAdmission:
+    enabled: true
+    checkIntervalSec: 10
+    pauseSec: 1
+    staleAfterSec: 30
 
 # -- Payload store for large work item payloads (images, long documents).
 # When a work item exceeds 1MB, the payload is offloaded to this store.
-# Only used when clusterRouting=queue.
 # IMPORTANT: payloadStore.url must point to shared storage accessible by both
-# gateway and worker pods. Use s3://bucket/prefix or gs://bucket/prefix.
+# gateway and worker pods. Supported schemes:
+#   - s3://<bucket>/<prefix>                                          (AWS S3)
+#   - gs://<bucket>/<prefix>                                          (GCP GCS)
+#   - abfs://<container>@<account>.dfs.core.windows.net/<prefix>      (Azure ADLS Gen2)
+#   - abfss://...                                                     (same as abfs, TLS-only enforced by the SDK)
 # Local filesystem paths (e.g., /tmp/payloads) will NOT work in queue mode
 # because gateway and worker pods have different filesystems.
 #
 # Auto-derivation: when workers.common.clusterCache.enabled=true and
 # workers.common.clusterCache.url is set, the chart enables the payload store
 # automatically and points it at the sibling /payloads prefix of the same
-# bucket. By convention the terraform modules expose the cache URL as
-# "<scheme>://<bucket>/models", and the chart strips a trailing "/models"
-# segment before appending "/payloads" so the two features live at top-level
-# sibling prefixes:
+# bucket/container. By convention the terraform modules expose the cache URL as
+# "<scheme>://<bucket-or-container>/models", and the chart strips a trailing
+# "/models" segment before appending "/payloads" so the two features live at
+# top-level sibling prefixes:
 #   <bucket>/models/...    model weights (managed by sie-admin)
 #   <bucket>/payloads/...  large work-item refs (managed by gateway)
-# The AWS and GCP terraform modules scope their workload IAM grants to these
-# top-level prefixes, so the auto-derived URL aligns with the permissions
-# out of the box. Set payloadStore.url explicitly only to override the
-# default (e.g., a separate bucket); leaving it empty is the right call
+# All three terraform modules (AWS, GCP, Azure) scope their workload IAM
+# grants to these top-level prefixes, so the auto-derived URL aligns with the
+# permissions out of the box. Set payloadStore.url explicitly only to override
+# the default (e.g., a separate bucket); leaving it empty is the right call
 # for most clusters.
 payloadStore:
-  # -- DEPRECATED, kept for backward compatibility only. The chart no longer
-  # reads this field; the payload store is enabled whenever the effective URL
-  # (see auto-derivation rules above) resolves to a non-empty value. Set
-  # payloadStore.url to "" and clusterCache.enabled to false to disable.
-  enabled: false
-  # -- Payload store URL. Must be an S3 or GCS URL (s3://bucket/prefix or gs://bucket/prefix).
+  # -- Payload store URL. Supported schemes: s3://, gs://, abfs://, abfss://
+  # (s3://bucket/prefix, gs://bucket/prefix, or abfs(s)://container@account.dfs.core.windows.net/prefix).
   # Local paths are rejected when clusterRouting=queue (see gateway-deployment.yaml validation).
   # Leave empty to auto-derive from workers.common.clusterCache.url (recommended).
   url: ""
   # -- TTL for stored payloads in seconds.
   # For S3: configure via S3 lifecycle rules on the bucket.
   # For GCS: configure via GCS lifecycle rules on the bucket.
+  # For Azure Blob: configure via lifecycle management rules on the storage account.
   # This value is passed as SIE_PAYLOAD_STORE_TTL env var to the gateway.
   ttlSeconds: 300
 
@@ -827,6 +1154,85 @@ payloadStore:
 # Sub-chart dependency control flags
 # All sub-charts are disabled by default. Enable what you need in your overlay.
 # =============================================================================
+
+# -- cert-manager subchart values (opt-in; default off). The `install` flag lives under
+# `certManagerBundle.certManager.install` (NOT here) because the cert-manager subchart enforces a
+# JSON Schema with additionalProperties=false, which rejects any extra key under this block. Override
+# subchart values here for things cert-manager actually understands.
+# Bundling is for SINGLE-TENANT clusters where SIE is the sole workload. If your cluster already
+# runs cert-manager, leave certManagerBundle.certManager.install=false and use
+# ingress.tlsConfig.mode=cert-manager against the existing install — bundling hard-fails via a pre-install
+# conflict-detection Job hook.
+cert-manager:
+  crds:
+    # CRDs are vendored under deploy/helm/sie-cluster/crds/ instead of being rendered by the subchart.
+    # Helm applies files in `crds/` BEFORE template discovery, which is the only mechanism that lets the
+    # bundled install render Certificate/ClusterIssuer/Bundle resources in a single `helm install` (the
+    # subchart's templated CRDs land too late — RESTMapper discovery fails first). Vendored bundle is
+    # `cert-manager.crds.yaml` pinned to the same version as the subchart pin in Chart.yaml; bump them
+    # together (see chart README §Bundling cert-manager → Vendored CRDs).
+    enabled: false
+    # `keep` is moot when enabled=false; the vendored files use `helm.sh/resource-policy: keep` directly.
+    keep: true
+  prometheus:
+    enabled: true
+    servicemonitor:
+      enabled: true
+  global:
+    leaderElection:
+      # Pin the leader-election namespace so cert-manager works regardless of release namespace.
+      namespace: cert-manager
+
+# -- trust-manager subchart values (opt-in; default off). The `install` flag lives under
+# `certManagerBundle.trustManager.install` (NOT here) — same reason as cert-manager. Used to
+# replicate the self-signed root CA bundle into other namespaces as a ConfigMap("ca.crt").
+# Requires cert-manager (either bundled or pre-existing).
+#
+# IMPORTANT: trust-manager's --trust-namespace defaults to "cert-manager" — it will only find
+# source Secrets in that namespace. The self-signed root CA Secret is written to
+# ingress.tlsConfig.selfSigned.rootCA.namespace (defaults to release namespace). For the bundled
+# trustBundle to sync, those two namespaces MUST match. Either:
+#   (a) set ingress.tlsConfig.selfSigned.rootCA.namespace: cert-manager  (route the root CA into the
+#       same namespace trust-manager looks in), OR
+#   (b) override trust-manager.app.trust.namespace at install time:
+#       --set trust-manager.app.trust.namespace=<release-namespace>
+# Symptom when mismatched: trust-manager logs `bundle source was not found`, Bundle stays
+# Synced=False with reason SourceNotFound.
+trust-manager:
+  # Disable the public CA bundle to reduce image size and CVE surface. Flip on if workloads need WebPKI roots.
+  defaultPackage:
+    enabled: false
+  secretTargets:
+    # Bundles render to ConfigMaps; we do not need write-to-Secret targets.
+    enabled: false
+  crds:
+    # Vendored under deploy/helm/sie-cluster/crds/ — same reason as the cert-manager block above.
+    enabled: false
+
+# -- SIE-owned controls for the bundled cert-manager / trust-manager (sie-cluster chart values, not subchart values).
+# The `install` flags below are the user-facing switches for bundling cert-manager / trust-manager.
+# They live here (instead of under `cert-manager.install` / `trust-manager.install`) because the
+# cert-manager and trust-manager subcharts ship strict JSON Schemas (additionalProperties=false) that
+# reject any extra key at the root of their values blocks.
+certManagerBundle:
+  certManager:
+    # -- Install cert-manager as a sub-chart. See chart README §TLS / HTTPS for the conflict-detection guard.
+    install: false
+  trustManager:
+    # -- Install trust-manager as a sub-chart.
+    install: false
+  # When true, skip the pre-install / template-time CRD conflict guard and proceed even if cert-manager CRDs
+  # already exist in the cluster. DANGER: only set true if you understand that two cert-manager controllers
+  # racing on the same CRDs WILL corrupt issuance state. Default is false.
+  allowExistingCRDs: false
+  # trust-manager Bundle that replicates the self-signed root CA into other namespaces as a ConfigMap.
+  trustBundle:
+    enabled: false
+    name: sie-root-ca-bundle
+    target:
+      configMapKey: ca.crt
+    namespaceSelector:
+      matchLabels: {}
 
 # -- KEDA autoscaler (required for scale-to-zero worker autoscaling)
 keda:
@@ -974,10 +1380,26 @@ dcgm-exporter:
     - "-f"
     - "/etc/dcgm-exporter/dcp-metrics-included.csv"
 
+# -- Observability feature gates
+observability:
+  logs:
+    # -- Optional global log observability override. Omitted by default, so the
+    # component toggles below decide. Set true to install Loki plus Alloy with
+    # one flag. Set false to force both off even if component toggles are true.
+    # Kubernetes events remain controlled by kubernetes-event-exporter.install.
+    # install: true
+    loki:
+      # -- Install bundled Loki. Can be enabled alone when logs are written by
+      # another collector.
+      install: false
+    alloy:
+      # -- Install bundled Alloy. Can be enabled alone when forwarding to an
+      # external Loki endpoint via alloy.logs.lokiUrl.
+      install: false
+
 # -- Loki log aggregation (Tier 2 - optional)
+# Installed when observability.logs.install=true or observability.logs.loki.install=true.
 loki:
-  # -- Install Loki as a sub-chart
-  install: false
   # -- Force a predictable service name so Alloy/Grafana/event-exporter can use
   # the static URL http://loki:3100 regardless of the Helm release name.
   fullnameOverride: loki
@@ -1027,34 +1449,37 @@ loki:
     enabled: false
 
 # -- Grafana Alloy log collector (Tier 2 - optional, replaces Promtail)
+# Installed when observability.logs.install=true or observability.logs.alloy.install=true.
 alloy:
-  # -- Install Alloy as a sub-chart
-  install: false
+  logs:
+    # -- Loki push endpoint used by the parent-rendered Alloy config. Override
+    # when observability.logs.alloy.install=true but bundled Loki is disabled.
+    lokiUrl: "http://loki:3100/loki/api/v1/push"
   alloy:
     configMap:
       # -- The River config is rendered from files/alloy/config.alloy via templates/alloy-configmap.yaml.
       # Setting create=false tells the sub-chart to mount the ConfigMap created by the parent chart.
       # name and key must match what templates/alloy-configmap.yaml emits.
       create: false
-      # NOTE: Static name — values.yaml is not templated so .Release.Name cannot
+      # NOTE: Static name; values.yaml is not templated so .Release.Name cannot
       # be used here. If deploying multiple releases in the same namespace, override
       # this to a unique name to avoid ConfigMap conflicts.
       name: "sie-alloy-config"
       key: "config.alloy"
+    mounts:
+      varlog: true
+      dockercontainers: true
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
   controller:
     type: daemonset
-  mounts:
-    varlog: true
-    dockercontainers: true
-  resources:
-    requests:
-      cpu: "50m"
-      memory: "64Mi"
-    limits:
-      cpu: "200m"
-      memory: "256Mi"
-  tolerations:
-    - operator: Exists
+    tolerations:
+      - operator: Exists
 
 # -- Kubernetes Event Exporter (Tier 2 - optional, sends K8s events to Loki)
 # Broadcom moved Bitnami community images behind a paywall on Docker Hub

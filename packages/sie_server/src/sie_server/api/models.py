@@ -43,6 +43,31 @@ class ModelLoadError(BaseModel):
     """True when the failure will not auto-retry; operator must intervene."""
 
 
+class ModelCapabilities(BaseModel):
+    """Advertised generation capabilities for a model.
+
+    Mirrors the gateway ``capabilities`` wire shape
+    (``ModelCapabilitiesWire``) for the keys derivable from the loaded
+    model config's :class:`~sie_server.config.model.GenerateCapabilities`.
+    ``code``/``sql``/``guard`` are informational flags advertising
+    validated generation jobs that back the ``model="code"`` /
+    ``model="sql"`` / ``model="guard"`` aliases. Populated only for
+    models that declare ``tasks.generate``; ``None`` otherwise.
+
+    These flags mean the model *supports* a task — they are NOT a
+    precision-independent quality SLA. A flag is true at the model level even
+    when quality is profile/precision-dependent (e.g. ``sql`` quality regresses
+    under FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``
+    alias).
+    """
+
+    grammar: list[str] = []
+    tools: bool = False
+    code: bool = False
+    sql: bool = False
+    guard: bool = False
+
+
 class ModelInfo(BaseModel):
     """Information about a model."""
 
@@ -61,6 +86,9 @@ class ModelInfo(BaseModel):
 
     max_sequence_length: int | None = None
     profiles: dict[str, ProfileInfo] = {}
+
+    capabilities: ModelCapabilities | None = None
+    """Advertised generation capabilities, ``None`` for non-generate models."""
 
 
 def _resolve_state_and_error(
@@ -104,6 +132,28 @@ def _resolve_state_and_error(
     return state, last_error
 
 
+def _resolve_capabilities(config: Any) -> ModelCapabilities | None:
+    """Build :class:`ModelCapabilities` from a loaded model config.
+
+    Reads ``config.tasks.generate.capabilities`` (a
+    :class:`~sie_server.config.model.GenerateCapabilities`) when the
+    model declares a generate task; returns ``None`` for
+    embedding/score/extract-only models that have no generate
+    capabilities to advertise.
+    """
+    generate = config.tasks.generate
+    if generate is None:
+        return None
+    caps = generate.capabilities
+    return ModelCapabilities(
+        grammar=list(caps.grammar),
+        tools=caps.tools,
+        code=caps.code,
+        sql=caps.sql,
+        guard=caps.guard,
+    )
+
+
 class ModelsListResponse(BaseModel):
     """Response for listing models."""
 
@@ -143,6 +193,7 @@ async def list_models(http_request: Request) -> ModelsListResponse:
                 last_error=last_error,
                 max_sequence_length=config.max_sequence_length,
                 profiles=profiles,
+                capabilities=_resolve_capabilities(config),
             )
         )
 
@@ -195,4 +246,5 @@ async def get_model(model: str, http_request: Request) -> ModelInfo:
         last_error=last_error,
         max_sequence_length=config.max_sequence_length,
         profiles=profiles,
+        capabilities=_resolve_capabilities(config),
     )

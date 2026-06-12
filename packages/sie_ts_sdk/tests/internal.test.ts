@@ -9,7 +9,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { handleError, parseCapacityInfo, parseGpuParam } from "../src/internal/parsing.js";
+import {
+  handleError,
+  parseCapacityInfo,
+  parseGenerateResult,
+  parseGpuParam,
+} from "../src/internal/parsing.js";
 import { computeBackoffWithJitter, getRetryAfter } from "../src/internal/retry.js";
 
 describe("Retry logic - exponential backoff with jitter", () => {
@@ -99,9 +104,12 @@ describe("Retry-After header parsing", () => {
     expect(delay).toBeUndefined();
   });
 
-  it("should return undefined for zero", () => {
+  it("should honor zero as retry-immediately (0ms)", () => {
+    // `Retry-After: 0` means "retry immediately" per the HTTP spec; it
+    // must return 0, not undefined (which would fall back to the default
+    // delay).
     const delay = getRetryAfter("0");
-    expect(delay).toBeUndefined();
+    expect(delay).toBe(0);
   });
 
   it("should return undefined for negative value", () => {
@@ -305,6 +313,49 @@ describe("handleError (gateway / FastAPI bodies)", () => {
     });
   });
 
+  // /v1/embeddings returns the OpenAI {error:{message,type,param,code}}
+  // envelope on every error path. A SIE SDK user hitting
+  // it directly must still get a typed error with the parsed `code`.
+  it("reads OpenAI {error:{type,param,code}} envelope (embeddings 4xx)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        error: {
+          message: 'field "model" is required',
+          type: "invalid_request_error",
+          param: "model",
+          code: "invalid_request",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "RequestError",
+      message: 'field "model" is required',
+      code: "invalid_request",
+      statusCode: 400,
+    });
+  });
+
+  it("reads OpenAI envelope for translated inner-encode 5xx (embeddings)", async () => {
+    const res = new Response(
+      JSON.stringify({
+        error: {
+          message: "queue unavailable",
+          type: "server_error",
+          param: null,
+          code: "transport_failure",
+        },
+      }),
+      { status: 503, headers: { "Content-Type": "application/json" } },
+    );
+    await expect(handleError(res)).rejects.toMatchObject({
+      name: "ServerError",
+      message: "queue unavailable",
+      code: "transport_failure",
+      statusCode: 503,
+    });
+  });
+
   it("supports legacy string detail", async () => {
     const res = new Response(JSON.stringify({ detail: "Not allowed" }), {
       status: 403,
@@ -432,5 +483,36 @@ describe("Capacity info parsing", () => {
     // Filter with lowercase should match both
     const result = parseCapacityInfo(wireData, "l4");
     expect(result.workers).toHaveLength(2);
+  });
+});
+
+describe("parseGenerateResult usage coercion (BUG 13c)", () => {
+  // REGRESSION: non-numeric / non-integer usage counts must NOT leak into the
+  // typed `number` fields. A string slips past `?? 0` (only null/undefined are
+  // caught) and a float must be truncated, mirroring the Python SDK's int coercion.
+  it("coerces non-numeric / non-integer token counts to safe integers", () => {
+    const result = parseGenerateResult({
+      model: "m",
+      text: "hi",
+      usage: { prompt_tokens: "5", completion_tokens: 3.9, total_tokens: null },
+    });
+    expect(result.usage).toEqual({
+      promptTokens: 0,
+      completionTokens: 3,
+      totalTokens: 0,
+    });
+  });
+
+  it("preserves valid integer token counts", () => {
+    const result = parseGenerateResult({
+      model: "m",
+      text: "hi",
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    });
+    expect(result.usage).toEqual({
+      promptTokens: 4,
+      completionTokens: 2,
+      totalTokens: 6,
+    });
   });
 });

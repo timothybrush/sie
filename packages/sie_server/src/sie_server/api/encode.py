@@ -39,7 +39,7 @@ def _format_dense(
 ) -> DenseVector:
     """Format a dense embedding for response.
 
-    Per DESIGN.md 13.2: Keep numpy arrays, don't convert to list.
+    Keep numpy arrays for msgpack serialization; do not convert to lists.
     Quantization is now done by QuantizePostprocessor before this is called.
     """
     # For binary (packed uint8), dims represents the original dimension
@@ -67,7 +67,7 @@ def _format_sparse(
 ) -> SparseVector:
     """Format a sparse embedding for response.
 
-    Per DESIGN.md 13.2: Keep numpy arrays, don't convert to list.
+    Keep numpy arrays for msgpack serialization; do not convert to lists.
     Quantization is now done by QuantizePostprocessor before this is called.
 
     Note: Sparse vectors only support float32 and float16 dtypes.
@@ -98,7 +98,7 @@ def _format_multivector(
 ) -> MultiVector:
     """Format a multivector embedding for response.
 
-    Per DESIGN.md 13.2: Keep numpy arrays, don't convert to list.
+    Keep numpy arrays for msgpack serialization; do not convert to lists.
     Quantization is now done by QuantizePostprocessor before this is called.
 
     Note: Quantization is applied per-token. ColBERTv2 uses 2-bit quantization

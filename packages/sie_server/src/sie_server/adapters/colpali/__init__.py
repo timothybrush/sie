@@ -10,9 +10,8 @@ ColPali models:
 
 Target model: vidore/colpali-v1.3-hf (PaliGemma-based, 3B params)
 
-Per roadmap Project 10.5 Phase 1:
 - Uses transformers ColPaliForRetrieval + ColPaliProcessor
-- Optimization (FA2 varlen, SGLang) deferred to Phase 2/3
+- Optimization (FA2 varlen, SGLang) remains deferred
 
 See: https://huggingface.co/vidore/colpali-v1.3-hf
 """
@@ -31,6 +30,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -304,16 +304,14 @@ class ColPaliAdapter(BaseAdapter):
         if not has_text and not has_images:
             raise ValueError(_ERR_NO_INPUT)
 
-        # For queries, prefer text; for documents, prefer images
+        # For queries, prefer text; for documents, prefer images. The top guard
+        # guarantees has_text once we get past has_images.
         if is_query and has_text:
             return self._encode_text(item.text)
         if has_images:
             pil_images = self._load_images(item)
             return self._encode_images(pil_images)
-        if has_text:
-            return self._encode_text(item.text)
-
-        raise ValueError(_ERR_NO_INPUT)
+        return self._encode_text(item.text)
 
     def _load_images(self, item: Any) -> list[Image.Image]:
         """Load images from item into PIL Images.
@@ -328,7 +326,7 @@ class ColPaliAdapter(BaseAdapter):
 
         pil_images = []
         for img_input in item.images or []:
-            img_bytes = img_input["data"]
+            img_bytes = media_bytes(img_input, kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             # Convert to RGB if necessary
             if pil_img.mode != "RGB":
@@ -367,13 +365,21 @@ class ColPaliAdapter(BaseAdapter):
         # For single image, return [num_patches, 128]
         # For multiple images, concatenate patches
         if len(images) == 1:
-            return embeddings[0].float().cpu().numpy()
+            result = embeddings[0].float().cpu().numpy()
+        else:
+            # Concatenate all image patches
+            all_patches = []
+            for i in range(len(images)):
+                all_patches.append(embeddings[i].float().cpu().numpy())
+            result = np.concatenate(all_patches, axis=0)
 
-        # Concatenate all image patches
-        all_patches = []
-        for i in range(len(images)):
-            all_patches.append(embeddings[i].float().cpu().numpy())
-        return np.concatenate(all_patches, axis=0)
+        # Free GPU memory from intermediate tensors to prevent OOM on
+        # subsequent batches (L4 22GB GPUs are tight for VLM models).
+        del embeddings, batch
+        if self._device and self._device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        return result
 
     def _encode_text(self, text: str) -> np.ndarray:
         """Encode text query into multi-vector embeddings.

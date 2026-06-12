@@ -1,13 +1,21 @@
 """Tests for the FastAPI app factory."""
 
 import logging
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sie_server.app.app_factory import AppFactory
 from sie_server.app.app_state_config import AppStateConfig
+from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
+from sie_server.core import readiness
+from sie_server.core.postprocessor_registry import PostprocessorRegistry
 
 
 @pytest.fixture
@@ -33,7 +41,6 @@ class TestAppFactory:
 
     def test_health_routes_registered(self, client: TestClient) -> None:
         """Health routes are registered in the app."""
-        # Get OpenAPI schema to verify routes exist
         response = client.get("/openapi.json")
         assert response.status_code == 200
 
@@ -41,32 +48,182 @@ class TestAppFactory:
         paths = openapi["paths"]
 
         assert "/healthz" in paths
+        assert "/livez" in paths
         assert "/readyz" in paths
 
 
-class TestNatsPullLoopGuard:
-    """Tests for _nats_pull_loop RuntimeError when NATS is None."""
+class TestAllRoutersAlwaysMounted:
+    """Queue routing is the only supported mode, so routers are mounted
+    unconditionally.
+
+    /ws/status MUST be mounted because it is the gateway's
+    worker-registration channel: the gateway opens
+    `ws://<worker>/ws/status` to learn pool_name, bundle,
+    machine_profile, and readiness. Without it, the gateway's
+    WorkerRegistry stays empty and every request falls through to the
+    202 "no queue worker available" branch. This test suite locks that
+    contract in.
+    """
+
+    @staticmethod
+    def _route_paths(app: FastAPI) -> set[str]:
+        return {getattr(r, "path", "") for r in app.router.routes}
+
+    def test_ws_status_is_always_mounted(self) -> None:
+        app = AppFactory.create_app(AppStateConfig())
+        assert "/ws/status" in self._route_paths(app)
+
+    def test_probe_and_metrics_routes_are_always_mounted(self) -> None:
+        app = AppFactory.create_app(AppStateConfig())
+        paths = self._route_paths(app)
+        for path in ("/healthz", "/readyz", "/metrics"):
+            assert path in paths, f"{path} missing — breaks K8s probes/Prometheus"
+
+    def test_inference_routers_are_mounted(self) -> None:
+        """Inference routers stay mounted unconditionally.
+
+        In production these endpoints are not a real ingress (the Rust
+        gateway is queue-only and publishes to JetStream, not HTTP),
+        but the routes exist on every pod for local debugging and to
+        keep the existing test/OpenAPI surface intact. If a future
+        refactor deletes them, update this test along with the router
+        imports in ``app_factory.create_app``.
+        """
+        app = AppFactory.create_app(AppStateConfig())
+        paths = self._route_paths(app)
+        for path in (
+            "/v1/encode/{model:path}",
+            "/v1/score/{model:path}",
+            "/v1/extract/{model:path}",
+            "/v1/embeddings",
+            "/v1/models",
+        ):
+            assert path in paths, f"{path} router missing"
+
+
+class TestIpcHeartbeatReadiness:
+    """IPC heartbeat readiness is opt-in so direct HTTP stays usable."""
+
+    @staticmethod
+    def _short_socket_path() -> Path:
+        # macOS caps AF_UNIX paths at 104 bytes; pytest temp roots can exceed it.
+        return Path("/tmp") / f"sie-ipc-{uuid.uuid4().hex[:12]}.sock"  # noqa: S108
 
     @pytest.mark.asyncio
-    async def test_nats_pull_loop_raises_when_nats_is_none(self, monkeypatch) -> None:
-        """SIE_CLUSTER_ROUTING=queue with no NATS subscriber raises RuntimeError."""
-        monkeypatch.setenv("SIE_CLUSTER_ROUTING", "queue")
+    async def test_direct_server_readiness_does_not_require_sidecar_ping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SIE_IPC_REQUIRE_HEARTBEAT", raising=False)
+        socket_path = self._short_socket_path()
+        monkeypatch.setenv("SIE_IPC_SOCKET_PATH", str(socket_path))
+        readiness.register_liveness_probe(None)
+        readiness.mark_ready()
 
-        registry = MagicMock()
-
-        with pytest.raises(RuntimeError, match="no NATS subscriber available"):
-            async with AppFactory._nats_pull_loop(registry, None):
-                pass  # pragma: no cover
+        try:
+            async with AppFactory._ipc_server(MagicMock()):
+                assert readiness.is_ready() is True
+        finally:
+            readiness.mark_not_ready()
+            readiness.register_liveness_probe(None)
+            socket_path.unlink(missing_ok=True)
 
     @pytest.mark.asyncio
-    async def test_nats_pull_loop_yields_none_when_not_queue(self, monkeypatch) -> None:
-        """When SIE_CLUSTER_ROUTING != queue, _nats_pull_loop yields None."""
-        monkeypatch.delenv("SIE_CLUSTER_ROUTING", raising=False)
+    async def test_sidecar_deployments_gate_readiness_on_ipc_ping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SIE_IPC_REQUIRE_HEARTBEAT", "true")
+        socket_path = self._short_socket_path()
+        monkeypatch.setenv("SIE_IPC_SOCKET_PATH", str(socket_path))
+        readiness.register_liveness_probe(None)
+        readiness.mark_ready()
 
-        registry = MagicMock()
+        try:
+            async with AppFactory._ipc_server(MagicMock()):
+                assert readiness.is_ready() is False
+        finally:
+            readiness.mark_not_ready()
+            readiness.register_liveness_probe(None)
+            socket_path.unlink(missing_ok=True)
 
-        async with AppFactory._nats_pull_loop(registry, None) as pull_loop:
-            assert pull_loop is None
+
+def _direct_encode_adapter_output(items: list[Any], output_types: list[str], **_kwargs: Any) -> Any:
+    from sie_server.core.inference_output import EncodeOutput
+
+    dense = None
+    if "dense" in output_types:
+        dense = np.array([[0.1, 0.2, 0.3]] * len(items), dtype=np.float32)
+
+    return EncodeOutput(
+        dense=dense,
+        sparse=None,
+        multivector=None,
+        batch_size=len(items),
+        dense_dim=3 if dense is not None else None,
+        multivector_token_dim=None,
+    )
+
+
+def _direct_http_registry() -> tuple[MagicMock, ThreadPoolExecutor]:
+    adapter = MagicMock()
+    adapter.encode = MagicMock(side_effect=_direct_encode_adapter_output)
+
+    registry = MagicMock()
+    registry.has_model.return_value = True
+    registry.is_loaded.return_value = True
+    registry.is_loading.return_value = False
+    registry.is_unloading.return_value = False
+    registry.is_failed.return_value = False
+    registry.get_failure.return_value = None
+    registry.get.return_value = adapter
+    registry.get_config.return_value = ModelConfig(
+        sie_id="test-model",
+        hf_id="org/test-model",
+        tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=3))),
+        profiles={"default": ProfileConfig(adapter_path="test:Adapter", max_batch_tokens=8192)},
+    )
+    registry.model_names = ["test-model"]
+    registry.device = "cpu"
+
+    preprocessor_registry = MagicMock()
+    preprocessor_registry.has_tokenizer.return_value = False
+    preprocessor_registry.has_preprocessor.return_value = False
+    registry.preprocessor_registry = preprocessor_registry
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    registry.postprocessor_registry = PostprocessorRegistry(executor)
+    return registry, executor
+
+
+class TestDirectServerHttpPath:
+    """Direct Python HTTP inference remains usable without the worker-sidecar."""
+
+    def test_app_factory_mounts_direct_generate_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SIE_IPC_REQUIRE_HEARTBEAT", raising=False)
+        app = AppFactory.create_app(AppStateConfig())
+        paths = {getattr(route, "path", "") for route in app.routes}
+        assert "/v1/generate/{model:path}" in paths
+
+    def test_app_factory_direct_encode_path_without_sidecar(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SIE_IPC_REQUIRE_HEARTBEAT", raising=False)
+        app = AppFactory.create_app(AppStateConfig())
+        registry, executor = _direct_http_registry()
+        app.state.registry = registry
+
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/v1/encode/test-model",
+                json={"items": [{"text": "direct python path"}]},
+                headers={"Accept": "application/json"},
+            )
+            models_response = client.get("/v1/models")
+        finally:
+            executor.shutdown(wait=True)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model"] == "test-model"
+        assert data["items"][0]["dense"]["dims"] == 3
+        assert data["items"][0]["dense"]["values"] == pytest.approx([0.1, 0.2, 0.3])
+
+        assert models_response.status_code == 200
+        assert models_response.json()["models"][0]["name"] == "test-model"
 
 
 class TestPreloadModels:

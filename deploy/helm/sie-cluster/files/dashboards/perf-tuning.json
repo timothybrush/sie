@@ -1,0 +1,644 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "SIE perf-tuning dashboard — 4 rows mirror the four tuning surfaces documented in sie-perf-lab/docs/l4-cluster-perf-tuning.md: (1) cluster throughput + SLO, (2) worker-sidecar pull loop / IPC pool, (3) Rust scheduler adaptive controller, (4) DCGM device-level power & clocks. Each panel is annotated with the knob it answers and the failure mode its shape encodes.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Findings doc",
+      "url": "https://github.com/superlinked/sie-perf-lab/blob/main/docs/l4-cluster-perf-tuning.md",
+      "type": "link",
+      "targetBlank": true,
+      "tags": []
+    }
+  ],
+  "panels": [
+    {
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "type": "text",
+      "options": {
+        "mode": "markdown",
+        "content": "## Cluster throughput & SLO\nTarget: **1M tok/s** cluster (= **100k tok/s per pod**). `sie_worker_backend_item_outcomes_total{disposition=\"publish_and_ack\"}` is the per-pod items/s — multiply by `tokens/item` (~433 on the NFCorpus bench) for tok/s."
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 2 },
+      "id": 1,
+      "type": "stat",
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "graphMode": "area",
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1500 },
+              { "color": "green", "value": 2200 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_backend_item_outcomes_total{namespace=\"$namespace\", disposition=\"publish_and_ack\"}[1m]))",
+          "legendFormat": "items/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Cluster items/s (all workers)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 2 },
+      "id": 2,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_backend_item_outcomes_total{namespace=\"$namespace\", disposition=\"publish_and_ack\"}[1m])) by (pod)",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Per-pod items/s (target ~230/s/pod at 433 tok/item)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 2 },
+      "id": 3,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\"}[1m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\"}[1m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sie_gateway_queue_result_wait_seconds_bucket{namespace=\"$namespace\"}[1m])) by (le))",
+          "legendFormat": "queue-wait p99",
+          "refId": "C"
+        }
+      ],
+      "title": "Gateway latency"
+    },
+    {
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 10 },
+      "id": 101,
+      "type": "text",
+      "options": {
+        "mode": "markdown",
+        "content": "## worker-sidecar — pull loop & IPC pool\n`ipc_pool_inflight` flatlining at `SIE_IPC_POOL_SIZE` is the canonical symptom of a too-small IPC pool. Rule of thumb: keep `SIE_PULL_LOOP_INFLIGHT ≤ SIE_MAX_CONCURRENT_BATCHES ≤ SIE_IPC_POOL_SIZE`."
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 10,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20 } } },
+      "targets": [
+        {
+          "expr": "avg(sie_worker_ipc_pool_inflight{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} inflight",
+          "refId": "A"
+        },
+        {
+          "expr": "avg(sie_worker_ipc_pool_size{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} pool size",
+          "refId": "B"
+        }
+      ],
+      "title": "IPC pool: inflight vs size (flatline at size = saturated)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 11,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(sie_pull_loop_batch_process_seconds_bucket{namespace=\"$namespace\"}[1m])) by (le, pod)) * 1000",
+          "legendFormat": "{{pod}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sie_pull_loop_batch_process_seconds_bucket{namespace=\"$namespace\"}[1m])) by (le, pod)) * 1000",
+          "legendFormat": "{{pod}} p99",
+          "refId": "B"
+        }
+      ],
+      "title": "Pull-loop batch wall time (fetch → IPC → GPU → ACK)",
+      "description": "Buckets in source are [1,5,10,25,50,100,250,500,1000,2500,5000,10000] ms. p50 (~20-80ms FP16) lands in the 25-100ms range → ±33% quantile error; p99 (~100-300ms) in 100-500ms → ±50%. Use for trend, not absolute regressions < 20%."
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 12,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_pull_loop_items_fetched_sum{namespace=\"$namespace\"}[1m])) by (pod) / sum(rate(sie_pull_loop_items_fetched_count{namespace=\"$namespace\"}[1m])) by (pod)",
+          "legendFormat": "{{pod}} items/pull (avg)",
+          "refId": "A"
+        }
+      ],
+      "title": "Avg items/pull (cap = SIE_NATS_FETCH_BUDGET, 64)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "id": 13,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_ipc_requests_total{namespace=\"$namespace\"}[1m])) by (pod)",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "IPC requests / s (sidecar → Python)"
+    },
+    {
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 28 },
+      "id": 102,
+      "type": "text",
+      "options": {
+        "mode": "markdown",
+        "content": "## Rust scheduler — adaptive controller\nIf `sie_worker_scheduler_batch_items` stays tiny while `sie_worker_scheduler_adaptive_fill_ratio` is low, the sidecar is flushing before work accumulates. Check `SIE_BATCHER_COALESCE_MS`, `SIE_BATCHER_MAX_BATCH_REQUESTS`, and the `SIE_ADAPTIVE_*` quantum knobs before changing Python adapter settings."
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "id": 20,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_scheduler_batch_items_sum{namespace=\"$namespace\"}[1m])) by (pod) / sum(rate(sie_worker_scheduler_batch_items_count{namespace=\"$namespace\"}[1m])) by (pod)",
+          "legendFormat": "{{pod}} items",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(sie_worker_scheduler_batch_cost_sum{namespace=\"$namespace\"}[1m])) by (pod) / sum(rate(sie_worker_scheduler_batch_cost_count{namespace=\"$namespace\"}[1m])) by (pod) / 1000",
+          "legendFormat": "{{pod}} cost (k)",
+          "refId": "B"
+        }
+      ],
+      "title": "Rust scheduler batch size (items & k cost per forward)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "id": 21,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "targets": [
+        {
+          "expr": "avg(sie_worker_scheduler_adaptive_wait_ms{namespace=\"$namespace\"}) by (pod, model)",
+          "legendFormat": "{{pod}} wait",
+          "refId": "A"
+        },
+        {
+          "expr": "avg(sie_worker_scheduler_adaptive_observed_p50_ms{namespace=\"$namespace\"}) by (pod, model)",
+          "legendFormat": "{{pod}} p50",
+          "refId": "B"
+        },
+        {
+          "expr": "avg(sie_worker_scheduler_adaptive_target_p50_ms{namespace=\"$namespace\"}) by (pod, model)",
+          "legendFormat": "{{pod}} target",
+          "refId": "C"
+        }
+      ],
+      "title": "Rust scheduler adaptive controller: wait / p50 / target"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
+      "id": 22,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "avg(sie_worker_scheduler_adaptive_cost{namespace=\"$namespace\"}) by (pod, model)",
+          "legendFormat": "{{pod}} batch-cost (tokens)",
+          "refId": "A"
+        }
+      ],
+      "title": "Rust scheduler adaptive max_batch_cost"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 38 },
+      "id": 23,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 20 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.75 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(sie_worker_scheduler_adaptive_fill_ratio{namespace=\"$namespace\"}) by (pod, model)",
+          "legendFormat": "{{pod}} fill",
+          "refId": "A"
+        }
+      ],
+      "title": "Adaptive fill ratio (actual_cost / max_cost)"
+    },
+    {
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 46 },
+      "id": 24,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_scheduler_enqueued_items_total{namespace=\"$namespace\"}[1m])) by (pod, model, operation)",
+          "legendFormat": "{{pod}} {{operation}} enq/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Rust scheduler enqueues / s"
+    },
+    {
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 46 },
+      "id": 25,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(sie_worker_scheduler_starvation_resets_total{namespace=\"$namespace\"}[5m])) by (pod, model)",
+          "legendFormat": "{{pod}} resets/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Starvation resets rate (non-zero = self-heal firing)"
+    },
+    {
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 52 },
+      "id": 103,
+      "type": "text",
+      "options": {
+        "mode": "markdown",
+        "content": "## GPU device counters (DCGM)\nL4 TDP = **72 W**, stock max proc clock = **2040 MHz**. Sustained power ≥ 65 W with proc clock ≤ 1500 MHz is the **power-capped** signature. See sie-perf-lab/docs/l4-cluster-perf-tuning.md §6.\n\n**MFU proxies** (below): `DCGM_FI_PROF_SM_ACTIVE` ≈ fraction of cycles an SM has ≥1 warp assigned (saturation). `DCGM_FI_PROF_PIPE_FP16_ACTIVE` + `PIPE_TENSOR_ACTIVE` = fraction of cycles the FP16/HMMA pipes are computing — our embedding model runs FP16 so `PIPE_FP16_ACTIVE` ≫ `PIPE_TENSOR_ACTIVE` is expected on varlen flash-attn."
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+      "id": 30,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 55 },
+              { "color": "red", "value": 68 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_DEV_POWER_USAGE{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "GPU power draw (72W TDP)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 54 },
+      "id": 31,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "min", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "asc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rotmhz",
+          "max": 2040,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1500 },
+              { "color": "green", "value": 1900 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_DEV_SM_CLOCK{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} sm_clock",
+          "refId": "A"
+        }
+      ],
+      "title": "GPU proc clock (stock max 2040 MHz; throttled < 1500)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 62 },
+      "id": 32,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_DEV_GPU_UTIL{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} sm%",
+          "refId": "A"
+        },
+        {
+          "expr": "avg(DCGM_FI_DEV_MEM_COPY_UTIL{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} mem%",
+          "refId": "B"
+        }
+      ],
+      "title": "SM vs memory utilisation"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 62 },
+      "id": 33,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_DEV_GPU_TEMP{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "GPU temperature"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 70 },
+      "id": 34,
+      "description": "DCGM_FI_PROF_SM_ACTIVE is the ratio of cycles at least one warp is resident on an SM — the right 'GPU saturated?' signal (DCGM_FI_DEV_GPU_UTIL above is the coarse nvidia-smi one). Sustained ≥0.9 with tensor/FP16 pipe ≥0.4 means the L4 is compute-bound on tensor ops.",
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.6 },
+              { "color": "green", "value": 0.85 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_PROF_SM_ACTIVE{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} sm_active",
+          "refId": "A"
+        }
+      ],
+      "title": "SM active (cycles with ≥1 warp) — saturation proxy"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 70 },
+      "id": 35,
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mbytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_DEV_FB_USED{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} FB",
+          "refId": "A"
+        }
+      ],
+      "title": "GPU framebuffer used (MiB; L4 has 24 GiB)"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 78 },
+      "id": 36,
+      "description": "FP16 pipe ratio over the full device: our gte-multilingual-base runs in torch.float16 and its flash-attn GEMMs dispatch onto the FP16 pipe. HMMA (Tensor Core) is a subset; if TENSOR_ACTIVE < FP16_ACTIVE the attention impl is not hitting tensor cores (varlen flash-attn does).",
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_PROF_PIPE_FP16_ACTIVE{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} fp16",
+          "refId": "A"
+        },
+        {
+          "expr": "avg(DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} tensor(hmma)",
+          "refId": "B"
+        }
+      ],
+      "title": "FP16 / Tensor-core pipe active — MFU proxy"
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 78 },
+      "id": 37,
+      "description": "DRAM active tells us if we're memory-bandwidth bound (embedding models usually are at short seq and small batch, compute-bound at long seq / large batch). High `dram_active` with low `pipe_fp16_active` = HBM-bandwidth limited. PCIe RX+TX = host<->device transfer volume; should be small for an on-GPU inference loop.",
+      "type": "timeseries",
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "/dram/" }, "properties": [{ "id": "unit", "value": "percentunit" }, { "id": "max", "value": 1 }] },
+          { "matcher": { "id": "byRegexp", "options": "/pcie/" }, "properties": [{ "id": "unit", "value": "Bps" }] }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "avg(DCGM_FI_PROF_DRAM_ACTIVE{namespace=\"$namespace\"}) by (pod)",
+          "legendFormat": "{{pod}} dram_active",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(DCGM_FI_PROF_PCIE_RX_BYTES{namespace=\"$namespace\"}[1m]) + rate(DCGM_FI_PROF_PCIE_TX_BYTES{namespace=\"$namespace\"}[1m])) by (pod)",
+          "legendFormat": "{{pod}} pcie_bps",
+          "refId": "B"
+        }
+      ],
+      "title": "DRAM active + PCIe bytes/s — memory-bandwidth bound?"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": ["sie", "perf", "tuning", "l4"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "perf-lab", "value": "perf-lab" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Namespace",
+        "multi": false,
+        "name": "namespace",
+        "options": [],
+        "query": "label_values(sie_worker_ipc_pool_size, namespace)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "SIE Perf Tuning (L4)",
+  "uid": "sie-perf-tuning",
+  "version": 2,
+  "weekStart": ""
+}

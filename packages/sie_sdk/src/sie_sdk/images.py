@@ -1,6 +1,6 @@
 """Image conversion utilities for SIE SDK.
 
-Per DESIGN.md Section 4.3, images are serialized as JPEG bytes for transport.
+Images are serialized as JPEG bytes for transport.
 This module handles conversion from various input formats to JPEG bytes.
 
 Wire format: raw JPEG bytes in msgpack (no base64 encoding).
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 # Type alias for all supported image input formats
 ImageLike = Union[Image.Image, "NDArray[Any]", bytes, str, Path]
 
-# Default JPEG quality (per design.md)
+# Default JPEG quality for image transport.
 DEFAULT_JPEG_QUALITY = 95
 
 
@@ -31,7 +31,7 @@ def to_jpeg_bytes(
 ) -> bytes:
     """Convert various image formats to JPEG bytes for wire transport.
 
-    Per DESIGN.md Section 4.3, supports:
+    Supports:
     - PIL.Image → JPEG bytes
     - np.ndarray (H,W,C) → PIL → JPEG bytes
     - bytes (JPEG/PNG) → pass through as-is
@@ -117,7 +117,7 @@ def _pil_to_jpeg_bytes(image: Image.Image, *, quality: int = DEFAULT_JPEG_QUALIT
 def convert_item_images(item: dict[str, Any]) -> dict[str, Any]:
     """Convert all images in an item to wire format for transport.
 
-    Per design.md Section 4.3, images are sent as JPEG bytes wrapped in
+    Images are sent as JPEG bytes wrapped in
     ImageInput format: {"data": <bytes>, "format": "jpeg"}.
 
     Modifies the item in-place and returns it.

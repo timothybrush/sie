@@ -1,14 +1,14 @@
 {{- if and .Values.healthGates.enabled .Values.autoscaling.enabled }}
 {{- /*
   When kube-prometheus-stack is installed as a sub-chart, Prometheus runs in the release
-  namespace — not the hardcoded "monitoring" namespace. Auto-derive both the namespace
+  namespace; not the hardcoded "monitoring" namespace. Auto-derive both the namespace
   and address so the health gate Job can reach Prometheus without manual overrides.
 */ -}}
 {{- $promNs := .Values.healthGates.monitoringNamespace }}
 {{- $promAddr := .Values.autoscaling.prometheusAddress }}
 {{- if index .Values "kube-prometheus-stack" "install" }}
 {{- $promNs = include "sie-cluster.namespace" . }}
-{{- $promAddr = printf "http://prometheus-operated.%s.svc.cluster.local:9090" (include "sie-cluster.namespace" .) }}
+{{- $promAddr = include "sie-cluster.kubePrometheusStack.prometheusAddress" . }}
 {{- end }}
 apiVersion: v1
 kind: ServiceAccount

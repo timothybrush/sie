@@ -48,7 +48,7 @@ def _mock_extract_impl(
     Returns ExtractOutput with mock entities based on item text and provided labels.
     """
     all_entities: list[list[Entity]] = []
-    for _item in items:
+    for _ in items:
         entities: list[Entity] = []
         # Simulate finding entities for each label
         if labels:
@@ -397,6 +397,31 @@ class TestExtractEndpoint:
         data = response.json()
         assert data["detail"]["code"] == "INVALID_INPUT"
         assert data["detail"]["message"] == "Expected `array | null`, got `str` - at `$.items[0].images`"
+
+    def test_image_preprocessor_model_rejects_text_only_request(
+        self,
+        client: TestClient,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Image-only preprocessors reject text-only extract requests with 400."""
+        preprocessor_registry = MagicMock()
+        preprocessor_registry.has_preprocessor.side_effect = lambda _model, modality: modality == "image"
+        mock_registry.preprocessor_registry = preprocessor_registry
+
+        response = client.post(
+            "/v1/extract/test-extractor",
+            json={
+                "items": [{"text": "receipt total"}],
+                "params": {},
+            },
+            headers=JSON_HEADERS,
+        )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["detail"]["code"] == "INVALID_INPUT"
+        assert "requires image input" in data["detail"]["message"]
+        mock_registry.start_worker.assert_not_called()
 
 
 class TestExtractEntityResults:

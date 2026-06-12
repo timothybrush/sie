@@ -1,7 +1,7 @@
 """Batch formation for dynamic batching.
 
 Accumulates requests until batch limits are reached, then returns a batch
-ready for inference. See DESIGN.md Section 5.1.
+ready for inference.
 
 Batch formation loop:
 1. Wait for first request
@@ -127,11 +127,11 @@ class BatchConfig:
         self,
         max_batch_cost: int = 16384,
         max_batch_requests: int = 64,
-        max_batch_wait_ms: float = 10.0,
+        max_batch_wait_ms: float = 15.0,
         *,
         max_batch_tokens: int | None = None,  # Backward compatibility alias
-        coalesce_ms: float = 2.0,
-        coalesce_ratio: float = 0.2,
+        coalesce_ms: float = 15.0,
+        coalesce_ratio: float = 0.5,
     ) -> None:
         """Initialize batch configuration.
 
@@ -143,12 +143,15 @@ class BatchConfig:
             coalesce_ms: Idle coalescing window ceiling. If no new items arrive
                 within this period, yield the batch even if max_batch_wait_ms
                 hasn't expired. The actual coalescing window may be smaller;
-                see effective_coalesce_ms.
+                see effective_coalesce_ms. Set around the expected inter-arrival
+                jitter of upstream IPC bursts so a whole burst lands in one
+                GPU batch — too small shreds IPC batches of 64 into 2–3
+                under-filled GPU forwards.
             coalesce_ratio: Coalesce window as a fraction of max_batch_wait_ms.
                 The effective coalesce window is
                 ``min(coalesce_ms, max_batch_wait_ms * coalesce_ratio)``.
                 This keeps coalesce proportional when the adaptive controller
-                changes max_batch_wait_ms. Default 0.2 (20%).
+                changes max_batch_wait_ms. Default 0.5 (50%).
         """
         # Allow max_batch_tokens as an alias for max_batch_cost
         if max_batch_tokens is not None:

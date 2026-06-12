@@ -1,9 +1,13 @@
 """Tests for storage backend functionality."""
 
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from sie_sdk.storage import (
+    AzureBlobBackend,
     GCSBackend,
     LocalBackend,
     S3Backend,
@@ -366,6 +370,162 @@ class TestGCSBackendHasChildren:
         assert backend.has_children("gs://sie-cache/seeded/snapshots") is True
 
 
+class TestAzureBlobBackend:
+    """Tests for ``AzureBlobBackend`` URL parsing and prefix semantics."""
+
+    def _install_fake_blob_module(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        blob_service_client: type[object],
+    ) -> None:
+        azure_module = types.ModuleType("azure")
+        storage_module = types.ModuleType("azure.storage")
+        blob_module = types.ModuleType("azure.storage.blob")
+        blob_module.BlobServiceClient = blob_service_client
+        monkeypatch.setitem(sys.modules, "azure", azure_module)
+        monkeypatch.setitem(sys.modules, "azure.storage", storage_module)
+        monkeypatch.setitem(sys.modules, "azure.storage.blob", blob_module)
+
+    def _backend_with_mock_container(self, container_client: MagicMock) -> AzureBlobBackend:
+        backend = AzureBlobBackend()
+        backend._container_clients[("sieacct", "sie-cache")] = container_client
+        return backend
+
+    def test_parse_abfs_url(self) -> None:
+        backend = AzureBlobBackend()
+
+        container, account, path, account_url = backend._parse_azure_url(
+            "abfs://sie-cache@sieacct.dfs.core.windows.net/models/org/model"
+        )
+
+        assert container == "sie-cache"
+        assert account == "sieacct"
+        assert path == "models/org/model"
+        assert account_url == "https://sieacct.blob.core.windows.net"
+
+    def test_parse_abfss_blob_endpoint_url(self) -> None:
+        backend = AzureBlobBackend()
+
+        container, account, path, account_url = backend._parse_azure_url(
+            "abfss://sie-cache@sieacct.blob.core.windows.net/models"
+        )
+
+        assert container == "sie-cache"
+        assert account == "sieacct"
+        assert path == "models"
+        assert account_url == "https://sieacct.blob.core.windows.net"
+
+    def test_parse_requires_container_account_separator(self) -> None:
+        backend = AzureBlobBackend()
+
+        with pytest.raises(ValueError, match="must use <container>@<account>"):
+            backend._parse_azure_url("abfs://sie-cache/models")
+
+    def test_has_children_returns_true_when_prefix_has_children(self) -> None:
+        container_client = MagicMock()
+        child = MagicMock()
+        child.name = "models/models--BAAI--bge-m3/snapshots/abc/config.json"
+        container_client.list_blobs.return_value = iter([child])
+        backend = self._backend_with_mock_container(container_client)
+
+        assert (
+            backend.has_children("abfs://sie-cache@sieacct.dfs.core.windows.net/models/models--BAAI--bge-m3/snapshots")
+            is True
+        )
+
+        container_client.list_blobs.assert_called_once_with(
+            name_starts_with="models/models--BAAI--bge-m3/snapshots/",
+            results_per_page=2,
+        )
+
+    def test_has_children_returns_false_when_only_folder_marker_exists(self) -> None:
+        container_client = MagicMock()
+        marker = MagicMock()
+        marker.name = "models/seeded/snapshots/"
+        container_client.list_blobs.return_value = iter([marker])
+        backend = self._backend_with_mock_container(container_client)
+
+        assert backend.has_children("abfs://sie-cache@sieacct.dfs.core.windows.net/models/seeded/snapshots") is False
+
+    def test_list_dirs_uses_hierarchical_prefixes(self) -> None:
+        container_client = MagicMock()
+        directory = MagicMock()
+        directory.name = "models/models--BAAI--bge-m3/"
+        file_blob = MagicMock()
+        file_blob.name = "models/config.json"
+        container_client.walk_blobs.return_value = iter([directory, file_blob])
+        backend = self._backend_with_mock_container(container_client)
+
+        assert list(backend.list_dirs("abfs://sie-cache@sieacct.dfs.core.windows.net/models")) == [
+            "models--BAAI--bge-m3"
+        ]
+        container_client.walk_blobs.assert_called_once_with(name_starts_with="models/", delimiter="/")
+
+    def test_list_files_filters_to_immediate_files(self) -> None:
+        container_client = MagicMock()
+        direct = MagicMock()
+        direct.name = "models/config.yaml"
+        nested = MagicMock()
+        nested.name = "models/subdir/config.yaml"
+        other = MagicMock()
+        other.name = "models/readme.md"
+        container_client.list_blobs.return_value = iter([direct, nested, other])
+        backend = self._backend_with_mock_container(container_client)
+
+        assert list(backend.list_files("abfss://sie-cache@sieacct.dfs.core.windows.net/models", "*.yaml")) == [
+            "config.yaml"
+        ]
+
+    def test_connection_string_account_mismatch_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FakeBlobServiceClient:
+            @classmethod
+            def from_connection_string(cls, connection_string: str) -> "FakeBlobServiceClient":
+                raise AssertionError("mismatched connection string should be rejected before client construction")
+
+        backend = AzureBlobBackend()
+        self._install_fake_blob_module(monkeypatch, FakeBlobServiceClient)
+        monkeypatch.setenv(
+            "AZURE_STORAGE_CONNECTION_STRING",
+            "DefaultEndpointsProtocol=https;AccountName=otheracct;AccountKey=fake;EndpointSuffix=core.windows.net",
+        )
+
+        with pytest.raises(ValueError, match="does not match URL account"):
+            backend._build_container_client(
+                "sie-cache",
+                "sieacct",
+                "https://sieacct.blob.core.windows.net",
+            )
+
+    def test_connection_string_matching_account_returns_container(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        container_client = MagicMock()
+
+        class FakeBlobServiceClient:
+            @classmethod
+            def from_connection_string(cls, connection_string: str) -> "FakeBlobServiceClient":
+                assert "AccountName=sieacct" in connection_string
+                return cls()
+
+            def get_container_client(self, container: str) -> MagicMock:
+                assert container == "sie-cache"
+                return container_client
+
+        backend = AzureBlobBackend()
+        self._install_fake_blob_module(monkeypatch, FakeBlobServiceClient)
+        monkeypatch.setenv(
+            "AZURE_STORAGE_CONNECTION_STRING",
+            "DefaultEndpointsProtocol=https;AccountName=sieacct;AccountKey=fake;EndpointSuffix=core.windows.net",
+        )
+
+        assert (
+            backend._build_container_client(
+                "sie-cache",
+                "sieacct",
+                "https://sieacct.blob.core.windows.net",
+            )
+            is container_client
+        )
+
+
 class TestHelperFunctions:
     """Tests for module-level helper functions."""
 
@@ -373,6 +533,8 @@ class TestHelperFunctions:
         """Cloud path detection works correctly."""
         assert is_cloud_path("s3://bucket/key")
         assert is_cloud_path("gs://bucket/key")
+        assert is_cloud_path("abfs://container@account.dfs.core.windows.net/key")
+        assert is_cloud_path("abfss://container@account.dfs.core.windows.net/key")
         assert not is_cloud_path("/local/path")
         assert not is_cloud_path("./relative/path")
 
@@ -391,12 +553,19 @@ class TestHelperFunctions:
         result = join_path("gs://bucket/prefix/", "dir", "file.txt")
         assert result == "gs://bucket/prefix/dir/file.txt"
 
+    def test_join_path_azure(self) -> None:
+        """Path joining works for Azure Blob paths."""
+        result = join_path("abfs://container@account.dfs.core.windows.net/models/", "dir", "file.txt")
+        assert result == "abfs://container@account.dfs.core.windows.net/models/dir/file.txt"
+
     def test_get_storage_backend(self) -> None:
         """Backend selection works correctly."""
         assert isinstance(get_storage_backend("/local/path"), LocalBackend)
-        # S3 and GCS backends are lazily initialized,
+        # Cloud backends are lazily initialized,
         # so we just check we get the right type
-        from sie_sdk.storage import GCSBackend, S3Backend
-
         assert isinstance(get_storage_backend("s3://bucket"), S3Backend)
         assert isinstance(get_storage_backend("gs://bucket"), GCSBackend)
+        assert isinstance(get_storage_backend("abfs://container@account.dfs.core.windows.net/models"), AzureBlobBackend)
+        assert isinstance(
+            get_storage_backend("abfss://container@account.dfs.core.windows.net/models"), AzureBlobBackend
+        )

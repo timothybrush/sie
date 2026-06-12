@@ -116,6 +116,38 @@ export interface ModelDims {
 }
 
 /**
+ * Advertised model capabilities.
+ *
+ * Mirrors the gateway `capabilities` object on each `/v1/models` entry
+ * (`ModelCapabilitiesWire`). All fields are optional; their presence
+ * depends on what the model config declares. `grammar` lists the
+ * supported grammar kinds ("json_schema" | "regex" | "ebnf").
+ * `code`/`sql`/`guard` are informational flags advertising validated
+ * generation jobs that back the model="code"/"sql"/"guard" aliases.
+ *
+ * These flags mean the model *supports* a task — they are NOT a
+ * precision-independent quality SLA. A flag is true at the model level even
+ * when quality is profile/precision-dependent (e.g. `sql` quality regresses
+ * under FP8; route SQL-critical traffic to a BF16 bundle via the `sql` alias).
+ */
+export interface ModelCapabilities {
+  /** Supported grammar kinds: ["json_schema", "regex", "ebnf"] */
+  grammar?: string[];
+  /** Whether the model supports tool / function calling */
+  tools?: boolean;
+  /** Union of LoRA served-names across profiles (display summary) */
+  lora_adapters?: string[];
+  /** Per-profile LoRA served-names, keyed by profile name */
+  profile_lora_adapters?: Record<string, string[]>;
+  /** Validated for code generation; backs model="code" */
+  code?: boolean;
+  /** Supports text-to-SQL; backs model="sql". Precision-sensitive (FP8 regresses SQL) — a support flag, not a per-profile quality guarantee. */
+  sql?: boolean;
+  /** Generative guard model; backs model="guard" */
+  guard?: boolean;
+}
+
+/**
  * Information about a model returned by listModels().
  */
 export interface ModelInfo {
@@ -131,6 +163,8 @@ export interface ModelInfo {
   dims?: ModelDims;
   /** Maximum sequence length the model supports */
   maxSequenceLength?: number;
+  /** Advertised model capabilities (grammar, tools, code/sql/guard, LoRA adapters) */
+  capabilities?: ModelCapabilities;
 }
 
 /**
@@ -255,9 +289,9 @@ export interface CapacityInfo {
   gpuCount: number;
   /** Number of unique models loaded across all workers */
   modelsLoaded: number;
-  /** GPU types configured in the cluster */
+  /** Canonical machine profiles configured in the cluster */
   configuredGpuTypes: string[];
-  /** GPU types currently running */
+  /** Machine profiles currently running */
   liveGpuTypes: string[];
   /** List of worker details */
   workers: WorkerInfo[];
@@ -267,10 +301,14 @@ export interface CapacityInfo {
  * Pool specification for creating resource pools.
  */
 export interface PoolSpec {
-  /** Pool name (used in GPU param as "poolName/gpuType") */
+  /** Pool name (used in GPU param as "poolName/machineProfile") */
   name: string;
-  /** GPU requirements, e.g., { l4: 2, "a100-40gb": 1 } */
+  /** Machine profile requirements for pool readiness, e.g., { l4: 2, "a100-40gb": 1 } */
   gpus?: Record<string, number>;
+  /** Optional maximum assigned workers per machine profile */
+  gpuCaps?: Record<string, number>;
+  /** Optional maximum assigned workers per machine profile, as returned by the gateway */
+  gpu_caps?: Record<string, number>;
 }
 
 /**
@@ -294,7 +332,7 @@ export interface PoolInfo {
   /** Pool name */
   name: string;
   /** Pool specification */
-  spec: { gpus?: Record<string, number> };
+  spec: { gpus?: Record<string, number>; gpu_caps?: Record<string, number> };
   /** Pool status */
   status: PoolStatus;
 }
@@ -439,6 +477,345 @@ export interface ScoreOptions {
   gpu?: string;
   /** Whether to wait for capacity */
   waitForCapacity?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Generation
+// ---------------------------------------------------------------------------
+
+/** Reason the generation terminated. */
+export type FinishReason = "stop" | "length" | "cancelled" | "content_filter" | "error";
+
+/** Token usage for a single generation call. */
+export interface GenerationUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** Options for the generate operation. */
+export interface GenerateOptions {
+  /** Hard cap on output tokens. Required. */
+  maxNewTokens: number;
+  /** Sampling temperature. */
+  temperature?: number;
+  /** Nucleus sampling cutoff. */
+  topP?: number;
+  /** Optional list of stop strings. */
+  stop?: string[];
+  /** GPU type / pool spec, e.g. ``"l4"`` or ``"eval-bench/l4"``. */
+  gpu?: string;
+  /** Auto-retry under provisioning. */
+  waitForCapacity?: boolean;
+}
+
+/** Aggregated generation result. */
+export interface GenerateResult {
+  /** Model id the gateway dispatched to. */
+  model: string;
+  /** Full generated text (concatenation of all streamed deltas). */
+  text: string;
+  /** Termination reason. */
+  finishReason: FinishReason;
+  /** Prompt / completion / total token counts. */
+  usage: GenerationUsage;
+  /** Worker-generated attempt id. */
+  attemptId?: string;
+  /** Time-to-first-token in milliseconds. */
+  ttftMs?: number;
+  /** Average time per output token in milliseconds. */
+  tpotMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Chat completions (OpenAI-compatible) — /v1/chat/completions
+// ---------------------------------------------------------------------------
+
+/**
+ * A single message in a chat completion request.
+ *
+ * Accepted roles: `system`, `user`, `assistant`, `tool`, `developer`. The
+ * gateway normalises `developer` → `system` before forwarding to the worker
+ * (the OpenAI 2024-08 rename — most chat templates only have `system`).
+ *
+ * `content` may be a string OR an array of typed content parts. The gateway
+ * concatenates `text` / `input_text` parts; `image_url` / `input_image` parts
+ * carrying a base64 `data:` URI are accepted for vision-capable generation
+ * models (non-vision/encode-only models reject with `400 unsupported_field`;
+ * remote (non-`data:`) URLs reject with `400 invalid_request`). See
+ * `packages/sie_gateway/src/openapi.rs` and `proxy.rs::chat_params_from_json`
+ * for the canonical accepted subset.
+ */
+export interface ChatMessage {
+  role: "system" | "user" | "assistant" | "tool" | "developer";
+  content: string | ChatContentPart[] | null;
+  name?: string;
+  /** Required when `role === "tool"`. */
+  tool_call_id?: string;
+  /** Populated by the model when calling tools (assistant turns only). */
+  tool_calls?: ToolCall[];
+}
+
+/**
+ * One content part inside a multimodal `messages[*].content` array. Text parts
+ * (`text` / `input_text`) are concatenated; image parts (`image_url` /
+ * `input_image`) carry a base64 `data:` URI and are accepted for vision-capable
+ * generation models.
+ */
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "input_text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "input_image"; image_url: string | { url: string } };
+
+/** A tool call emitted by the model. */
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+/** A tool the model is allowed to call. */
+export interface ToolSpec {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    /** JSON Schema describing the function arguments. */
+    parameters?: Record<string, unknown>;
+  };
+}
+
+/** Tool-routing directive. */
+export type ToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | { type: "function"; function: { name: string } };
+
+/** Structured-output `response_format` envelope. */
+export interface ResponseFormat {
+  type: "json_schema" | "json_object" | "text";
+  /** JSON Schema body when `type === "json_schema"`. */
+  json_schema?: unknown;
+}
+
+/** OpenAI-compatible chat-completion finish reason. */
+export type ChatFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | null;
+
+/**
+ * Request body for `chatCompletions` / `streamChatCompletions`.
+ *
+ * Field names are snake_case (the wire shape) so the SDK can hand the object
+ * to `JSON.stringify` without further translation. SIE-specific routing
+ * fields (`routing_key`, `prompt_cache_key`) match the gateway schema in
+ * `packages/sie_gateway/src/openapi.rs`.
+ *
+ * The gateway honours: `model`, `messages`, `max_tokens` /
+ * `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`,
+ * `stream_options`, `tools`, `tool_choice`, `parallel_tool_calls`,
+ * `response_format`, `frequency_penalty`, `presence_penalty` (each in
+ * `[-2, 2]`), `repetition_penalty`, `n`, `best_of`, `logprobs`,
+ * `top_logprobs`, `logit_bias`, `seed`, `user`, `safety_identifier`,
+ * `lora_adapter`, `routing_key`, and `prompt_cache_key`. Unknown fields
+ * are rejected with `400 unsupported_field`.
+ */
+export interface ChatCompletionRequest {
+  model: string;
+  messages: ChatMessage[];
+  /** Legacy alias; the gateway prefers `max_completion_tokens` when both set. */
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  /**
+   * Non-OpenAI sampling knob (vLLM / SGLang). Integer `>= 1`; absent →
+   * sampler default (top-k disabled).
+   */
+  top_k?: number;
+  /**
+   * Non-OpenAI repetition penalty (SGLang). Float in `(0.0, 2.0]`; `1.0`
+   * means no penalty. Absent → sampler default.
+   */
+  repetition_penalty?: number;
+  /** Single stop string or list of stop strings. */
+  stop?: string | string[];
+  /** Set to `true` to use `streamChatCompletions`. `chatCompletions` rejects this. */
+  stream?: boolean;
+  /** Streaming-only: ask the server to emit a final usage-only chunk before `[DONE]`. */
+  stream_options?: { include_usage?: boolean };
+  tools?: ToolSpec[];
+  tool_choice?: ToolChoice;
+  /** OpenAI parallel-tool-calls toggle (default `true`). */
+  parallel_tool_calls?: boolean;
+  response_format?: ResponseFormat;
+  /** Accepted in the OpenAI range [-2, 2]; out-of-range values are rejected. */
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  /**
+   * Multi-candidate count. Default `1`. `n > 1 && stream === true` is
+   * rejected by the gateway with 400.
+   */
+  n?: number;
+  /**
+   * Generate this many candidates and return the top `n` by cumulative
+   * logprob. Range `[1, 128]`; requires `best_of >= n` and `stream: false`.
+   */
+  best_of?: number;
+  /**
+   * `true` requests per-token log-probabilities on each chunk / on the
+   * aggregate response. Required when `top_logprobs > 0`.
+   */
+  logprobs?: boolean;
+  /**
+   * How many alternate-token logprobs to return per position. Range
+   * `[0, 20]` per the OpenAI spec; implies `logprobs: true` when `> 0`.
+   */
+  top_logprobs?: number;
+  /**
+   * `{token_id: bias_float}` map. Gateway validates per-value range
+   * `[-100, 100]` and caps map size.
+   */
+  logit_bias?: Record<string, number>;
+  seed?: number;
+  /**
+   * OpenAI's free-text end-user identifier. Accepted and logged at debug
+   * level by the gateway.
+   */
+  user?: string;
+  /**
+   * OpenAI's free-text safety-tier identifier (replacement for `user` on
+   * safety-sensitive accounts). Accepted but intentionally not logged.
+   */
+  safety_identifier?: string;
+  /**
+   * Multi-LoRA: served-name of the adapter to apply on the worker (SIE
+   * extension). Must be a non-empty string; unknown names are rejected by
+   * the gateway with 400 `unknown_lora`.
+   */
+  lora_adapter?: string;
+  /** SIE-native routing affinity hint. */
+  routing_key?: string;
+  /** SIE-native prompt-cache hint. */
+  prompt_cache_key?: string;
+}
+
+/** Token usage block (snake_case, matches the wire shape). */
+export interface ChatUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/** A single choice in a `ChatCompletion` (non-streaming). */
+export interface ChatChoice {
+  index: number;
+  message: ChatMessage;
+  finish_reason: ChatFinishReason;
+  logprobs: null;
+}
+
+/** Non-streaming response from `chatCompletions`. */
+export interface ChatCompletion {
+  id: string;
+  object: "chat.completion";
+  created: number;
+  model: string;
+  system_fingerprint: string | null;
+  choices: ChatChoice[];
+  usage: ChatUsage;
+}
+
+/** Incremental delta emitted on each streaming chunk. */
+export interface ChatDelta {
+  /** First chunk only, per the OpenAI streaming contract. */
+  role?: "assistant";
+  content?: string;
+  tool_calls?: ToolCallDelta[];
+}
+
+/** Partial tool-call materialised across multiple streaming chunks. */
+export interface ToolCallDelta {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: { name?: string; arguments?: string };
+}
+
+/** A single choice in a streaming `ChatCompletionChunk`. */
+export interface ChatChunkChoice {
+  index: number;
+  delta: ChatDelta;
+  finish_reason: ChatFinishReason;
+  logprobs: null;
+}
+
+/**
+ * One SSE event from `streamChatCompletions`.
+ *
+ * The terminal-usage chunk (emitted when `stream_options.include_usage` is
+ * `true`) sets `choices: []` and populates `usage`.
+ */
+export interface ChatCompletionChunk {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  system_fingerprint: string | null;
+  choices: ChatChunkChoice[];
+  usage?: ChatUsage;
+}
+
+/**
+ * Per-call options for `chatCompletions` controlling the pre-execution
+ * provisioning / retry loop. The request body itself is the separate
+ * {@link ChatCompletionRequest} argument; these knobs only govern HOW the
+ * SDK talks to the gateway, not WHAT it asks for.
+ *
+ * All fields are optional and fall back to the client-level defaults
+ * (`waitForCapacity`, `provisionTimeout`) when omitted.
+ */
+export interface ChatCompletionOptions {
+  /**
+   * When `true`, retry the SAFE pre-execution capacity signals
+   * (`202 Accepted`, `503 MODEL_LOADING`, generic `503`) until
+   * `provisionTimeoutMs` elapses. When `false`, the first such signal
+   * throws (`ProvisioningError` / `ModelLoadingError` / `ServerError`).
+   * Defaults to the client's `waitForCapacity` (false unless the
+   * constructor opted in).
+   */
+  waitForCapacity?: boolean;
+  /**
+   * Total cumulative wall-clock budget (ms) for provisioning retries.
+   * Independent of the per-attempt `timeout`. Defaults to the client's
+   * `provisionTimeout` (typically 5 minutes).
+   */
+  provisionTimeoutMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming generate — /v1/generate/{model} with stream:true
+// ---------------------------------------------------------------------------
+
+/**
+ * One SSE event from `streamGenerate`.
+ *
+ * SIE-native shape — see `packages/sie_gateway/src/handlers/sse.rs`
+ * (`build_generate_chunk_event`). `usage` and `ttft_ms` only land on the
+ * terminal chunk; `error` is populated when generation failed mid-stream
+ * (handled by throwing `SIEStreamError`, never yielded).
+ */
+export interface GenerateChunk {
+  request_id: string;
+  seq: number;
+  text_delta: string;
+  done: boolean;
+  finish_reason?: "stop" | "length" | "cancelled" | "error";
+  usage?: ChatUsage;
+  /** Time-to-first-token, milliseconds. Terminal chunk only. */
+  ttft_ms?: number;
+  /** Populated when the worker / gateway errored mid-stream. */
+  error?: { code: string; message: string };
 }
 
 /**

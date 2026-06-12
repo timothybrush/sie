@@ -11,6 +11,7 @@
 //! `sie-config`'s `/v1/configs/epoch` and triggers a full
 //! `GET /v1/configs/export` re-fetch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -331,6 +332,13 @@ impl NatsManager {
 
         match self.model_registry.add_model_config(config) {
             Ok(_) => {
+                if !notification.bundle_config_hash.is_empty() {
+                    self.model_registry
+                        .install_bundle_config_hashes(HashMap::from([(
+                            notification.bundle_id.clone(),
+                            notification.bundle_config_hash.clone(),
+                        )]));
+                }
                 self.config_epoch.set_max(notification.epoch);
                 metrics::CONFIG_DELTAS
                     .with_label_values(&[kind, "applied"])
@@ -414,6 +422,47 @@ mod tests {
         );
         let notify = mgr.reconnect_notify();
         notify.notify_waiters();
+    }
+
+    /// Regression for the chart-rendered Deployment name pattern. The
+    /// default allowlist (`"sie-config"`) does NOT match the production
+    /// pod-name prefix `sie-sie-cluster-config-...` produced by the Helm
+    /// chart (`{Release.Name}-{Chart.Name}-config`), so the
+    /// `gateway-deployment.yaml` template must wire
+    /// `SIE_NATS_CONFIG_TRUSTED_PRODUCERS` to the rendered Deployment
+    /// name. This test locks the matcher contract in: an operator-supplied
+    /// allowlist of the actual Deployment name accepts the suffixed pod
+    /// name, while the bare default does not.
+    #[test]
+    fn test_chart_rendered_pod_name_requires_helm_override() {
+        let registry = Arc::new(crate::state::model_registry::ModelRegistry::new(
+            "", "", false,
+        ));
+        // Default allowlist must reject the chart-rendered pod name —
+        // proves the helm override is load-bearing, not redundant.
+        let default_mgr = NatsManager::new(
+            "gw1".to_string(),
+            String::new(),
+            Arc::clone(&registry),
+            ConfigEpoch::new(),
+        );
+        assert!(
+            !default_mgr.is_trusted_producer("sie-sie-cluster-config-5f7b6d8c-kxwvr"),
+            "default allowlist must NOT match chart-rendered pod names; the helm chart \
+             passes the rendered Deployment name via SIE_NATS_CONFIG_TRUSTED_PRODUCERS"
+        );
+        // Operator-supplied allowlist (what the chart sets) accepts the
+        // Deployment-name prefix with the per-replica suffix.
+        let cluster_mgr = NatsManager::new_with_trusted_producers(
+            "gw1".to_string(),
+            String::new(),
+            Arc::clone(&registry),
+            ConfigEpoch::new(),
+            vec!["sie-sie-cluster-config".to_string()],
+        );
+        assert!(cluster_mgr.is_trusted_producer("sie-sie-cluster-config-5f7b6d8c-kxwvr"));
+        assert!(cluster_mgr.is_trusted_producer("sie-sie-cluster-config-0"));
+        assert!(!cluster_mgr.is_trusted_producer("sie-sie-cluster-configuration"));
     }
 
     #[test]
@@ -641,6 +690,7 @@ profiles:
         let mut profiles = registry.get_model_profile_names("test/model");
         profiles.sort();
         assert_eq!(profiles, vec!["default".to_string(), "fast".to_string()]);
+        assert_eq!(registry.compute_bundle_config_hash("default"), "hash3");
     }
 
     #[tokio::test]

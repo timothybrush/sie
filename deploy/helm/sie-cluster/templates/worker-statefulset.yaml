@@ -1,15 +1,52 @@
 {{- $root := . -}}
+{{/*
+Safety guard: the worker-sidecar container is the production data path (NATS ->
+Rust -> UDS IPC -> Python adapter process). The sidecar needs
+``SIE_NATS_URL`` and refuses to start without one, so enabling the
+sidecar without NATS produces a pod that CrashLoops forever. Fail
+fast at render time.
+*/}}
+{{- $routing := default "queue" $root.Values.clusterRouting }}
+{{- if and (eq $routing "queue") (not $root.Values.workers.common.workerSidecar.enabled) }}
+{{- fail "clusterRouting=queue requires workers.common.workerSidecar.enabled=true (the Python adapter process does not consume JetStream)" }}
+{{- end }}
+{{- if and $root.Values.workers.common.workerSidecar.enabled (not $root.Values.nats.enabled) }}
+{{- fail "workers.common.workerSidecar.enabled=true requires nats.enabled=true (the sidecar needs SIE_NATS_URL and has no default)" }}
+{{- end }}
+{{- if and $root.Values.workers.common.workerSidecar.enabled (not $root.Values.nats.config.jetstream.enabled) }}
+{{- fail "workers.common.workerSidecar.enabled=true requires nats.config.jetstream.enabled=true (the sidecar consumes JetStream)" }}
+{{- end }}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
-{{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
+{{- if not $pool.bundles }}
+{{- fail (printf "workers.pools.%s: missing required `bundles:` map. Define at least one bundle under the pool (e.g. `bundles: { default: { minReplicas: 0, maxReplicas: 1 } }`)." $poolName) }}
+{{- end }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
-{{- $machineProfile := default $pool.gpuType $pool.machineProfile }}
+{{- $machineProfile := default $poolName $pool.machineProfile }}
 {{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
+{{- range $bundleName, $bundleCfg := $pool.bundles }}
+{{- if dig "enabled" true $bundleCfg }}
+{{- if not (hasKey $bundleCfg "minReplicas") }}
+{{- fail (printf "workers.pools.%s.bundles.%s: missing required `minReplicas`." $poolName $bundleName) }}
+{{- end }}
+{{- if not (hasKey $bundleCfg "maxReplicas") }}
+{{- fail (printf "workers.pools.%s.bundles.%s: missing required `maxReplicas`." $poolName $bundleName) }}
+{{- end }}
+{{- if lt (int $bundleCfg.maxReplicas) (int $bundleCfg.minReplicas) }}
+{{- fail (printf "workers.pools.%s.bundles.%s: `maxReplicas` (%d) must be >= `minReplicas` (%d)." $poolName $bundleName (int $bundleCfg.maxReplicas) (int $bundleCfg.minReplicas)) }}
+{{- end }}
+{{- $bundle := $bundleName }}
+{{- /* imageBundle decouples the image-tag suffix from the logical bundle name.
+       Defaults to $bundle, but bundles whose logical name has no dedicated
+       Docker image (e.g. `sglang-embedding`, which shares deps and image with
+       `sglang`) set this to the bundle whose image they reuse. Labels, env
+       vars, --bundle flag, and metrics still use $bundle. */ -}}
+{{- $imageBundle := default $bundle $bundleCfg.imageBundle }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}
+  name: {{ include "sie-cluster.fullname" $root }}-worker-{{ $poolName }}-{{ $bundleName }}
   namespace: {{ include "sie-cluster.namespace" $root }}
   labels:
     {{- include "sie-cluster.worker.labels" $root | nindent 4 }}
@@ -19,15 +56,21 @@ metadata:
     sie.superlinked.com/pool: {{ $poolName | quote }}
 spec:
   serviceName: {{ include "sie-cluster.worker.serviceName" $root }}
-  replicas: {{ $pool.minReplicas }}
+  replicas: {{ $bundleCfg.minReplicas }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "sie-cluster.worker.selectorLabels" $root | nindent 6 }}
       sie.superlinked.com/pool: {{ $poolName | quote }}
+      sie.superlinked.com/bundle: {{ $bundle | quote }}
   template:
     metadata:
       labels:
+        {{- with $root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- /* Render selectorLabels last so user-supplied podLabels cannot
+               override the StatefulSet selector contract. */ -}}
         {{- include "sie-cluster.worker.selectorLabels" $root | nindent 8 }}
         sie.superlinked.com/gpu-type: {{ $pool.gpuType | quote }}
         sie.superlinked.com/machine-profile: {{ $machineProfile | quote }}
@@ -55,7 +98,7 @@ spec:
       containers:
         - name: worker
           {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
-          image: {{ printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $bundle }}
+          image: {{ printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
           imagePullPolicy: {{ $root.Values.workers.common.image.pullPolicy }}
           args:
             - serve
@@ -87,9 +130,10 @@ spec:
             - name: SIE_PRELOAD_MODELS
               value: {{ join "," $root.Values.workers.common.preloadModels | quote }}
             {{- end }}
-            # Logging configuration
+            {{- $workerLogLevel := trim ($root.Values.logging.workerLevel | default "") }}
+            # Logging configuration (``logging.workerLevel`` overrides workers when non-empty)
             - name: SIE_LOG_LEVEL
-              value: {{ $root.Values.logging.level | quote }}
+              value: {{ if ne $workerLogLevel "" }}{{ $workerLogLevel | quote }}{{ else }}{{ $root.Values.logging.level | quote }}{{ end }}
             {{- if $root.Values.logging.json }}
             - name: SIE_LOG_JSON
               value: "true"
@@ -104,7 +148,7 @@ spec:
                   name: {{ $root.Values.workers.common.hfCache.tokenSecret }}
                   key: {{ $root.Values.workers.common.hfCache.tokenSecretKey }}
             {{- end }}
-            # Cluster cache (S3/GCS)
+            # Cluster cache (object storage)
             {{- if $root.Values.workers.common.clusterCache.enabled }}
             - name: SIE_CLUSTER_CACHE
               value: {{ $root.Values.workers.common.clusterCache.url | quote }}
@@ -113,9 +157,6 @@ spec:
             - name: SIE_NATS_URL
               value: {{ $root.Values.nats.url | default (printf "nats://%s:4222" ($root.Values.nats.serviceName | default (printf "%s-nats" $root.Release.Name))) | quote }}
             {{- end }}
-            {{- if and $root.Values.clusterRouting (eq $root.Values.clusterRouting "queue") }}
-            - name: SIE_CLUSTER_ROUTING
-              value: {{ $root.Values.clusterRouting | quote }}
             - name: SIE_POOL
               value: {{ $queuePool | quote }}
             {{- with $root.Values.queueRouting }}
@@ -127,7 +168,6 @@ spec:
               value: {{ .streamMaxAgeSec | default 120 | quote }}
             - name: SIE_NATS_FETCH_BUDGET
               value: {{ .natsFetchBudget | default 64 | quote }}
-            {{- end }}
             {{- end }}
             {{- $payloadStoreUrl := include "sie-cluster.payloadStoreUrl" $root }}
             {{- if $payloadStoreUrl }}
@@ -147,7 +187,27 @@ spec:
               value: {{ printf "%s-%s" $platform $bundle | quote }}
             - name: SIE_DEPLOYMENT_ENV
               value: {{ if and $root.Values.telemetry $root.Values.telemetry.deploymentEnv }}{{ $root.Values.telemetry.deploymentEnv | quote }}{{ else }}"production"{{ end }}
+            {{- if $root.Values.workers.common.workerSidecar.enabled }}
+            # worker-sidecar owns the NATS loop; Python exposes the IPC
+            # server over a shared Unix socket. The chart fails render
+            # (at the top of this file) if the sidecar is enabled
+            # without NATS.
+            - name: SIE_IPC_SOCKET_PATH
+              value: /var/run/sie/ipc.sock
+            - name: SIE_IPC_REQUIRE_HEARTBEAT
+              value: "true"
+            {{- if $root.Values.workers.common.passthroughMode }}
+            # Queue-mode batching is owned by the worker-sidecar. Python
+            # treats each IPC frame as a complete GPU batch, so the pod
+            # has exactly one active batcher.
+            - name: SIE_WORKER_PASSTHROUGH
+              value: "1"
+            {{- end }}
+            {{- end }}
             {{- with $root.Values.workers.common.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with $bundleCfg.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           lifecycle:
@@ -163,8 +223,12 @@ spec:
               port: http
             {{- toYaml $root.Values.workers.common.probes.startup | nindent 12 }}
           livenessProbe:
+            # /livez is GPU-aware: it runs a tiny CUDA sync so a wedged context
+            # (device-side assert) escalates to a pod restart instead of serving
+            # 500s forever. /healthz (startupProbe) stays process-alive only.
+            # CPU workers report healthy from /livez, so this is safe for all pools.
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             {{- toYaml $root.Values.workers.common.probes.liveness | nindent 12 }}
           readinessProbe:
@@ -188,6 +252,228 @@ spec:
               mountPath: /models
             - name: shm
               mountPath: /dev/shm
+            {{- if $root.Values.workers.common.workerSidecar.enabled }}
+            - name: sie-ipc
+              mountPath: /var/run/sie
+            {{- end }}
+        {{- if $root.Values.workers.common.workerSidecar.enabled }}
+        # worker-sidecar
+        # Owns the NATS JetStream pull loop and forwards work into
+        # the Python adapter process over a shared Unix socket.
+        - name: worker-sidecar
+          {{- $rs := $root.Values.workers.common.workerSidecar }}
+          {{- $configReconcile := default dict $rs.configReconcile }}
+          {{- $rsTag := default $root.Chart.AppVersion $rs.image.tag }}
+          image: {{ printf "%s:%s" $rs.image.repository $rsTag }}
+          imagePullPolicy: {{ $rs.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ $rs.metricsPort }}
+              protocol: TCP
+          env:
+            - name: SIE_WORKER_METRICS_PORT
+              value: {{ $rs.metricsPort | quote }}
+            - name: SIE_IPC_SOCKET_PATH
+              value: /var/run/sie/ipc.sock
+            - name: SIE_POOL
+              value: {{ $queuePool | quote }}
+            - name: SIE_BUNDLE
+              value: {{ $bundle | quote }}
+            - name: SIE_GATEWAY_URL
+              value: {{ include "sie-cluster.gateway.internalUrl" $root | quote }}
+            {{- if $root.Values.gateway.auth.tokenSecretName }}
+            - name: SIE_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.gateway.auth.tokenSecretName }}
+                  key: {{ $root.Values.gateway.auth.tokenSecretKey }}
+            {{- end }}
+            - name: SIE_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              value: {{ $rs.logLevel | quote }}
+            {{- if $root.Values.nats.enabled }}
+            - name: SIE_NATS_URL
+              value: {{ $root.Values.nats.url | default (printf "nats://%s:4222" ($root.Values.nats.serviceName | default (printf "%s-nats" $root.Release.Name))) | quote }}
+            {{- end }}
+            {{- if $root.Values.config.enabled }}
+            - name: SIE_NATS_CONFIG_TRUSTED_PRODUCERS
+              value: {{ include "sie-cluster.config.serviceName" $root | quote }}
+            {{- end }}
+            {{- if and $root.Values.config.enabled (dig "enabled" true $configReconcile) }}
+            # sie-config reconciliation catches worker-side missed Core NATS
+            # config deltas by polling /v1/configs/epoch and replaying
+            # /v1/configs/export through Python IPC.
+            - name: SIE_CONFIG_SERVICE_URL
+              value: {{ include "sie-cluster.config.internalUrl" $root | quote }}
+            {{- if $root.Values.config.auth.adminTokenSecretName }}
+            - name: SIE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.config.auth.adminTokenSecretName }}
+                  key: {{ $root.Values.config.auth.adminTokenSecretKey }}
+            {{- end }}
+            {{- if $configReconcile.pollIntervalMs }}
+            - name: SIE_WORKER_CONFIG_POLL_INTERVAL_MS
+              value: {{ $configReconcile.pollIntervalMs | quote }}
+            {{- end }}
+            {{- if hasKey $configReconcile "fullExportIntervalMs" }}
+            - name: SIE_WORKER_CONFIG_FULL_EXPORT_INTERVAL_MS
+              value: {{ $configReconcile.fullExportIntervalMs | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with $root.Values.queueRouting }}
+            - name: SIE_NAK_DELAY_S
+              value: {{ .nakDelaySec | default 5 | quote }}
+            - name: SIE_MAX_DELIVER
+              value: {{ .maxDeliver | default 20 | quote }}
+            - name: SIE_NATS_FETCH_BUDGET
+              value: {{ .natsFetchBudget | default 64 | quote }}
+            # Keep stream retention in lockstep with the gateway and sidecar.
+            # Whoever creates the stream first wins, so both producers and
+            # consumers must agree on max_age or retries race against purge.
+            - name: SIE_STREAM_MAX_AGE_S
+              value: {{ .streamMaxAgeSec | default 120 | quote }}
+            {{- if .maxAckPending }}
+            - name: SIE_MAX_ACK_PENDING
+              value: {{ .maxAckPending | quote }}
+            {{- end }}
+            {{- with .poolAdmission }}
+            - name: SIE_POOL_ADMISSION_ENABLED
+              value: {{ if hasKey . "enabled" }}{{ .enabled | quote }}{{ else }}"true"{{ end }}
+            - name: SIE_POOL_ADMISSION_CHECK_INTERVAL_S
+              value: {{ .checkIntervalSec | default 10 | quote }}
+            - name: SIE_POOL_ADMISSION_PAUSE_S
+              value: {{ .pauseSec | default 1 | quote }}
+            - name: SIE_POOL_ADMISSION_STALE_AFTER_S
+              value: {{ .staleAfterSec | default 30 | quote }}
+            {{- end }}
+            {{- end }}
+            {{- $natsConsumerReconcile := default dict $rs.natsConsumerReconcile }}
+            {{- if hasKey $natsConsumerReconcile "intervalMs" }}
+            - name: SIE_NATS_CONSUMER_RECONCILE_INTERVAL_MS
+              value: {{ $natsConsumerReconcile.intervalMs | quote }}
+            {{- end }}
+            {{- if $rs.maxConcurrentBatches }}
+            - name: SIE_MAX_CONCURRENT_BATCHES
+              value: {{ $rs.maxConcurrentBatches | quote }}
+            {{- end }}
+            {{- if $rs.ipcPoolSize }}
+            # Size of the Rust-to-Python IPC connection pool. Should match
+            # (or exceed) SIE_MAX_CONCURRENT_BATCHES so the IPC layer
+            # isn't the binding constraint on dispatcher concurrency.
+            # When unset the Rust binary falls back to the dispatcher's
+            # own default (4).
+            - name: SIE_IPC_POOL_SIZE
+              value: {{ $rs.ipcPoolSize | quote }}
+            {{- end }}
+            {{- if $rs.pingIntervalMs }}
+            - name: SIE_WORKER_PING_INTERVAL_MS
+              value: {{ $rs.pingIntervalMs | quote }}
+            {{- end }}
+            {{- if $rs.readyStaleMult }}
+            # /readyz freshness-window multiplier:
+            #   freshness_ms = ping_interval_ms * ready_stale_mult
+            - name: SIE_WORKER_READYZ_STALE_MULT
+              value: {{ $rs.readyStaleMult | quote }}
+            {{- end }}
+            # NATS health-heartbeat publisher.
+            #
+            # With the worker-sidecar data path, the gateway builds its
+            # queue WorkerRegistry strictly from `sie.health.>` messages.
+            # Use `dig` rather than `default` so an explicit
+            # `healthPublish.enabled: false` stays false.
+            - name: SIE_HEALTH_PUBLISH_ENABLED
+              value: {{ dig "healthPublish" "enabled" true $rs | quote }}
+            {{- if $rs.healthPublish.intervalMs }}
+            - name: SIE_HEALTH_PUBLISH_INTERVAL_MS
+              value: {{ $rs.healthPublish.intervalMs | quote }}
+            {{- end }}
+            - name: SIE_MACHINE_PROFILE
+              value: {{ $rs.healthPublish.machineProfile | default $machineProfile | quote }}
+            {{- if $pool.gpu }}
+            {{- if $pool.gpu.count }}
+            - name: SIE_GPU_COUNT
+              value: {{ $pool.gpu.count | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $payloadStoreUrl }}
+            - name: SIE_PAYLOAD_STORE_URL
+              value: {{ $payloadStoreUrl | quote }}
+            {{- end }}
+            {{- if $rs.metricModelAllowlist }}
+            - name: SIE_METRIC_MODEL_ALLOWLIST
+              value: {{ $rs.metricModelAllowlist | quote }}
+            {{- end }}
+            # Queue-mode scheduler tuning. Each typed field maps to
+            # one env var; rendered before `extraEnv` so an
+            # operator-provided override wins.
+            {{- if $rs.pipelineDepth }}
+            - name: SIE_RUST_PIPELINE_DEPTH
+              value: {{ $rs.pipelineDepth | quote }}
+            {{- end }}
+            {{- if $rs.batcher }}
+            {{- if $rs.batcher.coalesceMs }}
+            - name: SIE_BATCHER_COALESCE_MS
+              value: {{ $rs.batcher.coalesceMs | quote }}
+            {{- end }}
+            {{- if $rs.batcher.maxBatchRequests }}
+            - name: SIE_BATCHER_MAX_BATCH_REQUESTS
+              value: {{ $rs.batcher.maxBatchRequests | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $rs.adaptive }}
+            {{- if $rs.adaptive.minQuantumMs }}
+            - name: SIE_ADAPTIVE_MIN_QUANTUM_MS
+              value: {{ $rs.adaptive.minQuantumMs | quote }}
+            {{- end }}
+            {{- if $rs.adaptive.maxQuantumMs }}
+            - name: SIE_ADAPTIVE_MAX_QUANTUM_MS
+              value: {{ $rs.adaptive.maxQuantumMs | quote }}
+            {{- end }}
+            {{- if $rs.adaptive.targetP50Ms }}
+            - name: SIE_ADAPTIVE_TARGET_P50_MS
+              value: {{ $rs.adaptive.targetP50Ms | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with $rs.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $rs.probes.enabled }}
+          # worker-sidecar K8s probes
+          # Off by default while the Python container's existing
+          # /healthz + /readyz on port 8080 remain the K8s contract.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: {{ $rs.probes.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ $rs.probes.startup.failureThreshold | default 60 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: {{ $rs.probes.liveness.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ $rs.probes.liveness.periodSeconds | default 30 }}
+            timeoutSeconds: {{ $rs.probes.liveness.timeoutSeconds | default 5 }}
+            failureThreshold: {{ $rs.probes.liveness.failureThreshold | default 3 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: {{ $rs.probes.readiness.initialDelaySeconds | default 3 }}
+            periodSeconds: {{ $rs.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ $rs.probes.readiness.timeoutSeconds | default 3 }}
+            failureThreshold: {{ $rs.probes.readiness.failureThreshold | default 3 }}
+          {{- end }}
+          resources:
+            {{- toYaml $rs.resources | nindent 12 }}
+          volumeMounts:
+            - name: sie-ipc
+              mountPath: /var/run/sie
+        {{- end }}
       {{- with $pool.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -197,7 +483,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       affinity:
-        # Prefer spreading across nodes
+        # Prefer spreading same-bundle workers across nodes
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
@@ -206,6 +492,7 @@ spec:
                   matchLabels:
                     {{- include "sie-cluster.worker.selectorLabels" $root | nindent 20 }}
                     sie.superlinked.com/pool: {{ $poolName | quote }}
+                    sie.superlinked.com/bundle: {{ $bundle | quote }}
                 topologyKey: kubernetes.io/hostname
       volumes:
         # Shared memory for PyTorch DataLoader
@@ -217,5 +504,15 @@ spec:
         - name: model-cache
           emptyDir:
             sizeLimit: {{ $root.Values.workers.common.cacheStorageSize }}
+        {{- if $root.Values.workers.common.workerSidecar.enabled }}
+        # Shared Unix-socket directory between the Python adapter and
+        # the worker-sidecar (in-Pod IPC, no network hop).
+        - name: sie-ipc
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

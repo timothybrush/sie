@@ -3,8 +3,8 @@
 This module manages postprocessors for loaded models and provides
 async postprocessing that runs in a shared thread pool.
 
-Postprocessors are triggered explicitly via runtime options (not inferred
-from output types). See DESIGN.md Section 7.3.2.
+Postprocessors are triggered explicitly via runtime options, not inferred
+from output types.
 
 Example:
     # Register when model loads

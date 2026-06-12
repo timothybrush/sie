@@ -35,7 +35,7 @@ def patch_ensure_model_cached():
 
 
 class TestAsyncLoading:
-    """Tests for async model loading (DESIGN.md Section 5.4)."""
+    """Tests for async model loading."""
 
     @pytest.fixture
     def mock_adapter(self) -> MagicMock:
@@ -167,6 +167,58 @@ class TestAsyncLoading:
 
             assert not registry_with_model.is_loaded("test-model")
             mock_adapter.unload.assert_called_once()
+
+    async def test_unload_async_closes_client_before_adapter_unload(self, registry_with_model: ModelRegistry) -> None:
+        """H5: ``aclose_client`` (HTTP client close) is awaited BEFORE
+        ``unload()`` (which terminates the SGLang subprocess). Closing the
+        client against a still-live subprocess avoids leaked fds / a wedged
+        half-open socket.
+        """
+        from unittest.mock import AsyncMock
+
+        order: list[str] = []
+
+        with patch("sie_server.core.model_loader.load_adapter") as mock_load:
+            mock_adapter = MagicMock()
+            mock_adapter.memory_footprint.return_value = 1000
+
+            async def _aclose_client() -> None:
+                order.append("aclose_client")
+
+            def _unload() -> None:
+                order.append("unload")
+
+            mock_adapter.aclose_client = AsyncMock(side_effect=_aclose_client)
+            mock_adapter.unload = MagicMock(side_effect=_unload)
+            mock_load.return_value = mock_adapter
+
+            await registry_with_model.load_async("test-model", "cpu")
+            await registry_with_model.unload_async("test-model")
+
+        mock_adapter.aclose_client.assert_awaited_once()
+        mock_adapter.unload.assert_called_once()
+        # Client close strictly precedes subprocess teardown.
+        assert order == ["aclose_client", "unload"]
+
+    async def test_unload_async_without_aclose_client_still_unloads(self, registry_with_model: ModelRegistry) -> None:
+        """Adapters without ``aclose_client`` (e.g. embedding adapters) still
+        unload cleanly — the new close path is opt-in via getattr.
+        """
+        with patch("sie_server.core.model_loader.load_adapter") as mock_load:
+            mock_adapter = MagicMock()
+            mock_adapter.capabilities.outputs = ["dense"]
+            mock_adapter.memory_footprint.return_value = 1000
+            # Simulate an adapter that does NOT expose ``aclose_client``
+            # (e.g. an embedding adapter). ``getattr(..., None)`` must
+            # short-circuit and unload still runs.
+            del mock_adapter.aclose_client
+            mock_load.return_value = mock_adapter
+
+            await registry_with_model.load_async("test-model", "cpu")
+            await registry_with_model.unload_async("test-model")
+
+            mock_adapter.unload.assert_called_once()
+            assert not registry_with_model.is_loaded("test-model")
 
     async def test_unload_all_async(self, registry_with_model: ModelRegistry) -> None:
         """unload_all_async unloads all models."""

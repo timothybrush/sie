@@ -39,7 +39,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
-from sie_server.types.inputs import ImageInput
+from sie_server.types.inputs import ImageInput, media_bytes
 from sie_server.types.responses import DetectedObject
 
 if TYPE_CHECKING:
@@ -381,7 +381,7 @@ class GroundingDINOAdapter(BaseAdapter):
         if not isinstance(img, dict) or "data" not in img:
             return None
 
-        pil_img = PILImage.open(BytesIO(img["data"]))
+        pil_img = PILImage.open(BytesIO(media_bytes(img, kind="image")))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
         return pil_img

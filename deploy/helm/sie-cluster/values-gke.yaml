@@ -3,7 +3,7 @@ fullnameOverride: sie
 
 # -- Sub-charts: batteries-included for GKE
 # KEDA + Prometheus + DCGM Exporter are required for autoscaling.
-# Loki + Alloy + Event Exporter provide optional log aggregation.
+# Loki + Alloy are enabled for cloud overlays; Event Exporter remains a separate toggle.
 keda:
   install: true
 
@@ -25,14 +25,12 @@ dcgm-exporter:
   nodeSelector:
     cloud.google.com/gke-accelerator-count: "1"
 
-loki:
-  install: true
-
-alloy:
-  install: true
+observability:
+  logs:
+    install: true
 
 kubernetes-event-exporter:
-  install: true
+  install: false
 
 # -- Autoscaling via KEDA (queries Prometheus for scaling decisions)
 # prometheusAddress is auto-derived when kube-prometheus-stack.install=true
@@ -68,15 +66,32 @@ ingress:
   enabled: true
   className: nginx
   # TLS defaults to BYO (user-supplied kubernetes.io/tls Secret).
-  # To enable automated HTTPS via cert-manager + Let's Encrypt, install cert-manager
-  # in the cluster (one-time prerequisite) and uncomment:
+  # Three other modes are supported:
   #
-  # host: sie.example.com  # required when tls.mode=cert-manager
-  # tls:
-  #   enabled: true
-  #   mode: cert-manager
-  #   certManager:
-  #     email: ops@example.com
+  #   1) cert-manager + Let's Encrypt (external cert-manager install):
+  #      hosts:
+  #        - sie.example.com
+  #      tlsConfig:
+  #        enabled: true
+  #        mode: cert-manager
+  #        certManager:
+  #          email: ops@example.com
+  #
+  #   2) self-signed (air-gapped / on-prem; bundles cert-manager — single-tenant clusters only):
+  #      hosts:
+  #        - sie.example.com
+  #      tlsConfig:
+  #        enabled: true
+  #        mode: self-signed
+  #      # And at the top level:
+  #      # certManagerBundle:
+  #      #   certManager:
+  #      #     install: true
+  #
+  #   3) disabled (TLS terminated upstream of the Ingress):
+  #      tlsConfig:
+  #        enabled: false
+  #        mode: disabled
 
 gateway:
   replicas: 2
@@ -110,11 +125,8 @@ workers:
     # GKE L4 pool (spot) — enable default bundle
     l4:
       enabled: true
-      minReplicas: 0
-      maxReplicas: 10
       machineProfile: l4
       gpuType: l4
-      bundle: default
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-l4
       gpu:
@@ -131,6 +143,10 @@ workers:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 10
 
 # ServiceAccount — Helm manages creation; Workload Identity annotation injected at deploy time.
 # NAMING CONTRACT: name must match Terraform's Workload Identity binding

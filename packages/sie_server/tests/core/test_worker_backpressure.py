@@ -58,7 +58,7 @@ class TestModelWorkerBackpressure:
             finally:
                 await worker.stop()
 
-        asyncio.get_event_loop().run_until_complete(test())
+        asyncio.new_event_loop().run_until_complete(test())
 
     def test_unlimited_queue_with_zero(self, mock_adapter: MagicMock) -> None:
         """max_queue_size=0 means unlimited queue."""
@@ -86,7 +86,7 @@ class TestModelWorkerBackpressure:
             finally:
                 await worker.stop()
 
-        asyncio.get_event_loop().run_until_complete(test())
+        asyncio.new_event_loop().run_until_complete(test())
 
     def test_queue_rejects_batch_that_would_exceed(self, mock_adapter: MagicMock) -> None:
         """Queue rejects a batch if adding it would exceed the limit."""
@@ -123,7 +123,7 @@ class TestModelWorkerBackpressure:
             finally:
                 await worker.stop()
 
-        asyncio.get_event_loop().run_until_complete(test())
+        asyncio.new_event_loop().run_until_complete(test())
 
     def test_default_max_queue_size(self, mock_adapter: MagicMock) -> None:
         """Default max_queue_size is 1000."""

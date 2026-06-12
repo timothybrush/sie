@@ -1,4 +1,4 @@
-FROM rust:1.95.0-slim-bookworm AS chef
+FROM rust:1.96.0-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -13,6 +13,10 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --features cloud-storage --recipe-path recipe.json
 COPY packages/sie_gateway/Cargo.toml packages/sie_gateway/Cargo.lock ./
 COPY packages/sie_gateway/src/ src/
+# Vendored Redoc bundle for the `/docs` page: `openapi.rs` embeds it via
+# `include_str!("../assets/redoc.standalone.js")`, so it must be present for the
+# final compile. (The chef cook step above uses dummy sources and doesn't need it.)
+COPY packages/sie_gateway/assets/ assets/
 RUN cargo build --release --features cloud-storage
 
 FROM gcr.io/distroless/cc-debian12:nonroot

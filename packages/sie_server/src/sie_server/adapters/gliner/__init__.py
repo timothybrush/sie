@@ -12,8 +12,6 @@ Reference models:
 - urchade/gliner_small-v2.1 (English, smaller/faster)
 - numind/NuNER_Zero (token-based, requires merge_adjacent_entities=True)
 - numind/NuNER_Zero-span (span-based, works without merging)
-
-See DESIGN.md Section 7.6 for adapter specification.
 """
 
 from pathlib import Path

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 from sie_server.adapters._utils import extract_texts, resolve_embedding_options
+from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
 from sie_server.types.inputs import Item
 
 
@@ -259,8 +260,6 @@ class TestRuntimeOptionsConsumption:
 
     def test_sglang_format_texts_uses_options(self) -> None:
         """SGLang adapter _format_texts accepts template overrides."""
-        from sie_server.adapters.sglang import SGLangEmbeddingAdapter
-
         adapter = SGLangEmbeddingAdapter(
             "test-model",
             query_template="default: {text}",
@@ -461,7 +460,7 @@ class TestRuntimeOptionsWiringRegression:
 
     def test_sglang_format_texts_accepts_all_template_params(self) -> None:
         """SGLangEmbeddingAdapter._format_texts must accept template and instruction params."""
-        cls = self._get_adapter_class("sglang", "SGLangEmbeddingAdapter")
+        cls = self._get_adapter_class("sglang.embedding", "SGLangEmbeddingAdapter")
         params = self._get_param_names(cls, "_format_texts")
         assert "query_template" in params
         assert "doc_template" in params
@@ -493,7 +492,7 @@ class TestRuntimeOptionsWiringRegression:
         ("splade_flash", "SPLADEFlashAdapter"),
         ("gte_sparse_flash", "GTESparseFlashAdapter"),
         ("pytorch_embedding", "PyTorchEmbeddingAdapter"),
-        ("sglang", "SGLangEmbeddingAdapter"),
+        ("sglang.embedding", "SGLangEmbeddingAdapter"),
         ("bge_m3_flash", "BGEM3FlashAdapter"),
         ("bge_m3", "BGEM3Adapter"),
     ]
@@ -1119,7 +1118,7 @@ class TestExtractRuntimeOptions:
         )
 
     def test_owlv2_reads_score_threshold_from_options(self) -> None:
-        """OWLv2 adapter reads score_threshold from options."""
+        """OWLv2 adapter reads score_threshold and threshold from options."""
         import inspect
 
         from sie_server.adapters.owlv2 import Owlv2Adapter
@@ -1127,6 +1126,9 @@ class TestExtractRuntimeOptions:
         source = inspect.getsource(Owlv2Adapter.extract)
         assert 'opts.get("score_threshold"' in source, (
             "Owlv2Adapter.extract() does not read score_threshold from options."
+        )
+        assert 'opts.get("threshold"' in source or "opts.get('threshold'" in source, (
+            "Owlv2Adapter.extract() does not read threshold alias from options."
         )
 
     def test_florence2_reads_task_from_options(self) -> None:

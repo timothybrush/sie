@@ -3,8 +3,8 @@
 This adapter provides support for CLIP and similar image-text models that
 produce aligned embeddings for both images and text in a shared vector space.
 
-Per roadmap Project 10.4, uses transformers CLIPModel with CLIPProcessor
-for Phase 1. Optimization (FA2 varlen for text) deferred to Phase 2.
+Uses transformers CLIPModel with CLIPProcessor. Optimization (FA2 varlen for
+text) remains deferred.
 
 Supports:
 - Text-only encoding → dense embeddings
@@ -30,6 +30,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -65,6 +66,7 @@ class CLIPAdapter(BaseAdapter):
         compute_precision: ComputePrecision = "float16",
         trust_remote_code: bool = False,
         max_seq_length: int | None = None,
+        dense_dim: int | None = None,
     ) -> None:
         """Initialize the adapter.
 
@@ -74,16 +76,19 @@ class CLIPAdapter(BaseAdapter):
             compute_precision: Compute precision for inference.
             trust_remote_code: Whether to trust remote code (False for standard CLIP).
             max_seq_length: Ignored - CLIP uses fixed token length from model config.
+            dense_dim: Catalog-declared dense embedding dimension. If provided,
+                validated against the loaded model's projection dimension.
         """
         self._model_name_or_path = str(model_name_or_path)
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._configured_dense_dim = dense_dim
 
         self._model: CLIPModel | None = None
         self._processor: CLIPProcessor | None = None
         self._device: str | None = None
-        self._dense_dim: int | None = None
+        self._dense_dim: int | None = dense_dim
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -120,9 +125,18 @@ class CLIPAdapter(BaseAdapter):
         self._model.to(device)
         self._model.eval()
 
-        # Get embedding dimension from model config
-        # CLIP uses projection_dim for the aligned embedding space
-        self._dense_dim = self._model.config.projection_dim
+        # CLIP uses projection_dim for the aligned embedding space.
+        self._dense_dim = self._validate_or_set_dense_dim(self._model.config.projection_dim)
+
+    def _validate_or_set_dense_dim(self, observed_dim: int) -> int:
+        """Validate observed CLIP projection width against configured dense_dim."""
+        if self._configured_dense_dim is not None and observed_dim != self._configured_dense_dim:
+            msg = (
+                "CLIP embedding dimension mismatch: "
+                f"configured dense_dim={self._configured_dense_dim}, model projection_dim={observed_dim}"
+            )
+            raise ValueError(msg)
+        return observed_dim
 
     def _resolve_dtype(self) -> torch.dtype:
         """Resolve dtype based on device and config."""
@@ -223,7 +237,7 @@ class CLIPAdapter(BaseAdapter):
         pil_images = []
         for img_input in item.images or []:
             # img_input is ImageInput TypedDict with data (bytes) and optional format
-            img_bytes = img_input["data"]
+            img_bytes = media_bytes(img_input, kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             # Convert to RGB if necessary (CLIP expects RGB)
             if pil_img.mode != "RGB":

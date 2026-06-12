@@ -19,6 +19,8 @@ pub struct CreatePoolRequest {
     #[serde(default)]
     pub gpus: HashMap<String, u32>,
     #[serde(default)]
+    pub gpu_caps: HashMap<String, u32>,
+    #[serde(default)]
     pub bundle: Option<String>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
@@ -32,7 +34,7 @@ pub struct CreatePoolRequest {
     tag = "pools",
     request_body = CreatePoolRequest,
     responses(
-        (status = 201, description = "Pool created", body = crate::types::pool::Pool),
+        (status = 201, description = "Pool created, renewed, or updated", body = crate::types::pool::Pool),
         (status = 400, description = "Invalid pool request", body = crate::openapi::StandardApiError)
     )
 )]
@@ -51,12 +53,12 @@ pub async fn create_pool(
             .into_response();
     }
 
-    if req.gpus.is_empty() {
+    if req.gpus.is_empty() && req.gpu_caps.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_detail(
                 err_code::INVALID_REQUEST,
-                "GPU requirements are required",
+                "GPU requirements or caps are required",
             )),
         )
             .into_response();
@@ -64,9 +66,10 @@ pub async fn create_pool(
 
     match state
         .pool_manager
-        .create_pool(
+        .create_pool_with_caps(
             &req.name,
             req.gpus,
+            req.gpu_caps,
             req.bundle,
             req.ttl_seconds,
             req.minimum_worker_count,

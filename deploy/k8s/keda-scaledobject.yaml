@@ -1,14 +1,18 @@
 # SIE KEDA ScaledObject Configuration
 #
 # GPU-optimized autoscaling for SIE inference workloads.
-# Based on research: product/research/cloud_deployment_research.md
 #
 # Prerequisites:
 #   - KEDA installed (via Terraform: install_keda = true)
 #   - Prometheus available for metrics
 #   - SIE deployment created
 #
-# Apply: kubectl apply -f keda-scaledobject.yaml
+# Apply after replacing the example lane values:
+#   kubectl apply -f keda-scaledobject.yaml
+#
+# NOTE: This standalone manifest is a single-lane example. The Helm chart is
+# the production path and renders one ScaledObject per
+# (queuePool, machineProfile, bundle) lane.
 
 ---
 # =============================================================================
@@ -23,14 +27,19 @@
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: sie-worker-scaler
+  name: sie-worker-default-l4-default-scaler
   namespace: sie
   labels:
     app.kubernetes.io/name: sie
     app.kubernetes.io/component: worker
+    sie.superlinked.com/pool: default
+    sie.superlinked.com/machine-profile: l4
+    sie.superlinked.com/bundle: default
 spec:
   scaleTargetRef:
-    name: sie-worker  # Target deployment name
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: sie-worker-l4-default  # Target worker StatefulSet for this one lane
 
   # Replica counts
   minReplicaCount: 0     # Scale to zero when idle (cost optimization)
@@ -75,25 +84,25 @@ spec:
 
   # Triggers for scaling decisions
   triggers:
-    # Primary: Queue depth (most responsive)
+    # Primary: Gateway pending demand (scale-from-zero signal)
     - type: prometheus
       metadata:
         serverAddress: http://prometheus-operated.monitoring.svc:9090
-        metricName: sie_request_queue_depth
-        query: sum(sie_request_queue_depth{namespace="sie"})
+        metricName: sie_gateway_pending_demand_default_l4_default
+        query: sum(sie_gateway_pending_demand{namespace="sie",pool="default",machine_profile="l4",bundle="default"}) or vector(0)
+        threshold: '1'
+        activationThreshold: '0'
+      # authenticationRef:          # Optional: uncomment if Prometheus requires auth
+      #   name: prometheus-auth
+
+    # Secondary: Worker queue depth (steady-state backlog signal)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-operated.monitoring.svc:9090
+        metricName: sie_gateway_worker_queue_depth_default_l4_default
+        query: sum(sie_gateway_worker_queue_depth{namespace="sie",pool="default",machine_profile="l4",bundle="default"}) or vector(0)
         threshold: '10'            # Target: 10 queued requests per pod
         activationThreshold: '2'   # Wake from 0 when >2 requests queued
-      authenticationRef:
-        name: prometheus-auth      # Optional: if Prometheus requires auth
-
-    # Secondary: Active requests (complementary signal)
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-operated.monitoring.svc:9090
-        metricName: sie_active_requests
-        query: sum(sie_active_requests{namespace="sie"})
-        threshold: '5'             # Target: 5 concurrent requests per pod
-        activationThreshold: '1'   # Wake from 0 when >1 active request
 
 ---
 # =============================================================================
@@ -113,6 +122,8 @@ metadata:
     app.kubernetes.io/component: gateway
 spec:
   scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
     name: sie-gateway
 
   minReplicaCount: 2     # Always keep 2 for HA

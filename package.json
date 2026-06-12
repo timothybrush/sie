@@ -8,7 +8,7 @@
     "lint": "pnpm -r run lint"
   },
   "devDependencies": {
-    "typescript": "^5.7.2"
+    "typescript": "^5.9.3"
   },
   "packageManager": "pnpm@9.15.0",
   "workspaces": [
@@ -17,5 +17,19 @@
     "integrations/sie_ts_llamaindex",
     "integrations/sie_ts_chroma",
     "integrations/sie_ts_lancedb"
-  ]
+  ],
+  "pnpm": {
+    "overrides": {
+      "esbuild": ">=0.25.0",
+      "form-data": ">=4.0.4",
+      "langsmith": ">=0.6.0",
+      "protobufjs": ">=7.5.8",
+      "qs": ">=6.15.2",
+      "tar": ">=7.5.11",
+      "uuid": ">=11.1.1",
+      "vite": "^6.4.2",
+      "vitest": "^4.1.0",
+      "ws": ">=8.20.1"
+    }
+  }
 }

@@ -35,6 +35,7 @@ import {
   ProvisioningError,
   RequestError,
   SIEConnectionError,
+  SIEStreamError,
 } from "./errors.js";
 import {
   DEFAULT_LEASE_RENEWAL_INTERVAL,
@@ -60,17 +61,27 @@ import {
   parseCapacityInfo,
   parseEncodeResults,
   parseExtractResults,
+  parseGenerateResult,
   parseScoreResult,
   throwIfInputTooLong,
   throwIfModelLoadFailed,
 } from "./internal/parsing.js";
+import { withProvisioningRetry } from "./internal/provisioning.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
+import { parseSseStream } from "./sse.js";
 import type {
   CapacityInfo,
+  ChatCompletion,
+  ChatCompletionChunk,
+  ChatCompletionOptions,
+  ChatCompletionRequest,
   EncodeOptions,
   EncodeResult,
   ExtractOptions,
   ExtractResult,
+  GenerateChunk,
+  GenerateOptions,
+  GenerateResult,
   Item,
   ModelInfo,
   PoolInfo,
@@ -103,6 +114,33 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<boolean> {
 }
 
 const _LEASE_RENEWAL_MAX_RETRIES = 5;
+
+/**
+ * Pluck a mid-stream `error` block out of a `ChatCompletionChunk` and
+ * convert it to `SIEStreamError`, mirroring the shape `sse.rs` emits:
+ * `{ message, type, param, code }`. Returns `null` when the chunk is a
+ * normal delta. Defined at module scope so it has zero coupling to
+ * `SIEClient` state.
+ */
+function extractChatChunkError(chunk: ChatCompletionChunk): SIEStreamError | null {
+  const err = (
+    chunk as ChatCompletionChunk & {
+      error?: { message?: string; type?: string; param?: string | null; code?: string };
+    }
+  ).error;
+  if (!err) return null;
+  return new SIEStreamError(err.message ?? "stream error", {
+    code: err.code,
+    errorType: err.type,
+    param: err.param,
+  });
+}
+
+/** SIE-native chunk variant — see `sse.rs::build_generate_chunk_event`. */
+function extractGenerateChunkError(chunk: GenerateChunk): SIEStreamError | null {
+  if (!chunk.error) return null;
+  return new SIEStreamError(chunk.error.message, { code: chunk.error.code });
+}
 
 /**
  * SIE Client for embedding, scoring, and extraction.
@@ -444,6 +482,534 @@ export class SIEClient {
    * console.log(result.scores[0].itemId); // most relevant
    * ```
    */
+  /**
+   * Generate text from a prompt (walking-skeleton SDK surface).
+   *
+   * The SDK does not currently expose streaming chunks. The worker streams
+   * to the gateway, the gateway aggregates, and the SDK returns the
+   * assembled result plus SIE-native timing metadata (TTFT, TPOT,
+   * attempt id).
+   *
+   * @example
+   * ```typescript
+   * const result = await client.generate(
+   *   "Qwen__Qwen3-4B-Instruct-2507",
+   *   "Write a haiku about the sea.",
+   *   { maxNewTokens: 64, temperature: 0.7 },
+   * );
+   * console.log(result.text);
+   * console.log(`TTFT: ${result.ttftMs}ms`);
+   * ```
+   */
+  async generate(model: string, prompt: string, options: GenerateOptions): Promise<GenerateResult> {
+    const body: Record<string, unknown> = {
+      prompt,
+      max_new_tokens: options.maxNewTokens,
+      temperature: options.temperature ?? 1.0,
+      top_p: options.topP ?? 1.0,
+    };
+    if (options.stop !== undefined) {
+      body.stop = options.stop;
+    }
+
+    const { pool, gpu } = this.parseGpuParam(options.gpu);
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": JSON_CONTENT_TYPE,
+      [SDK_VERSION_HEADER]: SDK_VERSION,
+    };
+    if (pool) headers["X-SIE-Pool"] = pool;
+    if (gpu) headers["X-SIE-MACHINE-PROFILE"] = gpu;
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+
+    const safeModel = model.replaceAll("/", "__");
+    const url = `${this.baseUrl}/v1/generate/${encodeURIComponent(safeModel)}`;
+    const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;
+
+    const response = await withProvisioningRetry(() => this.performJsonPost(url, body, headers), {
+      model,
+      gpu,
+      waitForCapacity,
+      provisionTimeoutMs: this.provisionTimeout,
+    });
+
+    const data = (await response.json()) as Record<string, unknown>;
+    if (data === null || typeof data !== "object") {
+      throw new RequestError("Unexpected generate response shape");
+    }
+    return parseGenerateResult(data);
+  }
+
+  /**
+   * Per-attempt JSON POST used by the non-streaming surfaces
+   * ({@link generate}, {@link chatCompletions}) inside the
+   * {@link withProvisioningRetry} loop.
+   *
+   * Translates low-level transport failures into typed errors that the
+   * retry loop will surface verbatim:
+   *   - `AbortError` → `SIEConnectionError` (per-attempt timeout)
+   *   - `TypeError`  → `SIEConnectionError` (NOT retried — generation is
+   *     non-idempotent, so a mid-flight drop must surface instead of
+   *     silently re-issuing a billable generation)
+   *
+   * Each call uses a fresh `AbortController` so concurrent retries don't
+   * share state, and the per-attempt timeout is bounded by `this.timeout`
+   * (NOT the cumulative provisioning budget).
+   */
+  private async performJsonPost(
+    url: string,
+    body: unknown,
+    headers: Record<string, string>,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    try {
+      return await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new SIEConnectionError(`Request timeout after ${this.timeout}ms`, "timeout");
+      }
+      if (err instanceof TypeError) {
+        // `generate()` / `chatCompletions()` are non-idempotent and carry
+        // no dedup key, so a SECOND attempt issues a SECOND billable
+        // generation. `fetch` throws `TypeError` for ANY network failure,
+        // including a connection dropped AFTER the request body was sent
+        // (mid-flight) — and it cannot reliably distinguish that from a
+        // connect-time refusal. Retrying a mid-flight drop would
+        // double-bill, so surface as `SIEConnectionError` and let the
+        // retry loop propagate it. The SAFE pre-execution capacity
+        // signals (202 / 503 MODEL_LOADING) are HTTP statuses, not
+        // exceptions, so the retry loop still handles them.
+        throw new SIEConnectionError(`Connection failed: ${err.message}`, "connect");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Non-streaming chat-completion call against `/v1/chat/completions`.
+   *
+   * This is the OpenAI-compatible surface. The request body is forwarded
+   * verbatim as JSON, so any field documented at
+   * <https://platform.openai.com/docs/api-reference/chat/create> can be set;
+   * the gateway will reject fields it does not yet support with
+   * `400 unsupported_field`. SIE-native routing hints (`routing_key`,
+   * `prompt_cache_key`) are part of the same request shape.
+   *
+   * Error semantics mirror `generate()`: 4xx → `RequestError`, 5xx →
+   * `ServerError` (or the more specific `ModelLoadFailedError` for 502
+   * `MODEL_LOAD_FAILED`), connection / timeout failures →
+   * `SIEConnectionError`.
+   *
+   * If `req.stream === true`, this method throws `RequestError` immediately —
+   * use {@link streamChatCompletions} instead. We do not auto-route because
+   * the return type is fundamentally different (`Promise` vs
+   * `AsyncGenerator`) and silently flipping would mis-type the call site.
+   *
+   * @example
+   * ```typescript
+   * const reply = await client.chatCompletions({
+   *   model: "Qwen/Qwen3-4B-Instruct-2507",
+   *   messages: [{ role: "user", content: "Write a haiku about the sea." }],
+   *   max_completion_tokens: 64,
+   * });
+   * console.log(reply.choices[0]?.message.content);
+   * ```
+   */
+  async chatCompletions(
+    req: ChatCompletionRequest,
+    options: ChatCompletionOptions = {},
+  ): Promise<ChatCompletion> {
+    if (req.stream === true) {
+      throw new RequestError(
+        "chatCompletions() cannot be used with stream:true — use streamChatCompletions() instead.",
+        "invalid_request",
+        400,
+      );
+    }
+
+    const body = { ...req, stream: false };
+    const url = `${this.baseUrl}/v1/chat/completions`;
+    const headers = this.buildChatHeaders("application/json");
+    const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;
+    const provisionTimeoutMs = options.provisionTimeoutMs ?? this.provisionTimeout;
+
+    // H1: pre-execution capacity signals (202 / 503 MODEL_LOADING /
+    // generic 503) MUST be handled by the shared provisioning loop —
+    // otherwise a 202 slipped through as `response.ok === true` and the
+    // SDK returned the provisioning envelope cast as `ChatCompletion`
+    // (no `choices`, no `id`). The loop also surfaces `ProvisioningError`
+    // when the caller opted out (`waitForCapacity: false`) or the
+    // provision budget is exhausted, matching `generate()`.
+    const response = await withProvisioningRetry(() => this.performJsonPost(url, body, headers), {
+      model: req.model,
+      gpu: undefined,
+      waitForCapacity,
+      provisionTimeoutMs,
+    });
+
+    this.checkServerVersion(response);
+
+    const data = (await response.json()) as ChatCompletion;
+    if (data === null || typeof data !== "object") {
+      throw new RequestError("Unexpected chat.completion response shape");
+    }
+    return data;
+  }
+
+  /**
+   * Streaming chat-completion call against `/v1/chat/completions` with
+   * `Accept: text/event-stream`.
+   *
+   * Yields `ChatCompletionChunk` events in the order the gateway emits them.
+   * The terminal chunk carries `finish_reason`; if
+   * `req.stream_options.include_usage === true`, a final usage-only chunk
+   * (`choices: []`, populated `usage`) follows it. The generator completes
+   * cleanly on the `data: [DONE]` sentinel.
+   *
+   * Error semantics:
+   *
+   *   - HTTP 4xx / 5xx **before** the stream opens → throws `RequestError` /
+   *     `ServerError` (same as {@link chatCompletions}).
+   *   - A chunk containing `error: { ... }` mid-stream → throws
+   *     {@link SIEStreamError}. The error chunk is consumed, never yielded.
+   *   - `signal.abort()` mid-stream → the generator throws
+   *     `SIEConnectionError` and releases the underlying reader, which
+   *     fires `StreamCancelGuard` on the gateway side.
+   *
+   * `req.stream` is set to `true` automatically; any existing value is
+   * overwritten. We do not validate `req.stream === false` because the
+   * call-site intent is unambiguous.
+   *
+   * @param req     The chat-completion request. See {@link ChatCompletionRequest}.
+   * @param signal  Optional `AbortSignal` for cooperative cancellation.
+   *
+   * @example
+   * ```typescript
+   * const controller = new AbortController();
+   * try {
+   *   for await (const chunk of client.streamChatCompletions(
+   *     {
+   *       model: "Qwen/Qwen3-4B-Instruct-2507",
+   *       messages: [{ role: "user", content: "Count to ten." }],
+   *       stream_options: { include_usage: true },
+   *     },
+   *     controller.signal,
+   *   )) {
+   *     process.stdout.write(chunk.choices[0]?.delta.content ?? "");
+   *   }
+   * } catch (err) {
+   *   if (err instanceof SIEStreamError) {
+   *     console.error(`mid-stream error: ${err.code} — ${err.message}`);
+   *   } else throw err;
+   * }
+   * ```
+   */
+  async *streamChatCompletions(
+    req: ChatCompletionRequest,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatCompletionChunk, void, undefined> {
+    const body = { ...req, stream: true };
+    const url = `${this.baseUrl}/v1/chat/completions`;
+    yield* this.consumeSseStream<ChatCompletionChunk>(url, body, req.model, signal, (chunk) =>
+      extractChatChunkError(chunk),
+    );
+  }
+
+  /**
+   * Streaming companion to {@link generate} — opens an SSE connection to
+   * `/v1/generate/{model}` with `stream: true` and yields the SIE-native
+   * chunk shape documented in
+   * `packages/sie_gateway/src/handlers/sse.rs::build_generate_chunk_event`.
+   *
+   * The first delta carries `seq: 0` and `text_delta` populated; the
+   * terminal chunk has `done: true`, `finish_reason`, and (typically)
+   * `usage` + `ttft_ms`. The generator completes on the `data: [DONE]`
+   * sentinel.
+   *
+   * Error semantics match {@link streamChatCompletions}: pre-stream HTTP
+   * errors throw normally, mid-stream `error` chunks throw
+   * {@link SIEStreamError}.
+   *
+   * @example
+   * ```typescript
+   * for await (const chunk of client.streamGenerate(
+   *   "Qwen/Qwen3-4B-Instruct-2507",
+   *   "Write a haiku.",
+   *   { maxNewTokens: 64, temperature: 0.7 },
+   * )) {
+   *   process.stdout.write(chunk.text_delta);
+   *   if (chunk.done) console.log(`\nTTFT: ${chunk.ttft_ms}ms`);
+   * }
+   * ```
+   */
+  async *streamGenerate(
+    model: string,
+    prompt: string,
+    options: GenerateOptions,
+    signal?: AbortSignal,
+  ): AsyncGenerator<GenerateChunk, void, undefined> {
+    const body: Record<string, unknown> = {
+      prompt,
+      max_new_tokens: options.maxNewTokens,
+      temperature: options.temperature ?? 1.0,
+      top_p: options.topP ?? 1.0,
+      stream: true,
+    };
+    if (options.stop !== undefined) body.stop = options.stop;
+
+    const safeModel = model.replaceAll("/", "__");
+    const url = `${this.baseUrl}/v1/generate/${encodeURIComponent(safeModel)}`;
+
+    // Routing headers (parallel to generate()) — pool / gpu are passed
+    // here even though the SSE handler also reads them from the body
+    // for some endpoints, because the gateway looks at headers first.
+    const { pool, gpu } = this.parseGpuParam(options.gpu);
+    const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;
+    yield* this.consumeSseStream<GenerateChunk>(
+      url,
+      body,
+      model,
+      signal,
+      (chunk) => extractGenerateChunkError(chunk),
+      { pool, gpu },
+      { waitForCapacity },
+    );
+  }
+
+  /**
+   * Shared SSE consumption helper for the streaming methods.
+   *
+   * Performs a pre-stream provisioning retry loop (honoring
+   * `waitForCapacity`/`provisionTimeout`), surfaces pre-stream errors via
+   * {@link handleError} (so callers see the same `RequestError` /
+   * `ServerError` hierarchy as the non-streaming endpoints), then iterates
+   * the SSE payloads via {@link parseSseStream}. Each payload is JSON-parsed;
+   * if the consumer-supplied `extractError` returns an `SIEStreamError`, the
+   * generator throws it instead of yielding the chunk.
+   *
+   * Retry policy mirrors {@link generate}: only the SAFE pre-execution
+   * capacity signals — `202` (provisioning) and `503 MODEL_LOADING` — are
+   * retried, and only while `waitForCapacity` is set and the provision
+   * budget remains. Once the body opens we never retry (the call is
+   * non-idempotent; a mid-stream failure must not re-issue generation).
+   *
+   * @internal
+   */
+  private async *consumeSseStream<T>(
+    url: string,
+    body: unknown,
+    model: string,
+    signal: AbortSignal | undefined,
+    extractError: (chunk: T) => SIEStreamError | null,
+    routing?: { pool?: string; gpu?: string },
+    provisioning?: { waitForCapacity?: boolean },
+  ): AsyncGenerator<T, void, undefined> {
+    const headers = this.buildChatHeaders("text/event-stream");
+    if (routing?.pool) headers["X-SIE-Pool"] = routing.pool;
+    if (routing?.gpu) headers["X-SIE-MACHINE-PROFILE"] = routing.gpu;
+    const waitForCapacity = provisioning?.waitForCapacity ?? this.defaultWaitForCapacity;
+    const gpu = routing?.gpu;
+
+    // Compose the caller's signal with our internal timeout-controller so
+    // both can cancel the fetch. We use a fresh controller per call so
+    // multiple concurrent streams don't share state.
+    const controller = new AbortController();
+    const onCallerAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) {
+        throw new SIEConnectionError("Stream aborted before request", "other");
+      }
+      signal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+
+    try {
+      const startTime = Date.now();
+      let response: Response | undefined;
+
+      // Pre-stream provisioning retry loop. We re-fetch on the SAFE
+      // pre-execution capacity signals only (202 / 503 MODEL_LOADING),
+      // parallel to `generate()`. The loop terminates by `break`-ing on a
+      // 200 (the only status that opens a body) or by throwing.
+      while (true) {
+        if (signal?.aborted) {
+          throw new SIEConnectionError("Stream aborted before request", "other");
+        }
+        // Pre-stream timeout only — once the body starts flowing we rely on
+        // inter-chunk timeouts on the gateway side (`sse.rs` has its own
+        // three-tier taxonomy). Setting `this.timeout` for the whole stream
+        // would cap long generations at 30s. A fresh per-attempt timeout
+        // covers each pre-stream fetch.
+        const preStreamTimeoutId = setTimeout(() => controller.abort(), this.timeout);
+        let attemptResponse: Response;
+        try {
+          attemptResponse = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } catch (error) {
+          if (signal?.aborted) {
+            throw new SIEConnectionError("Stream aborted before response", "other");
+          }
+          if (error instanceof Error && error.name === "AbortError") {
+            throw new SIEConnectionError(`Stream open timeout after ${this.timeout}ms`, "timeout");
+          }
+          if (error instanceof TypeError) {
+            throw new SIEConnectionError(`Connection failed: ${error.message}`, "connect");
+          }
+          throw error;
+        } finally {
+          clearTimeout(preStreamTimeoutId);
+        }
+
+        // BUG 13a: `Response.ok` is true for 202, so the old `!response.ok`
+        // gate let a 202 slip through to `response.body` (null) and throw a
+        // misleading "no body" RequestError. Handle 202 explicitly as the
+        // provisioning path (retry under `waitForCapacity`, else throw
+        // ProvisioningError honoring Retry-After).
+        if (attemptResponse.status === HTTP_ACCEPTED) {
+          if (!waitForCapacity) {
+            throw new ProvisioningError(
+              "No capacity available. Server is provisioning.",
+              gpu,
+              getRetryAfter(attemptResponse),
+            );
+          }
+          const elapsed = Date.now() - startTime;
+          if (elapsed >= this.provisionTimeout) {
+            throw new ProvisioningError(
+              `Provisioning timeout after ${elapsed}ms`,
+              gpu,
+              getRetryAfter(attemptResponse),
+            );
+          }
+          const delay = getRetryAfter(attemptResponse) ?? DEFAULT_RETRY_DELAY;
+          // Abortable: a long Retry-After sleep must yield promptly if the
+          // caller aborts (`controller.signal` fires on caller-abort), not
+          // wait out the full delay before the next loop's abort check.
+          if (
+            await abortableSleep(
+              Math.min(delay, this.provisionTimeout - elapsed),
+              controller.signal,
+            )
+          ) {
+            throw new SIEConnectionError("Stream aborted while provisioning", "other");
+          }
+          continue;
+        }
+
+        // 502 MODEL_LOAD_FAILED is terminal — surface immediately.
+        await throwIfModelLoadFailed(attemptResponse, model);
+
+        // BUG 13b: retry 503 MODEL_LOADING (a SAFE pre-execution signal)
+        // when the caller opted into waiting for capacity, parallel to
+        // `generate()`. Without `waitForCapacity` we fall through to
+        // `handleError` and reject immediately (no retry).
+        if (attemptResponse.status === 503) {
+          const errorCode = await getErrorCode(attemptResponse.clone());
+          if (errorCode === MODEL_LOADING_ERROR_CODE && waitForCapacity) {
+            const elapsed = Date.now() - startTime;
+            if (elapsed >= this.provisionTimeout) {
+              throw new ModelLoadingError(`Model loading timeout for '${model}'`, model);
+            }
+            const delay = getRetryAfter(attemptResponse) ?? MODEL_LOADING_DEFAULT_DELAY;
+            if (
+              await abortableSleep(
+                Math.min(delay, this.provisionTimeout - elapsed),
+                controller.signal,
+              )
+            ) {
+              throw new SIEConnectionError("Stream aborted while provisioning", "other");
+            }
+            continue;
+          }
+          // Generic 503 (scale-from-zero: no / non-MODEL_LOADING error code).
+          // Retry under `waitForCapacity`, mirroring non-streaming
+          // `generate()`. This is still a SAFE pre-execution signal — the
+          // body has not started, so no partial generation is at risk — so
+          // the non-idempotency reasoning (never retry a mid-stream failure)
+          // is preserved.
+          if (waitForCapacity) {
+            const elapsed = Date.now() - startTime;
+            if (elapsed < this.provisionTimeout) {
+              const delay = getRetryAfter(attemptResponse) ?? DEFAULT_RETRY_DELAY;
+              if (
+                await abortableSleep(
+                  Math.min(delay, this.provisionTimeout - elapsed),
+                  controller.signal,
+                )
+              ) {
+                throw new SIEConnectionError("Stream aborted while provisioning", "other");
+              }
+              continue;
+            }
+          }
+        }
+
+        // Any remaining non-200 is an error: don't rely on `!response.ok`
+        // (which would also be false for the already-handled 202).
+        if (attemptResponse.status !== 200) {
+          await handleError(attemptResponse);
+        }
+
+        response = attemptResponse;
+        break;
+      }
+
+      if (!response) {
+        throw new RequestError("Streaming request failed without producing a response");
+      }
+      this.checkServerVersion(response);
+
+      const bodyStream = response.body;
+      if (!bodyStream) {
+        throw new RequestError("Streaming response has no body");
+      }
+      const reader = bodyStream.getReader();
+      for await (const payload of parseSseStream(reader, signal ?? controller.signal)) {
+        let chunk: T;
+        try {
+          chunk = JSON.parse(payload) as T;
+        } catch (err) {
+          throw new RequestError(
+            `Failed to parse SSE chunk as JSON: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        const streamErr = extractError(chunk);
+        if (streamErr) throw streamErr;
+        yield chunk;
+      }
+    } finally {
+      if (signal) signal.removeEventListener("abort", onCallerAbort);
+    }
+  }
+
+  /**
+   * Build the standard JSON header set for the chat-completions surface.
+   * Pulled out so both the streaming and non-streaming paths agree on
+   * auth / version / content-type wiring.
+   */
+  private buildChatHeaders(
+    accept: "application/json" | "text/event-stream",
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
+      Accept: accept,
+      "Content-Type": JSON_CONTENT_TYPE,
+      [SDK_VERSION_HEADER]: SDK_VERSION,
+    };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    return headers;
+  }
+
   async score(
     model: string,
     query: Item,
@@ -588,17 +1154,18 @@ export class SIEClient {
   }
 
   /**
-   * Create a resource pool for isolated capacity.
+   * Create or update a resource pool for isolated capacity.
    *
    * Pools provide dedicated worker capacity, isolated from other clients.
    * Workers are assigned to pools and only serve requests from that pool.
    *
    * @param name - Pool name (used in GPU param as "poolName/machineProfile")
-   * @param gpus - Machine profile requirements, e.g., { "l4": 2, "l4-spot": 1 }
+   * @param gpus - Optional machine profile requirements for pool readiness, e.g., { "l4": 2, "l4-spot": 1 }
+   * @param gpuCaps - Optional maximum assigned workers per machine profile
    *
    * @example
    * ```typescript
-   * // Create a pool with 2 L4 GPUs
+   * // Create or update a pool with 2 L4 GPUs
    * await client.createPool("eval-bench", { l4: 2 });
    *
    * // Use the pool for requests
@@ -608,14 +1175,27 @@ export class SIEClient {
    * await client.deletePool("eval-bench");
    * ```
    */
-  async createPool(name: string, gpus: Record<string, number>): Promise<void> {
-    // Check if pool already exists in our tracking
-    if (this.pools.has(name)) {
-      return; // Pool already created
-    }
+  async createPool(
+    name: string,
+    gpus?: Record<string, number>,
+    gpuCaps?: Record<string, number>,
+  ): Promise<void> {
+    const alreadyTracking = this.pools.has(name);
 
     // Build pool creation request
-    const requestBody = { name, gpus };
+    const requestBody: {
+      name: string;
+      gpus?: Record<string, number>;
+      gpu_caps?: Record<string, number>;
+    } = {
+      name,
+    };
+    if (gpus !== undefined) {
+      requestBody.gpus = gpus;
+    }
+    if (gpuCaps) {
+      requestBody.gpu_caps = gpuCaps;
+    }
 
     const url = `${this.baseUrl}/v1/pools`;
     const headers: Record<string, string> = {
@@ -648,6 +1228,10 @@ export class SIEClient {
           // Use status text
         }
         throw new PoolError(`Failed to create pool '${name}': ${errorMsg}`, name);
+      }
+
+      if (alreadyTracking || this.pools.has(name)) {
+        return;
       }
 
       // Start lease renewal loop for this pool (recursive setTimeout
@@ -692,7 +1276,7 @@ export class SIEClient {
                 signal: perAttempt.signal,
               });
               if (resp.ok) break;
-            } catch (error) {
+            } catch {
               // Pool-level abort → stop entirely
               if (abortController.signal.aborted) return;
               // Per-attempt timeout or network error → fall through to retry
@@ -755,7 +1339,7 @@ export class SIEClient {
       const response = await this.requestJson(`/v1/pools/${encodeURIComponent(name)}`);
       const data = (await response.json()) as {
         name: string;
-        spec: { gpus?: Record<string, number> };
+        spec: { gpus?: Record<string, number>; gpu_caps?: Record<string, number> };
         status: {
           state: string;
           assigned_workers: Array<{ name: string; url: string; gpu: string }>;
@@ -1254,14 +1838,17 @@ export class SIEClient {
       : undefined;
 
     try {
-      if (headers) {
-        return new (
-          WebSocket as unknown as {
-            new (u: string, p?: string[], o?: { headers: Record<string, string> }): WebSocket;
-          }
-        )(url, [], { headers });
+      if (!headers) {
+        return new WebSocket(url);
       }
-      return new WebSocket(url);
+      // In Node, `WebSocket` resolves to the `ws` package which accepts
+      // a third `{ headers }` options argument. In browsers, the native
+      // WebSocket only takes `(url, protocols)` and the third arg is
+      // silently dropped. Use `Reflect.construct` with a runtime args
+      // array so the call site doesn't statically appear to pass
+      // superfluous trailing arguments to the lib.dom WebSocket type.
+      const args: unknown[] = [url, [], { headers }];
+      return Reflect.construct(WebSocket, args) as WebSocket;
     } catch (error) {
       if (headers) {
         throw new SIEConnectionError(

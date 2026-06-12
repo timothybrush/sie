@@ -10,6 +10,26 @@ use crate::server::AppState;
 use crate::state::model_registry::ModelRegistry;
 use crate::types::model::{ModelEntry, ModelInfoExtras};
 
+/// Stable `created` timestamp stamped on the OpenAI-shaped model
+/// objects. SIE has no per-model creation time and OpenAI clients only
+/// use the field for display/sorting, so a fixed epoch keeps the
+/// response deterministic (matches the value the demo nginx shim used).
+const OPENAI_MODEL_CREATED_TS: i64 = 1_700_000_000;
+/// `owned_by` value on OpenAI-shaped model objects.
+const OPENAI_MODEL_OWNER: &str = "sie";
+
+/// Build one OpenAI-shaped model object (`{id, object, created,
+/// owned_by}`). `id` matches the string `/v1/chat/completions` accepts
+/// as `model`, so a vanilla OpenAI client can list-then-call.
+fn openai_model_object(name: &str) -> Value {
+    json!({
+        "id": name,
+        "object": "model",
+        "created": OPENAI_MODEL_CREATED_TS,
+        "owned_by": OPENAI_MODEL_OWNER,
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/v1/models",
@@ -38,7 +58,25 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
         })
         .collect();
 
-    (StatusCode::OK, Json(json!({"models": models}))).into_response()
+    // Hybrid response: the native `models` array (consumed by the SIE
+    // Python/TS SDKs) plus the OpenAI list shape (`object` + `data`)
+    // that vanilla OpenAI clients and Open WebUI expect for model
+    // discovery. Emitting both keeps existing SDK consumers working
+    // while removing the need for an external OpenAI-shape shim.
+    let data: Vec<Value> = model_names
+        .iter()
+        .map(|name| openai_model_object(name))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": data,
+            "models": models,
+        })),
+    )
+        .into_response()
 }
 
 /// Detail counterpart to `get_models`.
@@ -55,15 +93,17 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
 pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppState>>) -> Response {
     let model_entry = state.model_registry.get_model_info(&model);
     let known_in_registry = model_entry.is_some();
-    let canonical_model = model_entry
+    // Own the canonical name so it stays valid after `model_entry` is
+    // moved into the body match below.
+    let canonical_model: String = model_entry
         .as_ref()
-        .map(|entry| entry.name.as_str())
-        .unwrap_or(model.as_str());
+        .map(|entry| entry.name.clone())
+        .unwrap_or_else(|| model.clone());
     let bundles = state.model_registry.get_model_bundles(&model);
     let model_workers =
         canonical_worker_models(state.registry.get_models().await, &state.model_registry);
     let worker_urls = model_workers
-        .get(canonical_model)
+        .get(canonical_model.as_str())
         .cloned()
         .unwrap_or_default();
 
@@ -81,10 +121,24 @@ pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppSta
     }
 
     let loaded = !worker_urls.is_empty();
-    let body = match model_entry {
+    let mut body = match model_entry {
         Some(entry) => entry.to_model_info_value(loaded),
         None => worker_only_model_info(&model, loaded),
     };
+
+    // Additive OpenAI compatibility: merge the OpenAI model-object
+    // fields (`id`/`object`/`created`/`owned_by`) into the native
+    // detail payload so a vanilla OpenAI client's "retrieve model"
+    // call works. `id` is the canonical model name — the same string
+    // `/v1/chat/completions` accepts. Native consumers ignore the
+    // extra keys.
+    if let Some(map) = body.as_object_mut() {
+        if let Value::Object(openai_fields) = openai_model_object(&canonical_model) {
+            for (k, v) in openai_fields {
+                map.entry(k).or_insert(v);
+            }
+        }
+    }
 
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -118,6 +172,14 @@ fn worker_only_model_info(name: &str, loaded: bool) -> Value {
             outputs: Vec::new(),
             dims: HashMap::new(),
             max_sequence_length: None,
+            max_output_tokens: None,
+            grammar_capabilities: None,
+            tools_supported: None,
+            code: false,
+            sql: false,
+            guard: false,
+            lora_adapters: None,
+            profile_lora_adapters: None,
         },
     }
     .to_model_info_value(loaded)
@@ -262,6 +324,7 @@ mod route_tests {
         Config {
             host: "127.0.0.1".to_string(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: "default".to_string(),
@@ -282,8 +345,11 @@ mod route_tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
+            stream_max_age_s: 120,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
@@ -351,6 +417,127 @@ mod route_tests {
             .unwrap();
     }
 
+    // End-to-end through the routing entry point (proxy::resolve_model_and_bundle),
+    // not just the pure resolver: a `sql` job alias whose target carries a BF16
+    // bundle routes model="sql" to that bundle, a `code` alias to the FP8 bundle
+    // of the SAME base model, an explicit caller bundle overrides the alias, and
+    // an alias pointing at a bundle the model isn't registered under is a hard
+    // error (not a silent FP8 fallback). Validates the #1184 precision-routing
+    // mechanism against a real AppState + ModelRegistry.
+    #[test]
+    fn test_resolve_model_and_bundle_alias_carries_precision_bundle() {
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        // Two bundles sharing the seeded model's adapter → the model lives in both.
+        for name in ["fp8-pytorch", "bf16-pytorch"] {
+            std::fs::write(
+                bundles_dir.path().join(format!("{name}.yaml")),
+                format!("name: {name}\nadapters:\n  - module\n"),
+            )
+            .unwrap();
+        }
+
+        let mut config = test_config(
+            bundles_dir.path().to_str().unwrap(),
+            models_dir.path().to_str().unwrap(),
+        );
+        config.model_aliases = HashMap::from([
+            ("sql".to_string(), "bf16-pytorch:/test/model".to_string()),
+            ("code".to_string(), "fp8-pytorch:/test/model".to_string()),
+            ("broken".to_string(), "ghost-bundle:/test/model".to_string()),
+        ]);
+        let config = Arc::new(config);
+        let model_registry = Arc::new(ModelRegistry::new(
+            bundles_dir.path(),
+            models_dir.path(),
+            true,
+        ));
+        let state = AppState {
+            registry: Arc::new(WorkerRegistry::new(Duration::from_secs(30), None)),
+            config: Arc::clone(&config),
+            model_registry,
+            pool_manager: Arc::new(PoolManager::new(Vec::new())),
+            work_publisher: None,
+            demand_tracker: Arc::new(DemandTracker::new()),
+            config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+        };
+        seed_model(&state, "test/model");
+
+        use crate::handlers::proxy::resolve_model_and_bundle;
+        // sql -> BF16 bundle; code -> FP8 bundle (same base model, different precision).
+        assert_eq!(
+            resolve_model_and_bundle(&state, "sql").unwrap(),
+            ("test/model".to_string(), "bf16-pytorch".to_string()),
+        );
+        assert_eq!(
+            resolve_model_and_bundle(&state, "code").unwrap(),
+            ("test/model".to_string(), "fp8-pytorch".to_string()),
+        );
+        // An explicit caller bundle overrides the alias's bundle.
+        assert_eq!(
+            resolve_model_and_bundle(&state, "fp8-pytorch:/sql").unwrap(),
+            ("test/model".to_string(), "fp8-pytorch".to_string()),
+        );
+        // Alias -> a bundle the model isn't registered under: hard 409, no fallback.
+        assert!(resolve_model_and_bundle(&state, "broken").is_err());
+    }
+
+    /// Seed a multi-profile model whose profiles declare disjoint LoRA
+    /// adapter sets. Used to exercise the per-profile lora_adapter
+    /// scoping behavior introduced for M10.
+    fn seed_multi_profile_lora_model(state: &AppState, model_id: &str) {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: Some(serde_json::json!({
+                    "loadtime": {
+                        "lora_paths": {
+                            "a1": "acme/a1",
+                            "a2": "acme/a2",
+                        }
+                    }
+                })),
+                extends: None,
+            },
+        );
+        profiles.insert(
+            "a100".to_string(),
+            ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(8192),
+                compute_precision: None,
+                adapter_options: Some(serde_json::json!({
+                    "loadtime": {
+                        "lora_paths": {
+                            "b1": "acme/b1",
+                        }
+                    }
+                })),
+                extends: None,
+            },
+        );
+        // Pass the raw profiles via the YAML tasks field so
+        // ``ModelInfoExtras::from_yaml_raw`` picks the lora_paths up.
+        // ``add_model_config`` re-serializes ModelConfig to YAML
+        // internally, so this just sets up the right shape.
+        state
+            .model_registry
+            .add_model_config(ModelConfig {
+                name: model_id.to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                profiles,
+                inputs: None,
+                tasks: Some(serde_yaml::from_str("generate: {}").unwrap()),
+                max_sequence_length: None,
+            })
+            .unwrap();
+    }
+
     fn worker_msg(name: &str, loaded_models: Vec<String>) -> WorkerStatusMessage {
         WorkerStatusMessage {
             name: name.into(),
@@ -366,6 +553,8 @@ mod route_tests {
             memory_total_bytes: Some(0),
             gpus: Vec::new(),
             pool_name: String::new(),
+            saturated: false,
+            terminated: false,
         }
     }
 
@@ -395,6 +584,39 @@ mod route_tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["name"], "BAAI/bge-m3");
         assert_eq!(models[0]["loaded"], false);
+    }
+
+    #[tokio::test]
+    async fn test_list_models_emits_openai_list_shape() {
+        // OpenAI-compat: `/v1/models` must carry the OpenAI list shape
+        // (`object: "list"` + `data: [{id, object, created, owned_by}]`)
+        // alongside the native `models` array so vanilla OpenAI clients
+        // (and Open WebUI) can discover models without an external shim.
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_model(&state, "BAAI/bge-m3");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["object"], "list");
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        // `id` must equal the string `/v1/chat/completions` accepts.
+        assert_eq!(data[0]["id"], "BAAI/bge-m3");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "sie");
+        assert!(data[0]["created"].is_i64());
+        // Native shape still present (SDK consumers depend on it).
+        assert_eq!(body["models"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -493,6 +715,11 @@ mod route_tests {
         assert_eq!(body["state"], "available");
         assert!(!body["inputs"].as_array().unwrap().is_empty());
         assert!(body["profiles"].is_object());
+        // Additive OpenAI retrieve-model fields are merged in.
+        assert_eq!(body["id"], "BAAI/bge-m3");
+        assert_eq!(body["object"], "model");
+        assert_eq!(body["owned_by"], "sie");
+        assert!(body["created"].is_i64());
     }
 
     #[tokio::test]
@@ -575,6 +802,69 @@ mod route_tests {
             .as_str()
             .unwrap()
             .contains("does/not/exist"));
+    }
+
+    #[tokio::test]
+    async fn test_models_response_advertises_per_profile_lora_breakdown() {
+        // M10: ``/v1/models`` must surface BOTH the model-level
+        // ``lora_adapters`` union (back-compat for existing clients
+        // listing advertised adapters) AND the per-profile
+        // ``profile_lora_adapters`` breakdown so consumers needing
+        // precise routing scope don't have to reverse-engineer it. A
+        // model with disjoint adapter sets on ``default`` and ``a100``
+        // must expose the union of all four under
+        // ``capabilities.lora_adapters`` and the precise per-profile
+        // mapping under ``capabilities.profile_lora_adapters``.
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_multi_profile_lora_model(&state, "acme/multi");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models/acme/multi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let caps = body["capabilities"]
+            .as_object()
+            .expect("capabilities block");
+        // Union (back-compat) carries every adapter advertised by any
+        // profile.
+        let mut union: Vec<String> = caps["lora_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        union.sort();
+        assert_eq!(
+            union,
+            vec!["a1".to_string(), "a2".to_string(), "b1".to_string()]
+        );
+        // Per-profile breakdown scopes adapters by profile name.
+        let per_profile = caps["profile_lora_adapters"]
+            .as_object()
+            .expect("profile_lora_adapters present");
+        let mut default_adapters: Vec<String> = per_profile["default"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        default_adapters.sort();
+        assert_eq!(default_adapters, vec!["a1".to_string(), "a2".to_string()]);
+        let a100_adapters: Vec<String> = per_profile["a100"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(a100_adapters, vec!["b1".to_string()]);
     }
 
     #[tokio::test]

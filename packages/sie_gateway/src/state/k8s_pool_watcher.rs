@@ -179,6 +179,7 @@ mod tests {
                 name: name.to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
+                gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
             },

@@ -12,6 +12,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import ScoreOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -375,7 +376,7 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         from PIL import Image
 
         img_input = item.images[0]
-        pil_img = Image.open(io.BytesIO(img_input["data"]))
+        pil_img = Image.open(io.BytesIO(media_bytes(img_input, kind="image")))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
         return pil_img

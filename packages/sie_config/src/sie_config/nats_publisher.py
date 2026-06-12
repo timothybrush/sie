@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import errno
 import logging
 import os
 import socket
@@ -71,6 +73,19 @@ class NatsPublisher:
         self._nc: nats.NATS | None = None
         self._router_id = _get_router_id()
         self._connected = False
+        self._boot_connect_task: asyncio.Task[None] | None = None
+        self._deferred_connect_task: asyncio.Task[None] | None = None
+
+    def kickoff_connect(self) -> None:
+        """Schedule :meth:`connect` without blocking the caller.
+
+        FastAPI only serves ``/healthz`` after the lifespan stack yields; awaiting
+        a long initial NATS dial here delays the HTTP bind and makes Kubernetes
+        startup probes fail while the NATS pod is still coming up.
+        """
+        if self._boot_connect_task is not None and not self._boot_connect_task.done():
+            return
+        self._boot_connect_task = asyncio.create_task(self.connect())
 
     @property
     def connected(self) -> bool:
@@ -87,31 +102,122 @@ class NatsPublisher:
 
         Does not raise on failure -- logs warning and sets connected=False.
         The config service can operate without NATS (config mutations blocked).
+
+        Kubernetes often starts sie-config before the NATS StatefulSet is ready.
+        ``nats.connect(..., max_reconnect_attempts=-1)`` can block for a long time
+        inside a single await. The lifespan uses :meth:`kickoff_connect` so HTTP
+        binds first; this method still caps the *first* dial with
+        ``SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC`` (default 45s), then retries in
+        :meth:`_deferred_connect_loop` until NATS is reachable.
         """
+        raw_budget = os.environ.get("SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC", "45")
         try:
-            self._nc = await nats.connect(
-                self._nats_url,
-                reconnected_cb=self._handle_reconnect,
-                disconnected_cb=self._handle_disconnect,
-                error_cb=self._handle_error,
-                max_reconnect_attempts=-1,  # Reconnect forever
-                reconnect_time_wait=2,  # 2s between reconnect attempts
+            budget = float(raw_budget)
+        except (TypeError, ValueError):
+            budget = 45.0
+            logger.warning(
+                "Invalid SIE_NATS_STARTUP_CONNECT_TIMEOUT_SEC=%r; using default %.0fs",
+                raw_budget,
+                budget,
+            )
+        try:
+            self._nc = await asyncio.wait_for(
+                nats.connect(
+                    self._nats_url,
+                    reconnected_cb=self._handle_reconnect,
+                    disconnected_cb=self._handle_disconnect,
+                    error_cb=self._handle_error,
+                    max_reconnect_attempts=-1,
+                    reconnect_time_wait=2,
+                ),
+                timeout=budget,
             )
             self._connected = True
             sie_metrics.set_nats_connected(True)
             logger.info("Connected to NATS at %s (router_id=%s)", self._nats_url, self._router_id)
-
-        except Exception:  # noqa: BLE001 -- graceful degradation when NATS unavailable
+            return
+        except TimeoutError:
+            self._nc = None
             self._connected = False
             sie_metrics.set_nats_connected(False)
             logger.warning(
-                "Failed to connect to NATS at %s -- config mutations will be blocked",
+                "NATS at %s not ready within %.0fs - retries continue in background",
+                self._nats_url,
+                budget,
+            )
+        except Exception:  # noqa: BLE001 -- graceful degradation when NATS unavailable
+            self._nc = None
+            self._connected = False
+            sie_metrics.set_nats_connected(False)
+            logger.warning(
+                "Failed to connect to NATS at %s -- config mutations will be blocked until reconnect",
                 self._nats_url,
                 exc_info=True,
             )
 
+        self._schedule_deferred_connect()
+
+    def _schedule_deferred_connect(self) -> None:
+        if self._connected:
+            return
+        if self._deferred_connect_task is not None and not self._deferred_connect_task.done():
+            return
+        self._deferred_connect_task = asyncio.create_task(self._deferred_connect_loop())
+
+    async def _deferred_connect_loop(self) -> None:
+        backoff_s = 2.0
+        while not self.connected:
+            try:
+                if self._nc is not None:
+                    try:
+                        await self._nc.drain()
+                    except Exception:  # noqa: BLE001 -- best-effort cleanup
+                        logger.debug("Failed to drain stale NATS client", exc_info=True)
+                    self._nc = None
+
+                self._nc = await nats.connect(
+                    self._nats_url,
+                    reconnected_cb=self._handle_reconnect,
+                    disconnected_cb=self._handle_disconnect,
+                    error_cb=self._handle_error,
+                    max_reconnect_attempts=-1,
+                    reconnect_time_wait=2,
+                )
+                self._connected = True
+                sie_metrics.set_nats_connected(True)
+                logger.info(
+                    "Connected to NATS at %s (router_id=%s) after startup deferral",
+                    self._nats_url,
+                    self._router_id,
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- keep retrying until cancelled or success
+                sie_metrics.set_nats_connected(False)
+                logger.debug("NATS connect retry failed; backing off", exc_info=True)
+                await asyncio.sleep(backoff_s)
+
     async def disconnect(self) -> None:
         """Disconnect from NATS."""
+        if self._boot_connect_task is not None and not self._boot_connect_task.done():
+            self._boot_connect_task.cancel()
+            try:
+                await self._boot_connect_task
+            except asyncio.CancelledError:
+                # Expected after cancelling the startup connect task during shutdown.
+                pass
+            self._boot_connect_task = None
+
+        if self._deferred_connect_task is not None and not self._deferred_connect_task.done():
+            self._deferred_connect_task.cancel()
+            try:
+                await self._deferred_connect_task
+            except asyncio.CancelledError:
+                # Expected after cancelling the deferred retry task during shutdown.
+                pass
+            self._deferred_connect_task = None
+
         if self._nc:
             try:
                 await self._nc.drain()
@@ -138,11 +244,12 @@ class NatsPublisher:
         For each affected bundle, builds one canonical ``ConfigNotification``
         payload and publishes it to two subjects:
 
-        1. ``sie.config.models.{bundle}`` -- consumed by workers
+        1. ``sie.config.models.{bundle}`` -- reserved for worker-side apply
         2. ``sie.config.models._all`` -- consumed by Rust gateways
 
-        The same payload shape goes to both subjects so every subscriber sees
-        the full set of fields that ``sie_gateway`` expects
+        worker-sidecar containers consume the bundle-scoped subject. The same
+        payload shape goes to both subjects so every subscriber sees the full
+        set of fields that ``sie_gateway`` expects
         (``router_id``, ``bundle_id``, ``epoch``, ``bundle_config_hash``,
         ``model_id``, ``profiles_added``, ``model_config``, ``affected_bundles``).
         See ``packages/sie_gateway/src/nats/manager.rs::ConfigNotification``.
@@ -259,4 +366,8 @@ class NatsPublisher:
 
     async def _handle_error(self, e: Exception) -> None:
         """Handle NATS errors."""
+        errno_val = getattr(e, "errno", None)
+        if isinstance(e, ConnectionRefusedError) or errno_val == errno.ECONNREFUSED:
+            logger.debug("NATS connection refused (retrying): %s", e)
+            return
         logger.error("NATS error: %s", e)

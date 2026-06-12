@@ -1,8 +1,5 @@
 """Typed output types for standardized batched inference results.
 
-See DESIGN.md Section 7.3 for specification.
-See product/roadmap.md Project 10.12 for design rationale.
-
 Three separate output types for three operations:
 - EncodeOutput: from adapter.encode() - embeddings (dense/sparse/multivector)
 - ScoreOutput: from adapter.score_pairs() - reranking scores

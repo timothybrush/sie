@@ -501,6 +501,7 @@ mod tests {
                     m.insert("l4-spot".to_string(), 2);
                     m
                 },
+                gpu_caps: HashMap::new(),
                 ttl_seconds: Some(600),
                 minimum_worker_count: 2,
             },
@@ -540,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_cas_retry_constants() {
-        // Verify the retry parameters match the specification (PRD S9.3)
+        // Verify the retry parameters used by compare-and-swap lease updates.
         assert_eq!(CAS_MAX_RETRIES, 10);
         assert!((CAS_BASE_DELAY_MS - 100.0).abs() < f64::EPSILON);
         assert!((CAS_BACKOFF_FACTOR - 1.5).abs() < f64::EPSILON);
@@ -591,6 +592,7 @@ mod tests {
                     m.insert("l4-spot".to_string(), 1);
                     m
                 },
+                gpu_caps: HashMap::new(),
                 ttl_seconds: Some(300),
                 minimum_worker_count: 1,
             },

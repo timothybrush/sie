@@ -62,6 +62,12 @@ auto-retries; see `packages/sie_sdk/README.md` for client-side controls.
 | `SIE_DEFAULT_COMPUTE_PRECISION` | `float16` | One of `float16`, `bfloat16`, `float32`. |
 | `SIE_ATTENTION_BACKEND` | `auto` | One of `auto`, `flash_attention_2`, `sdpa`, `eager`. |
 
+### Diagnostics
+
+| Env var | Default | Effect |
+|--|--|--|
+| `SIE_GRAMMAR_PREFLIGHT_DEBUG` | unset (off) | Enables the legacy worker-side Outlines preflight compile before each structured-output request. Off by default because SGLang is the production grammar authority. Use for diagnosing schema-rejection problems or slow compiles in a controlled environment; not recommended for production traffic. |
+
 For nested settings (any field with `__`), the env-var format is
 `SIE_<TOP>__<NESTED>=value`. The complete schema is in
 `packages/sie_server/src/sie_server/config/engine.py`.

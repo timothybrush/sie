@@ -1,4 +1,6 @@
 {{- if .Values.ingress.enabled }}
+{{- $hosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -29,9 +31,13 @@ metadata:
   }}
   {{- $annotations = merge $annotations $authDefaults }}
   {{- end }}
-  {{- if and .Values.ingress.tls.enabled (eq .Values.ingress.tls.mode "cert-manager") }}
-  {{- $issuerAnnotation := ternary "cert-manager.io/cluster-issuer" "cert-manager.io/issuer" (eq .Values.ingress.tls.certManager.kind "ClusterIssuer") }}
-  {{- $issuerName := .Values.ingress.tls.certManager.name }}
+  {{- /* cert-manager mode: rely on ingress-shim to auto-create the leaf Certificate from the annotation.
+         self-signed mode renders an explicit Certificate (see self-signed-issuer.yaml); adding the
+         annotation here would race ingress-shim with the explicit Cert (both targeting the same Secret). */ -}}
+  {{- if and $tls.enabled (eq (default "byo" $tls.mode) "cert-manager") }}
+  {{- $certManager := default (dict) $tls.certManager }}
+  {{- $issuerAnnotation := ternary "cert-manager.io/cluster-issuer" "cert-manager.io/issuer" (eq $certManager.kind "ClusterIssuer") }}
+  {{- $issuerName := $certManager.name }}
   {{- if not $issuerName }}{{ $issuerName = printf "%s-letsencrypt-prod" (include "sie-cluster.fullname" .) }}{{ end }}
   {{- $cmDefaults := dict $issuerAnnotation $issuerName }}
   {{- $annotations = merge $annotations $cmDefaults }}
@@ -44,15 +50,18 @@ spec:
   {{- if .Values.ingress.className }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
-  {{- if and .Values.ingress.tls.enabled .Values.ingress.host }}
+  {{- if and $tls.enabled $hosts }}
   tls:
     - hosts:
-        - {{ .Values.ingress.host }}
-      secretName: {{ .Values.ingress.tls.secretName }}
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ $tls.secretName }}
   {{- end }}
   rules:
-    - {{- if .Values.ingress.host }}
-      host: {{ .Values.ingress.host }}
+    {{- range (default (list "") $hosts) }}
+    - {{- if . }}
+      host: {{ . | quote }}
       {{- end }}
       http:
         paths:
@@ -60,7 +69,8 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "sie-cluster.gateway.serviceName" . }}
+                name: {{ include "sie-cluster.gateway.serviceName" $ }}
                 port:
-                  number: {{ .Values.gateway.service.port }}
+                  number: {{ $.Values.gateway.service.port }}
+    {{- end }}
 {{- end }}

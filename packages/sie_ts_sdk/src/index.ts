@@ -40,6 +40,7 @@ export type {
   DetectedObject,
   ExtractResult,
   // Model and cluster info
+  ModelCapabilities,
   ModelDims,
   ModelInfo,
   ModelState,
@@ -66,6 +67,28 @@ export type {
   EncodeOptions,
   ScoreOptions,
   ExtractOptions,
+  // Generation
+  FinishReason,
+  GenerationUsage,
+  GenerateOptions,
+  GenerateResult,
+  // Streaming generate (SSE)
+  GenerateChunk,
+  // Chat completions (OpenAI-compatible)
+  ChatMessage,
+  ToolCall,
+  ToolSpec,
+  ToolCallDelta,
+  ToolChoice,
+  ResponseFormat,
+  ChatFinishReason,
+  ChatCompletionRequest,
+  ChatCompletion,
+  ChatChoice,
+  ChatUsage,
+  ChatCompletionChunk,
+  ChatChunkChoice,
+  ChatDelta,
 } from "./types.js";
 
 // Utility functions
@@ -92,6 +115,7 @@ export {
   LoraLoadingError,
   ModelLoadingError,
   ModelLoadFailedError,
+  SIEStreamError,
   InputTooLongError,
 } from "./errors.js";
 

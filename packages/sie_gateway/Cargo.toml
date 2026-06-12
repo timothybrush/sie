@@ -1,6 +1,6 @@
 [package]
 name = "sie-gateway"
-version = "0.3.4"
+version = "0.6.4"
 edition = "2021"
 publish = false
 
@@ -12,6 +12,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -23,7 +24,7 @@ serde_yaml = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 thiserror = "2"
 dashmap = "6"
 tower = "0.5"
@@ -49,8 +50,11 @@ chrono = { version = "0.4", features = ["serde"] }
 # Phase 11: Request coalescing (MD5 for params hash)
 md-5 = "0.10"
 
+# HRW direct-dispatch routing (xxh3 64-bit hashing of routing keys)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 # Phase 8: NATS integration
-async-nats = "0.38"
+async-nats = "0.49"
 uuid = { version = "1", features = ["v4", "v7"] }
 
 # Phase 10: Queue mode (msgpack serialization)
@@ -64,14 +68,35 @@ fs2 = "0.4"
 serde_bytes = "0.11"
 percent-encoding = "2"
 
-# Cloud config store backends (opt-in)
-object_store = { version = "0.11", optional = true, features = ["aws", "gcp"] }
+# Cloud payload store backends (opt-in)
+object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "azure"] }
 url = { version = "2", optional = true }
 utoipa = "5.4.0"
+
+# W3C Trace Context propagation. The gateway extracts the
+# inbound `traceparent` / `tracestate` HTTP headers, opens a child
+# span around proxy/publish, and injects the resulting context into
+# the JetStream work envelope so the worker can continue the trace.
+#
+# Versions tracked together — the 0.24/0.17/0.25 set is the latest
+# mutually-compatible point release as of this addition. OTel does
+# break compat across minor versions; bumping requires updating all
+# four lines.
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-http = "0.13"
+tracing-opentelemetry = "0.25"
 
 [features]
 default = []
 cloud-storage = ["dep:object_store", "dep:url"]
+# Compile-in the raw-routing-key field on `RoutingKeyResolved` and the
+# `SIE_ROUTING_LOG_RAW` env-var read paths. Without this feature, raw
+# routing keys CANNOT appear in logs regardless of the env var — the
+# fields and code paths simply don't exist in the binary. Off by default
+# so production release builds are privacy-safe at compile time.
+raw-routing-logs = []
 
 [dev-dependencies]
 tempfile = "3"

@@ -13,6 +13,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -97,6 +98,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         max_seq_length: int | None = None,
         pooling: str = "last",
         default_instruction: str = _DEFAULT_INSTRUCTION,
+        dense_dim: int | None = None,
     ) -> None:
         if pooling not in _SUPPORTED_POOLING:
             msg = f"Unsupported pooling '{pooling}', must be one of {_SUPPORTED_POOLING}"
@@ -109,11 +111,12 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         self._max_seq_length = max_seq_length
         self._pooling = pooling
         self._default_instruction = default_instruction
+        self._configured_dense_dim = dense_dim
 
         self._model: Qwen3VLForConditionalGeneration | None = None
         self._processor: AutoProcessor | None = None
         self._device: str | None = None
-        self._dense_dim: int | None = 2048
+        self._dense_dim: int | None = dense_dim or 2048
 
     def load(self, device: str) -> None:
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
@@ -161,12 +164,22 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         # Qwen3VLConfig stores the text model hidden size under text_config
         cfg = self._model.config
         if hasattr(cfg, "hidden_size"):
-            self._dense_dim = cfg.hidden_size
+            self._dense_dim = self._validate_or_set_dense_dim(cfg.hidden_size)
         elif hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
-            self._dense_dim = cfg.text_config.hidden_size
+            self._dense_dim = self._validate_or_set_dense_dim(cfg.text_config.hidden_size)
         else:
             logger.warning("Could not determine hidden_size from config, defaulting to 2048")
-            self._dense_dim = 2048
+            self._dense_dim = self._validate_or_set_dense_dim(2048)
+
+    def _validate_or_set_dense_dim(self, observed_dim: int) -> int:
+        """Validate observed model width against configured dense_dim."""
+        if self._configured_dense_dim is not None and observed_dim != self._configured_dense_dim:
+            msg = (
+                "Qwen3-VL embedding dimension mismatch: "
+                f"configured dense_dim={self._configured_dense_dim}, model hidden_size={observed_dim}"
+            )
+            raise ValueError(msg)
+        return observed_dim
 
     def _resolve_dtype(self) -> torch.dtype:
         if not self._device or not str(self._device).startswith("cuda"):
@@ -356,7 +369,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         pil_images = []
         for idx, img_input in enumerate(item.images or []):
             try:
-                pil_img = Image.open(io.BytesIO(img_input["data"]))
+                pil_img = Image.open(io.BytesIO(media_bytes(img_input, kind="image")))
                 if pil_img.mode != "RGB":
                     pil_img = pil_img.convert("RGB")
                 pil_images.append(pil_img)
@@ -381,7 +394,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
             return []
 
         try:
-            video_bytes = video_input["data"]
+            video_bytes = media_bytes(video_input, kind="video")
         except (KeyError, TypeError) as exc:
             logger.warning("Failed to read video data: %s", exc)
             return []

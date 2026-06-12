@@ -13,8 +13,10 @@ import os
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 
+import hashlib
 import logging
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from sie_sdk.bundle_utils import find_bundle_for_models, match_bundle_models
@@ -218,17 +220,32 @@ def serve(
     host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),  # noqa: S104 — intentional bind to all interfaces for server
     device: str = typer.Option("auto", "--device", "-d", help="Device to use (auto, cuda, mps, cpu)"),
     models_dir: str = typer.Option(
-        DEFAULT_MODELS_DIR, "--models-dir", help="Models directory (local path, s3://, or gs://)"
+        DEFAULT_MODELS_DIR,
+        "--models-dir",
+        help="Models directory (local path, s3://, gs://, abfs://, or abfss://)",
     ),
     bundle: str | None = typer.Option(None, "--bundle", "-b", help="Bundle name to load (from bundles/ dir)"),
     models: str | None = typer.Option(None, "--models", "-m", help="Comma-separated model names to load"),
     local_cache: str | None = typer.Option(None, "--local-cache", help="Local cache directory (default: HF_HOME)"),
-    cluster_cache: str | None = typer.Option(None, "--cluster-cache", help="Cluster cache URL (s3:// or gs://)"),
+    cluster_cache: str | None = typer.Option(
+        None,
+        "--cluster-cache",
+        help="Cluster cache URL (s3://, gs://, abfs://, or abfss://)",
+    ),
     hf_fallback: bool = typer.Option(True, "--hf-fallback/--no-hf-fallback", help="Enable HuggingFace Hub fallback"),
     reload: bool = typer.Option(default=False, help="Enable auto-reload for development"),
     tracing: bool = typer.Option(default=False, help="Enable OpenTelemetry tracing (exports to localhost:4317)"),
     instrumentation: bool = typer.Option(False, "--instrumentation", "-i", help="Enable batch instrumentation logging"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    log_level: Annotated[
+        str,
+        typer.Option(
+            "--log-level",
+            "-l",
+            envvar="SIE_LOG_LEVEL",
+            help="Log level (DEBUG, INFO, WARNING, ERROR). Helm sets SIE_LOG_LEVEL for workers.",
+        ),
+    ] = "info",
     preload: str | None = typer.Option(None, "--preload", help="Comma-separated model names to preload at startup"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Enable structured JSON logging (for Loki)"),
 ) -> None:
@@ -238,7 +255,7 @@ def serve(
     from sie_server.core.logging import configure_logging
 
     # Configure logging (supports JSON format for Loki compatibility)
-    configure_logging(verbose=verbose, json_format=json_logs or None)
+    configure_logging(verbose=verbose, json_format=json_logs or None, level_name=log_level)
 
     # Handle models directory - cloud URLs pass through, local paths resolve
     if is_cloud_path(models_dir):
@@ -281,8 +298,34 @@ def serve(
             typer.echo(f"Available models: {', '.join(sorted(all_configs.keys())[:10])}...", err=True)
             raise typer.Exit(1)
 
+    # Augment the filter with explicitly-allowed extra model ids (opt-in via
+    # ``SIE_EXTRA_MODELS``). A bundle's filter is built by scanning model YAML
+    # files, so it only contains *base* ids — it can't see profile-variant ids
+    # like ``Qwen/Qwen3.6-27B:rtx-pro-6000`` that the loader expands at runtime.
+    # A worker that serves a base model's adapter can also serve that model's
+    # profile variants (same adapter, same weights, different launch flags), so
+    # allow naming them here. Validated against the variant-expanded config set.
+    # The advertised bundle (``SIE_BUNDLE`` below) is unchanged, so gateway
+    # routing by adapter→bundle still resolves these variants to this worker.
+    extra_models_env = os.environ.get("SIE_EXTRA_MODELS")
+    if extra_models_env and model_filter is not None:
+        extras = [m.strip() for m in extra_models_env.split(",") if m.strip()]
+        all_configs = load_model_configs(models_dir_resolved)
+        unknown_extra = [m for m in extras if m not in all_configs]
+        if unknown_extra:
+            typer.echo(f"Error: SIE_EXTRA_MODELS unknown model(s): {', '.join(unknown_extra)}", err=True)
+            raise typer.Exit(1)
+        model_filter = sorted(set(model_filter) | set(extras))
+        typer.echo(f"Extra models added to filter: {', '.join(extras)}")
+
     os.environ["SIE_INSTRUMENTATION"] = "true" if instrumentation else "false"
-    os.environ["SIE_BUNDLE"] = bundle or "default"
+    if bundle:
+        os.environ["SIE_BUNDLE"] = bundle
+    elif model_filter:
+        digest = hashlib.sha256(",".join(sorted(model_filter)).encode("utf-8")).hexdigest()[:12]
+        os.environ["SIE_BUNDLE"] = f"adhoc-{digest}"
+    else:
+        os.environ["SIE_BUNDLE"] = "default"
     # Pass cache config via environment variables
     if local_cache:
         os.environ["SIE_LOCAL_CACHE"] = str(Path(local_cache).resolve())
@@ -307,6 +350,7 @@ def serve(
         typer.echo("Start Jaeger with: mise run jaeger")
 
     typer.echo(f"Starting SIE server on {host}:{port}")
+
     typer.echo(f"Models directory: {models_dir_resolved}")
     typer.echo(f"Device: {resolved_device}")
     if cluster_cache:
@@ -343,7 +387,11 @@ def serve(
         preload_models=preload_models,
     )
 
-    run_server(host=host, port=port, reload=reload, config=config)
+    uvicorn_log = "debug" if verbose else log_level.strip().lower()
+    if uvicorn_log not in ("critical", "error", "warning", "info", "debug", "trace"):
+        uvicorn_log = "info"
+
+    run_server(host=host, port=port, reload=reload, config=config, uvicorn_log_level=uvicorn_log)
 
 
 if __name__ == "__main__":

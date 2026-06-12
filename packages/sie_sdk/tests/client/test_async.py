@@ -563,16 +563,35 @@ class TestAsyncPoolOperations:
         client = SIEAsyncClient("http://localhost:8080")
         client._post = AsyncMock(return_value=resp)  # type: ignore
 
-        await client.create_pool("my-pool", gpus={"l4": 1})
+        await client.create_pool("my-pool", gpus={"l4": 1}, gpu_caps={"l4": 4})
 
         client._post.assert_called_once()
         call_kwargs = client._post.call_args.kwargs
         assert call_kwargs["json_data"]["name"] == "my-pool"
         assert call_kwargs["json_data"]["gpus"] == {"l4": 1}
+        assert call_kwargs["json_data"]["gpu_caps"] == {"l4": 4}
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_create_pool_duplicate_skipped(self) -> None:
+    async def test_create_pool_gpu_caps_only_success(self) -> None:
+        resp = _make_json_response(
+            {"name": "my-pool", "status": {"state": "active"}},
+            status_code=200,
+        )
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(return_value=resp)  # type: ignore
+
+        await client.create_pool("my-pool", gpu_caps={"l4": 4})
+
+        client._post.assert_called_once()
+        call_kwargs = client._post.call_args.kwargs
+        assert call_kwargs["json_data"]["name"] == "my-pool"
+        assert "gpus" not in call_kwargs["json_data"]
+        assert call_kwargs["json_data"]["gpu_caps"] == {"l4": 4}
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_create_pool_duplicate_posts_update_without_duplicate_renewal(self) -> None:
         resp = _make_json_response(
             {"name": "my-pool", "status": {"state": "active"}},
             status_code=200,
@@ -583,11 +602,12 @@ class TestAsyncPoolOperations:
         await client.create_pool("my-pool", gpus={"l4": 1})
         await client.create_pool("my-pool", gpus={"l4": 1})
 
-        assert client._post.call_count == 1
+        assert client._post.call_count == 2
+        assert len(client._pools) == 1
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_create_pool_connection_error_cleans_sentinel(self) -> None:
+    async def test_create_pool_connection_error_cleans_inflight_entry(self) -> None:
         client = SIEAsyncClient("http://localhost:8080")
         client._post = AsyncMock(  # type: ignore
             side_effect=aiohttp.ClientConnectorError(
@@ -599,6 +619,155 @@ class TestAsyncPoolOperations:
         with pytest.raises(SIEConnectionError, match="connection error"):
             await client.create_pool("my-pool", gpus={"l4": 1})
 
+        assert "my-pool" not in client._pools
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_create_pool_waits_for_inflight_creation(self) -> None:
+        release = asyncio.Event()
+        post_calls = 0
+
+        async def gated_post(*_args: object, **_kwargs: object) -> _AioResponse:
+            nonlocal post_calls
+            post_calls += 1
+            await release.wait()
+            return _make_json_response({"name": "my-pool", "status": {"state": "active"}})
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = gated_post  # type: ignore
+
+        first = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+
+        assert post_calls == 1
+        assert not second.done()
+
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert post_calls == 1
+        assert len(client._pools) == 1
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_create_pool_propagates_inflight_failure(self) -> None:
+        release = asyncio.Event()
+        post_calls = 0
+
+        async def failing_post(*_args: object, **_kwargs: object) -> _AioResponse:
+            nonlocal post_calls
+            post_calls += 1
+            await release.wait()
+            raise aiohttp.ServerDisconnectedError
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = failing_post  # type: ignore
+
+        first = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+
+        assert post_calls == 1
+        assert not second.done()
+
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+
+        assert post_calls == 1
+        assert all(isinstance(result, SIEConnectionError) for result in results)
+        assert "my-pool" not in client._pools
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_create_pool_cancel_cleans_inflight_entry(self) -> None:
+        async def slow_post(*_args: object, **_kwargs: object) -> _AioResponse:
+            await asyncio.sleep(60)
+            return _make_json_response({"name": "my-pool", "status": {"state": "active"}})
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = slow_post  # type: ignore
+
+        task = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert "my-pool" not in client._pools
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_close_during_create_pool_does_not_start_renewal(self) -> None:
+        release = asyncio.Event()
+
+        async def gated_post(*_args: object, **_kwargs: object) -> _AioResponse:
+            await release.wait()
+            return _make_json_response({"name": "my-pool", "status": {"state": "active"}})
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = gated_post  # type: ignore
+
+        task = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+        await client.close()
+        release.set()
+        await task
+
+        assert "my-pool" not in client._pools
+
+    @pytest.mark.asyncio
+    async def test_create_pool_cancel_during_lease_start_cleans_inflight_entry(self) -> None:
+        resp = _make_json_response({"name": "my-pool", "status": {"state": "active"}})
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(return_value=resp)  # type: ignore
+
+        async def cancelled_start(*_args: object, **_kwargs: object) -> None:
+            raise asyncio.CancelledError
+
+        client._start_pool_lease_renewal = cancelled_start  # type: ignore
+
+        with pytest.raises(asyncio.CancelledError):
+            await client.create_pool("my-pool", gpus={"l4": 1})
+
+        assert "my-pool" not in client._pools
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_delete_pool_waits_for_inflight_create_before_delete(self) -> None:
+        release = asyncio.Event()
+        events: list[str] = []
+
+        async def gated_post(*_args: object, **_kwargs: object) -> _AioResponse:
+            events.append("post-start")
+            await release.wait()
+            events.append("post-end")
+            return _make_json_response({"name": "my-pool", "status": {"state": "active"}})
+
+        async def tracked_delete(*_args: object, **_kwargs: object) -> _AioResponse:
+            events.append("delete")
+            return _make_json_response({}, status_code=200)
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = gated_post  # type: ignore
+        client._delete = tracked_delete  # type: ignore
+
+        create_task = asyncio.create_task(client.create_pool("my-pool", gpus={"l4": 1}))
+        await asyncio.sleep(0)
+        delete_task = asyncio.create_task(client.delete_pool("my-pool"))
+        await asyncio.sleep(0)
+
+        assert events == ["post-start"]
+        assert not delete_task.done()
+
+        release.set()
+        assert await delete_task is True
+        await create_task
+
+        assert events == ["post-start", "post-end", "delete"]
         assert "my-pool" not in client._pools
         await client.close()
 

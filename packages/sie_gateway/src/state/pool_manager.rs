@@ -10,17 +10,53 @@ use crate::types::pool::{AssignedWorker, Pool, PoolSpec, PoolState, PoolStatus};
 
 pub const DEFAULT_POOL_NAME: &str = "default";
 const DEFAULT_LEASE_DURATION_S: f64 = 1200.0; // 20 minutes
+const TIMESTAMP_TOLERANCE_S: f64 = 0.001;
+type WorkerAssignment = (String, String, String, String, String);
 
 #[derive(Debug)]
-pub struct DefaultPoolProtectedError;
+pub enum PoolDeletionProtectedError {
+    Default,
+    Static(String),
+}
 
-impl std::fmt::Display for DefaultPoolProtectedError {
+impl std::fmt::Display for PoolDeletionProtectedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Cannot delete the default pool '{}'", DEFAULT_POOL_NAME)
+        match self {
+            PoolDeletionProtectedError::Default => {
+                write!(f, "Cannot delete the default pool '{}'", DEFAULT_POOL_NAME)
+            }
+            PoolDeletionProtectedError::Static(name) => {
+                write!(f, "Cannot delete static Helm queue pool '{}'", name)
+            }
+        }
     }
 }
 
-impl std::error::Error for DefaultPoolProtectedError {}
+impl std::error::Error for PoolDeletionProtectedError {}
+
+#[derive(Debug)]
+pub struct DefaultPoolMutationError;
+
+impl std::fmt::Display for DefaultPoolMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cannot modify the default pool '{}'", DEFAULT_POOL_NAME)
+    }
+}
+
+impl std::error::Error for DefaultPoolMutationError {}
+
+#[derive(Debug)]
+pub struct StaticPoolMutationError {
+    pub name: String,
+}
+
+impl std::fmt::Display for StaticPoolMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cannot modify static Helm queue pool '{}'", self.name)
+    }
+}
+
+impl std::error::Error for StaticPoolMutationError {}
 
 #[derive(Debug)]
 pub struct InvalidMachineProfileError {
@@ -40,10 +76,17 @@ impl std::fmt::Display for InvalidMachineProfileError {
 
 impl std::error::Error for InvalidMachineProfileError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolAdmissionStatus {
+    pub cap: u32,
+    pub assigned_count: usize,
+}
+
 pub struct PoolManager {
     pools: RwLock<HashMap<String, Pool>>,
     lease_duration_s: f64,
     configured_profiles: Vec<String>,
+    static_pool_names: RwLock<HashSet<String>>,
     /// Optional K8s ConfigMap backend for pool persistence.
     k8s_backend: Option<Arc<K8sPoolBackend>>,
 }
@@ -54,6 +97,7 @@ impl PoolManager {
             pools: RwLock::new(HashMap::new()),
             lease_duration_s: DEFAULT_LEASE_DURATION_S,
             configured_profiles,
+            static_pool_names: RwLock::new(HashSet::new()),
             k8s_backend: None,
         }
     }
@@ -73,9 +117,16 @@ impl PoolManager {
         };
 
         let k8s_pools = backend.list_pools().await?;
+        let static_pool_names = self.static_pool_names.read().await.clone();
         let mut pools = self.pools.write().await;
         let mut count = 0;
         for pool in k8s_pools {
+            if !Self::should_restore_pool_from_k8s(&pool) {
+                continue;
+            }
+            if static_pool_names.contains(&normalize_pool_name(&pool.spec.name)) {
+                continue;
+            }
             if !pools.contains_key(&pool.spec.name) {
                 info!(pool = %pool.spec.name, "restored pool from K8s");
                 pools.insert(pool.spec.name.clone(), pool);
@@ -83,6 +134,10 @@ impl PoolManager {
             }
         }
         Ok(count)
+    }
+
+    fn should_restore_pool_from_k8s(pool: &Pool) -> bool {
+        pool.spec.name != DEFAULT_POOL_NAME
     }
 
     fn now_secs() -> f64 {
@@ -100,6 +155,186 @@ impl PoolManager {
             .unwrap_or((DEFAULT_LEASE_DURATION_S as u64).min(i32::MAX as u64) as i32)
     }
 
+    fn normalize_gpus_and_caps(
+        mut gpus: HashMap<String, u32>,
+        gpu_caps: &HashMap<String, u32>,
+    ) -> HashMap<String, u32> {
+        for gpu_type in gpu_caps.keys() {
+            if !gpus
+                .keys()
+                .any(|required_gpu| required_gpu.eq_ignore_ascii_case(gpu_type))
+            {
+                gpus.insert(gpu_type.clone(), 0);
+            }
+        }
+        gpus
+    }
+
+    fn validate_pool_profiles(
+        &self,
+        gpus: &HashMap<String, u32>,
+        gpu_caps: &HashMap<String, u32>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.configured_profiles.is_empty() {
+            return Ok(());
+        }
+
+        let invalid: Vec<String> = gpus
+            .keys()
+            .chain(gpu_caps.keys())
+            .filter(|k| {
+                !self
+                    .configured_profiles
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(k))
+            })
+            .cloned()
+            .collect();
+
+        if invalid.is_empty() {
+            Ok(())
+        } else {
+            Err(Box::new(InvalidMachineProfileError {
+                invalid_profiles: invalid,
+                valid_profiles: self.configured_profiles.clone(),
+            }))
+        }
+    }
+
+    async fn is_static_pool(&self, name: &str) -> bool {
+        self.static_pool_names
+            .read()
+            .await
+            .contains(&normalize_pool_name(name))
+    }
+
+    pub async fn sync_static_pools(
+        &self,
+        specs: &[PoolSpec],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut normalized_specs = Vec::new();
+        let mut desired_names = HashSet::new();
+        for spec in specs {
+            let name = normalize_pool_name(&spec.name);
+            if name.is_empty() || name == DEFAULT_POOL_NAME {
+                continue;
+            }
+
+            let gpus = Self::normalize_gpus_and_caps(spec.gpus.clone(), &spec.gpu_caps);
+            self.validate_pool_profiles(&gpus, &spec.gpu_caps)?;
+            let bundle = spec.bundle.as_ref().and_then(|bundle| {
+                let bundle = bundle.trim().to_string();
+                if bundle.is_empty() {
+                    None
+                } else {
+                    Some(bundle)
+                }
+            });
+            let static_spec = PoolSpec {
+                name: name.clone(),
+                bundle,
+                gpus,
+                gpu_caps: spec.gpu_caps.clone(),
+                ttl_seconds: None,
+                minimum_worker_count: spec.minimum_worker_count,
+            };
+            if !desired_names.insert(static_spec.name.clone()) {
+                return Err(format!("duplicate static queue pool '{}'", name).into());
+            }
+            normalized_specs.push(static_spec);
+        }
+        normalized_specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let previous_names = {
+            let mut static_pool_names = self.static_pool_names.write().await;
+            let previous_names = static_pool_names.clone();
+            *static_pool_names = desired_names.clone();
+            previous_names
+        };
+
+        let now = Self::now_secs();
+        let mut pools = self.pools.write().await;
+        for name in previous_names.difference(&desired_names) {
+            if pools.remove(name).is_some() {
+                info!(pool = %name, "removed static Helm queue pool");
+            }
+        }
+        let shadowed_names: Vec<String> = pools
+            .keys()
+            .filter(|name| {
+                let normalized = normalize_pool_name(name);
+                desired_names.contains(&normalized) && **name != normalized
+            })
+            .cloned()
+            .collect();
+        for name in &shadowed_names {
+            if pools.remove(name).is_some() {
+                info!(
+                    pool = %name,
+                    static_pool = %normalize_pool_name(name),
+                    "removed case-variant pool shadowed by static Helm queue pool"
+                );
+            }
+        }
+
+        let mut count = 0;
+        for spec in normalized_specs {
+            count += 1;
+            if let Some(existing) = pools.get_mut(&spec.name) {
+                if existing.spec != spec {
+                    existing.spec = spec;
+                    existing.status.state = PoolState::Pending;
+                    existing.status.assigned_workers.clear();
+                    existing.status.last_renewed = now;
+                    info!(pool = %existing.spec.name, "updated static Helm queue pool");
+                    crate::metrics::POOL_EVENTS
+                        .with_label_values(&["updated"])
+                        .inc();
+                } else {
+                    existing.status.last_renewed = now;
+                    crate::metrics::POOL_EVENTS
+                        .with_label_values(&["renewed"])
+                        .inc();
+                }
+                continue;
+            }
+
+            let name = spec.name.clone();
+            pools.insert(
+                name.clone(),
+                Pool {
+                    spec,
+                    status: PoolStatus {
+                        state: PoolState::Pending,
+                        assigned_workers: Vec::new(),
+                        created_at: now,
+                        last_renewed: now,
+                    },
+                },
+            );
+            info!(pool = %name, "created static Helm queue pool");
+            crate::metrics::POOL_EVENTS
+                .with_label_values(&["created"])
+                .inc();
+        }
+        drop(pools);
+
+        if let Some(ref backend) = self.k8s_backend {
+            let mut backend_cleanup_names = desired_names.clone();
+            backend_cleanup_names.extend(shadowed_names);
+            for name in &backend_cleanup_names {
+                if let Err(e) = backend.delete_pool(name).await {
+                    warn!(pool = %name, error = %e, "failed to delete stale dynamic pool state for static Helm queue pool");
+                }
+                if let Err(e) = backend.delete_lease(name).await {
+                    warn!(pool = %name, error = %e, "failed to delete stale dynamic pool lease for static Helm queue pool");
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
     pub async fn create_default_pool(&self) {
         if self.configured_profiles.is_empty() {
             info!("no machine profiles configured, skipping default pool creation");
@@ -109,7 +344,7 @@ impl PoolManager {
         let gpus: HashMap<String, u32> = self
             .configured_profiles
             .iter()
-            .map(|p| (p.clone(), 999))
+            .map(|p| (p.clone(), 0))
             .collect();
 
         match self
@@ -136,25 +371,33 @@ impl PoolManager {
         ttl_seconds: Option<u64>,
         minimum_worker_count: u32,
     ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
-        // Validate profiles
-        if !self.configured_profiles.is_empty() {
-            let invalid: Vec<String> = gpus
-                .keys()
-                .filter(|k| {
-                    !self
-                        .configured_profiles
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case(k))
-                })
-                .cloned()
-                .collect();
+        self.create_pool_with_caps(
+            name,
+            gpus,
+            HashMap::new(),
+            bundle,
+            ttl_seconds,
+            minimum_worker_count,
+        )
+        .await
+    }
 
-            if !invalid.is_empty() {
-                return Err(Box::new(InvalidMachineProfileError {
-                    invalid_profiles: invalid,
-                    valid_profiles: self.configured_profiles.clone(),
-                }));
-            }
+    pub async fn create_pool_with_caps(
+        &self,
+        name: &str,
+        gpus: HashMap<String, u32>,
+        gpu_caps: HashMap<String, u32>,
+        bundle: Option<String>,
+        ttl_seconds: Option<u64>,
+        minimum_worker_count: u32,
+    ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
+        let gpus = Self::normalize_gpus_and_caps(gpus, &gpu_caps);
+        self.validate_pool_profiles(&gpus, &gpu_caps)?;
+        let is_static_pool = self.is_static_pool(name).await;
+        if is_static_pool {
+            return Err(Box::new(StaticPoolMutationError {
+                name: name.to_string(),
+            }));
         }
 
         let now = Self::now_secs();
@@ -162,13 +405,41 @@ impl PoolManager {
 
         // Idempotent: return existing pool if found
         if let Some(existing) = pools.get_mut(name) {
+            let spec_changed = existing.spec.bundle != bundle
+                || existing.spec.gpus != gpus
+                || existing.spec.gpu_caps != gpu_caps
+                || existing.spec.ttl_seconds != ttl_seconds
+                || existing.spec.minimum_worker_count != minimum_worker_count;
+
+            if name == DEFAULT_POOL_NAME && spec_changed {
+                return Err(Box::new(DefaultPoolMutationError));
+            }
+
             existing.status.last_renewed = now;
+            let event = if spec_changed {
+                existing.spec.bundle = bundle;
+                existing.spec.gpus = gpus;
+                existing.spec.gpu_caps = gpu_caps;
+                existing.spec.ttl_seconds = ttl_seconds;
+                existing.spec.minimum_worker_count = minimum_worker_count;
+                existing.status.state = PoolState::Pending;
+                existing.status.assigned_workers.clear();
+                "updated"
+            } else {
+                "renewed"
+            };
             let result = existing.clone();
             drop(pools); // release write lock before K8s call
 
-            // Renew the K8s Lease (best-effort, skip default pool)
+            // Persist spec updates and renew the K8s Lease (best-effort,
+            // skip default pool).
             if name != DEFAULT_POOL_NAME {
                 if let Some(ref backend) = self.k8s_backend {
+                    if spec_changed {
+                        if let Err(e) = backend.save_pool(&result).await {
+                            warn!(error = %e, pool = name, "failed to persist pool update to K8s");
+                        }
+                    }
                     let ttl = Self::lease_ttl_seconds(&result);
                     if let Err(e) = backend.create_or_renew_lease(name, ttl).await {
                         warn!(error = %e, pool = name, "failed to renew K8s Lease");
@@ -177,7 +448,7 @@ impl PoolManager {
             }
 
             crate::metrics::POOL_EVENTS
-                .with_label_values(&["renewed"])
+                .with_label_values(&[event])
                 .inc();
             return Ok(result);
         }
@@ -187,6 +458,7 @@ impl PoolManager {
                 name: name.to_string(),
                 bundle,
                 gpus,
+                gpu_caps,
                 ttl_seconds,
                 minimum_worker_count,
             },
@@ -205,14 +477,13 @@ impl PoolManager {
             .with_label_values(&["created"])
             .inc();
 
-        // Persist to K8s backend (best-effort)
-        if let Some(ref backend) = self.k8s_backend {
-            if let Err(e) = backend.save_pool(&pool).await {
-                warn!(error = %e, pool = name, "failed to persist pool to K8s");
-            }
-
-            // Create K8s Lease for crash-safe TTL (skip default pool)
-            if name != DEFAULT_POOL_NAME {
+        // Persist dynamic named pools to K8s. The default pool is synthetic
+        // per gateway replica and is not a lease-owned runtime pool.
+        if name != DEFAULT_POOL_NAME {
+            if let Some(ref backend) = self.k8s_backend {
+                if let Err(e) = backend.save_pool(&pool).await {
+                    warn!(error = %e, pool = name, "failed to persist pool to K8s");
+                }
                 let ttl = Self::lease_ttl_seconds(&pool);
                 if let Err(e) = backend.create_or_renew_lease(name, ttl).await {
                     warn!(error = %e, pool = name, "failed to create K8s Lease");
@@ -225,7 +496,114 @@ impl PoolManager {
 
     pub async fn get_pool(&self, name: &str) -> Option<Pool> {
         let pools = self.pools.read().await;
-        pools.get(name).cloned()
+        let key = pool_key_for_name(&pools, name)?;
+        pools.get(&key).cloned()
+    }
+
+    pub async fn capped_lane_status(
+        &self,
+        pool_name: &str,
+        machine_profile: &str,
+        bundle: &str,
+    ) -> Option<PoolAdmissionStatus> {
+        if machine_profile.is_empty() {
+            return None;
+        }
+
+        let pools = self.pools.read().await;
+        let key = pool_key_for_name(&pools, pool_name)?;
+        let pool = pools.get(&key)?;
+        let cap = pool
+            .spec
+            .gpu_caps
+            .iter()
+            .find(|(profile, _)| profile.eq_ignore_ascii_case(machine_profile))
+            .map(|(_, cap)| *cap)?;
+        let assigned_count = pool
+            .status
+            .assigned_workers
+            .iter()
+            .filter(|worker| worker.gpu.eq_ignore_ascii_case(machine_profile))
+            .filter(|worker| worker.bundle.eq_ignore_ascii_case(bundle))
+            .count();
+
+        Some(PoolAdmissionStatus {
+            cap,
+            assigned_count,
+        })
+    }
+
+    /// Return the assigned worker names for a capped concrete lane.
+    ///
+    /// `None` means the pool/profile is uncapped, so callers should not apply
+    /// an admission filter. `Some(empty)` means admission is enabled for this
+    /// profile but no worker is currently admitted. This mirrors the
+    /// worker-side pool-admission gate: named pools with missing status fail
+    /// closed, while the default pool remains fail-open.
+    pub async fn admitted_worker_names_for_capped_lane(
+        &self,
+        pool_name: &str,
+        machine_profile: &str,
+        bundle: &str,
+    ) -> Option<HashSet<String>> {
+        if machine_profile.trim().is_empty() {
+            return None;
+        }
+
+        let pools = self.pools.read().await;
+        let Some(key) = pool_key_for_name(&pools, pool_name) else {
+            return if pool_name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
+                None
+            } else {
+                Some(HashSet::new())
+            };
+        };
+        let pool = pools.get(&key)?;
+        let cap = pool
+            .spec
+            .gpu_caps
+            .iter()
+            .find(|(profile, _)| profile.eq_ignore_ascii_case(machine_profile))
+            .map(|(_, cap)| *cap)?;
+        if cap == 0 {
+            return Some(HashSet::new());
+        }
+
+        Some(
+            pool.status
+                .assigned_workers
+                .iter()
+                .filter(|worker| worker.gpu.eq_ignore_ascii_case(machine_profile))
+                .filter(|worker| worker.bundle.eq_ignore_ascii_case(bundle))
+                .map(|worker| worker.name.clone())
+                .collect(),
+        )
+    }
+
+    /// Return the pool's only configured machine profile, if the spec is
+    /// unambiguous across both requirements (`gpus`) and admission caps
+    /// (`gpu_caps`). Used by cold queue routing when a caller pins only a
+    /// pool: the NATS subject still needs a concrete machine-profile token so
+    /// KEDA can observe `pending_demand{pool,machine_profile,bundle}`.
+    pub async fn single_machine_profile_for_pool(&self, pool_name: &str) -> Option<String> {
+        let pools = self.pools.read().await;
+        let key = pool_key_for_name(&pools, pool_name)?;
+        let pool = pools.get(&key)?;
+        let mut profiles: Vec<String> = Vec::new();
+        for profile in pool.spec.gpus.keys().chain(pool.spec.gpu_caps.keys()) {
+            if profiles
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(profile))
+            {
+                continue;
+            }
+            profiles.push(profile.to_lowercase());
+        }
+        if profiles.len() == 1 {
+            profiles.pop()
+        } else {
+            None
+        }
     }
 
     pub async fn list_pools(&self) -> Vec<Pool> {
@@ -233,26 +611,30 @@ impl PoolManager {
         pools.values().cloned().collect()
     }
 
-    pub async fn delete_pool(&self, name: &str) -> Result<bool, DefaultPoolProtectedError> {
+    pub async fn delete_pool(&self, name: &str) -> Result<bool, PoolDeletionProtectedError> {
         if name == DEFAULT_POOL_NAME {
-            return Err(DefaultPoolProtectedError);
+            return Err(PoolDeletionProtectedError::Default);
+        }
+        if self.is_static_pool(name).await {
+            return Err(PoolDeletionProtectedError::Static(name.to_string()));
         }
 
         let mut pools = self.pools.write().await;
-        let removed = pools.remove(name).is_some();
+        let key = pool_key_for_name(&pools, name).unwrap_or_else(|| name.to_string());
+        let removed = pools.remove(&key).is_some();
         drop(pools); // release write lock before K8s call
 
         if removed {
-            info!(pool = name, "deleted pool");
+            info!(pool = %key, "deleted pool");
             crate::metrics::POOL_EVENTS
                 .with_label_values(&["deleted"])
                 .inc();
             if let Some(ref backend) = self.k8s_backend {
-                if let Err(e) = backend.delete_pool(name).await {
-                    warn!(error = %e, pool = name, "failed to delete pool from K8s");
+                if let Err(e) = backend.delete_pool(&key).await {
+                    warn!(error = %e, pool = %key, "failed to delete pool from K8s");
                 }
-                if let Err(e) = backend.delete_lease(name).await {
-                    warn!(error = %e, pool = name, "failed to delete K8s Lease");
+                if let Err(e) = backend.delete_lease(&key).await {
+                    warn!(error = %e, pool = %key, "failed to delete K8s Lease");
                 }
             }
         }
@@ -260,108 +642,144 @@ impl PoolManager {
     }
 
     pub async fn renew_pool(&self, name: &str) -> bool {
-        let found = {
+        let is_static_pool = self.is_static_pool(name).await;
+        let found_key = {
             let mut pools = self.pools.write().await;
-            if let Some(pool) = pools.get_mut(name) {
-                pool.status.last_renewed = Self::now_secs();
-                true
+            if let Some(key) = pool_key_for_name(&pools, name) {
+                if let Some(pool) = pools.get_mut(&key) {
+                    pool.status.last_renewed = Self::now_secs();
+                    Some(key)
+                } else {
+                    None
+                }
             } else {
-                false
+                None
             }
         }; // write lock dropped here
 
-        // Renew the K8s Lease (best-effort, skip default pool)
-        if found && name != DEFAULT_POOL_NAME {
+        // Renew the K8s Lease (best-effort, skip default and static Helm pools)
+        if let Some(key) = found_key.as_ref() {
             if let Some(ref backend) = self.k8s_backend {
-                if let Err(e) = backend.renew_lease(name).await {
-                    warn!(error = %e, pool = name, "failed to renew K8s Lease");
+                if key != DEFAULT_POOL_NAME && !is_static_pool {
+                    if let Err(e) = backend.renew_lease(key).await {
+                        warn!(error = %e, pool = %key, "failed to renew K8s Lease");
+                    }
                 }
             }
         }
 
-        if found {
+        if found_key.is_some() {
             crate::metrics::POOL_EVENTS
                 .with_label_values(&["renewed"])
                 .inc();
         }
-        found
+        found_key.is_some()
     }
 
     pub async fn assign_workers(
         &self,
         pool_name: &str,
-        available_workers: &[(String, String, String, String)], // (name, url, gpu, bundle)
+        available_workers: &[WorkerAssignment], // (name, url, gpu, bundle, queue_pool)
     ) -> bool {
+        let is_static_pool = self.is_static_pool(pool_name).await;
         let mut pools = self.pools.write().await;
-        let pool = match pools.get_mut(pool_name) {
-            Some(p) => p,
+        let pool_key = match pool_key_for_name(&pools, pool_name) {
+            Some(key) => key,
             None => return false,
         };
+        let pool = pools
+            .get_mut(&pool_key)
+            .expect("pool key resolved from the same map");
 
-        let filtered: Vec<&(String, String, String, String)> =
-            if let Some(ref bundle_filter) = pool.spec.bundle {
-                available_workers
-                    .iter()
-                    .filter(|(_, _, _, b)| b == bundle_filter)
-                    .collect()
-            } else {
-                available_workers.iter().collect()
-            };
+        let filtered: Vec<&WorkerAssignment> = available_workers
+            .iter()
+            .filter(|(_, _, _, _, queue_pool)| worker_consumes_pool(queue_pool, pool_name))
+            .filter(|(_, _, _, bundle, _)| match pool.spec.bundle.as_ref() {
+                Some(bundle_filter) => bundle == bundle_filter,
+                None => true,
+            })
+            .collect();
 
         // Group by GPU type (lowercase)
-        let mut workers_by_gpu: HashMap<String, Vec<&(String, String, String, String)>> =
-            HashMap::new();
+        let mut workers_by_gpu: HashMap<String, Vec<&WorkerAssignment>> = HashMap::new();
         for w in &filtered {
             workers_by_gpu
                 .entry(w.2.to_lowercase())
                 .or_default()
                 .push(w);
         }
+        for workers in workers_by_gpu.values_mut() {
+            // HA gateway replicas discover the same K8s endpoint set and each
+            // computes capped admission locally. Stable ordering keeps the
+            // admitted pod set convergent no matter how HashMap iteration lands.
+            workers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
 
         let mut assigned: Vec<AssignedWorker> = Vec::new();
         let mut all_met = true;
+        let gpu_caps: HashMap<String, u32> = pool
+            .spec
+            .gpu_caps
+            .iter()
+            .map(|(gpu, cap)| (gpu.to_lowercase(), *cap))
+            .collect();
 
-        for (gpu_type, count_needed) in &pool.spec.gpus {
+        for (gpu_type, required_count) in &pool.spec.gpus {
             let gpu_lower = gpu_type.to_lowercase();
             let available = workers_by_gpu.get_mut(&gpu_lower);
+            let available_count = available.as_ref().map(|workers| workers.len()).unwrap_or(0);
+            let required = *required_count as usize;
 
-            let count = *count_needed as usize;
-            match available {
-                Some(workers) if workers.len() >= count => {
-                    for w in workers.drain(..count) {
-                        assigned.push(AssignedWorker {
-                            name: w.0.clone(),
-                            url: w.1.clone(),
-                            gpu: w.2.clone(),
-                        });
-                    }
-                }
-                Some(workers) => {
-                    all_met = false;
-                    let take = workers.len();
-                    for w in workers.drain(..take) {
-                        assigned.push(AssignedWorker {
-                            name: w.0.clone(),
-                            url: w.1.clone(),
-                            gpu: w.2.clone(),
-                        });
-                    }
-                }
-                None => {
-                    all_met = false;
+            if available_count < required {
+                all_met = false;
+            }
+
+            if let Some(workers) = available {
+                let cap = gpu_caps
+                    .get(&gpu_lower)
+                    .map(|cap| *cap as usize)
+                    .unwrap_or(usize::MAX);
+                let take = workers.len().min(cap);
+                for w in workers.drain(..take) {
+                    assigned.push(AssignedWorker {
+                        name: w.0.clone(),
+                        url: w.1.clone(),
+                        gpu: w.2.clone(),
+                        bundle: w.3.clone(),
+                    });
                 }
             }
         }
 
-        pool.status.assigned_workers = assigned;
-        let meets_minimum =
-            pool.status.assigned_workers.len() as u32 >= pool.spec.minimum_worker_count;
-        pool.status.state = if all_met && !pool.status.assigned_workers.is_empty() && meets_minimum
-        {
+        let state = if pool_key == DEFAULT_POOL_NAME {
+            if assigned.is_empty() {
+                PoolState::Pending
+            } else {
+                PoolState::Active
+            }
+        } else if all_met && assigned.len() as u32 >= pool.spec.minimum_worker_count {
             PoolState::Active
         } else {
             PoolState::Pending
         };
+        let new_status = PoolStatus {
+            state,
+            assigned_workers: assigned,
+            created_at: pool.status.created_at,
+            last_renewed: pool.status.last_renewed,
+        };
+        let status_changed = pool.status != new_status;
+        pool.status = new_status.clone();
+        let backend = self.k8s_backend.clone();
+        drop(pools);
+
+        if status_changed && pool_key != DEFAULT_POOL_NAME && !is_static_pool {
+            if let Some(ref backend) = backend {
+                if let Err(e) = backend.update_pool_status(&pool_key, &new_status).await {
+                    warn!(error = %e, pool = %pool_key, "failed to persist pool assignment status to K8s");
+                }
+            }
+        }
 
         all_met
     }
@@ -382,7 +800,9 @@ impl PoolManager {
 
     /// Apply a pool received from a remote gateway (via K8s watch).
     /// Inserts the pool if it does not exist, or updates it if the incoming
-    /// pool has a more recent `last_renewed` timestamp.
+    /// pool has a more recent `last_renewed` timestamp. Status-only updates may
+    /// keep `last_renewed` unchanged, because assignment changes should not
+    /// extend the pool lease.
     /// Does NOT write back to K8s (the event already came from K8s).
     pub async fn apply_remote_pool(&self, pool: Pool) {
         let name = pool.spec.name.clone();
@@ -391,12 +811,24 @@ impl PoolManager {
         if name == DEFAULT_POOL_NAME {
             return;
         }
+        if self.is_static_pool(&name).await {
+            return;
+        }
 
         let mut pools = self.pools.write().await;
         if let Some(existing) = pools.get(&name) {
-            // Only update if the incoming pool is newer
-            if pool.status.last_renewed <= existing.status.last_renewed {
+            let renewed_delta = pool.status.last_renewed - existing.status.last_renewed;
+            if renewed_delta < -TIMESTAMP_TOLERANCE_S {
                 return;
+            }
+
+            if renewed_delta.abs() <= TIMESTAMP_TOLERANCE_S {
+                if pool.spec != existing.spec {
+                    return;
+                }
+                if pool.status == existing.status {
+                    return;
+                }
             }
         }
 
@@ -411,6 +843,9 @@ impl PoolManager {
         if name == DEFAULT_POOL_NAME {
             return;
         }
+        if self.is_static_pool(name).await {
+            return;
+        }
 
         let mut pools = self.pools.write().await;
         if pools.remove(name).is_some() {
@@ -421,11 +856,14 @@ impl PoolManager {
     pub async fn check_expired_leases(&self) -> Vec<String> {
         let now = Self::now_secs();
         let mut expired = Vec::new();
+        let static_pool_names = self.static_pool_names.read().await.clone();
 
         {
             let pools = self.pools.read().await;
             for (name, pool) in pools.iter() {
-                if name == DEFAULT_POOL_NAME {
+                if name == DEFAULT_POOL_NAME
+                    || static_pool_names.contains(&normalize_pool_name(name))
+                {
                     continue;
                 }
                 let ttl = pool
@@ -445,7 +883,10 @@ impl PoolManager {
             match backend.list_expired_leases().await {
                 Ok(k8s_expired) => {
                     for name in k8s_expired {
-                        if name == DEFAULT_POOL_NAME || expired.contains(&name) {
+                        if name == DEFAULT_POOL_NAME
+                            || expired.contains(&name)
+                            || static_pool_names.contains(&normalize_pool_name(&name))
+                        {
                             continue;
                         }
                         let pools = self.pools.read().await;
@@ -501,9 +942,53 @@ impl PoolManager {
     }
 }
 
+fn worker_consumes_pool(worker_pool: &str, pool_name: &str) -> bool {
+    normalize_pool_name(worker_pool) == normalize_pool_name(pool_name)
+}
+
+fn normalize_pool_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn pool_key_for_name(pools: &HashMap<String, Pool>, name: &str) -> Option<String> {
+    if pools.contains_key(name) {
+        return Some(name.to_string());
+    }
+    let normalized = normalize_pool_name(name);
+    pools
+        .keys()
+        .find(|pool_name| normalize_pool_name(pool_name) == normalized)
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker(
+        name: &str,
+        url: &str,
+        gpu: &str,
+        bundle: &str,
+    ) -> (String, String, String, String, String) {
+        worker_in_pool(name, url, gpu, bundle, DEFAULT_POOL_NAME)
+    }
+
+    fn worker_in_pool(
+        name: &str,
+        url: &str,
+        gpu: &str,
+        bundle: &str,
+        pool: &str,
+    ) -> (String, String, String, String, String) {
+        (
+            name.to_string(),
+            url.to_string(),
+            gpu.to_string(),
+            bundle.to_string(),
+            pool.to_string(),
+        )
+    }
 
     #[tokio::test]
     async fn test_create_pool() {
@@ -533,6 +1018,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_pool_existing_updates_spec() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+
+        let workers = vec![worker_in_pool(
+            "w1",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+            "test",
+        )];
+        pm.assign_workers("test", &workers).await;
+
+        let mut updated_gpus = HashMap::new();
+        updated_gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        let pool = pm
+            .create_pool_with_caps("test", updated_gpus, gpu_caps, None, Some(60), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&0));
+        assert_eq!(pool.spec.gpu_caps.get("l4-spot"), Some(&2));
+        assert_eq!(pool.spec.ttl_seconds, Some(60));
+        assert_eq!(pool.status.state, PoolState::Pending);
+        assert!(pool.status.assigned_workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_rejects_default_mutation() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+        pm.create_default_pool().await;
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        let result = pm.create_pool(DEFAULT_POOL_NAME, gpus, None, None, 0).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_delete_default_pool_fails() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
         pm.create_default_pool().await;
@@ -557,6 +1087,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_static_pools_creates_uncapped_non_expiring_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![PoolSpec {
+            name: "company-a".to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: Some(1),
+            minimum_worker_count: 0,
+        }];
+
+        let count = pm.sync_static_pools(&specs).await.unwrap();
+        assert_eq!(count, 1);
+
+        let pool = pm.get_pool("company-a").await.unwrap();
+        assert_eq!(pool.spec.ttl_seconds, None);
+        assert!(pool.spec.gpu_caps.is_empty());
+        assert!(pm
+            .admitted_worker_names_for_capped_lane("company-a", "l4-spot", "default")
+            .await
+            .is_none());
+
+        {
+            let mut pools = pm.pools.write().await;
+            pools.get_mut("company-a").unwrap().status.last_renewed -=
+                DEFAULT_LEASE_DURATION_S + 10.0;
+        }
+
+        let expired = pm.check_expired_leases().await;
+        assert!(!expired.contains(&"company-a".to_string()));
+        assert!(pm.get_pool("company-a").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_caps_are_assignable_and_lane_scoped() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 1);
+        let specs = vec![PoolSpec {
+            name: "bench".to_string(),
+            bundle: None,
+            gpus: HashMap::new(),
+            gpu_caps,
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+
+        pm.sync_static_pools(&specs).await.unwrap();
+        let pool = pm.get_pool("bench").await.unwrap();
+        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&0));
+
+        let workers = vec![
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "bench"),
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "bench"),
+            worker("default-worker", "http://w3:8080", "l4-spot", "default"),
+        ];
+        assert!(pm.assign_workers("bench", &workers).await);
+
+        let admitted = pm
+            .admitted_worker_names_for_capped_lane("bench", "l4-spot", "default")
+            .await
+            .expect("static cap should make admission lane-scoped");
+        assert_eq!(admitted, HashSet::from(["w1".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_rejects_api_mutation_and_delete() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![PoolSpec {
+            name: "bench".to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+        pm.sync_static_pools(&specs).await.unwrap();
+
+        let mut changed_gpus = HashMap::new();
+        changed_gpus.insert("l4-spot".to_string(), 1);
+        let result = pm
+            .create_pool("bench", changed_gpus, None, Some(60), 0)
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("static Helm queue pool"));
+
+        let delete_result = pm.delete_pool("bench").await;
+        assert!(delete_result.is_err());
+        assert!(delete_result
+            .unwrap_err()
+            .to_string()
+            .contains("static Helm queue pool"));
+        assert!(pm.renew_pool("bench").await);
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_case_variants_are_protected() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![PoolSpec {
+            name: "Bench".to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+        pm.sync_static_pools(&specs).await.unwrap();
+
+        assert_eq!(pm.get_pool("Bench").await.unwrap().spec.name, "bench");
+
+        let mut changed_gpus = HashMap::new();
+        changed_gpus.insert("l4-spot".to_string(), 1);
+        let result = pm
+            .create_pool("BENCH", changed_gpus, None, Some(60), 0)
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("static Helm queue pool"));
+
+        let delete_result = pm.delete_pool("BENCH").await;
+        assert!(delete_result.is_err());
+        assert!(delete_result
+            .unwrap_err()
+            .to_string()
+            .contains("static Helm queue pool"));
+        assert!(pm.renew_pool("BENCH").await);
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_rejects_duplicate_case_variants() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![
+            PoolSpec {
+                name: "Bench".to_string(),
+                bundle: None,
+                gpus: gpus.clone(),
+                gpu_caps: HashMap::new(),
+                ttl_seconds: None,
+                minimum_worker_count: 0,
+            },
+            PoolSpec {
+                name: "bench".to_string(),
+                bundle: None,
+                gpus,
+                gpu_caps: HashMap::new(),
+                ttl_seconds: None,
+                minimum_worker_count: 0,
+            },
+        ];
+
+        let result = pm.sync_static_pools(&specs).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate static queue pool 'bench'"));
+        assert!(pm.list_pools().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_removes_shadowed_case_variant_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut dynamic_gpus = HashMap::new();
+        dynamic_gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("Bench", dynamic_gpus, None, Some(60), 0)
+            .await
+            .unwrap();
+
+        let mut static_gpus = HashMap::new();
+        static_gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![PoolSpec {
+            name: "bench".to_string(),
+            bundle: None,
+            gpus: static_gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+        pm.sync_static_pools(&specs).await.unwrap();
+
+        let pools = pm.list_pools().await;
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].spec.name, "bench");
+        assert_eq!(pools[0].spec.gpus.get("l4-spot"), Some(&0));
+        assert_eq!(pm.get_pool("Bench").await.unwrap().spec.name, "bench");
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_ignores_remote_k8s_watch_events() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let specs = vec![PoolSpec {
+            name: "bench".to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+        pm.sync_static_pools(&specs).await.unwrap();
+
+        let mut remote_gpus = HashMap::new();
+        remote_gpus.insert("l4-spot".to_string(), 1);
+        let remote = Pool {
+            spec: PoolSpec {
+                name: "bench".to_string(),
+                bundle: Some("other".to_string()),
+                gpus: remote_gpus,
+                gpu_caps: HashMap::new(),
+                ttl_seconds: Some(60),
+                minimum_worker_count: 1,
+            },
+            status: PoolStatus {
+                state: PoolState::Active,
+                assigned_workers: vec![AssignedWorker {
+                    name: "remote-worker".to_string(),
+                    url: "http://remote-worker:8080".to_string(),
+                    gpu: "l4-spot".to_string(),
+                    bundle: "other".to_string(),
+                }],
+                created_at: 9999.0,
+                last_renewed: 9999.0,
+            },
+        };
+
+        pm.apply_remote_pool(remote).await;
+        let found = pm.get_pool("bench").await.unwrap();
+        assert_eq!(found.spec.bundle, None);
+        assert_eq!(found.spec.gpus.get("l4-spot"), Some(&0));
+        assert_eq!(found.spec.ttl_seconds, None);
+        assert_eq!(found.status.state, PoolState::Pending);
+        assert!(found.status.assigned_workers.is_empty());
+
+        pm.remove_remote_pool("bench").await;
+        assert!(pm.get_pool("bench").await.is_some());
+    }
+
+    #[tokio::test]
     async fn test_assign_workers() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
@@ -565,24 +1354,9 @@ mod tests {
         pm.create_pool("test", gpus, None, None, 0).await.unwrap();
 
         let workers = vec![
-            (
-                "w1".to_string(),
-                "http://w1:8080".to_string(),
-                "l4-spot".to_string(),
-                "default".to_string(),
-            ),
-            (
-                "w2".to_string(),
-                "http://w2:8080".to_string(),
-                "l4-spot".to_string(),
-                "default".to_string(),
-            ),
-            (
-                "w3".to_string(),
-                "http://w3:8080".to_string(),
-                "a100".to_string(),
-                "default".to_string(),
-            ),
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w3", "http://w3:8080", "a100", "default", "test"),
         ];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -594,6 +1368,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_assign_workers_required_count_does_not_cap_assignment() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 3);
+        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+
+        let workers: Vec<(String, String, String, String, String)> = (1..=5)
+            .map(|i| {
+                worker_in_pool(
+                    &format!("w{}", i),
+                    &format!("http://w{}:8080", i),
+                    "l4-spot",
+                    "default",
+                    "test",
+                )
+            })
+            .collect();
+
+        let all_met = pm.assign_workers("test", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("test").await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_assign_workers_honors_gpu_cap() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 3);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 4);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers: Vec<(String, String, String, String, String)> = (1..=5)
+            .map(|i| {
+                worker_in_pool(
+                    &format!("w{}", i),
+                    &format!("http://w{}:8080", i),
+                    "l4-spot",
+                    "default",
+                    "test",
+                )
+            })
+            .collect();
+
+        let all_met = pm.assign_workers("test", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("test").await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_assign_workers_cap_selection_is_deterministic() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![
+            worker_in_pool("w3", "http://w3:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+        ];
+
+        let all_met = pm.assign_workers("test", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("test").await.unwrap();
+        let names: Vec<&str> = pool
+            .status
+            .assigned_workers
+            .iter()
+            .map(|worker| worker.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["w1", "w2"]);
+    }
+
+    #[tokio::test]
+    async fn test_assign_workers_ignores_other_queue_pools_when_capped() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 1);
+        pm.create_pool_with_caps("bench", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![
+            worker("default-worker", "http://w1:8080", "l4-spot", "default"),
+            worker_in_pool(
+                "bench-worker",
+                "http://w2:8080",
+                "l4-spot",
+                "default",
+                "bench",
+            ),
+        ];
+
+        let all_met = pm.assign_workers("bench", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("bench").await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 1);
+        assert_eq!(pool.status.assigned_workers[0].name, "bench-worker");
+    }
+
+    #[tokio::test]
+    async fn test_assign_workers_ignores_other_queue_pools_without_caps() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("bench", gpus, None, None, 0).await.unwrap();
+
+        let workers = vec![worker(
+            "default-worker",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+        )];
+
+        let all_met = pm.assign_workers("bench", &workers).await;
+        assert!(!all_met);
+
+        let pool = pm.get_pool("bench").await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Pending);
+        assert!(pool.status.assigned_workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_gpu_cap_without_requirement_defaults_required_to_zero() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let gpus = HashMap::new();
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers: Vec<(String, String, String, String, String)> = (1..=3)
+            .map(|i| {
+                worker_in_pool(
+                    &format!("w{}", i),
+                    &format!("http://w{}:8080", i),
+                    "l4-spot",
+                    "default",
+                    "test",
+                )
+            })
+            .collect();
+
+        let all_met = pm.assign_workers("test", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("test").await.unwrap();
+        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&0));
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_zero_required_pool_can_be_active_without_workers() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+
+        let workers = Vec::new();
+        let all_met = pm.assign_workers("test", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("test").await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert!(pool.status.assigned_workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_capped_lane_status_reports_cap_and_assigned_count() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![worker_in_pool(
+            "w1",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+            "test",
+        )];
+        pm.assign_workers("test", &workers).await;
+
+        let lane_status = pm
+            .capped_lane_status("test", "L4-SPOT", "default")
+            .await
+            .expect("lane should be capped");
+        assert_eq!(lane_status.cap, 2);
+        assert_eq!(lane_status.assigned_count, 1);
+        assert!(pm
+            .capped_lane_status("test", "a100", "default")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_capped_lane_filters_assignment() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 1);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+        ];
+        pm.assign_workers("test", &workers).await;
+
+        let admitted = pm
+            .admitted_worker_names_for_capped_lane("test", "L4-SPOT", "default")
+            .await
+            .expect("profile should be capped");
+        assert_eq!(admitted, HashSet::from(["w1".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_capped_lane_respects_bundle() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 2);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        let workers = vec![
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "sglang", "test"),
+        ];
+        pm.assign_workers("test", &workers).await;
+
+        let admitted = pm
+            .admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+            .await
+            .expect("profile should be capped");
+        assert_eq!(admitted, HashSet::from(["w1".to_string()]));
+
+        let default_status = pm
+            .capped_lane_status("test", "l4-spot", "default")
+            .await
+            .expect("default lane should be capped");
+        assert_eq!(default_status.assigned_count, 1);
+        let missing_status = pm
+            .capped_lane_status("test", "l4-spot", "rerank")
+            .await
+            .expect("missing bundle lane should still be capped");
+        assert_eq!(missing_status.assigned_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_uncapped_lane_returns_none() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string(), "a100".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("a100".to_string(), 1);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        assert!(pm
+            .admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_admitted_worker_names_for_zero_cap_and_missing_named_pool_fail_closed() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let mut gpu_caps = HashMap::new();
+        gpu_caps.insert("l4-spot".to_string(), 0);
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pm.admitted_worker_names_for_capped_lane("test", "l4-spot", "default")
+                .await,
+            Some(HashSet::new())
+        );
+        assert_eq!(
+            pm.admitted_worker_names_for_capped_lane("missing", "l4-spot", "default")
+                .await,
+            Some(HashSet::new())
+        );
+        assert!(pm
+            .admitted_worker_names_for_capped_lane(DEFAULT_POOL_NAME, "l4-spot", "default")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_assign_workers_partial() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
@@ -601,11 +1710,12 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 3);
         pm.create_pool("test", gpus, None, None, 0).await.unwrap();
 
-        let workers = vec![(
-            "w1".to_string(),
-            "http://w1:8080".to_string(),
-            "l4-spot".to_string(),
-            "default".to_string(),
+        let workers = vec![worker_in_pool(
+            "w1",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+            "test",
         )];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -625,11 +1735,12 @@ mod tests {
         pm.create_pool("test", gpus, None, None, 3).await.unwrap();
 
         // Provide only 1 matching worker — GPU requirement met but worker count too low
-        let workers = vec![(
-            "w1".to_string(),
-            "http://w1:8080".to_string(),
-            "l4-spot".to_string(),
-            "default".to_string(),
+        let workers = vec![worker_in_pool(
+            "w1",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+            "test",
         )];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -650,18 +1761,8 @@ mod tests {
         pm.create_pool("test", gpus, None, None, 2).await.unwrap();
 
         let workers = vec![
-            (
-                "w1".to_string(),
-                "http://w1:8080".to_string(),
-                "l4-spot".to_string(),
-                "default".to_string(),
-            ),
-            (
-                "w2".to_string(),
-                "http://w2:8080".to_string(),
-                "l4-spot".to_string(),
-                "default".to_string(),
-            ),
+            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
+            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
         ];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -746,8 +1847,57 @@ mod tests {
 
         let pool = pool.unwrap();
         assert_eq!(pool.spec.gpus.len(), 2);
-        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&999));
-        assert_eq!(pool.spec.gpus.get("a100-40gb"), Some(&999));
+        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&0));
+        assert_eq!(pool.spec.gpus.get("a100-40gb"), Some(&0));
+        assert!(pool.spec.gpu_caps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_pool_state_tracks_eligible_workers() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        pm.create_default_pool().await;
+
+        let no_workers: Vec<WorkerAssignment> = Vec::new();
+        pm.assign_workers(DEFAULT_POOL_NAME, &no_workers).await;
+        let pending = pm.get_pool(DEFAULT_POOL_NAME).await.unwrap();
+        assert_eq!(pending.status.state, PoolState::Pending);
+        assert!(pending.status.assigned_workers.is_empty());
+
+        let workers = vec![worker_in_pool(
+            "w1",
+            "http://w1:8080",
+            "l4-spot",
+            "default",
+            DEFAULT_POOL_NAME,
+        )];
+        pm.assign_workers(DEFAULT_POOL_NAME, &workers).await;
+        let active = pm.get_pool(DEFAULT_POOL_NAME).await.unwrap();
+        assert_eq!(active.status.state, PoolState::Active);
+        assert_eq!(active.status.assigned_workers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_default_pool_requires_explicit_worker_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        pm.create_default_pool().await;
+
+        let workers = vec![
+            worker_in_pool("empty", "http://w1:8080", "l4-spot", "default", ""),
+            worker_in_pool(
+                "_default",
+                "http://w2:8080",
+                "l4-spot",
+                "default",
+                "_default",
+            ),
+        ];
+        pm.assign_workers(DEFAULT_POOL_NAME, &workers).await;
+
+        let pool = pm.get_pool(DEFAULT_POOL_NAME).await.unwrap();
+        assert_eq!(pool.status.state, PoolState::Pending);
+        assert!(pool.status.assigned_workers.is_empty());
     }
 
     #[tokio::test]
@@ -756,6 +1906,28 @@ mod tests {
         // No K8s backend → returns Ok(0)
         let count = pm.restore_from_k8s().await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_restore_from_k8s_skips_default_pool() {
+        let pool = Pool {
+            spec: PoolSpec {
+                name: DEFAULT_POOL_NAME.to_string(),
+                bundle: None,
+                gpus: HashMap::new(),
+                gpu_caps: HashMap::new(),
+                ttl_seconds: None,
+                minimum_worker_count: 0,
+            },
+            status: PoolStatus {
+                state: PoolState::Pending,
+                assigned_workers: Vec::new(),
+                created_at: 9999.0,
+                last_renewed: 9999.0,
+            },
+        };
+
+        assert!(!PoolManager::should_restore_pool_from_k8s(&pool));
     }
 
     #[tokio::test]
@@ -776,6 +1948,7 @@ mod tests {
                 name: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
+                gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
             },
@@ -791,9 +1964,82 @@ mod tests {
 
         // Should still have the locally-created default pool, not the remote one
         let found = pm.get_pool(DEFAULT_POOL_NAME).await.unwrap();
-        // The remote pool had empty gpus; the original default pool has l4-spot=999
-        assert_eq!(found.spec.gpus.get("l4-spot"), Some(&999));
+        // The remote pool had empty gpus; the original default pool has l4-spot=0
+        assert_eq!(found.spec.gpus.get("l4-spot"), Some(&0));
         assert_eq!(found.status.created_at, original.status.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_pool_same_timestamp_applies_status_update() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let local = pm
+            .create_pool("bench", gpus.clone(), None, Some(60), 0)
+            .await
+            .unwrap();
+
+        let mut remote = local.clone();
+        remote.status.state = PoolState::Active;
+        remote.status.assigned_workers = vec![AssignedWorker {
+            name: "worker-a".to_string(),
+            url: "http://worker-a:8080".to_string(),
+            gpu: "l4-spot".to_string(),
+            bundle: "default".to_string(),
+        }];
+
+        pm.apply_remote_pool(remote).await;
+
+        let found = pm.get_pool("bench").await.unwrap();
+        assert_eq!(found.status.state, PoolState::Active);
+        assert_eq!(found.status.assigned_workers.len(), 1);
+        assert_eq!(found.spec.gpus, gpus);
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_pool_same_timestamp_keeps_local_spec() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let local = pm
+            .create_pool("bench", gpus, Some("default".to_string()), Some(60), 0)
+            .await
+            .unwrap();
+
+        let mut remote = local.clone();
+        remote.spec.bundle = Some("other".to_string());
+        remote.status.state = PoolState::Active;
+
+        pm.apply_remote_pool(remote).await;
+
+        let found = pm.get_pool("bench").await.unwrap();
+        assert_eq!(found.spec.bundle, Some("default".to_string()));
+        assert_eq!(found.status.state, PoolState::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_pool_timestamp_tolerance_keeps_local_spec() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 0);
+        let local = pm
+            .create_pool("bench", gpus, Some("default".to_string()), Some(60), 0)
+            .await
+            .unwrap();
+
+        let mut remote = local.clone();
+        remote.status.last_renewed += TIMESTAMP_TOLERANCE_S / 2.0;
+        remote.spec.bundle = Some("other".to_string());
+        remote.status.state = PoolState::Active;
+
+        pm.apply_remote_pool(remote).await;
+
+        let found = pm.get_pool("bench").await.unwrap();
+        assert_eq!(found.spec.bundle, Some("default".to_string()));
+        assert_eq!(found.status.state, PoolState::Pending);
     }
 
     #[tokio::test]

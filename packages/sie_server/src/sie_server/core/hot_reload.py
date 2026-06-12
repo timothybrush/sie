@@ -7,8 +7,6 @@ configurations change. Handles the full lifecycle:
 3. Unload model and clear module cache
 4. Load new adapter
 5. Resume serving
-
-See DESIGN.md Section 7.4.
 """
 
 from __future__ import annotations

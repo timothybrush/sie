@@ -50,7 +50,13 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         crate::handlers::proxy::proxy_openai_embeddings,
         crate::handlers::proxy::proxy_score,
         crate::handlers::proxy::proxy_extract,
-        crate::server::metrics_handler
+        crate::handlers::proxy::proxy_generate,
+        crate::handlers::proxy::proxy_chat,
+        crate::handlers::proxy::proxy_completions,
+        crate::handlers::proxy::proxy_responses,
+        crate::handlers::proxy::proxy_moderations,
+        crate::server::metrics_handler,
+        docs_ui
     ),
     components(schemas(
         BundleConfigDocument,
@@ -90,8 +96,11 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         InferenceErrorDetail,
         MessageResponse,
         ModelAckBundleStatus,
+        ModelCapabilitiesWire,
         ModelConfigStatusResponse,
         ModelInfoWire,
+        ModelsResponse,
+        OpenAiModelObject,
         ModelNotFoundDetail,
         ModelNotFoundResponse,
         ProfileInfoWire,
@@ -104,6 +113,19 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         OpenAIEmbeddingUsage,
         OpenAIEmbeddingVector,
         OpenAIEmbeddingsListResponse,
+        GenerateRequest,
+        GenerateResponse,
+        GenerateUsage,
+        ChatCompletionRequest,
+        ChatCompletionMessage,
+        ChatCompletionResponse,
+        ChatCompletionChoice,
+        ChatCompletionChoiceMessage,
+        ChatCompletionUsage,
+        CompletionsRequest,
+        ResponsesRequest,
+        OpenAIErrorBody,
+        OpenAIErrorEnvelope,
         PoolListResponse,
         crate::types::pool::PoolSpec,
         crate::types::pool::PoolStatus,
@@ -149,6 +171,62 @@ pub async fn openapi_json() -> impl IntoResponse {
     )
 }
 
+/// Vendored Redoc standalone bundle — pinned **v2.5.0**, sha256
+/// `0ec05be285ac885a330289b02f470e1bdbd2b6b3223a9fa213f24bf805a851d1`,
+/// from `https://cdn.redoc.ly/redoc/v2.5.0/bundles/redoc.standalone.js`.
+/// Inlined into the binary so `/docs` is fully self-contained: no runtime
+/// CDN/egress dependency, works in air-gapped clusters. Treat the pin as a
+/// tracked dependency — bump by re-vendoring the file and re-running the
+/// `docs_*` tests.
+const REDOC_BUNDLE: &str = include_str!("../assets/redoc.standalone.js");
+
+/// Self-contained Redoc page. Renders the **live** `/openapi.json` at
+/// request time (so it can never drift from the served spec) and loads the
+/// vendored bundle from a sibling route. Both URLs are relative so the page
+/// works unchanged at `/docs` and behind a sub-path ingress.
+const REDOC_HTML: &str = r#"<!DOCTYPE html>
+<html>
+  <head>
+    <title>SIE Gateway — API reference</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>body { margin: 0; padding: 0; }</style>
+  </head>
+  <body>
+    <redoc spec-url="openapi.json"></redoc>
+    <script src="docs/redoc.standalone.js"></script>
+  </body>
+</html>
+"#;
+
+/// Rendered, human-browsable API reference (Redoc) over the live
+/// `/openapi.json`. Auth-exempt (documentation, like `/openapi.json`) and
+/// read-only — no in-browser request console, so no token-leak surface.
+#[utoipa::path(
+    get,
+    path = "/docs",
+    tag = "docs",
+    responses((status = 200, description = "Rendered API reference (Redoc)"))
+)]
+pub async fn docs_ui() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        REDOC_HTML,
+    )
+}
+
+/// The vendored Redoc JS bundle referenced by [`docs_ui`]. Served from the
+/// gateway itself (not a CDN) so `/docs` has no outbound dependency.
+pub async fn redoc_asset() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        REDOC_BUNDLE,
+    )
+}
+
 #[cfg(test)]
 fn openapi_document() -> utoipa::openapi::OpenApi {
     OPENAPI_DOC.clone()
@@ -180,20 +258,34 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         .and_then(|components| components.get_mut("schemas"))
         .and_then(|schemas| schemas.get_mut("CreatePoolRequest"))
     {
-        create_pool["required"] = json!(["name", "gpus"]);
-        if let Some(gpus) = create_pool
-            .get_mut("properties")
-            .and_then(|properties| properties.get_mut("gpus"))
-        {
-            gpus["minProperties"] = json!(1);
-        }
+        create_pool["required"] = json!(["name"]);
+        create_pool["anyOf"] = json!([
+            {
+                "required": ["gpus"],
+                "properties": {
+                    "gpus": {
+                        "minProperties": 1
+                    }
+                }
+            },
+            {
+                "required": ["gpu_caps"],
+                "properties": {
+                    "gpu_caps": {
+                        "minProperties": 1
+                    }
+                }
+            }
+        ]);
     }
+
+    patch_chat_completion_schema(value);
 
     let paths = value["paths"]
         .as_object_mut()
         .expect("OpenAPI paths should be an object");
 
-    for path in ["/healthz", "/readyz", "/openapi.json"] {
+    for path in ["/healthz", "/readyz", "/openapi.json", "/docs"] {
         if let Some(operation) = paths
             .get_mut(path)
             .and_then(|path_item| path_item.get_mut("get"))
@@ -221,6 +313,641 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
     inject_inference_response_headers(paths);
     inject_bearer_auth_error_responses(paths);
     annotate_slash_bearing_path_parameters(paths);
+}
+
+fn patch_chat_completion_schema(value: &mut Value) {
+    patch_chat_request_schema(value);
+    patch_chat_message_schema(value);
+    patch_completions_request_schema(value);
+    patch_responses_request_schema(value);
+    patch_chat_completion_paths(value);
+    patch_completions_path(value);
+    patch_responses_path(value);
+}
+
+fn patch_chat_request_schema(value: &mut Value) {
+    let Some(properties) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("ChatCompletionRequest"))
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(|properties| properties.as_object_mut())
+    else {
+        return;
+    };
+
+    // Per-choice streaming: n > 1 with stream:true is now
+    // supported (per-choice_index delta + per-choice closure chunks ride
+    // before the single global [DONE]).
+    properties.insert(
+        "n".to_string(),
+        json!({
+            "description": "Number of candidate completions in [1, 128]. n>1 returns a \
+                            multi-entry choices array; streaming with n>1 is supported \
+                            (per-choice_index delta chunks + per-choice closure chunks \
+                            ride before the single global [DONE]).",
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 128,
+            "nullable": true,
+        }),
+    );
+    // best_of: range [1, 128]; cross-field rule best_of >= n; rejected with
+    // 400 unsupported_field when stream:true (mirrors OpenAI). Cross-field
+    // rules don't have a clean OpenAPI 3.0 expression — documented in prose.
+    properties.insert(
+        "best_of".to_string(),
+        json!({
+            "description": "Generate this many candidates and return the top `n` by \
+                            cumulative logprob. Integer in [1, 128]. Cross-field rule: \
+                            `best_of >= n` (otherwise 400 invalid_request). Rejected \
+                            with 400 unsupported_field when `stream: true` (mirrors OpenAI).",
+            "type": ["integer", "null"],
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 128,
+        }),
+    );
+    // top_logprobs: [0, 20]; requires logprobs:true when > 0.
+    properties.insert(
+        "top_logprobs".to_string(),
+        json!({
+            "description": "Number of alternative top tokens to return alongside each \
+                            chosen token's logprob. Integer in [0, 20]. Requires \
+                            `logprobs: true` when > 0 (OpenAI rule; 400 invalid_request \
+                            otherwise).",
+            "type": ["integer", "null"],
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 20,
+        }),
+    );
+    // logprobs: explicit boolean (not nullable in OpenAI's spec but optional).
+    properties.insert(
+        "logprobs".to_string(),
+        json!({
+            "description": "Return per-token logprobs. Boolean. When true, the chosen \
+                            token's logprob (and optionally a top-N list via \
+                            `top_logprobs`) rides on each `choices[].logprobs` entry.",
+            "type": ["boolean", "null"],
+        }),
+    );
+    // logit_bias: {token_id_string -> float in [-100, 100]}; capped at 1024 keys.
+    properties.insert(
+        "logit_bias".to_string(),
+        json!({
+            "description": "OpenAI `logit_bias` — `{token_id_string: bias_float}`. Keys \
+                            must parse as integer token ids; values must be finite numbers \
+                            in [-100.0, 100.0]. Map size capped at 1024 keys (request \
+                            rejects with 400 invalid_request beyond the cap).",
+            "type": ["object", "null"],
+            "additionalProperties": {
+                "type": "number",
+                "format": "double",
+                "minimum": -100.0,
+                "maximum": 100.0,
+            },
+            "maxProperties": 1024,
+        }),
+    );
+    // top_k: integer >= 1.
+    properties.insert(
+        "top_k".to_string(),
+        json!({
+            "description": "Non-OpenAI `top_k` (Together / Fireworks / vLLM extension): \
+                            integer >= 1. Absent → top-k disabled (model default).",
+            "type": ["integer", "null"],
+            "format": "int32",
+            "minimum": 1,
+        }),
+    );
+    // repetition_penalty: float in (0.0, 2.0]; exclusiveMinimum is OpenAPI 3.0-compatible.
+    properties.insert(
+        "repetition_penalty".to_string(),
+        json!({
+            "description": "Non-OpenAI `repetition_penalty`: float in (0.0, 2.0] \
+                            (1.0 = no penalty). Absent → sampler default.",
+            "type": ["number", "null"],
+            "format": "float",
+            "exclusiveMinimum": 0.0,
+            "maximum": 2.0,
+        }),
+    );
+    // seed: i64 reinterpreted as u64; document as integer.
+    properties.insert(
+        "seed".to_string(),
+        json!({
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). \
+                            Plumbed to the worker as SGLang's `sampling_params.seed`. \
+                            Non-integer values reject with 400 invalid_request.",
+            "type": ["integer", "null"],
+            "format": "int64",
+        }),
+    );
+    // stream: boolean; per-choice streaming for n>1 is supported.
+    properties.insert(
+        "stream".to_string(),
+        json!({
+            "description": "SSE streaming. When true, the response is a stream of \
+                            `chat.completion.chunk` events terminated by `data: [DONE]`. \
+                            For n > 1: per-`choice_index` delta chunks include a per-choice \
+                            `delta.role:\"assistant\"` once per choice; per-choice closure \
+                            chunks carry the `finish_reason` for that choice before the \
+                            global `[DONE]`. Non-boolean values reject with 400 invalid_request.",
+            "type": ["boolean", "null"],
+        }),
+    );
+    // stream_options.include_usage is the only accepted sub-key.
+    properties.insert(
+        "stream_options".to_string(),
+        json!({
+            "description": "OpenAI `stream_options`. Accepted sub-key: `include_usage` \
+                            (boolean — when true, the gateway emits a terminal `usage` frame \
+                            before `[DONE]`). Any other sub-key rejects with 400 \
+                            unsupported_field. Legal with `stream:false` (options ignored).",
+            "type": ["object", "null"],
+            "properties": {
+                "include_usage": {
+                    "type": ["boolean", "null"],
+                    "description": "Emit a terminal `usage` frame before `[DONE]`.",
+                }
+            },
+            "additionalProperties": false,
+        }),
+    );
+    // tools: array of {type:"function", function:{name, parameters, description?}}.
+    properties.insert(
+        "tools".to_string(),
+        json!({
+            "description": "OpenAI tool-calling. Array of tool specs; each tool must match \
+                            `{type:\"function\", function:{name, parameters, description?}}`. \
+                            With n > 1, per-candidate `tool_calls` surface on \
+                            `choices[i].message.tool_calls` (non-streaming) or ride on each \
+                            `choices[].delta` (streaming).",
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "required": ["type", "function"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["function"]},
+                    "function": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "parameters": {"type": "object"},
+                        },
+                    },
+                },
+            },
+        }),
+    );
+    // tool_choice: one of "auto"|"none"|"required" or {type:"function", function:{name}}.
+    properties.insert(
+        "tool_choice".to_string(),
+        json!({
+            "description": "OpenAI `tool_choice`. One of: `\"auto\"`, `\"none\"`, \
+                            `\"required\"`, or `{type:\"function\", function:{name}}` \
+                            (named function). Requires `tools` to be set (otherwise 400 \
+                            invalid_request). `\"required\"` and named-function choices \
+                            cannot be combined with `response_format` (two competing \
+                            grammars; 400 invalid_request).",
+            "oneOf": [
+                {"type": "string", "enum": ["auto", "none", "required"]},
+                {
+                    "type": "object",
+                    "required": ["type", "function"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["function"]},
+                        "function": {
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {"name": {"type": "string"}},
+                        },
+                    },
+                },
+            ],
+        }),
+    );
+    properties.insert(
+        "parallel_tool_calls".to_string(),
+        json!({
+            "description": "OpenAI `parallel_tool_calls` — boolean controlling whether the \
+                            model may emit multiple tool calls per turn.",
+            "type": ["boolean", "null"],
+        }),
+    );
+    // response_format: {type:"text"|"json_object"|"json_schema", json_schema?:{...}}.
+    properties.insert(
+        "response_format".to_string(),
+        json!({
+            "description": "OpenAI `response_format` — translated into a grammar spec on \
+                            the worker. Accepted shapes: `{type:\"text\"}`, \
+                            `{type:\"json_object\"}`, `{type:\"json_schema\", \
+                            json_schema:{...}}`. Cannot be combined with a forcing \
+                            `tool_choice` (`\"required\"` or a named function) — two \
+                            competing grammars on one request reject with 400 invalid_request.",
+            "type": ["object", "null"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["text", "json_object", "json_schema"],
+                },
+                "json_schema": {"type": "object"},
+            },
+        }),
+    );
+    properties.insert(
+        "stop".to_string(),
+        json!({
+            "description": "Either a string or an array of strings, mirroring OpenAI.",
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}}
+            ]
+        }),
+    );
+    // lora_adapter: top-level /generate lora_path kwarg (the worker forwards to
+    // SGLang where it ends up in sampling_params.lora_path — the wire shape at
+    // the gateway→worker boundary is a top-level kwarg, not a sampling_params field).
+    properties.insert(
+        "lora_adapter".to_string(),
+        json!({
+            "description": "SIE extension: non-empty served-name of a LoRA adapter declared \
+                            in the model profile's `lora_paths`. Absent → the base model. \
+                            Unknown name → 400 with `param:\"lora_adapter\"`. The gateway \
+                            forwards it to the worker as a top-level `lora_path` generation \
+                            kwarg (SGLang then selects the adapter by served name; the \
+                            sampling-params placement is an SGLang implementation detail, \
+                            not part of the SIE wire contract).",
+            "type": ["string", "null"],
+            "minLength": 1,
+        }),
+    );
+    properties.insert(
+        "user".to_string(),
+        json!({
+            "description": "OpenAI `user` — Sensitive PII. Accepted-and-dropped: \
+                            debug-logged only, never persisted, never forwarded to \
+                            the worker.",
+            "type": ["string", "null"],
+            "x-sensitive": true
+        }),
+    );
+}
+
+fn patch_chat_message_schema(value: &mut Value) {
+    let Some(schema) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("ChatCompletionMessage"))
+    else {
+        return;
+    };
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.as_object_mut())
+    else {
+        return;
+    };
+    // content: string OR array of text-only content parts; null on
+    // assistant-with-tool_calls messages.
+    properties.insert(
+        "content".to_string(),
+        json!({
+            "description": "Either a string or an array of content parts \
+                            (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image parts \
+                            (`image_url` / `input_image`) carrying a base64 `data:` URI are \
+                            accepted for generation models that declare `inputs.image`; non-vision models \
+                            reject with 400 unsupported_field and remote (non-`data:`) URLs \
+                            reject with 400 invalid_request. May be \
+                            `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["type"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["text", "input_text", "image_url", "input_image"]},
+                            "text": {"type": "string"},
+                            "image_url": {
+                                "description": "Image payload for `image_url` / `input_image` parts: a base64 `data:` URI, either as a bare string or as `{ \"url\": \"data:...\" }`. Remote (non-`data:`) URLs reject with 400 invalid_request.",
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "object", "properties": {"url": {"type": "string"}}},
+                                ],
+                            },
+                        },
+                    },
+                },
+                {"type": "null"},
+            ],
+        }),
+    );
+    // tool_calls: array of {id, type:"function", function:{name, arguments}}.
+    properties.insert(
+        "tool_calls".to_string(),
+        json!({
+            "description": "OpenAI tool-call replay on `role:\"assistant\"` messages. Each \
+                            entry MUST match `{id, type:\"function\", function:{name, \
+                            arguments}}`; `arguments` is a JSON-encoded string. Rejected on \
+                            other roles with 400.",
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "required": ["id", "type", "function"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "type": {"type": "string", "enum": ["function"]},
+                    "function": {
+                        "type": "object",
+                        "required": ["name", "arguments"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {
+                                "type": "string",
+                                "description": "JSON-encoded argument string (OpenAI convention).",
+                            },
+                        },
+                    },
+                },
+            },
+        }),
+    );
+    properties.insert(
+        "tool_call_id".to_string(),
+        json!({
+            "description": "Required on `role:\"tool\"` messages (matches the assistant turn's \
+                            `tool_calls[].id`). Rejected on every other role with 400 \
+                            invalid_request.",
+            "type": ["string", "null"],
+        }),
+    );
+    // ``content`` is required EXCEPT on assistant-with-tool_calls (per parser),
+    // which OpenAPI 3.0 can't express precisely without conditional schemas.
+    // Document the optionality in prose; keep ``role`` required.
+    if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+        required.retain(|v| v.as_str() != Some("content"));
+    }
+}
+
+fn patch_completions_request_schema(value: &mut Value) {
+    let Some(schema) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("CompletionsRequest"))
+    else {
+        return;
+    };
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.as_object_mut())
+    else {
+        return;
+    };
+    properties.insert(
+        "stop".to_string(),
+        json!({
+            "description": "Either a string or an array of strings, mirroring OpenAI.",
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}}
+            ]
+        }),
+    );
+    properties.insert(
+        "n".to_string(),
+        json!({
+            "description": "Single-candidate only: integer `1` (or absent) accepted; `n > 1` \
+                            rejects with 400 unsupported_field (use chat for multi-candidate). \
+                            `n == 0` rejects with 400 invalid_request.",
+            "type": ["integer", "null"],
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 1,
+        }),
+    );
+    properties.insert(
+        "stream".to_string(),
+        json!({
+            "description": "SSE streaming. When true, the response is a stream of \
+                            `text_completion` events terminated by `data: [DONE]`. \
+                            Non-boolean values reject with 400 invalid_request.",
+            "type": ["boolean", "null"],
+        }),
+    );
+    properties.insert(
+        "seed".to_string(),
+        json!({
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). \
+                            Non-integer values reject with 400 invalid_request.",
+            "type": ["integer", "null"],
+            "format": "int64",
+        }),
+    );
+}
+
+fn patch_responses_request_schema(value: &mut Value) {
+    let Some(schema) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("ResponsesRequest"))
+    else {
+        return;
+    };
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.as_object_mut())
+    else {
+        return;
+    };
+    // input: either a string OR an array of {role, content} messages.
+    properties.insert(
+        "input".to_string(),
+        json!({
+            "description": "Either a string prompt OR an array of `{role, content}` messages \
+                            (array-input support). Array form: `role` is one of \
+                            `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" \
+                            normalizes to \"system\"). `content` is a string or an array of \
+                            text-only content parts; image parts (`image_url` / `input_image`) \
+                            reject with 400 unsupported_field. The array must not be empty.",
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": ["role", "content"],
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "enum": ["system", "user", "assistant", "developer"],
+                            },
+                            "content": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["type"],
+                                            "properties": {
+                                                "type": {
+                                                    "type": "string",
+                                                    "enum": ["text", "input_text"],
+                                                },
+                                                "text": {"type": "string"},
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+            ],
+        }),
+    );
+    properties.insert(
+        "stream".to_string(),
+        json!({
+            "description": "Accepted only as `false` (or absent). `true` rejects with 400 \
+                            unsupported_field because Responses SSE is not supported yet.",
+            "type": ["boolean", "null"],
+            "enum": [false, null],
+        }),
+    );
+    properties.insert(
+        "seed".to_string(),
+        json!({
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). \
+                            Non-integer values reject with 400 invalid_request.",
+            "type": ["integer", "null"],
+            "format": "int64",
+        }),
+    );
+}
+
+fn patch_chat_completion_paths(value: &mut Value) {
+    let Some(op) = value
+        .get_mut("paths")
+        .and_then(|paths| paths.get_mut("/v1/chat/completions"))
+        .and_then(|path_item| path_item.get_mut("post"))
+    else {
+        return;
+    };
+    if let Some(op_obj) = op.as_object_mut() {
+        op_obj.insert(
+            "description".to_string(),
+            json!(
+                "OpenAI-compatible chat completions. Strict allow-list parser: \
+                 unknown top-level fields reject with 400 \
+                 `unsupported_field`. Streaming (`stream: true`) is supported and emits \
+                 SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates \
+                 out as per-`choice_index` delta chunks with per-choice closure chunks \
+                 (each carrying `finish_reason`) before the single global `[DONE]`. \
+                 Content is either a string or an array of content parts; image parts \
+                 (`image_url` / `input_image`) with a base64 `data:` URI are accepted for \
+                 generation models declaring `inputs.image` (non-vision/encode-only models reject 400 \
+                 `unsupported_field`; remote URLs reject 400 `invalid_request`). \
+                 `lora_adapter` is forwarded to the worker as a \
+                 top-level `lora_path` generation kwarg."
+            ),
+        );
+    }
+}
+
+fn patch_completions_path(value: &mut Value) {
+    let Some(post) = value
+        .get_mut("paths")
+        .and_then(|paths| paths.get_mut("/v1/completions"))
+        .and_then(|path_item| path_item.get_mut("post"))
+    else {
+        return;
+    };
+    if let Some(op_obj) = post.as_object_mut() {
+        op_obj.insert(
+            "description".to_string(),
+            json!(
+                "OpenAI-compatible legacy Completions. Strict allow-list parser: \
+                 unknown top-level fields reject with 400 \
+                 `unsupported_field`. `stream: true` is supported (SSE `text_completion`). \
+                 Known-rejected fields: `echo`, `suffix`, `logprobs`, `best_of`, `n > 1`, \
+                 batched array `prompt` — each rejects with 400 `unsupported_field`. The \
+                 response body no longer carries the always-null `logprobs` field."
+            ),
+        );
+        op_obj.insert(
+            "summary".to_string(),
+            json!("`/v1/completions` — legacy OpenAI Completions (single-candidate, raw-prompt)."),
+        );
+        // Document the request body shape (utoipa generates this from the
+        // attribute on the handler — but proxy.rs has no request_body
+        // attribute on proxy_completions, so we add the schema reference here).
+        let request_body = op_obj
+            .entry("requestBody".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(request_body) = request_body.as_object_mut() {
+            request_body.insert("required".to_string(), json!(true));
+            request_body.insert(
+                "content".to_string(),
+                json!({
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/CompletionsRequest"}
+                    }
+                }),
+            );
+        }
+    }
+}
+
+fn patch_responses_path(value: &mut Value) {
+    let Some(post) = value
+        .get_mut("paths")
+        .and_then(|paths| paths.get_mut("/v1/responses"))
+        .and_then(|path_item| path_item.get_mut("post"))
+    else {
+        return;
+    };
+    if let Some(op_obj) = post.as_object_mut() {
+        op_obj.insert(
+            "description".to_string(),
+            json!(
+                "OpenAI Responses API (MVP). Strict allow-list parser: \
+                 unknown top-level fields reject with 400 \
+                 `unsupported_field`. `input` is either a string prompt OR an array of \
+                 `{role, content}` messages. \
+                 Known-rejected fields: `tools`, `tool_choice`, `previous_response_id`, \
+                 `reasoning`, `background`, `metadata`, `instructions` — each rejects \
+                 with 400 `unsupported_field`. `stream: true` is rejected (Responses SSE \
+                 is deferred). Multimodal image content parts reject with 400 \
+                 `unsupported_field` on the array form."
+            ),
+        );
+        op_obj.insert(
+            "summary".to_string(),
+            json!("`/v1/responses` — OpenAI Responses API (MVP, stateless single-turn)."),
+        );
+        let request_body = op_obj
+            .entry("requestBody".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(request_body) = request_body.as_object_mut() {
+            request_body.insert("required".to_string(), json!(true));
+            request_body.insert(
+                "content".to_string(),
+                json!({
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ResponsesRequest"}
+                    }
+                }),
+            );
+        }
+    }
 }
 
 /// Duplicate ``application/json`` schemas to the msgpack media types accepted by queue inference.
@@ -512,6 +1239,7 @@ fn annotate_slash_bearing_path_parameters(paths: &mut serde_json::Map<String, Va
         ("/v1/encode/{model}", "model", "/v1/encode/{*model}"),
         ("/v1/score/{model}", "model", "/v1/score/{*model}"),
         ("/v1/extract/{model}", "model", "/v1/extract/{*model}"),
+        ("/v1/generate/{model}", "model", "/v1/generate/{*model}"),
         ("/v1/configs/models/{id}", "id", "/v1/configs/models/{*id}"),
         (
             "/v1/configs/models/{id}/status",
@@ -666,6 +1394,436 @@ pub struct OpenAIEmbeddingsListResponse {
     pub usage: OpenAIEmbeddingUsage,
 }
 
+// ── /v1/generate/{model} schemas ──────────────────────────────────
+
+/// SIE-native blocking text-generation request.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GenerateRequest {
+    #[schema(min_length = 1)]
+    pub prompt: String,
+    #[schema(minimum = 1)]
+    pub max_new_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Stop sequences for the native generate surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    /// Optional grammar object accepted by the gateway grammar validator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Sensitive PII - parsed and dropped, never logged or forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GenerateUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GenerateResponse {
+    pub model: String,
+    pub text: String,
+    pub finish_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<GenerateUsage>,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpot_ms: Option<f64>,
+}
+
+// ── /v1/chat/completions schemas ──────────────────────────────────
+
+/// One chat message in an OpenAI chat-completions request.
+///
+/// Per the strict allow-list parser, ``content`` is either a
+/// plain string OR a list of content parts (``{type:"text"|"input_text",
+/// text:"..."}``). ``image_url`` / ``input_image`` parts carrying a base64
+/// ``data:`` URI are accepted for generation models declaring ``inputs.image`` (non-vision
+/// models reject 400 ``unsupported_field``; remote URLs reject 400
+/// ``invalid_request``). Assistant messages that carry ``tool_calls`` may set
+/// ``content: null``.
+///
+/// ``tool_calls`` is accepted only on ``role:"assistant"`` messages; each
+/// entry has the validated shape ``{id, type:"function", function:{name, arguments}}``
+/// where ``arguments`` is a JSON-encoded string (OpenAI convention).
+/// ``tool_call_id`` is required on ``role:"tool"`` messages and rejected
+/// on every other role.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionMessage {
+    /// One of ``"system" | "user" | "assistant" | "tool" | "developer"``.
+    /// ``tool`` carries multi-turn tool-call replay; ``developer`` is OpenAI's
+    /// newer alias for ``system`` and is normalized to ``system``. Any other
+    /// role rejects with 400 ``invalid_request``.
+    pub role: String,
+    /// Either a string or an array of content parts. ``image_url`` /
+    /// ``input_image`` parts with a base64 ``data:`` URI are accepted for
+    /// vision-capable generation models (``inputs.image`` + a generate task); non-vision/encode-only models reject 400
+    /// ``unsupported_field`` and remote URLs reject 400 ``invalid_request``.
+    /// May be ``null`` on an assistant message that carries ``tool_calls``.
+    pub content: Value,
+    /// OpenAI tool-call replay on ``role:"assistant"`` messages.
+    /// Each entry MUST match ``{id, type:"function", function:{name, arguments}}``;
+    /// ``arguments`` is a JSON-encoded string. Rejected on other roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    /// Required on ``role:"tool"`` messages (matches the assistant turn's
+    /// ``tool_calls[].id``). Rejected on every other role with 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI-compatible ``POST /v1/chat/completions`` request.
+///
+/// **Strict allow-list:** unknown top-level fields reject with 400
+/// ``unsupported_field``. Type-invalid values for accepted fields reject
+/// with 400 ``invalid_request``.
+///
+/// **Known-rejected fields**:
+/// - ``functions`` / ``function_call`` — deprecated by OpenAI; use ``tools`` instead.
+/// - ``modalities``, ``audio``, ``metadata``, ``store``, ``service_tier``,
+///   ``prediction``, ``reasoning_effort``, ``verbosity`` — out of scope.
+///
+/// **Streaming:** ``stream: true`` is supported (SSE ``chat.completion.chunk``).
+/// ``n > 1`` streaming fans candidates out as per-``choice_index``-tagged delta
+/// chunks with a per-choice closure carrying ``finish_reason`` (and a per-choice
+/// ``delta.role:"assistant"`` once per choice) before the single global ``[DONE]``.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<ChatCompletionMessage>,
+    /// Preferred output-token cap. Falls back to ``max_tokens`` when
+    /// absent. When BOTH are omitted the gateway applies a default
+    /// (1024, override via ``SIE_GATEWAY_DEFAULT_MAX_TOKENS``) rather
+    /// than rejecting — matching OpenAI, where this field is optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    /// Legacy compatibility — ``max_completion_tokens`` wins when both
+    /// are present. Optional; see ``max_completion_tokens`` for the
+    /// behaviour when neither is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature. Finite number ``>= 0``; non-finite values reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling. Finite number in ``(0, 1]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Either a string or an array of strings, mirroring OpenAI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Value>,
+    /// OpenAI ``frequency_penalty`` in ``[-2.0, 2.0]``; out-of-range or
+    /// non-numeric values yield 400 ``invalid_request``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI ``presence_penalty`` in ``[-2.0, 2.0]``; same validation as
+    /// ``frequency_penalty``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Non-OpenAI ``top_k`` (Together / Fireworks / vLLM extension):
+    /// integer ``>= 1``. Absent → top-k disabled (model default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Non-OpenAI ``repetition_penalty``: float in ``(0.0, 2.0]``
+    /// (``1.0`` = no penalty). Absent → sampler default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// SGLang ``sampling_params.min_new_tokens``: integer ``>= 0`` capping
+    /// how many tokens the model must emit before any stop condition can
+    /// fire. Use to work around models that occasionally emit the stop
+    /// token as the very first decoded token (e.g. Qwen3.6 thinking-off
+    /// under greedy decode). Absent → sampler default (no minimum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+    /// Per-request overrides for kwargs passed to the tokenizer's
+    /// ``apply_chat_template`` call. Object whose entries are merged on
+    /// top of the model YAML's ``chat_template_kwargs`` (the YAML wins
+    /// for keys present in both — adjust the YAML when a request needs
+    /// to defeat a baked-in default). Typical use: pass
+    /// ``{"enable_thinking": false}`` to the Qwen3 family to suppress
+    /// ``<think>`` reasoning on a per-request basis. Absent → only the
+    /// model YAML's defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<Value>,
+    /// Number of candidate completions, ``[1, 128]``. ``n>1`` returns a
+    /// multi-entry ``choices`` array. Streaming with ``n>1`` is supported:
+    /// per-``choice_index`` delta chunks plus per-choice closure chunks
+    /// (each carrying a ``finish_reason``) ride before the single ``[DONE]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// OpenAI ``best_of``: integer in ``[1, 128]``. Generate this many
+    /// candidates and return the top ``n`` by cumulative logprob.
+    /// Cross-field rule: ``best_of >= n``. Rejected with 400
+    /// ``unsupported_field`` when ``stream: true`` (mirrors OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_of: Option<u32>,
+    /// SIE extension: non-empty served-name of a LoRA adapter declared in the
+    /// model profile's ``lora_paths``. Absent → the base model. The gateway
+    /// resolves the name against the model's loaded adapters; unknown name →
+    /// 400 with ``param:"lora_adapter"``. Forwarded to the worker as a
+    /// top-level ``lora_path`` generation kwarg (SGLang then selects the
+    /// adapter by served name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora_adapter: Option<String>,
+    /// OpenAI ``user`` — accepted-and-dropped (debug-logged only, never
+    /// persisted, never forwarded to the worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Accepted and silently ignored (never logged, never forwarded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    /// Prompt-cache hint; plumbed onto the work envelope and
+    /// ignored by the worker on the chat-completions surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Routing affinity hint; same plumbing as
+    /// ``prompt_cache_key``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+    /// Best-effort determinism seed (i64 reinterpreted as u64). Plumbed to
+    /// the worker as SGLang's ``sampling_params.seed``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Return per-token logprobs. Boolean. When ``true``, the chosen
+    /// token's logprob (and optionally a top-N list) rides on each
+    /// ``choices[].logprobs`` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// Number of alternative top tokens to return alongside each chosen
+    /// token's logprob. Integer in ``[0, 20]``. Requires ``logprobs: true``
+    /// when > 0 (the OpenAI rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    /// OpenAI ``logit_bias`` — ``{token_id_string: bias_float}``. Keys must
+    /// parse as integer token ids; values must be finite numbers in
+    /// ``[-100.0, 100.0]``. Map size capped at 1024 keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::BTreeMap<String, f64>>,
+    /// OpenAI ``response_format`` — translated into a grammar spec on the
+    /// worker. Accepted shapes: ``{type:"text"}``, ``{type:"json_object"}``,
+    /// ``{type:"json_schema", json_schema:{...}}``. Cannot be combined with
+    /// a forcing ``tool_choice`` (``"required"`` or a named function); two
+    /// competing grammars on one request reject with 400 ``invalid_request``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
+    /// SSE streaming. When ``true``, the response is a stream of
+    /// ``chat.completion.chunk`` events terminated by ``data: [DONE]``.
+    /// For ``n > 1``, per-``choice_index`` delta chunks include a per-choice
+    /// ``delta.role:"assistant"`` once per choice; per-choice closure chunks
+    /// carry the ``finish_reason`` for that choice before the global ``[DONE]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// OpenAI ``stream_options``. Accepted sub-key: ``include_usage``
+    /// (boolean — when true, the gateway emits a terminal ``usage`` frame
+    /// before ``[DONE]``). Any other sub-key rejects with 400
+    /// ``unsupported_field``. Legal with ``stream:false`` (the options are
+    /// simply ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
+    /// OpenAI tool-calling. Array of tool specs; each tool must match
+    /// ``{type:"function", function:{name, parameters, description?}}``.
+    /// Combined with ``n > 1``, per-candidate ``tool_calls`` surface on
+    /// ``choices[i].message.tool_calls`` (non-streaming). On the streaming
+    /// path, tool-call deltas ride on each ``choices[].delta`` chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Value>,
+    /// OpenAI ``tool_choice``. One of: ``"auto"``, ``"none"``, ``"required"``,
+    /// or ``{type:"function", function:{name}}`` (named function). Requires
+    /// ``tools`` to be set. ``"required"`` and named-function choices cannot
+    /// be combined with ``response_format`` (two competing grammars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
+    /// OpenAI ``parallel_tool_calls`` — boolean controlling whether the
+    /// model may emit multiple tool calls per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionChoiceMessage {
+    pub role: String,
+    pub content: String,
+    /// Per-candidate tool-call list. Present when the model
+    /// emitted one or more tool calls for this choice; absent otherwise.
+    /// Each entry has the OpenAI shape ``{id, type:"function",
+    /// function:{name, arguments}}`` where ``arguments`` is a JSON-encoded string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionChoice {
+    pub index: u32,
+    pub message: ChatCompletionChoiceMessage,
+    /// One of ``"stop" | "length" | "tool_calls"``. The chat surface collapses
+    /// unknown SIE-native finish reasons to ``stop`` so strict OpenAI clients
+    /// still parse the response. ``_close_choice`` coerces a length-truncated
+    /// candidate that also produced a tool call to ``"tool_calls"`` per the
+    /// OpenAI convention.
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatCompletionResponse {
+    /// Always ``"chatcmpl-<request_id>"``.
+    pub id: String,
+    /// Always ``"chat.completion"`` on the non-streaming endpoint.
+    pub object: String,
+    /// Epoch seconds.
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChoice>,
+    pub usage: ChatCompletionUsage,
+}
+
+/// OpenAI-compatible ``POST /v1/completions`` request (legacy raw-prompt surface).
+///
+/// **Strict allow-list**: unknown fields reject with 400
+/// ``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.
+///
+/// **Known-rejected fields**:
+/// - ``echo`` — rejected with 400 ``unsupported_field``.
+/// - ``suffix`` — rejected with 400 ``unsupported_field``.
+/// - ``logprobs`` — rejected with 400 ``unsupported_field`` (the legacy
+///   ``{tokens, token_logprobs}`` response shape is a follow-up; chat
+///   ``logprobs`` is available on ``/v1/chat/completions``).
+/// - ``best_of`` — rejected with 400 ``unsupported_field`` (use chat).
+/// - ``n > 1`` — rejected with 400 ``unsupported_field`` (chat is the
+///   multi-candidate surface). ``n == 1`` (or absent) is a no-op.
+/// - Batched array ``prompt`` — rejected with 400 ``unsupported_field``;
+///   send one prompt string.
+///
+/// **Streaming:** ``stream: true`` is supported (SSE ``text_completion``).
+///
+/// **Response body wire change:** the always-null ``logprobs`` field has
+/// been dropped from the response body; SDKs that destructure
+/// ``choices[].logprobs`` should treat absence as the new normal.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CompletionsRequest {
+    pub model: String,
+    /// Single prompt string. Batched array prompts reject with 400
+    /// ``unsupported_field``.
+    pub prompt: String,
+    /// Positive integer; defaults to 16 (OpenAI's documented default for
+    /// completions) when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature. Finite number ``>= 0``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling. Finite number in ``(0, 1]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Either a string or an array of strings, mirroring OpenAI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Value>,
+    /// In ``[-2.0, 2.0]``; out-of-range or non-numeric values yield 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// In ``[-2.0, 2.0]``; out-of-range or non-numeric values yield 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Best-effort determinism seed (i64 reinterpreted as u64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// SSE streaming. ``true`` is supported; the response is a stream of
+    /// ``text_completion`` events terminated by ``data: [DONE]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Single-candidate only: ``1`` (or absent) is accepted; ``n > 1``
+    /// rejects with 400 ``unsupported_field`` (use chat for multi-candidate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+}
+
+/// OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).
+///
+/// **Strict allow-list**: unknown fields reject with 400
+/// ``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.
+///
+/// **Known-rejected fields**:
+/// - ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.
+/// - ``previous_response_id`` — rejected with 400 ``unsupported_field``
+///   (Responses MVP is stateless single-turn).
+/// - ``reasoning`` — rejected with 400 ``unsupported_field``.
+/// - ``background`` — rejected with 400 ``unsupported_field``.
+/// - ``metadata`` — rejected with 400 ``unsupported_field``.
+/// - ``instructions`` — rejected with 400 ``unsupported_field``.
+/// - ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on
+///   Responses is deferred; use ``stream: false`` or omit).
+/// - Multimodal ``image_url`` / ``input_image`` content parts on the array
+///   form — rejected with 400 ``unsupported_field``: the Responses surface is
+///   text-only. (Vision input is supported on ``/v1/chat/completions``.)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesRequest {
+    pub model: String,
+    /// Either a string prompt OR an array of ``{role, content}`` messages
+    /// (array-input support). Array form: ``role`` is one of
+    /// ``"system" | "user" | "assistant" | "developer"`` (``"tool"`` is
+    /// nominally accepted but Responses tools are rejected so it is
+    /// effectively unreachable). ``content`` is a string or an array of
+    /// text-only content parts; image parts reject.
+    pub input: Value,
+    /// Defaults to 16 (mirroring completions) when absent. Positive integer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Sampling temperature. Finite number ``>= 0``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling. Finite number in ``(0, 1]``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Best-effort determinism seed (i64 reinterpreted as u64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Accepted only as ``false`` (or absent). ``true`` rejects with 400
+    /// ``unsupported_field`` (Responses SSE is deferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+/// OpenAI-shaped error body used by ``/v1/generate/{model}`` and
+/// ``/v1/chat/completions``.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OpenAIErrorBody {
+    pub message: String,
+    /// One of the stable types in ``http_error::openai_type``.
+    #[serde(rename = "type")]
+    pub err_type: String,
+    /// Offending field name (e.g. ``"messages"``, ``"max_completion_tokens"``).
+    /// ``null`` when the error is not field-specific.
+    pub param: Option<String>,
+    /// SIE-native discriminator, see ``http_error::openai_code``.
+    pub code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OpenAIErrorEnvelope {
+    pub error: OpenAIErrorBody,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GatewayErrorResponse {
     #[serde(default)]
@@ -786,10 +1944,96 @@ pub struct ModelInfoWire {
     pub last_error: Option<serde_json::Value>,
     pub max_sequence_length: Option<u64>,
     pub profiles: std::collections::HashMap<String, ProfileInfoWire>,
+    /// Advertised model capabilities. Consumers use this to discover
+    /// which features the model supports before composing a request.
+    ///
+    /// Validation is profile-scoped per ADR-0001 / M10 — clients
+    /// selecting a specific profile must check
+    /// ``capabilities.profile_lora_adapters[profile_name]``, not the
+    /// ``capabilities.lora_adapters`` union summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilitiesWire>,
 }
 
+/// Capability summary surfaced on each entry of ``GET /v1/models``.
+///
+/// Mirrors the JSON shape constructed in
+/// ``types/model.rs::to_model_info_value``. All fields are optional —
+/// their presence depends on what the model config declares.
+///
+/// These flags indicate that a model *supports* a task — they are NOT a
+/// precision-independent quality SLA. A flag is true at the model level even
+/// when quality is profile/precision-dependent (e.g. ``sql`` quality regresses
+/// under FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``
+/// alias). Treat them as "can do this", not "guaranteed to score X".
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelCapabilitiesWire {
+    /// Union of LoRA served-names across profiles. Back-compat summary
+    /// for consumers that don't care about profile scope; validation
+    /// MUST go through ``profile_lora_adapters``.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_adapters: Option<Vec<String>>,
+    /// Per-profile LoRA breakdown — keyed by profile name. Added by
+    /// M10 so consumers needing precise routing scope don't have to
+    /// reverse-engineer it from the union. The validation gate uses
+    /// this map; ``lora_adapters`` is for display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_lora_adapters: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Grammar kinds the model's active backend supports
+    /// (``json_schema`` | ``regex`` | ``ebnf``). EBNF presence depends
+    /// on the backend: SGLang's Outlines backend does not implement
+    /// EBNF, so a profile with ``grammar_backend: outlines`` advertises
+    /// only ``["json_schema", "regex"]``; xgrammar/llguidance profiles
+    /// advertise all three.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<Vec<String>>,
+    /// Whether the model supports tool / function calling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    /// Whether the model is validated for code generation — backs the
+    /// ``model="code"`` alias. Informational only; never request-gated.
+    pub code: bool,
+    /// Whether the model targets the SQL path — backs the ``model="sql"``
+    /// alias. Informational only; never request-gated. Precision-sensitive:
+    /// SQL quality can regress sharply under FP8, so this model-level flag is a
+    /// support signal, not a per-profile quality guarantee.
+    pub sql: bool,
+    /// Whether the model is a content-moderation / policy-check guard —
+    /// backs the ``model="guard"`` alias. Informational only; never
+    /// request-gated.
+    pub guard: bool,
+}
+
+/// One OpenAI-shaped model object in the `data` array of
+/// `GET /v1/models`. Present for OpenAI-ecosystem compatibility; native
+/// SIE consumers read the richer [`ModelInfoWire`] entries under
+/// `models` instead.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OpenAiModelObject {
+    /// Model id — the same string `/v1/chat/completions` accepts as `model`.
+    pub id: String,
+    /// Always `"model"`.
+    pub object: String,
+    /// Unix epoch seconds. SIE has no per-model creation time, so this
+    /// is a fixed sentinel; OpenAI clients use it only for display.
+    pub created: i64,
+    /// Always `"sie"`.
+    pub owned_by: String,
+}
+
+/// Response for `GET /v1/models`.
+///
+/// Hybrid shape: `object` + `data` is the OpenAI list format (consumed
+/// by vanilla OpenAI clients and Open WebUI for model discovery);
+/// `models` is the richer native shape consumed by the SIE Python/TS
+/// SDKs. Both describe the same set of models.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
+    /// Always `"list"` (OpenAI list envelope).
+    pub object: String,
+    /// OpenAI-shaped model objects for ecosystem compatibility.
+    pub data: Vec<OpenAiModelObject>,
+    /// Native SIE model info (capabilities, dims, profiles).
     pub models: Vec<ModelInfoWire>,
 }
 
@@ -1132,9 +2376,55 @@ mod tests {
             .unwrap()
             .contains("never returns 503"));
         assert_eq!(spec["paths"]["/openapi.json"]["get"]["security"], json!([]));
+        // The rendered reference at /docs must be reachable without a token
+        // when auth is on, so client codegen + discovery still work.
+        assert_eq!(spec["paths"]["/docs"]["get"]["security"], json!([]));
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_ui_serves_self_contained_redoc_html() {
+        let resp = docs_ui().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        // Renders the live spec via Redoc, loads the vendored (non-CDN) bundle.
+        assert!(html.contains("<redoc spec-url=\"openapi.json\">"));
+        assert!(html.contains("docs/redoc.standalone.js"));
+        assert!(
+            !html.contains("cdn.") && !html.contains("http"),
+            "no outbound CDN/URL may appear in the served docs page"
+        );
+    }
+
+    #[tokio::test]
+    async fn redoc_asset_serves_vendored_bundle_as_javascript() {
+        let resp = redoc_asset().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        // The bundle is non-trivially sized (the real Redoc standalone build).
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            body.len() > 100_000,
+            "vendored Redoc bundle looks truncated"
         );
     }
 
@@ -1152,8 +2442,68 @@ mod tests {
     fn openapi_json_documents_create_pool_runtime_validation() {
         let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
         let create_pool = &spec["components"]["schemas"]["CreatePoolRequest"];
-        assert_eq!(create_pool["required"], json!(["name", "gpus"]));
-        assert_eq!(create_pool["properties"]["gpus"]["minProperties"], 1);
+        assert_eq!(create_pool["required"], json!(["name"]));
+        assert_eq!(
+            create_pool["anyOf"],
+            json!([
+                {
+                    "required": ["gpus"],
+                    "properties": {
+                        "gpus": {
+                            "minProperties": 1
+                        }
+                    }
+                },
+                {
+                    "required": ["gpu_caps"],
+                    "properties": {
+                        "gpu_caps": {
+                            "minProperties": 1
+                        }
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn openapi_json_documents_generate_contract() {
+        let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        let generate = &spec["paths"]["/v1/generate/{model}"]["post"];
+
+        assert_eq!(
+            generate["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/GenerateRequest"
+        );
+        assert_eq!(
+            generate["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/GenerateResponse"
+        );
+
+        let request = &spec["components"]["schemas"]["GenerateRequest"];
+        assert_eq!(request["required"], json!(["prompt", "max_new_tokens"]));
+    }
+
+    #[test]
+    fn openapi_json_documents_chat_privacy_and_constraints() {
+        let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
+        let properties = &spec["components"]["schemas"]["ChatCompletionRequest"]["properties"];
+
+        // n in [1, 128]; n>1 is supported (non-streaming multi-candidate).
+        assert_eq!(properties["n"]["minimum"], 1);
+        assert_eq!(properties["n"]["maximum"], 128);
+        assert_eq!(properties["n"]["type"], "integer");
+        assert_eq!(
+            properties["stop"]["oneOf"],
+            json!([
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}}
+            ])
+        );
+        assert_eq!(properties["user"]["x-sensitive"], true);
+        let user_description = properties["user"]["description"].as_str().unwrap();
+        assert!(user_description.contains("Sensitive PII"));
+        assert!(!user_description.contains("Logged at debug level"));
     }
 
     #[test]
@@ -1188,6 +2538,7 @@ mod tests {
             ("/health", &["get"][..]),
             ("/metrics", &["get"][..]),
             ("/openapi.json", &["get"][..]),
+            ("/docs", &["get"][..]),
             ("/v1/models", &["get"][..]),
             ("/v1/models/{model}", &["get"][..]),
             ("/v1/pools", &["get", "post"][..]),
@@ -1200,10 +2551,15 @@ mod tests {
             ("/v1/configs/bundles/{id}", &["get"][..]),
             ("/v1/configs/resolve", &["post"][..]),
             ("/v1/embeddings", &["post"][..]),
+            ("/v1/chat/completions", &["post"][..]),
+            ("/v1/completions", &["post"][..]),
+            ("/v1/responses", &["post"][..]),
+            ("/v1/moderations", &["post"][..]),
             ("/ws/cluster-status", &["get"][..]),
             ("/v1/encode/{model}", &["post"][..]),
             ("/v1/score/{model}", &["post"][..]),
             ("/v1/extract/{model}", &["post"][..]),
+            ("/v1/generate/{model}", &["post"][..]),
         ];
 
         let actual_paths: std::collections::BTreeSet<_> =
@@ -1222,19 +2578,23 @@ mod tests {
     }
 
     #[test]
-    fn openapi_document_does_not_advertise_internal_engine_header() {
+    fn openapi_document_advertises_engine_header_on_inference_paths() {
         let spec = serde_json::to_value(openapi_document()).unwrap();
-        for path_item in spec["paths"].as_object().unwrap().values() {
-            for operation in path_item.as_object().unwrap().values() {
-                let Some(parameters) = operation.get("parameters").and_then(|p| p.as_array())
-                else {
-                    continue;
-                };
-                for parameter in parameters {
-                    let name = parameter["name"].as_str().unwrap_or_default();
-                    assert_ne!(name.to_ascii_lowercase(), "x-sie-engine");
-                }
-            }
+        for path in [
+            "/v1/encode/{model}",
+            "/v1/score/{model}",
+            "/v1/extract/{model}",
+            "/v1/embeddings",
+        ] {
+            let parameters = spec["paths"][path]["post"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} must document parameters"));
+            assert!(
+                parameters.iter().any(|p| p["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("x-sie-engine"))),
+                "{path} must document X-SIE-Engine"
+            );
         }
     }
 
@@ -1290,11 +2650,13 @@ mod tests {
             ])
         );
 
+        // SIE-native passthrough endpoints keep the legacy `detail`-shaped
+        // error unions. `/v1/embeddings` is OpenAI-shaped and asserted
+        // separately below.
         for path in [
             "/v1/encode/{model}",
             "/v1/score/{model}",
             "/v1/extract/{model}",
-            "/v1/embeddings",
         ] {
             assert_eq!(
                 spec["paths"][path]["post"]["responses"]["500"]["content"]["application/json"]
@@ -1305,6 +2667,22 @@ mod tests {
                 spec["paths"][path]["post"]["responses"]["503"]["content"]["application/json"]
                     ["schema"]["$ref"],
                 "#/components/schemas/InferenceServiceUnavailableResponse"
+            );
+        }
+
+        // `/v1/embeddings` is OpenAI-compatible: every handler-generated error
+        // path documents the OpenAI `{error:{…}}` envelope so an `openai`
+        // client's error handling works unchanged. (401 is emitted upstream by
+        // the auth middleware and stays on the SIE-native shape.)
+        // (In the raw document each error is a direct `$ref`; the export step
+        // later merges the auth-misconfigured `StandardApiError` into the 500
+        // as a `oneOf` — see `openapi_export_*` tests.)
+        let emb = &spec["paths"]["/v1/embeddings"]["post"]["responses"];
+        for status in ["400", "404", "409", "413", "500", "502", "503", "504"] {
+            assert_eq!(
+                emb[status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/OpenAIErrorEnvelope",
+                "/v1/embeddings {status} must be the OpenAI envelope"
             );
         }
     }
@@ -1416,6 +2794,15 @@ mod tests {
         assert_eq!(
             spec["paths"]["/v1/encode/{model}"]["post"]["x-sie-axum-catch-all"],
             "/v1/encode/{*model}"
+        );
+        let generate_model_param = &spec["paths"]["/v1/generate/{model}"]["post"]["parameters"][0];
+        assert!(generate_model_param["description"]
+            .as_str()
+            .unwrap()
+            .contains("percent-encode slashes"));
+        assert_eq!(
+            spec["paths"]["/v1/generate/{model}"]["post"]["x-sie-axum-catch-all"],
+            "/v1/generate/{*model}"
         );
 
         let model_load_failed = &spec["components"]["schemas"]["GatewayModelLoadFailedResponse"];

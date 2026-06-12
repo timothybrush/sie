@@ -10,6 +10,7 @@ class _WorkItemRequired(TypedDict):
     model_id: str
     profile_id: str
     pool_name: str
+    machine_profile: str
     router_id: str
     reply_subject: str
     timestamp: float
@@ -18,7 +19,8 @@ class _WorkItemRequired(TypedDict):
 class WorkItem(_WorkItemRequired, total=False):
     """A single inference work item published to NATS JetStream.
 
-    Published by the gateway to ``sie.work.{model_id_normalized}.{pool_name}``.
+    Published by the gateway to
+    ``sie.work.{pool_name}.{machine_profile}.{bundle_id}.{model_id_normalized}``.
     Consumed by workers via JetStream pull consumers.
 
     Attributes:
@@ -29,7 +31,7 @@ class WorkItem(_WorkItemRequired, total=False):
         operation: Inference operation: ``"encode"`` | ``"score"`` | ``"extract"``.
         model_id: Model identifier (e.g., ``"BAAI/bge-m3"``).
         profile_id: Profile name (e.g., ``"default"``).
-        pool_name: Target pool (e.g., ``"_default"``).
+        pool_name: Target pool (e.g., ``"default"``).
         machine_profile: Required GPU type (e.g., ``"l4"``). Workers validate this.
         bundle_config_hash: Expected bundle config hash from the gateway's ModelRegistry.
             Workers compare this against their own computed hash and NAK items with
@@ -55,7 +57,6 @@ class WorkItem(_WorkItemRequired, total=False):
         timestamp: Unix timestamp when the work item was created.
     """
 
-    machine_profile: str
     bundle_config_hash: str
 
     # Item payload (inline or reference)
@@ -76,6 +77,26 @@ class WorkItem(_WorkItemRequired, total=False):
     # Extract-specific
     labels: list[str] | None
     output_schema: dict[str, Any] | None
+
+    # Generate-specific wire shape.
+    # Carries prompt + sampling params for one blocking call to
+    # ``adapter.generate(...)``. Keys: prompt (str), max_new_tokens (int),
+    # temperature (float), top_p (float), stop (list[str]).
+    generate: dict[str, Any] | None
+
+    # W3C Trace Context propagation. Populated by the gateway
+    # when it has an active span (extracted from the inbound
+    # ``traceparent`` HTTP header, or rooted at the gateway when
+    # the client did not send one). Both fields are msgpack-
+    # skipped on the wire when ``None``, so a worker without trace
+    # support sees its expected key set, and a trace-aware worker
+    # decoding an older envelope sees both
+    # fields default to ``None`` via ``WorkItem.get(...)``.
+    #
+    # Privacy: the value is two opaque IDs (trace id + span id)
+    # plus flags. Do not log it at info-level; debug is fine.
+    traceparent: str | None
+    tracestate: str | None
 
 
 class _WorkResultRequired(TypedDict):
@@ -138,14 +159,12 @@ class WorkResult(_WorkResultRequired, total=False):
 # NATS JetStream max message size default is 1MB.
 INLINE_THRESHOLD_BYTES = 1_048_576  # 1 MB
 
-# Stream name prefix for work queues
-WORK_STREAM_PREFIX = "WORK"
-
 # Subject prefix for work items
 WORK_SUBJECT_PREFIX = "sie.work"
 
 # Dead-letter subject prefix — uses ``sie.dlq`` (not ``sie.work.dead``)
-# to avoid subject overlap with pool-level work streams (``sie.work.*.{pool}``).
+# to avoid subject overlap with pool-level work streams
+# (``sie.work.{pool}.*.*.*``).
 DEAD_LETTER_PREFIX = "sie.dlq"
 
 
@@ -180,6 +199,50 @@ def normalize_model_id(model_id: str) -> str:
     return result
 
 
+def normalize_worker_id(worker_id: str) -> str:
+    """Normalize a worker identity for use as a single NATS subject token.
+
+    Worker IDs flow into three places that all share the same wire contract:
+
+    * the gateway's direct-dispatch publish subject
+      (``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}``),
+    * the per-worker JetStream stream subjects
+      (``sie.work.{pool}.{machine_profile}.{bundle}.*.{worker_id}``), and
+    * the durable consumer name (``gen-{worker_id}``).
+
+    In production, worker IDs come from ``SIE_WORKER_ID`` / ``HOSTNAME`` /
+    ``POD_NAME``. Kubernetes pod hostnames (e.g.
+    ``sie-worker-7d9f-default-0.sie-worker.default.svc``) contain ``.``
+    which is the NATS subject separator — interpolating that raw value
+    expands the subject into extra tokens and the gateway and worker bind
+    to different subjects, silently breaking direct-dispatch.
+
+    This helper applies the **same** mapping as :func:`normalize_model_id`
+    (matching the Rust gateway's ``normalize_model_id`` in
+    ``packages/sie_gateway/src/queue/publisher.rs``), so the two sides
+    always produce identical subject tokens. Empty input — and input that
+    normalizes to the empty string — is rejected: silently substituting a
+    default (the previous ``or "worker"`` fallback) caused durable-consumer
+    collisions across processes when env vars were missing.
+
+    Args:
+        worker_id: Raw worker identity (env var value, hostname, pod name).
+
+    Returns:
+        Single NATS-subject-safe token derived from ``worker_id``.
+
+    Raises:
+        ValueError: ``worker_id`` is empty or whitespace-only.
+    """
+    if not worker_id or not worker_id.strip():
+        raise ValueError(
+            "worker_id is empty after stripping whitespace; refusing to "
+            "substitute a default because that would collide durables "
+            "across processes"
+        )
+    return normalize_model_id(worker_id)
+
+
 def denormalize_model_id(normalized: str) -> str:
     """Best-effort reversal of :func:`normalize_model_id`.
 
@@ -198,42 +261,37 @@ def denormalize_model_id(normalized: str) -> str:
     return result
 
 
-def work_subject(model_id: str, pool_name: str) -> str:
+def work_subject(pool_name: str, machine_profile: str, bundle_id: str, model_id: str) -> str:
     """Build the NATS subject for a work queue.
 
     Args:
-        model_id: Model identifier (e.g., ``"BAAI/bge-m3"``).
-        pool_name: Pool name (e.g., ``"_default"``).
-
-    Returns:
-        NATS subject string (e.g., ``"sie.work.BAAI__bge-m3._default"``).
-    """
-    return f"{WORK_SUBJECT_PREFIX}.{normalize_model_id(model_id)}.{pool_name}"
-
-
-def work_stream_name(model_id: str) -> str:
-    """Build the JetStream stream name for a model's work queue.
-
-    Args:
+        pool_name: Pool name (e.g., ``"default"``).
+        machine_profile: Hardware lane (e.g., ``"rtx6000"``).
+        bundle_id: Runtime/image bundle identifier (e.g., ``"sglang"``).
         model_id: Model identifier (e.g., ``"BAAI/bge-m3"``).
 
     Returns:
-        Stream name (e.g., ``"WORK_BAAI__bge-m3"``).
+        NATS subject string, e.g.
+        ``"sie.work.default.rtx6000.sglang.BAAI__bge-m3"``.
     """
-    return f"{WORK_STREAM_PREFIX}_{normalize_model_id(model_id)}"
+    return (
+        f"{WORK_SUBJECT_PREFIX}.{pool_name}.{normalize_model_id(machine_profile)}."
+        f"{normalize_model_id(bundle_id)}.{normalize_model_id(model_id)}"
+    )
 
 
-def work_consumer_name(bundle_id: str, pool_name: str) -> str:
-    """Build the JetStream consumer name for a (bundle, pool) pair.
+def work_consumer_name(pool_name: str, machine_profile: str, bundle_id: str) -> str:
+    """Build the JetStream consumer name for a concrete queue lane.
 
     Args:
+        pool_name: Pool name (e.g., ``"default"``).
+        machine_profile: Hardware lane (e.g., ``"rtx6000"``).
         bundle_id: Bundle identifier (e.g., ``"default"``).
-        pool_name: Pool name (e.g., ``"_default"``).
 
     Returns:
-        Consumer durable name (e.g., ``"default__default"``).
+        Consumer durable name (e.g., ``"default_rtx6000_sglang"``).
     """
-    return f"{bundle_id}_{pool_name}"
+    return f"{normalize_model_id(pool_name)}_{normalize_model_id(machine_profile)}_{normalize_model_id(bundle_id)}"
 
 
 # -- Pool-level (multiplexed) stream helpers --------------------------------
@@ -259,13 +317,126 @@ def work_pool_stream_name(pool_name: str) -> str:
 def work_pool_stream_subjects(pool_name: str) -> list[str]:
     """Subjects captured by a pool-level stream.
 
-    Matches ``sie.work.<any-single-token>.<pool_name>`` which covers all
-    models for the given pool.
+    Matches ``sie.work.<pool_name>.<machine_profile>.<bundle>.<model>`` for
+    all machine profiles, bundles, and models in the given logical pool.
 
     Args:
         pool_name: Pool name (e.g., ``"l4"``).
 
     Returns:
-        Subject list, e.g. ``["sie.work.*.l4"]``.
+        Subject list, e.g. ``["sie.work.default.*.*.*"]``.
     """
-    return [f"{WORK_SUBJECT_PREFIX}.*.{pool_name}"]
+    return [f"{WORK_SUBJECT_PREFIX}.{pool_name}.*.*.*"]
+
+
+# -- Per-worker direct-dispatch helpers -----------------------------------
+# Each worker subscribes to a second, narrower JetStream stream that
+# captures ONLY messages addressed to its own worker_id. The gateway
+# computes an HRW pick and publishes to
+# ``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}``; the pool
+# stream's subjects (``sie.work.{pool}.*.*.*``) deliberately do not match those
+# worker-addressed subjects, so the two paths cannot double-deliver.
+
+WORK_WORKER_STREAM_PREFIX = "WORK_WORKER"
+
+
+def work_worker_subject(
+    pool_name: str,
+    machine_profile: str,
+    bundle_id: str,
+    model_id: str,
+    worker_id: str,
+) -> str:
+    """Build the NATS subject for a per-worker direct-dispatch.
+
+    Args:
+        pool_name: Pool name (e.g., ``"default"``).
+        machine_profile: Hardware lane (e.g., ``"rtx6000"``).
+        bundle_id: Runtime/image bundle identifier (e.g., ``"sglang"``).
+        model_id: Model identifier (e.g., ``"BAAI/bge-m3"``).
+        worker_id: Stable worker identity (matches
+            :attr:`sie_server.nats_pull_loop.NatsPullLoop.worker_id`).
+
+    Returns:
+        NATS subject like
+        ``"sie.work.default.rtx6000.sglang.BAAI__bge-m3.worker-0"``.
+
+    Raises:
+        ValueError: ``worker_id`` is empty or whitespace-only — see
+            :func:`normalize_worker_id`.
+    """
+    return (
+        f"{WORK_SUBJECT_PREFIX}.{pool_name}.{normalize_model_id(machine_profile)}."
+        f"{normalize_model_id(bundle_id)}.{normalize_model_id(model_id)}."
+        f"{normalize_worker_id(worker_id)}"
+    )
+
+
+def work_worker_stream_name(worker_id: str) -> str:
+    """Stream name for the per-worker direct-dispatch queue.
+
+    Args:
+        worker_id: Stable worker identity.
+
+    Returns:
+        Stream name (e.g., ``"WORK_WORKER_worker-0"``).
+
+    Raises:
+        ValueError: ``worker_id`` is empty or whitespace-only — see
+            :func:`normalize_worker_id`.
+    """
+    return f"{WORK_WORKER_STREAM_PREFIX}_{normalize_worker_id(worker_id)}"
+
+
+def work_worker_stream_subjects(
+    pool_name: str,
+    machine_profile: str,
+    bundle_id: str,
+    worker_id: str,
+) -> list[str]:
+    """Subjects captured by a per-worker stream.
+
+    Matches
+    ``sie.work.<pool>.<machine_profile>.<bundle>.<any-model>.<worker_id>``
+    so any model on this concrete lane addressed to this worker lands in
+    the stream.
+
+    Args:
+        pool_name: Pool name.
+        machine_profile: Hardware lane.
+        bundle_id: Runtime/image bundle identifier.
+        worker_id: Stable worker identity.
+
+    Returns:
+        Subject list, e.g.
+        ``["sie.work.default.rtx6000.sglang.*.worker-0"]``.
+
+    Raises:
+        ValueError: ``worker_id`` is empty or whitespace-only — see
+            :func:`normalize_worker_id`.
+    """
+    return [
+        f"{WORK_SUBJECT_PREFIX}.{pool_name}.{normalize_model_id(machine_profile)}."
+        f"{normalize_model_id(bundle_id)}.*.{normalize_worker_id(worker_id)}"
+    ]
+
+
+def work_worker_consumer_name(worker_id: str) -> str:
+    """Durable JetStream consumer name for the per-worker stream.
+
+    The plan calls for ``gen-{worker_id}``. Collisions corrupt durables
+    across worker boots, so callers must use a stable worker_id
+    (``SIE_WORKER_ID`` env or hostname-derived).
+
+    Uses :func:`normalize_worker_id` rather than a private sanitizer so
+    the consumer name always tracks the subject token the gateway and
+    worker actually publish/subscribe on. The previous ``or "worker"``
+    fallback silently substituted a constant for an empty input — that
+    constant collided durables across processes and is now an explicit
+    error.
+
+    Raises:
+        ValueError: ``worker_id`` is empty or whitespace-only — see
+            :func:`normalize_worker_id`.
+    """
+    return f"gen-{normalize_worker_id(worker_id)}"

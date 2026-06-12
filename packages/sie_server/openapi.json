@@ -3,7 +3,7 @@
   "info": {
     "title": "SIE Server",
     "description": "Search Inference Engine - GPU inference server for search workloads",
-    "version": "0.3.4"
+    "version": "0.6.4"
   },
   "paths": {
     "/": {
@@ -45,13 +45,33 @@
         }
       }
     },
+    "/livez": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Livez",
+        "description": "GPU-aware liveness probe.\n\nUnlike /healthz (process-alive only), this exercises the GPU with a tiny CUDA\nsync. A wedged CUDA context (``device-side assert``) is unrecoverable in\nPyTorch, so failing liveness lets the kubelet restart the pod \u2014 the only path\nback to a serving worker (see issue #1025).\n\nIt deliberately does NOT consult the lifecycle ready flag, so graceful\nshutdown draining (when the worker marks itself not-ready) never trips a\nrestart. Wire this to the K8s ``livenessProbe`` with a tolerant\n``failureThreshold`` so a momentarily busy GPU is not mistaken for a wedge.\n\nReturns:\n    200 OK with \"ok\" body if the GPU can run a kernel (or this is a CPU\n    worker). 503 Service Unavailable with \"gpu unhealthy\" if wedged.",
+        "operationId": "livez_livez_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/readyz": {
       "get": {
         "tags": [
           "health"
         ],
         "summary": "Readyz",
-        "description": "Readiness probe.\n\nReturns 200 if the server is ready to accept traffic.\nUsed by Kubernetes to determine if traffic should be routed to this pod.\n\nThe readiness state is managed by the lifespan handler:\n- Ready after startup completes (all initialization done)\n- Not ready during shutdown (draining in-flight requests)\n\nReturns:\n    200 OK with \"ok\" body if ready.\n    503 Service Unavailable if not ready (starting up or shutting down).",
+        "description": "Readiness probe.\n\nReturns 200 if the server is ready to accept traffic.\nUsed by Kubernetes to determine if traffic should be routed to this pod.\n\nReadiness has two conditions:\n- Lifecycle state, managed by the lifespan handler: ready after startup\n  completes, not ready during shutdown (draining in-flight requests).\n- GPU health: a tiny CUDA sync confirms the device can still run kernels. A\n  wedged CUDA context (``device-side assert``) keeps returning sticky errors\n  from every inference while a process-alive check stays green, so without\n  this the gateway would keep routing to a dead worker (see issue #1025).\n\nReturns:\n    200 OK with \"ok\" body if ready.\n    503 Service Unavailable if starting up / shutting down (\"not ready\") or\n    the GPU context is wedged (\"gpu unhealthy\").",
         "operationId": "readyz_readyz_get",
         "responses": {
           "200": {
@@ -828,6 +848,41 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "ModelCapabilities": {
+        "properties": {
+          "grammar": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Grammar",
+            "default": []
+          },
+          "tools": {
+            "type": "boolean",
+            "title": "Tools",
+            "default": false
+          },
+          "code": {
+            "type": "boolean",
+            "title": "Code",
+            "default": false
+          },
+          "sql": {
+            "type": "boolean",
+            "title": "Sql",
+            "default": false
+          },
+          "guard": {
+            "type": "boolean",
+            "title": "Guard",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ModelCapabilities",
+        "description": "Advertised generation capabilities for a model.\n\nMirrors the gateway ``capabilities`` wire shape\n(``ModelCapabilitiesWire``) for the keys derivable from the loaded\nmodel config's :class:`~sie_server.config.model.GenerateCapabilities`.\n``code``/``sql``/``guard`` are informational flags advertising\nvalidated generation jobs that back the ``model=\"code\"`` /\n``model=\"sql\"`` / ``model=\"guard\"`` aliases. Populated only for\nmodels that declare ``tasks.generate``; ``None`` otherwise.\n\nThese flags mean the model *supports* a task \u2014 they are NOT a\nprecision-independent quality SLA. A flag is true at the model level even\nwhen quality is profile/precision-dependent (e.g. ``sql`` quality regresses\nunder FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``\nalias)."
+      },
       "ModelInfo": {
         "properties": {
           "name": {
@@ -899,6 +954,16 @@
             "type": "object",
             "title": "Profiles",
             "default": {}
+          },
+          "capabilities": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",

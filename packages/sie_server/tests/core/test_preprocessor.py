@@ -9,7 +9,7 @@ from PIL import Image
 from sie_server.core.prepared import ImagePayload, PreparedItem, TextPayload
 from sie_server.core.preprocessor import ImagePreprocessor, Preprocessor, TextPreprocessor
 from sie_server.core.preprocessor.image import OpenCLIPImagePreprocessor
-from sie_server.types.inputs import ImageInput, Item
+from sie_server.types.inputs import ImageInput, InvalidMediaError, Item
 
 
 class TestPreprocessorProtocol:
@@ -199,6 +199,364 @@ class TestTextPreprocessor:
         assert result["attention_mask"].numel() == 0
 
 
+class TestTextPreprocessorFastPath:
+    """Tests for the Rust-tokenise fast-path consumer on TextPreprocessor.
+
+    These tests cover the contract exposed over IPC: the worker-sidecar
+    attaches a ``PreparedTokens`` bundle, Python validates the
+    ``tokenizer_id`` hash and, on match, assembles ``PreparedBatch``
+    directly without calling the HF tokenizer. On any mismatch, drift,
+    or unsupported shape the method MUST return ``None`` so the caller
+    falls back to ``prepare()`` — correctness always wins over speed.
+    """
+
+    @pytest.fixture
+    def mock_config(self):
+        config = MagicMock()
+        config.max_sequence_length = 512
+        return config
+
+    @staticmethod
+    def _make_preprocessor(tokenizer_canonical: bytes) -> tuple[TextPreprocessor, str]:
+        """Build a preprocessor whose ``backend_tokenizer.to_str()``
+        returns ``tokenizer_canonical``. Returns the preprocessor and
+        its expected tokenizer_id (BLAKE3, truncated to 32 hex).
+        """
+        import blake3
+
+        backend = MagicMock()
+        backend.to_str.return_value = tokenizer_canonical.decode("utf-8")
+        tokenizer = MagicMock()
+        tokenizer.backend_tokenizer = backend
+        preprocessor = TextPreprocessor(tokenizer, "fast-model")
+        expected = blake3.blake3(tokenizer_canonical).hexdigest()[:32]
+        return preprocessor, expected
+
+    def test_tokenizer_id_is_cached_and_matches_blake3(self):
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, expected = self._make_preprocessor(canonical)
+
+        first = preprocessor.tokenizer_id
+        second = preprocessor.tokenizer_id
+
+        assert first == expected
+        assert first == second
+        # ``backend.to_str`` must be called exactly once regardless of
+        # how many callers read the property — it's on the hot path.
+        assert preprocessor._tokenizer.backend_tokenizer.to_str.call_count == 1
+
+    def test_tokenizer_id_is_none_for_slow_tokenizer(self):
+        """Slow tokenizers don't expose ``backend_tokenizer`` — no hash."""
+        tokenizer = MagicMock(spec=[])  # nothing but what we set explicitly
+        preprocessor = TextPreprocessor(tokenizer, "slow-model")
+        assert preprocessor.tokenizer_id is None
+
+    def test_fast_path_builds_prepared_batch_on_hash_match(self, mock_config):
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        items = [Item(text="foo"), Item(text="bar"), Item(text="baz")]
+        prepared_tokens = [
+            PreparedTokens(
+                input_ids=[[101, 2003, 102]],
+                tokenizer_id=tok_id,
+                # Omit attention_mask — Rust elides when all-ones. The
+                # consumer must rebuild it as [1]*len(input_ids).
+                attention_mask=[],
+                token_type_ids=[],
+                max_seq_len=128,
+            ),
+            PreparedTokens(
+                input_ids=[[101, 3231, 102]],
+                tokenizer_id=tok_id,
+                attention_mask=[[1, 1, 1]],
+                token_type_ids=[],
+                max_seq_len=128,
+            ),
+            PreparedTokens(
+                input_ids=[[101, 4, 5, 102]],
+                tokenizer_id=tok_id,
+                attention_mask=[[1, 1, 1, 1]],
+                # All-zero token_type_ids are allowed (BERT-style
+                # single-segment default).
+                token_type_ids=[[0, 0, 0, 0]],
+                max_seq_len=128,
+            ),
+        ]
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(items, prepared_tokens, config=mock_config)
+
+        assert batch is not None
+        assert batch.modality == "text"
+        assert batch.size == 3
+        assert batch.total_cost == 3 + 3 + 4
+
+        # First item used the elided-attention-mask path — rebuilt as all ones.
+        assert batch.items[0].payload.input_ids == [101, 2003, 102]
+        assert batch.items[0].payload.attention_mask == [1, 1, 1]
+        assert batch.items[0].cost == 3
+        assert batch.items[0].original_index == 0
+
+        # Second item had an explicit attention mask; preserved verbatim.
+        assert batch.items[1].payload.attention_mask == [1, 1, 1]
+        assert batch.items[2].payload.attention_mask == [1, 1, 1, 1]
+
+    def test_fast_path_rejects_tokenizer_id_mismatch(self, mock_config):
+        from sie_server.ipc_types import PreparedTokens
+
+        preprocessor, _ = self._make_preprocessor(b'{"version":"1.0","model":{"type":"WordLevel"}}')
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="x")],
+            [
+                PreparedTokens(
+                    input_ids=[[1, 2, 3]],
+                    tokenizer_id="a" * 32,  # deliberately wrong
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                )
+            ],
+            config=mock_config,
+        )
+        assert batch is None
+
+    def test_fast_path_rejects_malformed_attention_mask_shape(self, mock_config):
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="x")],
+            [
+                PreparedTokens(
+                    input_ids=[[1, 2, 3]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                )
+            ],
+            config=mock_config,
+        )
+        assert batch is None
+
+    def test_fast_path_rejects_non_zero_token_type_ids(self, mock_config):
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="x")],
+            [
+                PreparedTokens(
+                    input_ids=[[1, 2, 3]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1]],
+                    # Segment ids for a sentence-pair encoder are not
+                    # part of the Rust-side text payload contract.
+                    token_type_ids=[[0, 1, 1]],
+                    max_seq_len=128,
+                )
+            ],
+            config=mock_config,
+        )
+        assert batch is None
+
+    def test_fast_path_hybrid_tokenises_slow_subset_in_python(self, mock_config):
+        """Per-item hybrid: items with ``pt=None`` fall back to the
+        Python tokeniser inline, other items take the Rust bytes
+        unchanged. A single merged ``PreparedBatch`` comes out with
+        ``original_index`` preserved so the adapter's output routing
+        continues to work.
+        """
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        # Wire in a tokeniser stub for the Python fall-back side —
+        # only the "b" item (index 1) should flow through.
+        preprocessor._tokenizer.return_value = {
+            "input_ids": [[101, 999, 102]],
+            "attention_mask": [[1, 1, 1]],
+        }
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="a"), Item(text="b"), Item(text="c")],
+            [
+                PreparedTokens(
+                    input_ids=[[101, 1, 102]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                ),
+                None,  # Rust skipped this item (e.g. empty-text gate).
+                PreparedTokens(
+                    input_ids=[[101, 2, 3, 102]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                ),
+            ],
+            config=mock_config,
+        )
+        assert batch is not None
+        assert batch.size == 3
+
+        # Fast-path item (index 0) — Rust bytes verbatim.
+        assert batch.items[0].payload.input_ids == [101, 1, 102]
+        assert batch.items[0].original_index == 0
+
+        # Slow-path item (index 1) — tokenised in Python via the stub.
+        assert batch.items[1].payload.input_ids == [101, 999, 102]
+        assert batch.items[1].original_index == 1
+
+        # Fast-path item (index 2) — Rust bytes verbatim.
+        assert batch.items[2].payload.input_ids == [101, 2, 3, 102]
+        assert batch.items[2].original_index == 2
+
+        # The Python tokeniser was called exactly once, on the
+        # one-item slow subset. Multi-call would indicate we re-ran
+        # tokenisation on already-prepared inputs.
+        assert preprocessor._tokenizer.call_count == 1
+        (_, kwargs) = preprocessor._tokenizer.call_args
+        assert kwargs["truncation"] is True
+        assert kwargs["padding"] is False
+
+    def test_fast_path_returns_none_when_all_items_miss(self, mock_config):
+        """All-slow batch: skip the hybrid path entirely so the
+        caller's normal ``prepare()`` can run without an extra
+        tokeniser call from inside the fast-path helper.
+        """
+        from sie_server.ipc_types import PreparedTokens as _PT  # noqa: F401, N814
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, _ = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="a"), Item(text="b")],
+            [None, None],
+            config=mock_config,
+        )
+        assert batch is None
+        # Python tokeniser was NOT called from the fast-path helper —
+        # the caller will invoke ``prepare()`` on the full batch.
+        assert preprocessor._tokenizer.call_count == 0
+
+    def test_fast_path_hybrid_for_nonzero_token_type_ids(self, mock_config):
+        """Non-zero ``token_type_ids`` on a single item falls back to
+        Python for that item without killing the whole batch.
+        """
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        preprocessor._tokenizer.return_value = {
+            "input_ids": [[101, 500, 102]],
+            "attention_mask": [[1, 1, 1]],
+        }
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="clean"), Item(text="pair")],
+            [
+                PreparedTokens(
+                    input_ids=[[101, 1, 102]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                ),
+                PreparedTokens(
+                    input_ids=[[101, 2, 3, 102]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1, 1]],
+                    token_type_ids=[[0, 1, 1, 0]],  # segment ids.
+                    max_seq_len=128,
+                ),
+            ],
+            config=mock_config,
+        )
+        assert batch is not None
+        assert batch.items[0].payload.input_ids == [101, 1, 102]
+        # Item 1 went through Python.
+        assert batch.items[1].payload.input_ids == [101, 500, 102]
+        assert preprocessor._tokenizer.call_count == 1
+
+    def test_fast_path_rejects_whole_batch_on_tokenizer_drift(self, mock_config):
+        """Tokenizer_id drift on ANY item collapses the whole batch —
+        the hybrid split doesn't help if Rust and Python disagree on
+        what tokeniser they're running.
+        """
+        from sie_server.ipc_types import PreparedTokens
+
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="a"), Item(text="b")],
+            [
+                PreparedTokens(
+                    input_ids=[[1, 2, 3]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                ),
+                PreparedTokens(
+                    input_ids=[[4, 5, 6]],
+                    tokenizer_id="deadbeef" * 4,  # drift signal.
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=128,
+                ),
+            ],
+            config=mock_config,
+        )
+        assert batch is None
+
+    def test_fast_path_rejects_when_truncated_above_model_cap(self, mock_config):
+        from sie_server.ipc_types import PreparedTokens
+
+        # Model caps at 128; Rust used 512. Staying on Python path
+        # ensures the truncation policy the operator configured is
+        # the one that takes effect.
+        mock_config.max_sequence_length = 128
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, tok_id = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens(
+            [Item(text="x")],
+            [
+                PreparedTokens(
+                    input_ids=[[1, 2, 3]],
+                    tokenizer_id=tok_id,
+                    attention_mask=[[1, 1, 1]],
+                    token_type_ids=[],
+                    max_seq_len=512,
+                )
+            ],
+            config=mock_config,
+        )
+        assert batch is None
+
+    def test_fast_path_empty_items_returns_empty_batch(self, mock_config):
+        canonical = b'{"version":"1.0","model":{"type":"WordLevel"}}'
+        preprocessor, _ = self._make_preprocessor(canonical)
+
+        batch = preprocessor.try_prepare_from_prepared_tokens([], [], config=mock_config)
+        assert batch is not None
+        assert batch.size == 0
+        assert batch.total_cost == 0
+
+
 class TestImagePreprocessor:
     """Tests for ImagePreprocessor."""
 
@@ -284,6 +642,21 @@ class TestImagePreprocessor:
         assert batch.total_cost == 1
         # Only item at index 1 has image
         assert batch.items[0].original_index == 1
+
+    def test_prepare_rejects_str_image_data(self, mock_processor, mock_config):
+        """Non-bytes image data raises a structured error (defense-in-depth, #1026).
+
+        An un-decoded base64 str on the queue path (where typed msgspec decoding
+        doesn't run) must raise InvalidMediaError, not a raw TypeError from
+        ``io.BytesIO(str)``.
+        """
+        preprocessor = ImagePreprocessor(mock_processor, "test-model")
+        # msgspec Structs don't validate on direct construction, so this mirrors
+        # how the worker builds an Item from an undecoded wire dict.
+        items = [Item(images=[{"data": "aGVsbG8=", "format": "png"}])]
+
+        with pytest.raises(InvalidMediaError, match="image data must be bytes, got str"):
+            preprocessor.prepare(items, config=mock_config)
 
     def test_prepare_rgba_conversion(self, mock_processor, mock_config):
         """RGBA images are converted to RGB."""

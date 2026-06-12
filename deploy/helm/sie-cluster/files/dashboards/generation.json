@@ -1,0 +1,929 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Generation dashboard. Full §4.11 metric surface — header (TTFT/TPOT/throughput), overhead attribution (gateway vs worker), routing (direct-dispatch hits vs fallback by reason), admission (in-flight + KV reservation + rejected), grammar (compile latency + cache hit rate), failure modes (timeouts, cancellations, stale-attempt drops), saturation (per-worker flag), speculative decoding (acceptance rate when the speculative side-cell is active).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 100,
+      "title": "Header — TTFT / TPOT / Throughput",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "id": 1,
+      "type": "stat",
+      "title": "Gateway TTFT p50 (ms)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 250
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_gateway_generation_ttft_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p50",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "id": 2,
+      "type": "stat",
+      "title": "Gateway TTFT p99 (ms)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sie_gateway_generation_ttft_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p99",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "id": 3,
+      "type": "stat",
+      "title": "Gateway TPOT p50 / p99 (ms)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_gateway_generation_tpot_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sie_gateway_generation_tpot_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "id": 4,
+      "type": "stat",
+      "title": "Completion tokens / sec",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum(rate(sie_gateway_generation_total_tokens{namespace=\"$namespace\",kind=\"completion\"}[$rate_window]))",
+          "legendFormat": "tokens/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "id": 101,
+      "title": "Overhead Attribution — Gateway vs Worker",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 10,
+      "type": "timeseries",
+      "title": "TTFT p50 — gateway vs worker (ms)",
+      "description": "Gap between the two lines is the NATS + queue overhead. Worker-side metric is observed inside the streaming adapter before any inter-process hop, so subtraction is honest given identical histogram buckets (TTFT_TPOT_BUCKETS).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_gateway_generation_ttft_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "gateway p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_worker_generation_ttft_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "worker p50",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 11,
+      "type": "timeseries",
+      "title": "TPOT p50 — gateway vs worker (ms)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_gateway_generation_tpot_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "gateway p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sie_worker_generation_tpot_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "worker p50",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 102,
+      "title": "Failure Modes",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "id": 20,
+      "type": "timeseries",
+      "title": "Timeouts / sec by kind",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(sie_gateway_generation_timeout_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "id": 21,
+      "type": "timeseries",
+      "title": "Client cancellations / sec by stage",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(sie_gateway_generation_cancelled_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "id": 22,
+      "type": "timeseries",
+      "title": "Stale-attempt chunks dropped / sec",
+      "description": "JetStream-redelivered work after a worker crash generates a fresh attempt_id; if the gateway has already latched a different one, the late chunks are dropped and counted here. A sustained nonzero rate without corresponding pool churn means redelivery is happening but the pool-republish-driven attempt bumping isn't keeping up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (model, pool) (rate(sie_gateway_generation_stale_attempt_chunks_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{model}} / {{pool}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 103,
+      "title": "Routing — Direct-dispatch vs Fallback",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "id": 30,
+      "type": "timeseries",
+      "title": "Routing fallbacks / sec by reason",
+      "description": "Each HRW direct-dispatch miss attributes to one reason (unhealthy_skipped, saturated_skipped, no_key, nak_*, first_chunk_timeout). A sustained spike on `saturated_skipped` means admission high-water mark is too low; a spike on `unhealthy_skipped` means workers are flapping.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(sie_gateway_routing_fallback_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 31,
+      "type": "timeseries",
+      "title": "Routing cache-hit estimate (per model/pool)",
+      "description": "Rolling-window estimate of routing-key → worker affinity. Higher is better — means consecutive requests with the same routing_key land on the same worker, maximising KV-cache reuse.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sie_gateway_routing_cache_hit_estimate{namespace=\"$namespace\"}",
+          "legendFormat": "{{model}} / {{pool}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "id": 104,
+      "title": "Admission — In-flight, KV reservation, Rejections",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
+      "id": 40,
+      "type": "timeseries",
+      "title": "In-flight generations (worker)",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (model) (sie_worker_generation_in_flight{namespace=\"$namespace\"})",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
+      "id": 41,
+      "type": "timeseries",
+      "title": "KV reserved tokens (worker reports vs gateway view)",
+      "description": "Worker-side `sie_worker_generation_kv_reserved_tokens` is the source of truth; the gateway mirrors it as `sie_gateway_kv_reservation_known` so we can spot stale views. A widening gap means status envelopes are stalling.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (model) (sie_worker_generation_kv_reserved_tokens{namespace=\"$namespace\"})",
+          "legendFormat": "worker {{model}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (worker) (sie_gateway_kv_reservation_known{namespace=\"$namespace\"})",
+          "legendFormat": "gateway view {{worker}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
+      "id": 42,
+      "type": "timeseries",
+      "title": "Admission rejections / sec by reason",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(sie_worker_generation_admission_rejected_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "id": 105,
+      "title": "Grammar — Compile latency, Cache hit rate",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "id": 50,
+      "type": "timeseries",
+      "title": "Grammar compile latency p50/p99 (ms) by kind",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, kind) (rate(sie_worker_grammar_compile_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p50 {{kind}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, kind) (rate(sie_worker_grammar_compile_seconds_bucket{namespace=\"$namespace\"}[$rate_window]))) * 1000",
+          "legendFormat": "p99 {{kind}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "id": 51,
+      "type": "timeseries",
+      "title": "Grammar cache hit rate",
+      "description": "hits / (hits + misses). A sustained low rate (< 0.5) means clients are sending one-off schemas and the worker cache is not amortising compile cost.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(sie_worker_grammar_cache_hits_total{namespace=\"$namespace\"}[$rate_window])) / clamp_min(sum by (model) (rate(sie_worker_grammar_cache_hits_total{namespace=\"$namespace\"}[$rate_window]) + rate(sie_worker_grammar_cache_misses_total{namespace=\"$namespace\"}[$rate_window])), 1e-9)",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "id": 106,
+      "title": "Saturation & Speculative Decoding",
+      "type": "row"
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "id": 60,
+      "type": "timeseries",
+      "title": "Worker saturation flag (per model)",
+      "description": "0/1 gauge. A flat-1 model is permanently rejected by the HRW ring; check admission high-water tuning.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sie_worker_generation_saturated{namespace=\"$namespace\"}",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "id": 61,
+      "type": "timeseries",
+      "title": "Speculative-decoding acceptance rate",
+      "description": "Populates only when the speculative-decoding side-cell is active; empty otherwise.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sie_worker_speculative_acceptance_rate{namespace=\"$namespace\"}",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": [
+    "sie",
+    "generation"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "sie",
+          "value": "sie"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Namespace",
+        "multi": false,
+        "name": "namespace",
+        "options": [],
+        "query": "label_values(up, namespace)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "1m",
+          "value": "1m"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Rate Window",
+        "multi": false,
+        "name": "rate_window",
+        "options": [
+          {
+            "selected": true,
+            "text": "1m",
+            "value": "1m"
+          },
+          {
+            "selected": false,
+            "text": "2m",
+            "value": "2m"
+          },
+          {
+            "selected": false,
+            "text": "5m",
+            "value": "5m"
+          }
+        ],
+        "query": "1m,2m,5m",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "SIE Generation",
+  "uid": "sie-generation",
+  "version": 1,
+  "weekStart": ""
+}

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import errno
 import logging
+import math
+import random
 import socket
 import ssl
 import time
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from typing import Any, Protocol
@@ -39,7 +44,15 @@ from sie_sdk.types import (
     SparseResult,
 )
 
-from .errors import InputTooLongError, ModelLoadFailedError, RequestError, ServerError
+from .errors import (
+    InputTooLongError,
+    ModelLoadFailedError,
+    ModelLoadingError,
+    ProvisioningError,
+    RequestError,
+    ResourceExhaustedError,
+    ServerError,
+)
 
 # Content types
 MSGPACK_CONTENT_TYPE = "application/msgpack"
@@ -49,6 +62,7 @@ JSON_CONTENT_TYPE = "application/json"
 HTTP_ACCEPTED = 202
 HTTP_CLIENT_ERROR = 400
 HTTP_SERVER_ERROR = 500
+HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_GATEWAY_TIMEOUT = 504
 
 # Default provisioning settings
@@ -89,6 +103,46 @@ RESOURCE_EXHAUSTED_DEFAULT_DELAY_S = 5.0
 RESOURCE_EXHAUSTED_MAX_DELAY_S = 30.0
 RESOURCE_EXHAUSTED_ERROR_CODE = "RESOURCE_EXHAUSTED"
 
+# Retry jitter. Fixed / pure-exponential backoff makes every client that
+# lost a worker at the same instant (cluster cold start, rolling restart)
+# wake up and retry in lockstep — a thundering herd that re-saturates the
+# gateway. We apply *downward-only* "equal jitter": the returned delay is
+# drawn uniformly from ``[delay * (1 - RETRY_JITTER_FRACTION), delay]``.
+# Downward-only is deliberate so the jittered value never exceeds the
+# caller's existing cap (``timeout - elapsed``, ``max_delay``) and stays
+# non-negative — preserving every existing delay/budget bound.
+RETRY_JITTER_FRACTION = 0.25
+
+# Module-level RNG, seedable in tests for determinism. Not used for
+# anything security-sensitive — only to de-correlate retry timing.
+_retry_rng = random.Random()  # noqa: S311 — non-cryptographic jitter only
+
+
+def apply_jitter(delay: float, *, rng: random.Random | None = None) -> float:
+    """Apply bounded downward jitter to a backoff ``delay``.
+
+    Returns a value drawn uniformly from
+    ``[delay * (1 - RETRY_JITTER_FRACTION), delay]`` (clamped to
+    ``>= 0``). Jittering *down only* guarantees the result never exceeds
+    the input, so callers' existing caps and provision-timeout budgets
+    remain valid. A non-positive ``delay`` is returned unchanged (no
+    point jittering a zero/negative sleep).
+
+    Args:
+        delay: The pre-jitter backoff seconds.
+        rng: Optional :class:`random.Random` for deterministic tests.
+            Defaults to the module RNG.
+
+    Returns:
+        Jittered, non-negative delay in seconds.
+    """
+    if delay <= 0:
+        return max(delay, 0.0)
+    r = rng if rng is not None else _retry_rng
+    low = delay * (1.0 - RETRY_JITTER_FRACTION)
+    return max(0.0, r.uniform(low, delay))
+
+
 # Version negotiation headers
 SDK_VERSION_HEADER = "X-SIE-SDK-Version"
 SERVER_VERSION_HEADER = "X-SIE-Server-Version"
@@ -123,6 +177,7 @@ def check_version_skew(sdk_version: str, server_version: str) -> str | None:
                 f"server {server_version}. Consider upgrading."
             )
     except (ValueError, IndexError):
+        # Best-effort version compare; non-semver inputs silently skip the warning.
         pass
     return None
 
@@ -195,14 +250,21 @@ def compute_retry_delay(
     timeout: float,
     error_label: str,
     error: BaseException,
+    rng: random.Random | None = None,
 ) -> float | None:
     """Sleep duration for the next transport-error retry, or ``None`` if
     the provision-timeout budget is exhausted (caller must re-raise).
+
+    Bounded downward jitter (see :func:`apply_jitter`) is applied so a
+    fleet of clients that lost connectivity simultaneously don't retry in
+    lockstep. The jittered value never exceeds ``timeout - elapsed``, so
+    the provision-timeout budget is still respected. ``rng`` is exposed
+    for deterministic tests.
     """
     elapsed = time.monotonic() - start_time
     if elapsed >= timeout:
         return None
-    actual_delay = min(MODEL_LOADING_DEFAULT_DELAY_S, timeout - elapsed)
+    actual_delay = apply_jitter(min(MODEL_LOADING_DEFAULT_DELAY_S, timeout - elapsed), rng=rng)
     _logger.info(
         "%s (%s), retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs): %s",
         error_label,
@@ -222,15 +284,42 @@ def get_retry_after(response: _HttpResponse) -> float | None:
         response: HTTP response that may contain Retry-After header.
 
     Returns:
-        Retry delay in seconds, or None if header not present.
+        Retry delay in seconds, or None if the header is absent OR carries
+        an unusable value. A non-finite (``nan`` / ``inf`` / ``-inf``) or
+        negative value is treated as "no usable hint" and returned as
+        ``None`` so callers fall back to their default delay. Returning
+        these verbatim would crash sync ``time.sleep`` (``ValueError`` on
+        ``nan``) and busy-loop async ``asyncio.sleep`` (returns instantly
+        for ``nan`` / negative input) — a retry-budget-burning DoS.
     """
     retry_after = response.headers.get("Retry-After")
-    if retry_after:
+    if not retry_after:
+        return None
+    try:
+        value = float(retry_after)
+    except ValueError:
+        # RFC 7231 also permits an HTTP-date form ("Wed, 21 Oct 2025
+        # 07:28:00 GMT"). Parse it and return the delta in seconds for
+        # cross-SDK parity with the TS SDK. A past date / unparseable
+        # value yields "no usable hint" (None).
         try:
-            return float(retry_after)
-        except ValueError:
+            when = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError):
             return None
-    return None
+        if when is None:
+            return None
+        # RFC 7231 HTTP-dates are GMT, so ``parsedate_to_datetime`` normally
+        # returns an aware datetime; tolerate a naive one (compare against a
+        # naive UTC ``now``) so the subtraction never raises ``TypeError``.
+        if when.tzinfo is not None:
+            now = datetime.now(when.tzinfo)
+        else:
+            now = datetime.now(UTC).replace(tzinfo=None)
+        delta = (when - now).total_seconds()
+        return max(delta, 0.0)
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
 
 
 def compute_oom_backoff(
@@ -239,6 +328,7 @@ def compute_oom_backoff(
     *,
     base_delay: float = RESOURCE_EXHAUSTED_DEFAULT_DELAY_S,
     max_delay: float = RESOURCE_EXHAUSTED_MAX_DELAY_S,
+    rng: random.Random | None = None,
 ) -> float:
     """Compute the next sleep interval for a RESOURCE_EXHAUSTED retry.
 
@@ -250,21 +340,32 @@ def compute_oom_backoff(
     negative or malformed header value being passed straight to
     ``time.sleep`` (which raises ``ValueError`` on negative input).
 
+    Bounded downward jitter (see :func:`apply_jitter`) de-correlates a
+    fleet of clients all evicted by the same OOM event. Jitter is applied
+    *after* the cap, so the returned value is still ``<= max_delay`` and
+    ``>= 0`` — preserving the documented bound. A first-attempt
+    ``Retry-After`` hint is honoured verbatim (no jitter): when the
+    server explicitly tells us "wait N seconds" we respect it, only
+    de-correlating the SDK-derived exponential schedule.
+
     Args:
         retry_after: Value parsed from the ``Retry-After`` header, or None.
         attempt: 0-indexed retry number (0 = first retry).
         base_delay: Base interval when no Retry-After is supplied.
         max_delay: Hard ceiling on the returned delay.
+        rng: Optional :class:`random.Random` for deterministic tests.
 
     Returns:
-        Seconds to sleep before the next attempt. Always non-negative.
+        Seconds to sleep before the next attempt. Always non-negative and
+        never greater than ``max_delay``.
     """
     # Defensive floor: a negative ``Retry-After`` (malformed / malicious
     # upstream) would otherwise crash ``time.sleep``.
     safe_retry_after = max(retry_after, 0.0) if retry_after is not None else None
     if safe_retry_after is not None and attempt == 0:
         # Trust the first server hint (capped to ``max_delay`` so a buggy
-        # header can't strand the caller).
+        # header can't strand the caller). Honoured verbatim — no jitter,
+        # because the server gave an explicit instruction.
         return min(safe_retry_after, max_delay)
     # On subsequent attempts, the exponential base is the larger of
     # ``base_delay`` and the server-supplied hint:
@@ -280,7 +381,10 @@ def compute_oom_backoff(
     # ``max(...)`` covers both: a zero hint falls back to ``base_delay``,
     # and a hint above ``base_delay`` keeps the schedule non-decreasing.
     base = max(base_delay, safe_retry_after) if safe_retry_after is not None else base_delay
-    return max(0.0, min(base * (2**attempt), max_delay))
+    capped = max(0.0, min(base * (2**attempt), max_delay))
+    # Jitter is applied after the cap and is downward-only, so the result
+    # remains ``0 <= result <= max_delay``.
+    return apply_jitter(capped, rng=rng)
 
 
 def get_error_code(response: _HttpResponse) -> str | None:
@@ -325,6 +429,7 @@ def get_error_detail(response: _HttpResponse) -> dict[str, Any] | None:
             if isinstance(detail, dict):
                 return detail
     except (ValueError, KeyError, TypeError):
+        # Malformed error body — caller treats as "no detail" and falls back.
         pass
     return None
 
@@ -449,6 +554,218 @@ def handle_error(response: _HttpResponse) -> None:
     if response.status_code >= HTTP_SERVER_ERROR:
         raise ServerError(message, code=code, status_code=response.status_code)
     raise RequestError(message, code=code, status_code=response.status_code)
+
+
+def next_stream_retry_delay(
+    response: _HttpResponse,
+    *,
+    model: str,
+    gpu: str | None,
+    wait_for_capacity: bool,
+    start_time: float,
+    timeout: float,
+    oom_retries: int,
+    max_oom_retries: int,
+) -> tuple[float, int]:
+    """Decide whether to retry an opened streaming response with a non-2xx status.
+
+    Shared by the sync and async streaming surfaces so the pre-stream
+    provisioning rules stay identical to the buffered ``generate()``. The
+    caller opens the stream, and on a non-200 status buffers the body
+    (``response.read()`` / ``await response.aread()``) and calls this — the
+    body must already be available so :func:`get_error_code` can inspect it.
+
+    Returns ``(delay_seconds, new_oom_retries)`` to sleep-then-retry, or
+    raises a terminal error. Only pre-execution signals are retried
+    (202 provisioning, 503 MODEL_LOADING / RESOURCE_EXHAUSTED, generic 503
+    under ``wait_for_capacity``); a 504 and any other error are terminal —
+    streaming generation is non-idempotent, so a post-publish retry could
+    double-bill.
+    """
+    elapsed = time.monotonic() - start_time
+    status = response.status_code
+
+    if status == HTTP_ACCEPTED:
+        retry_after = get_retry_after(response)
+        if not wait_for_capacity:
+            msg = f"No capacity available for GPU '{gpu}'. Server is provisioning."
+            raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+        if elapsed >= timeout:
+            msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{gpu}'"
+            raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+        return min(retry_after or DEFAULT_RETRY_DELAY_S, timeout - elapsed), oom_retries
+
+    # Non-retryable load failure / oversized input short-circuits (these
+    # read the buffered body and raise their own typed errors).
+    raise_if_model_load_failed(response, model=model)
+    raise_if_input_too_long(response, model=model)
+
+    if status == HTTP_SERVICE_UNAVAILABLE:
+        code = get_error_code(response)
+        if code == MODEL_LOADING_ERROR_CODE:
+            if elapsed >= timeout:
+                msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
+                raise ModelLoadingError(msg, model=model)
+            delay = get_retry_after(response) or MODEL_LOADING_DEFAULT_DELAY_S
+            return min(delay, timeout - elapsed), oom_retries
+        if code == RESOURCE_EXHAUSTED_ERROR_CODE:
+            if not wait_for_capacity or oom_retries >= max_oom_retries or elapsed >= timeout:
+                msg = f"Server out of memory after {oom_retries} retries for '{model}'"
+                raise ResourceExhaustedError(msg, model=model, retries=oom_retries)
+            delay = compute_oom_backoff(get_retry_after(response), oom_retries)
+            return min(delay, timeout - elapsed), oom_retries + 1
+        if wait_for_capacity and elapsed < timeout:
+            delay = get_retry_after(response) or DEFAULT_RETRY_DELAY_S
+            return min(delay, timeout - elapsed), oom_retries
+
+    if status == HTTP_GATEWAY_TIMEOUT:
+        msg = (
+            "Gateway timed out (504) after the request was published to the queue; "
+            "a worker may already be generating. Not retried because generation is "
+            "non-idempotent (retrying could double-bill)."
+        )
+        raise ServerError(msg, code=get_error_code(response), status_code=status)
+
+    if status >= HTTP_CLIENT_ERROR:
+        handle_error(response)  # always raises
+
+    # A non-200, non-error status with no retry rule — surface rather than
+    # silently treat as streamable.
+    msg = f"Unexpected status {status} opening stream"
+    raise ServerError(msg, code=get_error_code(response), status_code=status)
+
+
+def build_chat_body(
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    stream: bool,
+    max_completion_tokens: int | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    repetition_penalty: float | None = None,
+    stop: str | list[str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any | None = None,
+    parallel_tool_calls: bool | None = None,
+    response_format: dict[str, Any] | None = None,
+    frequency_penalty: float | None = None,
+    presence_penalty: float | None = None,
+    n: int | None = None,
+    best_of: int | None = None,
+    logprobs: bool | None = None,
+    top_logprobs: int | None = None,
+    logit_bias: dict[str, float] | None = None,
+    seed: int | None = None,
+    user: str | None = None,
+    safety_identifier: str | None = None,
+    lora_adapter: str | None = None,
+    stream_options: dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the ``/v1/chat/completions`` request body (snake_case wire shape).
+
+    Only fields the caller set are included so the gateway applies its own
+    defaults for the rest. ``extra_body`` is merged LAST so a caller can still
+    override / supply any forward-compat field not yet named on the typed
+    surface (the typed kwargs win unless the caller explicitly puts the same
+    key into ``extra_body``). Shared by the sync and async clients.
+
+    Field set mirrors ``packages/sie_gateway/src/handlers/proxy.rs::chat_params_from_json``:
+    the gateway rejects unknown keys with 400 ``unsupported_field`` and
+    validates ranges (e.g. ``top_logprobs`` in ``[0, 20]``,
+    ``logit_bias`` values in ``[-100.0, 100.0]``, ``best_of`` in
+    ``[1, 128]``); ``logprobs: true`` is required when ``top_logprobs > 0``.
+    """
+    body: dict[str, Any] = {"model": model, "messages": list(messages)}
+    if stream:
+        body["stream"] = True
+    optional: dict[str, Any] = {
+        "max_completion_tokens": max_completion_tokens,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repetition_penalty": repetition_penalty,
+        "stop": stop,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+        "response_format": response_format,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "n": n,
+        "best_of": best_of,
+        "logprobs": logprobs,
+        "top_logprobs": top_logprobs,
+        "logit_bias": logit_bias,
+        "seed": seed,
+        "user": user,
+        "safety_identifier": safety_identifier,
+        "lora_adapter": lora_adapter,
+        "stream_options": stream_options,
+    }
+    body.update({key: value for key, value in optional.items() if value is not None})
+    if extra_body:
+        body.update(extra_body)
+    return body
+
+
+def sse_headers(resolved_gpu: str | None, pool_name: str | None) -> dict[str, str]:
+    """Headers for an SSE streaming request (``Accept: text/event-stream``)."""
+    headers: dict[str, str] = {
+        "content-type": JSON_CONTENT_TYPE,
+        "accept": "text/event-stream",
+    }
+    if resolved_gpu:
+        headers["X-SIE-MACHINE-PROFILE"] = resolved_gpu
+    if pool_name:
+        headers["X-SIE-Pool"] = pool_name
+    return headers
+
+
+def sse_chunk_error(chunk: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(code, message)`` if an SSE chunk carries a mid-stream error.
+
+    Both the chat and SIE-native generate surfaces put the error object at the
+    top level of the chunk (see ``send_error_chunk`` in
+    ``packages/sie_gateway/src/handlers/sse.rs``).
+    """
+    err = chunk.get("error")
+    if isinstance(err, dict):
+        return str(err.get("code") or "error"), str(err.get("message") or "stream error")
+    return None
+
+
+def _coerce_token_count(value: Any) -> int:
+    """Best-effort coerce a usage token count to a non-negative ``int``.
+
+    The generate-result parser is tolerant of malformed *optional* usage
+    fields (mirroring how it silently skips a non-numeric ``ttft_ms`` /
+    ``tpot_ms``). A non-numeric token count (``None``, a string, a list,
+    …) must NOT crash the parser with an un-wrapped ``ValueError`` /
+    ``TypeError`` outside the parser's :class:`RequestError` contract, so
+    it degrades to ``0`` instead. ``bool`` is accepted (it is an ``int``
+    subclass) and coerces to 0/1. This deliberately does not loosen the
+    strict ``model`` / ``text`` checks, which still raise.
+
+    Args:
+        value: Raw value pulled from the ``usage`` dict.
+
+    Returns:
+        The integer token count, or ``0`` for any non-numeric input.
+    """
+    # ``math.isfinite`` guards against a non-finite float (``nan`` / ``inf``)
+    # which is an ``int``/``float`` instance but blows up ``int()``:
+    # ``int(nan)`` -> ``ValueError``, ``int(inf)`` -> ``OverflowError``.
+    # Both would escape the parser's ``RequestError``-only contract, so they
+    # degrade to ``0`` like any other non-numeric value. ``bool`` is finite
+    # and coerces to 0/1 as documented.
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value)
+    return 0
 
 
 def parse_encode_results(items: list[dict[str, Any]]) -> list[EncodeResult]:

@@ -226,8 +226,10 @@ class AppFactory:
 
         if nats_url:
             nats_publisher = NatsPublisher(nats_url=nats_url)
-            await nats_publisher.connect()
             app.state.nats_publisher = nats_publisher
+            # Do not await NATS here: it can outlast startup probe budgets while the
+            # NATS pod schedules; /healthz must bind as soon as model registry + store init finish.
+            nats_publisher.kickoff_connect()
         else:
             app.state.nats_publisher = None
             logger.info("NATS not configured (SIE_NATS_URL not set) -- config distribution disabled")

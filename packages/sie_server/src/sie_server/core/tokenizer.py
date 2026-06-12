@@ -1,10 +1,4 @@
-"""Tokenization utilities.
-
-Contains load_tokenizer() for loading HuggingFace tokenizers.
-For preprocessing types, see the prepared module (PreparedItem, TextPayload, etc.).
-
-See DESIGN.md Section 5.2.
-"""
+"""Tokenization utilities."""
 
 from __future__ import annotations
 
@@ -24,17 +18,7 @@ def load_tokenizer(
     *,
     trust_remote_code: bool = False,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    """Load a tokenizer from a model path or HuggingFace ID.
-
-    Attempts to load the fast (Rust) tokenizer first, falls back to Python.
-
-    Args:
-        model_path: Local path or HuggingFace model ID.
-        trust_remote_code: Whether to trust remote code in the tokenizer.
-
-    Returns:
-        Loaded tokenizer instance.
-    """
+    """Load a HuggingFace tokenizer from a local path or model id."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(

@@ -220,4 +220,4 @@ class TestModelWorkerScoreBackpressure:
             finally:
                 await worker.stop()
 
-        asyncio.get_event_loop().run_until_complete(test())
+        asyncio.new_event_loop().run_until_complete(test())

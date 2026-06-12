@@ -2,7 +2,7 @@
 
 Implements the caching hierarchy for model weights:
 1. Local cache (HF_HOME/hub by default)
-2. Cluster cache (S3/GCS bucket)
+2. Cluster cache (S3/GCS/Azure object storage)
 3. HuggingFace Hub fallback (if enabled)
 
 The caching is transparent to adapters - they always see files in local cache.
@@ -51,7 +51,7 @@ class CacheConfig:
     """Local cache directory (usually HF_HOME/hub)."""
 
     cluster_cache: str | None = None
-    """Cluster cache URL (s3:// or gs://), or None if not configured."""
+    """Cluster cache URL (s3://, gs://, abfs://, or abfss://), or None if not configured."""
 
     hf_fallback: bool = True
     """Whether to fallback to HuggingFace Hub for downloads."""
@@ -62,7 +62,7 @@ def get_cache_config() -> CacheConfig:
 
     Reads:
         SIE_LOCAL_CACHE: Local cache directory (default: HF_HOME/hub)
-        SIE_CLUSTER_CACHE: Cluster cache URL (s3:// or gs://)
+        SIE_CLUSTER_CACHE: Cluster cache URL (s3://, gs://, abfs://, or abfss://)
         SIE_HF_FALLBACK: Whether to enable HF Hub fallback (default: true)
 
     Returns:
@@ -79,7 +79,7 @@ def get_cache_config() -> CacheConfig:
         else:
             local_cache = Path.home() / ".cache" / "huggingface" / "hub"
 
-    # Cluster cache: S3/GCS URL
+    # Cluster cache: S3/GCS/Azure object-store URL
     cluster_cache = os.environ.get("SIE_CLUSTER_CACHE")
 
     # HF fallback: default true

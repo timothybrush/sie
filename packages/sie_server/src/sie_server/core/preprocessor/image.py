@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from sie_server.core.prepared import ImagePayload, PreparedBatch, PreparedItem
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     import torch
@@ -82,7 +83,7 @@ class ImagePreprocessor:
 
             # Load first image from bytes
             img_input = item.images[0]
-            pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+            pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
             original_size = pil_img.size
 
             # Convert to RGB if needed
@@ -210,7 +211,7 @@ class OpenCLIPImagePreprocessor:
 
             # Load first image from bytes
             img_input = item.images[0]
-            pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+            pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
             original_size = pil_img.size
 
             # Convert to RGB if needed

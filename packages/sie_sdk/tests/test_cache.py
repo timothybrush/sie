@@ -68,6 +68,14 @@ class TestGetCacheConfig:
 
         assert config.cluster_cache == "gs://my-bucket/models"
 
+    def test_cluster_cache_azure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Azure cluster cache URL parsed correctly."""
+        monkeypatch.setenv("SIE_CLUSTER_CACHE", "abfs://models@sieacct.dfs.core.windows.net/models")
+
+        config = get_cache_config()
+
+        assert config.cluster_cache == "abfs://models@sieacct.dfs.core.windows.net/models"
+
     def test_hf_fallback_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SIE_HF_FALLBACK=false disables HF fallback."""
         monkeypatch.setenv("SIE_HF_FALLBACK", "false")

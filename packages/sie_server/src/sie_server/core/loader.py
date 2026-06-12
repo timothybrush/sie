@@ -15,6 +15,7 @@ from sie_sdk.storage import (
     join_path,
 )
 
+from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.engine import ComputePrecision
 from sie_server.config.model import AdapterOptions, ModelConfig, ProfileConfig
@@ -47,7 +48,7 @@ def load_model_configs(models_dir: Path | str) -> dict[str, ModelConfig]:
     """Load all model configs from a directory (local or cloud).
 
     Args:
-        models_dir: Path to the models directory (local path, s3://, or gs://).
+        models_dir: Path to the models directory (local path, s3://, gs://, abfs://, or abfss://).
 
     Returns:
         Dictionary mapping model names to their ModelConfig objects.
@@ -140,7 +141,7 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
 
 
 def _load_configs_from_cloud(models_dir: str) -> dict[str, ModelConfig]:
-    """Load model configs from S3/GCS.
+    """Load model configs from cloud object storage.
 
     Discovers YAML files via LIST operation, downloads them to local cache, and parses them.
     Model configs are flat YAML files (e.g., gs://bucket/models/BAAI__bge-m3.yaml).
@@ -290,6 +291,27 @@ def load_adapter(
             # If signature inspection fails, avoid passing unsupported kwargs
             pass
 
+    # Wire the profile's ``runtime.default_sampling`` into the adapter when its
+    # constructor accepts it. These defaults live under ``adapter_options.runtime``
+    # (not ``loadtime``) and were previously dropped entirely — so a profile's
+    # ``default_sampling`` silently no-op'd (e.g. a ``min_new_tokens`` floor for
+    # the Qwen3.6 stop-token-as-first-token bug never reached SGLang). The adapter
+    # merges this dict with ``setdefault`` semantics, so request-supplied sampling
+    # values still win; this only fills params the caller omitted, which is the
+    # documented intent of a ``default_sampling`` block. Guarded by signature
+    # inspection so adapters that don't accept the kwarg are unaffected.
+    if "default_sampling" not in adapter_kwargs:
+        try:
+            signature = inspect.signature(adapter_class.__init__)
+            default_sampling = dict(config.resolve_profile("default").runtime).get("default_sampling")
+            if "default_sampling" in signature.parameters and default_sampling:
+                adapter_kwargs["default_sampling"] = default_sampling
+        except (TypeError, ValueError):
+            logger.debug(
+                "Could not inspect adapter constructor for default_sampling support; skipping default_sampling wiring.",
+                exc_info=True,
+            )
+
     # Instantiate adapter using factory method for device-aware selection
     # All adapters inherit create_for_device() from ModelAdapter base class
     adapter = adapter_class.create_for_device(device=device, **adapter_kwargs)
@@ -302,6 +324,22 @@ def load_adapter(
         msg = (
             f"Adapter '{adapter_class.__name__}' does not support output types {unsupported}. "
             f"Adapter supports: {adapter_outputs}, config requires: {config_outputs}"
+        )
+        raise ValueError(msg)
+
+    # If the config declares ``tasks.generate``, the resolved adapter MUST
+    # be a ``GenerationAdapter`` subclass. The outputs check above would
+    # catch any adapter that doesn't declare "tokens" in capabilities,
+    # but an embedding adapter that mistakenly declared "tokens" would
+    # slip through — this is the structural check. Surfacing the error
+    # at adapter-load (worker boot) rather than first-request time
+    # means misconfiguration is caught before any traffic lands.
+    if config.tasks.generate is not None and not isinstance(adapter, GenerationAdapter):
+        msg = (
+            f"Model '{config.sie_id}' declares 'tasks.generate' but adapter "
+            f"'{adapter_class.__name__}' is not a GenerationAdapter subclass. "
+            "Generation requests require an adapter that inherits from "
+            "sie_server.adapters._generation_base.GenerationAdapter."
         )
         raise ValueError(msg)
 
@@ -321,6 +359,8 @@ def _import_builtin_adapter(module_path: str, class_name: str) -> type[ModelAdap
     Raises:
         ImportError: If module or class not found.
     """
+    module_path = _resolve_legacy_adapter_module(module_path, class_name)
+
     try:
         module = importlib.import_module(module_path)
     except ImportError as e:
@@ -332,6 +372,15 @@ def _import_builtin_adapter(module_path: str, class_name: str) -> type[ModelAdap
         raise ImportError(msg)
 
     return getattr(module, class_name)
+
+
+def _resolve_legacy_adapter_module(module_path: str, class_name: str) -> str:
+    if module_path == "sie_server.adapters.sglang":
+        if class_name == "SGLangEmbeddingAdapter":
+            return "sie_server.adapters.sglang.embedding"
+        if class_name == "SGLangGenerationAdapter":
+            return "sie_server.adapters.sglang.generation"
+    return module_path
 
 
 def _import_custom_adapter(file_path: Path, class_name: str) -> type[ModelAdapter]:
@@ -418,6 +467,8 @@ def _build_adapter_kwargs(
         "max_seq_length": config.max_sequence_length,
         "compute_precision": compute_precision,
     }
+    if config.tasks.encode is not None and config.tasks.encode.dense is not None:
+        kwargs["dense_dim"] = config.tasks.encode.dense.dim
 
     # Pass HF revision if pinned in config
     if config.hf_revision is not None:

@@ -28,7 +28,14 @@ def _create_app_from_env() -> FastAPI:
     return AppFactory.create_app(config)
 
 
-def run_server(host: str, port: int, reload: bool, config: AppStateConfig) -> None:
+def run_server(
+    host: str,
+    port: int,
+    reload: bool,
+    config: AppStateConfig,
+    *,
+    uvicorn_log_level: str = "info",
+) -> None:
     config.save_to_env_vars()
     uvicorn.run(
         "sie_server.main:_create_app_from_env",
@@ -38,4 +45,5 @@ def run_server(host: str, port: int, reload: bool, config: AppStateConfig) -> No
         factory=True,
         loop="uvloop",
         timeout_keep_alive=120,
+        log_level=uvicorn_log_level,
     )

@@ -234,6 +234,42 @@ class TestWebSocketEndpoint:
                 assert "queue_depth" in model
 
 
+class TestStatusReadyReflectsGpuHealth:
+    """The gateway-facing `ready` field must drop when the GPU is wedged (issue #1025)."""
+
+    @pytest.mark.asyncio
+    async def test_ready_false_when_gpu_wedged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wedged GPU makes `ready` False even though the process is up and ready."""
+        from sie_server.api import ws
+        from sie_server.core.readiness import mark_ready
+
+        mark_ready()
+
+        async def unhealthy(**_: object) -> bool:
+            return False
+
+        monkeypatch.setattr(ws, "gpu_is_healthy_async", unhealthy)
+
+        msg = await ws.build_status_message(ModelRegistry())
+        assert msg["ready"] is False
+
+    @pytest.mark.asyncio
+    async def test_ready_true_when_gpu_healthy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A healthy GPU and a ready process report `ready` True."""
+        from sie_server.api import ws
+        from sie_server.core.readiness import mark_ready
+
+        mark_ready()
+
+        async def healthy(**_: object) -> bool:
+            return True
+
+        monkeypatch.setattr(ws, "gpu_is_healthy_async", healthy)
+
+        msg = await ws.build_status_message(ModelRegistry())
+        assert msg["ready"] is True
+
+
 class TestGpuTypeNormalization:
     """Tests for GPU type normalization."""
 

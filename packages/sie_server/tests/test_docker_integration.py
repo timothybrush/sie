@@ -35,9 +35,14 @@ class TestDockerImageBasics:
         response = httpx.get(f"{sie_docker_server}/healthz", timeout=10.0)
         assert response.status_code == 200
 
-    def test_models_endpoint(self, docker_client: SIEClient) -> None:
+        # GPU-aware liveness probe (issue #1025) is wired and healthy. On a CPU
+        # container there is no GPU to wedge, so it reports 200.
+        response = httpx.get(f"{sie_docker_server}/livez", timeout=10.0)
+        assert response.status_code == 200
+
+    def test_models_endpoint(self, sie_docker_client: SIEClient) -> None:
         """Docker container can list available models."""
-        models = docker_client.list_models()
+        models = sie_docker_client.list_models()
         assert len(models) > 0
         # Should include the model we started with
         # Model list returns "name" not "id"
@@ -52,7 +57,7 @@ class TestDockerModelDownload:
     be able to download models to the HuggingFace cache directory.
     """
 
-    def test_encode_triggers_model_load(self, docker_client: SIEClient) -> None:
+    def test_encode_triggers_model_load(self, sie_docker_client: SIEClient) -> None:
         """Encoding request successfully loads model and returns embeddings.
 
         This tests the full flow:
@@ -67,14 +72,14 @@ class TestDockerModelDownload:
         from sie_sdk.types import Item
 
         model = "sentence-transformers/all-MiniLM-L6-v2"
-        result = docker_client.encode(model, Item(text="Hello, world!"))
+        result = sie_docker_client.encode(model, Item(text="Hello, world!"))
 
         # Should get a dense embedding
         assert "dense" in result
         assert result["dense"] is not None
         assert len(result["dense"]) == 384  # MiniLM embedding dimension
 
-    def test_encode_batch(self, docker_client: SIEClient) -> None:
+    def test_encode_batch(self, sie_docker_client: SIEClient) -> None:
         """Batch encoding works correctly."""
         from sie_sdk.types import Item
 
@@ -85,7 +90,7 @@ class TestDockerModelDownload:
             Item(text="Third sentence"),
         ]
 
-        results = docker_client.encode(model, items)
+        results = sie_docker_client.encode(model, items)
 
         assert len(results) == 3
         for result in results:
@@ -100,7 +105,7 @@ class TestDockerCachePermissions:
     and writable in the Docker container.
     """
 
-    def test_second_request_uses_cache(self, docker_client: SIEClient) -> None:
+    def test_second_request_uses_cache(self, sie_docker_client: SIEClient) -> None:
         """Second request should be faster (model cached).
 
         This indirectly tests that:
@@ -115,12 +120,12 @@ class TestDockerCachePermissions:
 
         # First request (may need to load model)
         start1 = time.perf_counter()
-        docker_client.encode(model, Item(text="First request"))
+        sie_docker_client.encode(model, Item(text="First request"))
         time1 = time.perf_counter() - start1
 
         # Second request (model should be loaded)
         start2 = time.perf_counter()
-        docker_client.encode(model, Item(text="Second request"))
+        sie_docker_client.encode(model, Item(text="Second request"))
         time2 = time.perf_counter() - start2
 
         # Second request should be significantly faster

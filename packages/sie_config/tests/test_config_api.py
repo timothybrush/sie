@@ -128,6 +128,46 @@ class TestConfigAPIModels:
         assert data["created_profiles"] == []
         assert data["existing_profiles_skipped"] == ["default"]
 
+    def test_add_model_conflicting_existing_profile_returns_409_without_store(self) -> None:
+        client = TestClient(_create_test_app(self._bundles, self._models))
+        yaml_body = (
+            "sie_id: new/conflict\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:Bert\n"
+            "    max_batch_tokens: 8192\n"
+            "    max_sequence_length: 256\n"
+        )
+        resp1 = client.post("/v1/configs/models", content=yaml_body)
+        assert resp1.status_code == 201
+
+        conflict_body = yaml_body.replace("max_sequence_length: 256", "max_sequence_length: 128")
+        resp2 = client.post("/v1/configs/models", content=conflict_body)
+        assert resp2.status_code == 409
+        data = resp2.json()
+        assert data["detail"]["error"] == "content_conflict"
+        assert data["detail"]["conflicting_profiles"] == ["default"]
+
+    def test_add_model_conflicting_top_level_field_returns_409_without_store(self) -> None:
+        client = TestClient(_create_test_app(self._bundles, self._models))
+        yaml_body = (
+            "sie_id: new/top-level-conflict\n"
+            "max_sequence_length: 256\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:Bert\n"
+            "    max_batch_tokens: 8192\n"
+        )
+        resp1 = client.post("/v1/configs/models", content=yaml_body)
+        assert resp1.status_code == 201
+
+        conflict_body = yaml_body.replace("max_sequence_length: 256", "max_sequence_length: 128")
+        resp2 = client.post("/v1/configs/models", content=conflict_body)
+        assert resp2.status_code == 409
+        data = resp2.json()
+        assert data["detail"]["error"] == "content_conflict"
+        assert data["detail"]["conflicting_fields"] == ["max_sequence_length"]
+
     def test_list_models_includes_api_added(self) -> None:
         yaml_body = "sie_id: api/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:Bert\n    max_batch_tokens: 8192\n"
         self.client.post("/v1/configs/models", content=yaml_body)
@@ -364,6 +404,10 @@ class TestConfigAPIExport:
         assert data["snapshot_version"] == 1
         assert data["epoch"] == 0
         assert "generated_at" in data
+        assert data["bundle_config_hashes"]["default"]
+        assert data["bundle_config_hashes"]["default"] == self.app.state.model_registry.compute_bundle_config_hash(
+            "default"
+        )
         assert len(data["models"]) == 1
         assert data["models"][0]["model_id"] == "test/model"
         assert data["models"][0]["affected_bundles"] == ["default"]
@@ -386,6 +430,7 @@ class TestConfigAPIExport:
         assert resp.status_code == 200
         data = resp.json()
         assert data["models"] == []
+        assert data["bundle_config_hashes"] == {"default": ""}
         assert data["epoch"] == 0
 
     def test_export_generated_at_is_utc_iso8601(self) -> None:

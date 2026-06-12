@@ -114,7 +114,7 @@ def client(mock_registry: MagicMock) -> TestClient:
 
 
 class TestTimingHeaders:
-    """Tests for timing headers in encode responses (DESIGN.md Section 5.7)."""
+    """Tests for timing headers in encode responses."""
 
     @pytest.fixture
     def mock_adapter_with_timing(self) -> MagicMock:

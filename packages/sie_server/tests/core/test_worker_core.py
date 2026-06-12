@@ -68,7 +68,9 @@ class TestWorkerConfig:
 
         assert config.max_batch_tokens == 16384
         assert config.max_batch_requests == 256
-        assert config.max_batch_wait_ms == 10
+        assert config.max_batch_wait_ms == 15
+        assert config.coalesce_ms == 15.0
+        assert config.coalesce_ratio == 0.5
 
     def test_custom_values(self) -> None:
         """Can set custom config values."""
@@ -129,6 +131,42 @@ class TestModelWorker:
         worker = ModelWorker(mock_adapter, config)
 
         assert worker.config.max_batch_tokens == 8192
+
+    def test_adaptive_cost_floor_anchors_to_max_batch_tokens(self, mock_adapter: MagicMock) -> None:
+        """The adaptive controller's cost floor scales with max_batch_tokens.
+
+        Regression guard: before this fix, ``min_batch_cost`` was always
+        ``min(256, max_batch_tokens)`` — i.e. 256 for anything realistic,
+        which let the PI loop collapse each GPU forward to a single item
+        under sustained negative-headroom load. The floor must now be at
+        least ``max_batch_tokens // 4`` so even a fully-collapsed cost knob
+        still packs several items per forward.
+        """
+        from sie_server.core.worker.types import AdaptiveBatchingParams
+
+        ab = AdaptiveBatchingParams(enabled=True)
+
+        # Typical production model: floor should be a quarter of budget.
+        worker_big = ModelWorker(mock_adapter, WorkerConfig(max_batch_tokens=16384, adaptive_batching=ab))
+        assert worker_big._adaptive_controller is not None
+        assert worker_big._adaptive_controller.min_batch_cost == 4096
+
+        # Medium model: still anchored to budget // 4.
+        worker_med = ModelWorker(mock_adapter, WorkerConfig(max_batch_tokens=8192, adaptive_batching=ab))
+        assert worker_med._adaptive_controller is not None
+        assert worker_med._adaptive_controller.min_batch_cost == 2048
+
+        # Small model where max_batch_tokens > 256: floor stays at the 256
+        # legacy minimum (max(256, 1024//4) = max(256, 256) = 256).
+        worker_boundary = ModelWorker(mock_adapter, WorkerConfig(max_batch_tokens=1024, adaptive_batching=ab))
+        assert worker_boundary._adaptive_controller is not None
+        assert worker_boundary._adaptive_controller.min_batch_cost == 256
+
+        # Tiny ``max_batch_tokens`` (pathological unit tests): clamp the
+        # floor to the configured budget so we never drive min above max.
+        worker_small = ModelWorker(mock_adapter, WorkerConfig(max_batch_tokens=100, adaptive_batching=ab))
+        assert worker_small._adaptive_controller is not None
+        assert worker_small._adaptive_controller.min_batch_cost == 100
 
     @pytest.mark.asyncio
     async def test_start_stop(self, mock_adapter: MagicMock) -> None:

@@ -119,7 +119,9 @@ class TestBatchConfig:
 
         assert config.max_batch_tokens == 16384
         assert config.max_batch_requests == 64
-        assert config.max_batch_wait_ms == 10
+        assert config.max_batch_wait_ms == 15
+        assert config.coalesce_ms == 15.0
+        assert config.coalesce_ratio == 0.5
 
     def test_custom_values(self) -> None:
         """Can create config with custom values."""
@@ -877,32 +879,32 @@ class TestEffectiveCoalesce:
     """Tests for proportional coalesce scaling (effective_coalesce_ms)."""
 
     def test_default_scaling(self) -> None:
-        """With default ratio (0.2), effective coalesce is 20% of batch wait."""
+        """With default ratio (0.5), effective coalesce is half of batch wait."""
         config = BatchConfig(max_batch_wait_ms=50, coalesce_ms=20.0)
-        # 50 * 0.2 = 10, min(20, 10) = 10
-        assert config.effective_coalesce_ms == 10.0
+        # 50 * 0.5 = 25, min(20, 25) = 20
+        assert config.effective_coalesce_ms == 20.0
 
     def test_ceiling_respected(self) -> None:
         """When ratio * wait > coalesce_ms, coalesce_ms is the ceiling."""
         config = BatchConfig(max_batch_wait_ms=50, coalesce_ms=5.0)
-        # 50 * 0.2 = 10, min(5, 10) = 5
+        # 50 * 0.5 = 25, min(5, 25) = 5
         assert config.effective_coalesce_ms == 5.0
 
     def test_scales_with_adaptive_wait(self) -> None:
         """Effective coalesce tracks changes to max_batch_wait_ms."""
         config = BatchConfig(max_batch_wait_ms=10, coalesce_ms=20.0)
-        # Initial: 10 * 0.2 = 2, min(20, 2) = 2
-        assert config.effective_coalesce_ms == 2.0
+        # Initial: 10 * 0.5 = 5, min(20, 5) = 5
+        assert config.effective_coalesce_ms == 5.0
 
         # Simulate adaptive controller increasing wait
         config.max_batch_wait_ms = 50.0
-        # 50 * 0.2 = 10, min(20, 10) = 10
-        assert config.effective_coalesce_ms == 10.0
+        # 50 * 0.5 = 25, min(20, 25) = 20
+        assert config.effective_coalesce_ms == 20.0
 
         # Simulate adaptive controller decreasing wait
         config.max_batch_wait_ms = 2.0
-        # 2 * 0.2 = 0.4, min(20, 0.4) = 0.4
-        assert config.effective_coalesce_ms == pytest.approx(0.4)
+        # 2 * 0.5 = 1, min(20, 1) = 1
+        assert config.effective_coalesce_ms == pytest.approx(1.0)
 
     def test_custom_ratio(self) -> None:
         """Custom coalesce_ratio is respected."""

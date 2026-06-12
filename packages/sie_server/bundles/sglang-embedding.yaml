@@ -1,0 +1,18 @@
+name: sglang-embedding
+priority: 21
+adapters:
+- sie_server.adapters.sglang.embedding
+deps:
+  # Lockstep with ``bundles/sglang.yaml``. The dependency stack is
+  # identical (sglang's grammar backends are unavoidably pulled in even
+  # on embedding-only deployments), and the bundle split exists only for
+  # worker pool isolation. The previous revision pinned ``outlines-core``
+  # (a transitive of ``outlines``) instead of the actual top-level deps
+  # the generation bundle pins, which was both wrong and produced silent
+  # pip resolution drift on environments that already had a different
+  # ``outlines`` installed. Asserted in ``tests/test_bundles.py`` so a
+  # future drift fails fast.
+  sglang: '==0.5.10.post1'
+  xgrammar: '==0.1.32'
+  outlines: '==0.1.11'
+  llguidance: '>=0.7.11,<0.8.0'

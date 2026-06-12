@@ -2,8 +2,7 @@
 
 Provides a Python client for the Search Inference Engine server.
 
-Per DESIGN.md Section 8.1:
-- Synchronous encode() method (async variants in M5)
+- Synchronous encode() method
 - Accepts Item or list[Item], returns matching shape
 - Uses msgpack for efficient serialization with native numpy support
 - Returns numpy arrays directly
@@ -25,7 +24,7 @@ GPU Selection and Auto-Retry:
     ...     provision_timeout_s=900,  # Wait up to 15 min
     ... )
 
-Resource Pools (per DESIGN.md Section 10.3):
+Resource Pools:
     >>> # Create pool for isolated capacity
     >>> client = SIEClient("http://gateway:8080")
     >>> client.create_pool("eval-bench", {"l4": 2})  # 2 L4 GPUs
@@ -53,8 +52,13 @@ from sie_sdk.documents import convert_item_document
 from sie_sdk.images import convert_item_images
 from sie_sdk.types import (
     CapacityInfo,
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatMessage,
     EncodeResult,
     ExtractResult,
+    GenerateChunk,
+    GenerateResult,
     Item,
     ModelInfo,
     OutputType,
@@ -83,20 +87,27 @@ from ._shared import (
     RESOURCE_EXHAUSTED_MAX_RETRIES,
     SDK_VERSION_HEADER,
     SERVER_VERSION_HEADER,
+    _coerce_token_count,
+    build_chat_body,
     check_version_skew,
     compute_oom_backoff,
     compute_retry_delay,
+    get_error_code,
     get_retry_after,
     get_sdk_version,
     handle_error,
     is_transient_connect_error,
+    next_stream_retry_delay,
     parse_encode_results,
     parse_extract_results,
     parse_gpu_param,
     parse_score_result,
     raise_if_input_too_long,
     raise_if_model_load_failed,
+    sse_chunk_error,
+    sse_headers,
 )
+from ._sse import iter_sse_payloads
 from .errors import (
     LoraLoadingError,
     ModelLoadingError,
@@ -104,6 +115,7 @@ from .errors import (
     ProvisioningError,
     RequestError,
     ResourceExhaustedError,
+    ServerError,
     SIEConnectionError,
 )
 
@@ -129,6 +141,50 @@ _LEASE_RENEWAL_MAX_RETRIES = 5
 # This prevents overhead in processes that import sie_sdk but don't use
 # the client (e.g., the gateway only needs sie_sdk.types/queue_types).
 _NUMPY_PATCHED = False
+
+
+def _parse_generate_result(data: dict[str, Any]) -> GenerateResult:
+    """Build a :class:`GenerateResult` from the gateway's JSON envelope.
+
+    The gateway shape (streaming): ``{model, text, finish_reason, usage,
+    attempt_id, ttft_ms?, tpot_ms?}``. Tolerant of extra fields for
+    forward compatibility with future surface extensions. ``model`` and
+    ``text`` are required strings; a missing or null value is surfaced
+    as :class:`RequestError` so silent data loss does not look like an
+    empty completion.
+    """
+    model = data.get("model")
+    if not isinstance(model, str):
+        msg = f"Generate response missing string 'model' field: got {type(model).__name__}"
+        raise RequestError(msg)
+    text = data.get("text")
+    if not isinstance(text, str):
+        msg = f"Generate response missing string 'text' field: got {type(text).__name__}"
+        raise RequestError(msg)
+    result: GenerateResult = {
+        "model": model,
+        "text": text,
+    }
+    finish = data.get("finish_reason")
+    if isinstance(finish, str):
+        result["finish_reason"] = finish  # type: ignore[typeddict-item]
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        result["usage"] = {
+            "prompt_tokens": _coerce_token_count(usage.get("prompt_tokens")),
+            "completion_tokens": _coerce_token_count(usage.get("completion_tokens")),
+            "total_tokens": _coerce_token_count(usage.get("total_tokens")),
+        }
+    attempt_id = data.get("attempt_id")
+    if isinstance(attempt_id, str):
+        result["attempt_id"] = attempt_id
+    ttft = data.get("ttft_ms")
+    if isinstance(ttft, (int, float)):
+        result["ttft_ms"] = float(ttft)
+    tpot = data.get("tpot_ms")
+    if isinstance(tpot, (int, float)):
+        result["tpot_ms"] = float(tpot)
+    return result
 
 
 def _close_transport(transport: httpx.Client) -> None:
@@ -211,8 +267,6 @@ def _handle_oom_retry(
 
 class SIEClient:
     """Client for the Search Inference Engine.
-
-    Per DESIGN.md Section 8.1 and 9.6.
 
     Args:
         base_url: Base URL of the SIE server (e.g., "http://localhost:8080").
@@ -397,6 +451,8 @@ class SIEClient:
             request_body: dict[str, Any] = {"name": pool_name}
             if "gpus" in self._pool_spec:
                 request_body["gpus"] = self._pool_spec["gpus"]
+            if "gpu_caps" in self._pool_spec:
+                request_body["gpu_caps"] = self._pool_spec["gpu_caps"]
             if "bundle" in self._pool_spec:
                 request_body["bundle"] = self._pool_spec["bundle"]
             if self._pool_spec.get("minimum_worker_count") is not None:
@@ -520,11 +576,12 @@ class SIEClient:
     def create_pool(
         self,
         name: str,
-        gpus: dict[str, int],
+        gpus: dict[str, int] | None = None,
+        gpu_caps: dict[str, int] | None = None,
         bundle: str | None = None,
         minimum_worker_count: int | None = None,
     ) -> None:
-        """Create a resource pool for isolated capacity.
+        """Create or update a resource pool for isolated capacity.
 
         Pools reserve exclusive GPU capacity for your workload. Use them for:
         - Benchmarks that need consistent performance
@@ -533,8 +590,11 @@ class SIEClient:
 
         Args:
             name: Pool name (used in gpu="pool_name/machine_profile" routing).
-            gpus: Machine profile requirements, e.g., {"l4": 2, "l4-spot": 1}.
+            gpus: Optional machine profile requirements for pool readiness, e.g.,
+                {"l4": 2, "l4-spot": 1}.
                 Keys are machine profile names from cluster config.
+            gpu_caps: Optional maximum assigned workers per machine profile, e.g.,
+                {"l4": 4}. If omitted, all matching workers can be assigned.
             bundle: Optional bundle filter. When set, only workers running this
                 bundle will be assigned to the pool.
             minimum_worker_count: Desired minimum number of warm workers in the pool.
@@ -551,18 +611,26 @@ class SIEClient:
             >>> client.delete_pool("eval")
         """
         with self._pools_lock:
-            if name in self._pools:
-                logger.debug("Pool '%s' already tracked, skipping creation", name)
-                return
+            already_tracking = name in self._pools
 
         if minimum_worker_count is not None and minimum_worker_count < 0:
             msg = "minimum_worker_count must be >= 0"
             raise ValueError(msg)
 
-        logger.info("Creating pool '%s' with gpus=%s, bundle=%s", name, gpus, bundle)
+        logger.info(
+            "Creating/updating pool '%s' with gpus=%s, gpu_caps=%s, bundle=%s",
+            name,
+            gpus,
+            gpu_caps,
+            bundle,
+        )
 
         # Build pool creation request
-        request_body: dict[str, Any] = {"name": name, "gpus": gpus}
+        request_body: dict[str, Any] = {"name": name}
+        if gpus is not None:
+            request_body["gpus"] = gpus
+        if gpu_caps is not None:
+            request_body["gpu_caps"] = gpu_caps
         if bundle:
             request_body["bundle"] = bundle
         if minimum_worker_count is not None:
@@ -591,24 +659,28 @@ class SIEClient:
         # Pool created successfully
         data = response.json()
         state = data.get("status", {}).get("state", "unknown")
-        logger.info("Pool '%s' created with state '%s'", name, state)
+        logger.info("Pool '%s' created/updated with state '%s'", name, state)
 
-        # Start lease renewal thread for this pool
-        self._start_pool_lease_renewal(name)
+        # Start lease renewal thread for this pool if this client is not
+        # already tracking it. Repeated create_pool calls intentionally still
+        # POST so callers can update gpus/gpu_caps on the gateway.
+        if not already_tracking:
+            self._start_pool_lease_renewal(name)
 
     def _start_pool_lease_renewal(self, pool_name: str) -> None:
         """Start lease renewal thread for a pool."""
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._pool_lease_renewal_loop,
-            args=(pool_name, stop_event),
-            name=f"pool-lease-{pool_name}",
-            daemon=True,
-        )
-        thread.start()
-
         with self._pools_lock:
+            if pool_name in self._pools:
+                return
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._pool_lease_renewal_loop,
+                args=(pool_name, stop_event),
+                name=f"pool-lease-{pool_name}",
+                daemon=True,
+            )
             self._pools[pool_name] = (thread, stop_event)
+            thread.start()
 
         logger.debug("Started lease renewal thread for pool '%s'", pool_name)
 
@@ -853,8 +925,6 @@ class SIEClient:
     ) -> EncodeResult | list[EncodeResult]:
         """Encode items into vector representations.
 
-        Per DESIGN.md Section 8.1.
-
         Args:
             model: Model name to use for encoding (e.g., "bge-m3").
             items: Single Item or list of Items to encode.
@@ -965,7 +1035,7 @@ class SIEClient:
         single_item = not isinstance(items, list)
         items_list = [items] if single_item else items
 
-        # Convert images to JPEG bytes for transport (per design.md Section 4.3)
+        # Convert images to JPEG bytes for transport.
         # Only copy items that have images — text-only items are passed through directly
         items_for_wire = [
             convert_item_images({**item}) if "images" in item else item  # ty: ignore[invalid-argument-type]
@@ -1105,8 +1175,6 @@ class SIEClient:
 
             # Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
             if response.status_code == 503:
-                from ._shared import get_error_code
-
                 error_code = get_error_code(response)
                 if error_code == LORA_LOADING_ERROR_CODE:
                     lora_retries += 1
@@ -1364,7 +1432,6 @@ class SIEClient:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
-        last_error: Exception | None = None
         for path in paths:
             ws_url = self._ws_url(path)
             try:
@@ -1378,7 +1445,6 @@ class SIEClient:
                         yield data
                 return
             except InvalidStatus as e:
-                last_error = e
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(e, "status", None)
@@ -1386,14 +1452,9 @@ class SIEClient:
                 )
                 raise RequestError(f"WebSocket connection failed: {status}") from e
             except WebSocketException as e:
-                last_error = e
                 raise SIEConnectionError(f"WebSocket error: {e}") from e
             except (OSError, json.JSONDecodeError) as e:
-                last_error = e
                 raise SIEConnectionError(f"WebSocket error: {e}") from e
-
-        if last_error:
-            raise SIEConnectionError(f"WebSocket connection failed: {last_error}") from last_error
 
     def get_capacity(self, *, gpu: str | None = None) -> CapacityInfo:
         """Get current cluster capacity information.
@@ -1752,8 +1813,6 @@ class SIEClient:
 
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
-                from ._shared import get_error_code
-
                 error_code = get_error_code(response)
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     # Check if we've exceeded the provision timeout
@@ -1845,6 +1904,557 @@ class SIEClient:
 
         # Build ScoreResult
         return parse_score_result(response_data)
+
+    def generate(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        stop: list[str] | None = None,
+        gpu: str | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> GenerateResult:
+        """Generate text from a prompt (walking-skeleton SDK surface).
+
+        The SDK does not currently expose streaming chunks to the caller;
+        the worker streams chunks to the gateway, the gateway aggregates,
+        and the SDK returns the assembled result plus SIE-native timing
+        metadata (``ttft_ms``, ``tpot_ms``, ``attempt_id``).
+
+        Args:
+            model: Model name. HF-style IDs such as
+                ``"Qwen/Qwen3-4B-Instruct-2507"`` are normalized to the
+                gateway's SIE-safe path id
+                ``"Qwen__Qwen3-4B-Instruct-2507"`` for this endpoint.
+            prompt: Raw prompt string. Chat-template rendering, if any,
+                is performed by the worker — this surface has no chat-template
+                helpers in the SDK (use the OpenAI SDK against
+                ``/v1/chat/completions`` for chat-shaped requests).
+            max_new_tokens: Hard cap on output tokens.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling cutoff.
+            stop: Optional list of stop strings.
+            gpu: Target GPU type / pool spec; see ``encode``.
+            wait_for_capacity: Auto-retry 202 / 503 MODEL_LOADING responses
+                under ``provision_timeout_s``. See ``encode``. Unlike the
+                idempotent encode/score/extract paths, a ``504`` gateway
+                timeout is NOT retried here: generation is non-idempotent
+                and a 504 is a post-publish timeout, so retrying could
+                double-bill an inference. A ``504`` is surfaced as a
+                terminal :class:`ServerError`.
+            provision_timeout_s: Maximum time to wait for capacity.
+
+        Returns:
+            :class:`GenerateResult` with text, usage, finish_reason, and
+            timing metadata.
+
+        Raises:
+            ServerError: On a ``504`` gateway timeout (post-publish, not
+                retried) or other 5xx responses.
+        """
+        pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
+
+        safe_model = model.replace("/", "__")
+
+        request_body: dict[str, Any] = {
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if stop is not None:
+            request_body["stop"] = stop
+
+        body = json.dumps(request_body).encode("utf-8")
+        headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
+        if resolved_gpu:
+            headers["X-SIE-MACHINE-PROFILE"] = resolved_gpu
+        if pool_name:
+            headers["X-SIE-Pool"] = pool_name
+
+        timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
+        start_time = time.monotonic()
+        oom_retries = 0
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                msg = f"Provision timeout ({timeout:.1f}s) exceeded before request could be sent"
+                raise ProvisioningError(msg, gpu=resolved_gpu)
+            request_timeout = min(self._timeout, remaining)
+
+            try:
+                response = self._client.post(
+                    f"/v1/generate/{safe_model}",
+                    content=body,
+                    headers=headers,
+                    timeout=request_timeout,
+                )
+            except httpx.ConnectError as e:
+                # ``ConnectError`` fails *before* the request is sent, so no
+                # generation could have started — safe to retry.
+                if wait_for_capacity and is_transient_connect_error(e):
+                    delay_s = compute_retry_delay(
+                        start_time=start_time,
+                        timeout=timeout,
+                        error_label="Connect error",
+                        error=e,
+                    )
+                    if delay_s is not None:
+                        time.sleep(delay_s)
+                        continue
+                msg = f"Failed to connect to {self._base_url}: {e}"
+                raise SIEConnectionError(msg) from e
+            except _RETRYABLE_TRANSPORT_ERRORS as e:
+                # Unlike the idempotent encode/score/extract paths, generation
+                # is NOT idempotent and carries no dedup key. By the time these
+                # mid-flight errors fire (read/write timeout, peer reset) the
+                # request body has already been sent and the worker may be — or
+                # have finished — generating. Retrying would issue a *second*
+                # billable generation with a different completion, so surface
+                # the error instead of silently re-running.
+                if isinstance(e, httpx.TimeoutException):
+                    msg = f"Request timed out: {e}"
+                else:
+                    msg = (
+                        f"Connection lost mid-request ({type(e).__name__}); "
+                        f"the peer closed the connection before sending a complete response: {e}"
+                    )
+                raise SIEConnectionError(msg) from e
+
+            if response.status_code == HTTP_ACCEPTED:
+                retry_after = get_retry_after(response)
+                if not wait_for_capacity:
+                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
+                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
+                elapsed = time.monotonic() - start_time
+                if elapsed >= timeout:
+                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
+                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
+                delay = retry_after or DEFAULT_RETRY_DELAY_S
+                actual_delay = min(delay, timeout - elapsed)
+                time.sleep(actual_delay)
+                continue
+
+            raise_if_model_load_failed(response, model=model)
+
+            if response.status_code == 503:
+                error_code = get_error_code(response)
+                if error_code == MODEL_LOADING_ERROR_CODE:
+                    elapsed = time.monotonic() - start_time
+                    if elapsed >= timeout:
+                        msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
+                        raise ModelLoadingError(msg, model=model)
+                    retry_after = get_retry_after(response)
+                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    actual_delay = min(delay, timeout - elapsed)
+                    time.sleep(actual_delay)
+                    continue
+                if error_code == RESOURCE_EXHAUSTED_ERROR_CODE:
+                    oom_retries = _handle_oom_retry(
+                        response,
+                        start_time=start_time,
+                        oom_retries=oom_retries,
+                        max_oom_retries=max_oom_retries,
+                        timeout=timeout,
+                        model=model,
+                    )
+                    continue
+                if wait_for_capacity:
+                    elapsed = time.monotonic() - start_time
+                    if elapsed < timeout:
+                        retry_after = get_retry_after(response)
+                        delay = retry_after or DEFAULT_RETRY_DELAY_S
+                        actual_delay = min(delay, timeout - elapsed)
+                        time.sleep(actual_delay)
+                        continue
+
+            # Do NOT retry 504 here. Unlike the idempotent encode/score/extract
+            # paths (which keep the 504 retry block), generation is NOT
+            # idempotent and carries no dedup key. A 504 GATEWAY_TIMEOUT is a
+            # *post-publish* timeout: the work item is already on the queue and
+            # a worker may be — or have finished — generating. Retrying would
+            # issue a SECOND billable generation with a different completion, so
+            # surface it as a terminal ServerError instead (same reasoning as
+            # the mid-flight transport-error block above). The pre-execution
+            # 503 MODEL_LOADING / 202 provisioning retries above remain because
+            # those fire *before* any generation can have started.
+            if response.status_code == HTTP_GATEWAY_TIMEOUT:
+                msg = (
+                    "Gateway timed out (504) after the generate request was published to the "
+                    "queue; a worker may already be generating. Not retried because generation "
+                    "is non-idempotent (retrying could double-bill). Re-issue manually if needed."
+                )
+                raise ServerError(msg, code=get_error_code(response), status_code=response.status_code)
+
+            if response.status_code >= HTTP_CLIENT_ERROR:
+                handle_error(response)
+
+            break
+
+        self._check_server_version(response)
+
+        data = response.json()
+        if not isinstance(data, dict):
+            msg = f"Unexpected generate response shape: {type(data).__name__}"
+            raise RequestError(msg)
+        return _parse_generate_result(data)
+
+    def chat_completions(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        *,
+        max_completion_tokens: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
+        stop: str | list[str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+        parallel_tool_calls: bool | None = None,
+        response_format: dict[str, Any] | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        n: int | None = None,
+        best_of: int | None = None,
+        logprobs: bool | None = None,
+        top_logprobs: int | None = None,
+        logit_bias: dict[str, float] | None = None,
+        seed: int | None = None,
+        user: str | None = None,
+        safety_identifier: str | None = None,
+        lora_adapter: str | None = None,
+        gpu: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> ChatCompletion:
+        """Non-streaming OpenAI-compatible chat completion (``/v1/chat/completions``).
+
+        Mirrors the subset of OpenAI's ``chat.completions.create`` the gateway
+        honours. For token streaming use :meth:`stream_chat_completions`.
+        Generation is non-idempotent, so — like :meth:`generate` — only
+        pre-execution 202 / 503 responses are retried; a 504 (post-publish)
+        surfaces as :class:`ServerError`.
+
+        Typed kwargs cover the full gateway-supported field set (see
+        :func:`build_chat_body` for the canonical list); ``extra_body`` is
+        still merged last for forward-compat fields the typed surface does
+        not name yet.
+        """
+        pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
+        body = json.dumps(
+            build_chat_body(
+                model,
+                messages,
+                stream=False,
+                max_completion_tokens=max_completion_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                stop=stop,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                response_format=response_format,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                n=n,
+                best_of=best_of,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs,
+                logit_bias=logit_bias,
+                seed=seed,
+                user=user,
+                safety_identifier=safety_identifier,
+                lora_adapter=lora_adapter,
+                extra_body=extra_body,
+            )
+        ).encode("utf-8")
+        headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
+        if resolved_gpu:
+            headers["X-SIE-MACHINE-PROFILE"] = resolved_gpu
+        if pool_name:
+            headers["X-SIE-Pool"] = pool_name
+
+        timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
+        start_time = time.monotonic()
+        oom_retries = 0
+        while True:
+            remaining = timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                msg = f"Provision timeout ({timeout:.1f}s) exceeded before request could be sent"
+                raise ProvisioningError(msg, gpu=resolved_gpu)
+            try:
+                response = self._client.post(
+                    "/v1/chat/completions",
+                    content=body,
+                    headers=headers,
+                    timeout=min(self._timeout, remaining),
+                )
+            except httpx.ConnectError as e:
+                if wait_for_capacity and is_transient_connect_error(e):
+                    delay_s = compute_retry_delay(
+                        start_time=start_time, timeout=timeout, error_label="Connect error", error=e
+                    )
+                    if delay_s is not None:
+                        time.sleep(delay_s)
+                        continue
+                msg = f"Failed to connect to {self._base_url}: {e}"
+                raise SIEConnectionError(msg) from e
+            except _RETRYABLE_TRANSPORT_ERRORS as e:
+                # Non-idempotent: a mid-flight failure may have already started
+                # a generation, so surface it instead of silently re-running.
+                msg = f"Connection lost mid-request ({type(e).__name__}): {e}"
+                raise SIEConnectionError(msg) from e
+
+            if response.status_code == 200:
+                break
+            delay, oom_retries = next_stream_retry_delay(
+                response,
+                model=model,
+                gpu=resolved_gpu,
+                wait_for_capacity=wait_for_capacity,
+                start_time=start_time,
+                timeout=timeout,
+                oom_retries=oom_retries,
+                max_oom_retries=max_oom_retries,
+            )
+            time.sleep(delay)
+
+        self._check_server_version(response)
+        data = response.json()
+        if not isinstance(data, dict):
+            msg = f"Unexpected chat completion response shape: {type(data).__name__}"
+            raise RequestError(msg)
+        return data  # type: ignore[return-value]
+
+    def stream_chat_completions(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        *,
+        max_completion_tokens: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
+        stop: str | list[str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+        parallel_tool_calls: bool | None = None,
+        response_format: dict[str, Any] | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        n: int | None = None,
+        logprobs: bool | None = None,
+        top_logprobs: int | None = None,
+        logit_bias: dict[str, float] | None = None,
+        seed: int | None = None,
+        user: str | None = None,
+        safety_identifier: str | None = None,
+        lora_adapter: str | None = None,
+        stream_options: dict[str, Any] | None = None,
+        gpu: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> Iterator[ChatCompletionChunk]:
+        """Streaming OpenAI-compatible chat completion.
+
+        Yields :class:`ChatCompletionChunk` events. Pass
+        ``stream_options={"include_usage": True}`` to receive a final
+        usage-only chunk (``choices: []``) before the stream ends. Raises
+        :class:`ServerError` if the gateway emits a mid-stream error chunk;
+        breaking out of the iterator early closes the stream so the worker
+        stops generating.
+
+        ``best_of`` is intentionally not exposed on the streaming surface —
+        the gateway rejects ``best_of`` together with ``stream: true``.
+        """
+        pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
+        body = json.dumps(
+            build_chat_body(
+                model,
+                messages,
+                stream=True,
+                max_completion_tokens=max_completion_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                stop=stop,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                response_format=response_format,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                n=n,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs,
+                logit_bias=logit_bias,
+                seed=seed,
+                user=user,
+                safety_identifier=safety_identifier,
+                lora_adapter=lora_adapter,
+                stream_options=stream_options,
+                extra_body=extra_body,
+            )
+        ).encode("utf-8")
+        headers = sse_headers(resolved_gpu, pool_name)
+        yield from self._stream_sse_chunks(
+            "/v1/chat/completions",
+            body,
+            headers,
+            model=model,
+            resolved_gpu=resolved_gpu,
+            wait_for_capacity=wait_for_capacity,
+            provision_timeout_s=provision_timeout_s,
+            max_oom_retries=max_oom_retries,
+        )
+
+    def stream_generate(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        stop: list[str] | None = None,
+        gpu: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> Iterator[GenerateChunk]:
+        """Streaming SIE-native generation (``/v1/generate/{model}``).
+
+        Yields :class:`GenerateChunk` events; the terminal chunk carries
+        ``done: true`` plus ``usage`` / ``ttft_ms``. Error semantics match
+        :meth:`stream_chat_completions`.
+        """
+        pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
+        safe_model = model.replace("/", "__")
+        req: dict[str, Any] = {
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": True,
+        }
+        if stop is not None:
+            req["stop"] = stop
+        if extra_body:
+            req.update(extra_body)
+        body = json.dumps(req).encode("utf-8")
+        headers = sse_headers(resolved_gpu, pool_name)
+        yield from self._stream_sse_chunks(
+            f"/v1/generate/{safe_model}",
+            body,
+            headers,
+            model=model,
+            resolved_gpu=resolved_gpu,
+            wait_for_capacity=wait_for_capacity,
+            provision_timeout_s=provision_timeout_s,
+            max_oom_retries=max_oom_retries,
+        )
+
+    def _stream_sse_chunks(
+        self,
+        url: str,
+        body: bytes,
+        headers: dict[str, str],
+        *,
+        model: str,
+        resolved_gpu: str | None,
+        wait_for_capacity: bool,
+        provision_timeout_s: float | None,
+        max_oom_retries: int,
+    ) -> Iterator[Any]:
+        """Open an SSE stream (with pre-stream provisioning retry) and yield chunks.
+
+        Shared by :meth:`stream_chat_completions` and :meth:`stream_generate`.
+        Only the *pre-stream* response is retried (202 / 503); once bytes start
+        flowing a failure is terminal (non-idempotent). Yielding inside the
+        ``with`` keeps the stream open while the caller consumes it; an early
+        ``break`` tears the context down and the worker sees the disconnect.
+        """
+        timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
+        start_time = time.monotonic()
+        oom_retries = 0
+        while True:
+            remaining = timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                msg = f"Provision timeout ({timeout:.1f}s) exceeded before request could be sent"
+                raise ProvisioningError(msg, gpu=resolved_gpu)
+            retry_delay: float | None = None
+            try:
+                with self._client.stream(
+                    "POST", url, content=body, headers=headers, timeout=min(self._timeout, remaining)
+                ) as response:
+                    if response.status_code != 200:
+                        # Buffer the body so the decision helper can read the
+                        # error code, then either sleep-retry or raise.
+                        response.read()
+                        retry_delay, oom_retries = next_stream_retry_delay(
+                            response,
+                            model=model,
+                            gpu=resolved_gpu,
+                            wait_for_capacity=wait_for_capacity,
+                            start_time=start_time,
+                            timeout=timeout,
+                            oom_retries=oom_retries,
+                            max_oom_retries=max_oom_retries,
+                        )
+                    else:
+                        self._check_server_version(response)
+                        for payload in iter_sse_payloads(response.iter_lines()):
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError as e:
+                                msg = f"Malformed SSE chunk from server: {e}"
+                                raise RequestError(msg) from e
+                            if isinstance(chunk, dict):
+                                err = sse_chunk_error(chunk)
+                                if err is not None:
+                                    code, message = err
+                                    raise ServerError(message, code=code)
+                            yield chunk
+                        return
+            except httpx.ConnectError as e:
+                if wait_for_capacity and is_transient_connect_error(e):
+                    delay_s = compute_retry_delay(
+                        start_time=start_time, timeout=timeout, error_label="Connect error", error=e
+                    )
+                    if delay_s is not None:
+                        time.sleep(delay_s)
+                        continue
+                msg = f"Failed to connect to {self._base_url}: {e}"
+                raise SIEConnectionError(msg) from e
+            except _RETRYABLE_TRANSPORT_ERRORS as e:
+                # Mid-stream/connection failure: non-idempotent, do not retry.
+                msg = f"Connection lost during stream ({type(e).__name__}): {e}"
+                raise SIEConnectionError(msg) from e
+            # Reached only on the non-200 pre-stream retry path.
+            if retry_delay is not None:
+                time.sleep(retry_delay)
 
     # Use overload for proper type hints when single item vs list
     @overload
@@ -2112,8 +2722,6 @@ class SIEClient:
 
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
-                from ._shared import get_error_code
-
                 error_code = get_error_code(response)
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     # Check if we've exceeded the provision timeout

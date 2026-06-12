@@ -13,6 +13,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image as PILImage
@@ -124,6 +125,25 @@ class ColQwen3Adapter(BaseAdapter):
         if isinstance(out_features, int) and out_features > 0:
             self._multivector_dim = out_features
 
+        # FIX[#1055]: propagate the requested attention impl onto the inner VLM.
+        # The model builds ``self.vlm`` via ``AutoModelForImageTextToText.from_config``
+        # with a *fresh* ``Qwen3VLConfig`` that does not inherit the
+        # ``attn_implementation`` passed to ``from_pretrained`` (and its own
+        # ``attn_impl`` constructor hook is never invoked by ``from_pretrained``),
+        # so the inner VLM silently defaults to sdpa. On the sdpa/eager path
+        # Qwen3-VL's vision attention falls back to a per-image Python loop over
+        # ``torch.split`` (one attention call per image per layer), which
+        # serializes the batch and starves the GPU (~27s/image, util ~31%).
+        # Re-dispatching to flash_attention_2 routes the whole batch through the
+        # single cu_seqlens flash-varlen call.
+        self._apply_attn_implementation(attn_impl)
+
+        # FIX[#1055]: replace the vision Conv3d patch-embed with its matmul
+        # equivalent. It dominated the forward at ~169s/6-image batch (99.7% of
+        # the vision tower; the transformer blocks were only ~140ms each) — see
+        # _patch_vision_patch_embed for why.
+        self._patch_vision_patch_embed()
+
     def _resolve_dtype(self) -> torch.dtype:
         if not self._device or not str(self._device).startswith("cuda"):
             return torch.float32
@@ -144,6 +164,59 @@ class ColQwen3Adapter(BaseAdapter):
         except ImportError:
             logger.info("flash_attn not available, using sdpa attention")
             return "sdpa"
+
+    def _apply_attn_implementation(self, attn_impl: str | None) -> None:
+        """Force the requested attention impl onto the inner Qwen3-VL (``self.vlm``).
+
+        Needed because the requested impl does not propagate through the model's
+        ``from_config`` construction. Best-effort: on failure we keep the inner
+        default (sdpa) rather than break loading.
+        """
+        if attn_impl is None or attn_impl == "sdpa":
+            return
+        vlm = getattr(self._model, "vlm", None)
+        if vlm is None or not hasattr(vlm, "set_attn_implementation"):
+            logger.warning("ColQwen3: inner VLM cannot set attn_implementation; keeping default")
+            return
+        try:
+            vlm.set_attn_implementation(attn_impl)
+            logger.info("ColQwen3: set inner-VLM attn_implementation=%s", attn_impl)
+        except Exception:  # noqa: BLE001 - best-effort, keep loaded default on failure
+            logger.warning("ColQwen3: could not set inner-VLM attn=%s; keeping default", attn_impl, exc_info=True)
+
+    def _patch_vision_patch_embed(self) -> None:
+        """Rebind the Qwen3-VL vision Conv3d patch-embed to its matmul equivalent.
+
+        ``Qwen3VLVisionPatchEmbed`` projects patches with a ``nn.Conv3d`` whose
+        kernel equals its stride, i.e. a non-overlapping per-patch linear
+        projection. On this GPU the cuDNN Conv3d path for the (~30k-patch,
+        tiny-kernel) shape is pathologically slow — measured at ~169s for a
+        6-image batch, ~99.7% of the whole vision-tower forward, while the 24
+        transformer blocks took only ~140ms each. Reshaping to ``F.linear`` with
+        the *same weights* is numerically identical but runs as a fast matmul.
+
+        Best-effort: on any structural mismatch we leave the original Conv3d.
+        """
+        try:
+            visual = self._model.vlm.model.visual
+            patch_embed = visual.patch_embed
+            proj = patch_embed.proj
+            if not isinstance(proj, torch.nn.Conv3d):
+                return
+            embed_dim = proj.out_channels
+            in_features = proj.in_channels * proj.kernel_size[0] * proj.kernel_size[1] * proj.kernel_size[2]
+
+            def fast_patch_embed_forward(
+                hidden_states: torch.Tensor, _pe: Any = patch_embed, _embed: int = embed_dim, _in: int = in_features
+            ) -> torch.Tensor:
+                weight = _pe.proj.weight
+                hs = hidden_states.to(weight.dtype).reshape(-1, _in)
+                return F.linear(hs, weight.reshape(_embed, _in), _pe.proj.bias)
+
+            patch_embed.forward = fast_patch_embed_forward
+            logger.info("ColQwen3: replaced vision Conv3d patch-embed with matmul equivalent")
+        except Exception:  # noqa: BLE001 - best-effort, keep the original Conv3d on failure
+            logger.warning("ColQwen3: could not rebind vision patch-embed; keeping Conv3d", exc_info=True)
 
     # ------------------------------------------------------------------
     # Encode
@@ -218,7 +291,7 @@ class ColQwen3Adapter(BaseAdapter):
 
         pil_images: list[PILImage.Image] = []
         for img_input in item.images or []:
-            pil_img = Image.open(io.BytesIO(img_input["data"]))
+            pil_img = Image.open(io.BytesIO(media_bytes(img_input, kind="image")))
             if pil_img.mode != "RGB":
                 pil_img = pil_img.convert("RGB")
             pil_images.append(pil_img)

@@ -1,4 +1,6 @@
+import logging
 import threading
+import warnings
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -7,7 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from sie_server.config.engine import ComputePrecision
 
-OutputType = Literal["dense", "sparse", "multivector", "score", "json"]
+logger = logging.getLogger(__name__)
+
+OutputType = Literal["dense", "sparse", "multivector", "score", "json", "tokens"]
 PoolingStrategy = Literal["cls", "mean", "last_token", "splade", "none"]
 
 _MODALITY_NAMES = ("text", "image", "audio", "video", "document")
@@ -48,12 +52,128 @@ class ExtractTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class GenerateCapabilities(BaseModel):
+    """Generation capability flags advertised by the model config.
+
+    Gateway-readable surface; used by ``proxy_generate`` to enforce that a
+    requested grammar / tools / streaming flavour is actually supported.
+    ``grammar`` accepts ``json_schema``, ``regex``, and ``ebnf``; the
+    capability gate at the gateway uses this list to reject unsupported
+    kinds before any work hits the queue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    grammar: list[Literal["json_schema", "regex", "ebnf"]] = []
+    streaming: bool = True
+    tools: bool = False
+    # Advertises that the model is validated for code generation (HumanEval /
+    # MBPP pass@1 in the generation quality gate). Informational only — unlike
+    # ``grammar``, the gateway does not reject requests on this flag; it lets
+    # the SDK/UI surface the capability and backs the ``model="code"`` alias.
+    code: bool = False
+    # Same, for text-to-SQL (Spider execution accuracy); backs ``model="sql"``.
+    sql: bool = False
+    # Same, for the content-moderation / policy-check job (CHECK POLICY): a
+    # generative guard model that emits a safe/unsafe verdict (e.g. Granite
+    # Guardian, measured on ToxicChat). Backs the ``model="guard"`` alias.
+    guard: bool = False
+
+
+# Kinds permitted in ``prewarm_grammars`` entries. Mirrors the
+# capability list :class:`GenerateCapabilities` advertises for the
+# request path so an operator cannot prewarm a kind the worker would
+# refuse to serve. Same set as :class:`GenerateCapabilities.grammar`
+# (the literal in :data:`GrammarKind`) since EBNF prewarm is just as
+# valid as runtime EBNF compile.
+PrewarmGrammarKind = Literal["json_schema", "regex", "ebnf"]
+
+
+class PrewarmGrammar(BaseModel):
+    """Operator-declared grammar to compile during model load.
+
+    Pre-compiling hot schemas/regexes at worker boot moves Outlines compile
+    cost out of cold-start TTFT. Each entry corresponds to one ``(kind, value)``
+    pair that would otherwise be compiled lazily on first request.
+
+    ``name`` is a human-readable label used in log lines and is otherwise
+    informational — the cache key is derived from ``value`` via
+    :func:`~sie_server.types.grammar.hash_grammar`. ``kind`` must be one
+    of :data:`PrewarmGrammarKind` (the narrower per-capability surface,
+    not the full :data:`GrammarKind` literal). ``value`` matches the
+    on-wire shape: a JSON Schema ``dict`` for ``kind: json_schema`` and
+    a regex/EBNF ``str`` for ``kind: regex`` / ``kind: ebnf``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    kind: PrewarmGrammarKind
+    value: dict[str, Any] | str
+
+    @model_validator(mode="after")
+    def validate_value_shape(self) -> "PrewarmGrammar":
+        """Cross-field check: value type matches kind discriminator.
+
+        Defence-in-depth — pydantic's union accepts either shape at parse
+        time but a regex with a dict value (or vice versa) would only
+        surface as a compile failure later. Reject loudly at config-load.
+        """
+        if self.kind == "json_schema" and not isinstance(self.value, dict):
+            msg = f"prewarm grammar '{self.name}': kind=json_schema requires a dict value, got {type(self.value).__name__}"
+            raise ValueError(msg)
+        if self.kind == "regex" and not isinstance(self.value, str):
+            msg = f"prewarm grammar '{self.name}': kind=regex requires a str value, got {type(self.value).__name__}"
+            raise ValueError(msg)
+        if self.kind == "ebnf" and not isinstance(self.value, str):
+            msg = f"prewarm grammar '{self.name}': kind=ebnf requires a str value, got {type(self.value).__name__}"
+            raise ValueError(msg)
+        return self
+
+
+class GenerateTask(BaseModel):
+    """Generation task declaration.
+
+    ``context_length`` is the maximum total tokens (prompt + completion) the
+    model can process. ``max_output_tokens`` is the per-request hard cap on
+    ``max_new_tokens`` enforced by the gateway.
+
+    ``chat_template_kwargs`` are forwarded verbatim to the tokenizer's
+    ``apply_chat_template(**kwargs)`` call when the worker renders an
+    OpenAI-shaped ``messages`` request. The Qwen3 family for
+    example accepts ``enable_thinking: false`` to suppress its reasoning
+    block. Empty dict by default — non-chat / prompt-shape requests
+    ignore the field.
+
+    ``prewarm_grammars`` is an optional list of grammars to compile at
+    model-load time so the cold-start TTFT for these schemas excludes
+    Outlines compile cost. See :class:`PrewarmGrammar` for the entry
+    shape; the worker iterates the list once on boot and silently
+    continues past individual compile failures (which are surfaced via
+    the ``sie_worker_grammar_prewarm_total{outcome="failed"}`` counter).
+
+    ``kv_budget_tokens`` for admission control lives on
+    :class:`ProfileConfig` rather than here, because the
+    budget is a per-worker/per-profile shape rather than a per-task
+    semantic.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_length: int
+    max_output_tokens: int
+    capabilities: GenerateCapabilities = GenerateCapabilities()
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    prewarm_grammars: list[PrewarmGrammar] = Field(default_factory=list)
+
+
 class Tasks(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     encode: EncodeTask | None = None
     score: ScoreTask | None = None
     extract: ExtractTask | None = None
+    generate: GenerateTask | None = None
 
 
 class AdapterOptions(BaseModel):
@@ -84,6 +204,27 @@ class ProfileAdaptiveBatching(BaseModel):
 
 
 class ProfileConfig(BaseModel):
+    """Per-profile configuration.
+
+    ``kv_budget_tokens`` is the per-worker KV-cache budget
+    used by the streaming admission controller to reject requests whose
+    ``input_tokens_estimate + max_new_tokens`` would push the worker
+    over capacity. **Required** (positive int) for profiles whose
+    ``adapter_path`` resolves to a ``GenerationAdapter`` subclass —
+    i.e. for any profile attached to a model with ``tasks.generate``
+    set. Calibration of the actual value lives in the calibration
+    follow-up; until then the model YAML may carry a sentinel
+    placeholder, but a missing / zero / negative value at config-load
+    time is a hard error pointing operators at the calibration
+    deliverable.
+
+    ``admission_enabled`` gates admission control per
+    profile. ``None`` defers to the ``SIE_GENERATION_ADMISSION`` env
+    var (default-off until the calibration ablation flips it); explicit
+    ``True`` / ``False`` wins unless the env var is set to ``on`` or
+    ``off`` (which override the profile in both directions).
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     extends: str | None = None
@@ -92,6 +233,8 @@ class ProfileConfig(BaseModel):
     adapter_path: str | None = None
     adapter_options: AdapterOptions = AdapterOptions()
     adaptive_batching: ProfileAdaptiveBatching | None = None
+    kv_budget_tokens: int | None = None
+    admission_enabled: bool | None = None
 
 
 class ResolvedProfile(BaseModel):
@@ -103,6 +246,144 @@ class ResolvedProfile(BaseModel):
     loadtime: MappingProxyType[str, Any]
     runtime: MappingProxyType[str, Any]
     adaptive_batching: ProfileAdaptiveBatching | None = None
+    kv_budget_tokens: int | None = None
+    admission_enabled: bool | None = None
+
+
+# Coarse per-family KV-bytes-per-token constants used by the derived-budget
+# warning. Real calibration lives in the calibration follow-up; these constants
+# are intentionally conservative (overestimates) so the warning fires for
+# genuinely over-subscribed configurations but stays silent for the calibrated
+# values that follow-up will publish. ``None`` skips the warning for unknown
+# families.
+_KV_BYTES_PER_TOKEN_BY_FAMILY: dict[str, int] = {
+    # Qwen3-4B-Instruct: 36 layers × 8 KV heads × 128 head_dim × 2 bytes
+    # (bf16) × 2 (K+V) ≈ ~150 KB/token. Round up.
+    "qwen3-4b": 160_000,
+}
+
+# Coarse GPU capacity assumption for the derived-budget warning. Real
+# deployment surfaces this via SGLang's ``mem_fraction_static`` × the
+# device's reported total memory; this constant is the fallback used
+# when no GPU is available at config-load time (CI, dry-run validation).
+_DEFAULT_GPU_MEMORY_GB = 24.0
+
+# Profile-name → GPU memory (GB) mapping. Used by
+# :func:`_maybe_warn_oversubscribed_budget` so per-profile entries like
+# ``a100-40gb`` and ``h100`` don't false-positive against the L4-baseline
+# default of 24 GB. The matcher is substring-based on the profile name
+# (lowercased) so variant names like ``a100-80gb`` or ``h100-sxm`` still
+# resolve. ``default`` retains the L4 baseline (where the historical
+# fallback comes from).
+_GPU_MEMORY_GB_BY_PROFILE_HINT: tuple[tuple[str, float], ...] = (
+    ("h200", 141.0),
+    ("rtx-pro-6000", 96.0),  # RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7)
+    ("h100", 80.0),
+    ("a100-80", 80.0),
+    ("a100-40", 40.0),
+    ("a100", 40.0),  # ambiguous bare ``a100`` — treat as 40gb conservatively
+    ("l40", 48.0),
+    ("a10", 24.0),
+    ("l4", 24.0),
+    ("t4", 16.0),
+)
+
+
+def _gpu_memory_gb_for_profile(profile_name: str) -> float:
+    """Match a profile name to a coarse GPU memory size, defaulting to
+    :data:`_DEFAULT_GPU_MEMORY_GB` (L4) when no hint matches.
+    """
+    lower = profile_name.lower()
+    for hint, gb in _GPU_MEMORY_GB_BY_PROFILE_HINT:
+        if hint in lower:
+            return gb
+    return _DEFAULT_GPU_MEMORY_GB
+
+
+def _coarse_kv_bytes_per_token_for(sie_id: str) -> int | None:
+    """Return a coarse ``kv_bytes_per_token`` for a known model family.
+
+    Returns ``None`` for unknown families — the over-subscription
+    warning is skipped silently rather than guessing.
+    """
+    lower = sie_id.lower()
+    if "qwen3-4b" in lower:
+        return _KV_BYTES_PER_TOKEN_BY_FAMILY["qwen3-4b"]
+    return None
+
+
+def _maybe_warn_oversubscribed_budget(
+    *,
+    sie_id: str,
+    profile_name: str,
+    effective_budget: int,
+    profile: "ProfileConfig",
+    parent: "ProfileConfig | None",
+) -> None:
+    """Emit a ``UserWarning`` + structured log when ``kv_budget_tokens`` x
+    a conservative concurrency factor exceeds the coarsely-derivable KV
+    capacity for the model family. Warning, not error — operators can
+    override (e.g. via larger GPUs or a tighter ``mem_fraction_static``).
+    """
+    kv_bytes_per_token = _coarse_kv_bytes_per_token_for(sie_id)
+    if kv_bytes_per_token is None:
+        # The coarse per-family table is intentionally narrow — the
+        # calibration follow-up publishes calibrated values per family.
+        # Surface the skip so
+        # operators of unrecognised models can spot the gap and either
+        # add a constant or open an issue.
+        logger.debug(
+            "kv_bytes_per_token unknown for %s; over-subscription guard skipped for profile '%s'",
+            sie_id,
+            profile_name,
+        )
+        return
+
+    # Resolve effective loadtime (fieldwise: child non-empty wins).
+    loadtime: dict[str, Any] = {}
+    if parent is not None:
+        loadtime = dict(parent.adapter_options.loadtime)
+    if profile.adapter_options.loadtime:
+        loadtime = dict(profile.adapter_options.loadtime)
+
+    mem_fraction_static = loadtime.get("mem_fraction_static")
+    if not isinstance(mem_fraction_static, int | float):
+        return
+
+    # Coarse: assume the documented in-flight estimate is 4 concurrent
+    # generations (source-spec language). A higher concurrency makes
+    # the budget more easily oversubscribed.
+    in_flight_estimate = 4
+    gpu_memory_gb = _gpu_memory_gb_for_profile(profile_name)
+    derivable_bytes = float(mem_fraction_static) * gpu_memory_gb * 1024**3
+    derivable_tokens = int(derivable_bytes / kv_bytes_per_token)
+    needed_tokens = effective_budget * in_flight_estimate
+    if needed_tokens > derivable_tokens:
+        msg = (
+            f"Profile '{profile_name}' on '{sie_id}': "
+            f"kv_budget_tokens={effective_budget} * in_flight_estimate={in_flight_estimate} = "
+            f"{needed_tokens} tokens exceeds the coarse derivable budget of "
+            f"~{derivable_tokens} tokens (mem_fraction_static={mem_fraction_static}, "
+            f"kv_bytes_per_token≈{kv_bytes_per_token}, "
+            f"assumed_gpu_memory_gb={gpu_memory_gb}). "
+            "Operators can override — this is a warning, not an error. "
+            "Use measured workload and GPU data to calibrate this value."
+        )
+        warnings.warn(msg, UserWarning, stacklevel=2)
+        logger.warning(
+            "kv_budget_tokens may be oversubscribed for %s/%s: budget=%d, in_flight_estimate=%d, derivable=%d",
+            sie_id,
+            profile_name,
+            effective_budget,
+            in_flight_estimate,
+            derivable_tokens,
+            extra={
+                "model": sie_id,
+                "profile": profile_name,
+                "kv_budget_tokens": effective_budget,
+                "derivable_tokens": derivable_tokens,
+            },
+        )
 
 
 def _merge_profile_adaptive_batching(
@@ -185,6 +466,51 @@ class ModelConfig(BaseModel):
                 if profile.max_batch_tokens is None:
                     msg = f"Profile '{name}' must have 'max_batch_tokens' set (or use 'extends')"
                     raise ValueError(msg)
+
+        # KV-budget admission control. For models declaring
+        # ``tasks.generate``, every profile (after parent merge) must
+        # provide a positive ``kv_budget_tokens``. The actual
+        # calibrated value lands in the calibration follow-up; until then operators may
+        # carry a placeholder in YAML but missing/non-positive values
+        # are a hard error pointing at the calibration deliverable.
+        if self.tasks.generate is not None:
+            for name, profile in self.profiles.items():
+                effective_budget: int | None
+                if profile.extends is not None:
+                    parent = self.profiles[profile.extends]
+                    effective_budget = (
+                        profile.kv_budget_tokens if profile.kv_budget_tokens is not None else parent.kv_budget_tokens
+                    )
+                else:
+                    effective_budget = profile.kv_budget_tokens
+                if effective_budget is None:
+                    msg = (
+                        f"Profile '{name}' on a generation model "
+                        f"('{self.sie_id}') is missing 'kv_budget_tokens'. "
+                        "This is the per-worker KV-cache admission budget."
+                    )
+                    raise ValueError(msg)
+                if not isinstance(effective_budget, int) or effective_budget <= 0:
+                    msg = (
+                        f"Profile '{name}' on a generation model "
+                        f"('{self.sie_id}'): 'kv_budget_tokens' must be a "
+                        f"positive int, got {effective_budget!r}."
+                    )
+                    raise ValueError(msg)
+
+                # Coarse over-subscription warning. Derivation uses
+                # ``loadtime.mem_fraction_static`` × an assumed GPU
+                # capacity in GB, multiplied by a coarse
+                # ``kv_bytes_per_token`` constant for known model
+                # families. Operators can override; this is a
+                # warning, not an error.
+                _maybe_warn_oversubscribed_budget(
+                    sie_id=self.sie_id,
+                    profile_name=name,
+                    effective_budget=effective_budget,
+                    profile=profile,
+                    parent=self.profiles[profile.extends] if profile.extends is not None else None,
+                )
         return self
 
     def resolve_profile(self, name: str) -> ResolvedProfile:
@@ -221,6 +547,8 @@ class ModelConfig(BaseModel):
                 loadtime=MappingProxyType(dict(profile.adapter_options.loadtime)),
                 runtime=MappingProxyType(dict(profile.adapter_options.runtime)),
                 adaptive_batching=profile.adaptive_batching,
+                kv_budget_tokens=profile.kv_budget_tokens,
+                admission_enabled=profile.admission_enabled,
             )
 
         # Resolve via parent — validators guarantee parent exists and has no chaining
@@ -251,6 +579,12 @@ class ModelConfig(BaseModel):
         # Adaptive batching: fieldwise merge (child overrides parent per-field)
         adaptive_batching = _merge_profile_adaptive_batching(parent.adaptive_batching, profile.adaptive_batching)
 
+        # Child non-None overrides parent for the admission fields.
+        kv_budget_tokens = profile.kv_budget_tokens if profile.kv_budget_tokens is not None else parent.kv_budget_tokens
+        admission_enabled = (
+            profile.admission_enabled if profile.admission_enabled is not None else parent.admission_enabled
+        )
+
         if max_batch_tokens is None:
             msg = f"Resolved profile '{name}': max_batch_tokens must be set"
             raise ValueError(msg)
@@ -265,6 +599,8 @@ class ModelConfig(BaseModel):
             loadtime=MappingProxyType(loadtime),
             runtime=MappingProxyType(runtime),
             adaptive_batching=adaptive_batching,
+            kv_budget_tokens=kv_budget_tokens,
+            admission_enabled=admission_enabled,
         )
 
     @property
@@ -286,6 +622,8 @@ class ModelConfig(BaseModel):
             result.append("score")
         if self.tasks.extract is not None:
             result.append("json")
+        if self.tasks.generate is not None:
+            result.append("tokens")
         return result
 
     @property

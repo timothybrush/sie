@@ -11,19 +11,20 @@ logger = logging.getLogger(__name__)
 
 
 class ConfigStore:
-    """Config store backed by local filesystem, S3, or GCS.
+    """Config store backed by local filesystem, S3, GCS, or Azure Blob.
 
     The backend is auto-detected from the base_dir URL scheme:
     - Local path (e.g., /tmp/config-store) -> LocalBackend
     - s3://bucket/prefix -> S3Backend
     - gs://bucket/prefix -> GCSBackend
+    - abfs(s)://container@account.dfs.core.windows.net/prefix -> AzureBlobBackend
 
     Layout (same for all backends):
         {base_dir}/models/{model_id}.yaml   # Per-model config files
         {base_dir}/epoch                     # Monotonic counter (plain text integer)
 
     Args:
-        base_dir: Root path for config storage. Accepts local path, s3://, or gs://.
+        base_dir: Root path for config storage. Accepts local path, s3://, gs://, abfs://, or abfss://.
     """
 
     def __init__(self, base_dir: str) -> None:

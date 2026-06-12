@@ -44,7 +44,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(sie_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le)) * 1000",
+          "expr": "histogram_quantile(0.95, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le)) * 1000",
           "legendFormat": "p95 Latency (ms)",
           "refId": "A"
         }
@@ -106,12 +106,12 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(sie_requests_total{namespace=\"$namespace\"}[5m])) by (gpu_type)",
-          "legendFormat": "{{gpu_type}}",
+          "expr": "sum(rate(sie_gateway_requests_total{namespace=\"$namespace\", machine_profile=~\".+\"}[5m])) by (machine_profile)",
+          "legendFormat": "{{machine_profile}}",
           "refId": "A"
         }
       ],
-      "title": "QPS by GPU Type",
+      "title": "QPS by Machine Profile",
       "type": "timeseries"
     },
     {
@@ -124,22 +124,22 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(sie_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le, gpu_type)) * 1000",
-          "legendFormat": "{{gpu_type}} p50",
+          "expr": "histogram_quantile(0.50, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\", machine_profile=~\".+\"}[5m])) by (le, machine_profile)) * 1000",
+          "legendFormat": "{{machine_profile}} p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(sie_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le, gpu_type)) * 1000",
-          "legendFormat": "{{gpu_type}} p95",
+          "expr": "histogram_quantile(0.95, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\", machine_profile=~\".+\"}[5m])) by (le, machine_profile)) * 1000",
+          "legendFormat": "{{machine_profile}} p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(sie_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le, gpu_type)) * 1000",
-          "legendFormat": "{{gpu_type}} p99",
+          "expr": "histogram_quantile(0.99, sum(rate(sie_gateway_request_latency_seconds_bucket{namespace=\"$namespace\", machine_profile=~\".+\"}[5m])) by (le, machine_profile)) * 1000",
+          "legendFormat": "{{machine_profile}} p99",
           "refId": "C"
         }
       ],
-      "title": "Latency by GPU Type",
+      "title": "Latency by Machine Profile",
       "type": "timeseries"
     },
     {
@@ -152,12 +152,12 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(sie_request_queue_depth{namespace=\"$namespace\"}) by (gpu_type)",
-          "legendFormat": "{{gpu_type}}",
+          "expr": "sum(sie_gateway_worker_queue_depth{namespace=\"$namespace\"}) by (pool, machine_profile, bundle)",
+          "legendFormat": "{{pool}}/{{machine_profile}}/{{bundle}}",
           "refId": "A"
         }
       ],
-      "title": "Queue Depth by GPU Type",
+      "title": "Queue Depth by Lane",
       "type": "timeseries"
     },
     {

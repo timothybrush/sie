@@ -70,6 +70,7 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
         normalize: bool = True,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision = "float16",
+        **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
 
@@ -78,7 +79,9 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
             normalize: Whether to L2-normalize dense embeddings.
             max_seq_length: Maximum sequence length (default 8192).
             compute_precision: Compute precision (float16, bfloat16, float32).
+            **kwargs: Additional arguments (ignored, for loader compatibility).
         """
+        _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
         self._normalize = normalize
         self._max_seq_length = max_seq_length

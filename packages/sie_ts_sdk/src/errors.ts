@@ -199,6 +199,40 @@ export class ModelLoadingError extends SIEError {
 }
 
 /**
+ * Error surfaced mid-stream from `streamChatCompletions` / `streamGenerate`.
+ *
+ * The SSE wire shape includes optional `error: {message, type, param, code}`
+ * (chat) or `error: {code, message}` (SIE-native generate) on the terminal
+ * chunk. When the SDK sees such a chunk it does NOT yield the chunk; instead
+ * it throws `SIEStreamError`, mirroring the non-streaming `handleError` path
+ * so callers can catch the same way they would for HTTP-level failures.
+ *
+ * Compare with `RequestError` / `ServerError`: those fire before the SSE
+ * stream opens (HTTP 4xx / 5xx). `SIEStreamError` fires after at least one
+ * byte has gone out — the connection itself was healthy, but the worker /
+ * gateway emitted an error envelope partway through generation.
+ */
+export class SIEStreamError extends SIEError {
+  /** SIE-native error code (e.g. `context_exceeded`, `cancelled`). */
+  readonly code: string | undefined;
+  /** OpenAI-style error type (e.g. `context_length_exceeded`, `server_error`). */
+  readonly errorType: string | undefined;
+  /** Offending field name when known (chat shape only). */
+  readonly param: string | null | undefined;
+
+  constructor(
+    message: string,
+    options?: { code?: string; errorType?: string; param?: string | null },
+  ) {
+    super(message);
+    this.name = "SIEStreamError";
+    this.code = options?.code;
+    this.errorType = options?.errorType;
+    this.param = options?.param;
+  }
+}
+
+/**
  * Error when the server reports a *terminal* model-load failure.
  *
  * Distinct from {@link ModelLoadingError} — this is thrown on the first

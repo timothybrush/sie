@@ -1,10 +1,12 @@
+import time
 from unittest.mock import MagicMock, patch
 
 import httpx
 import msgpack
 import numpy as np
 import pytest
-from sie_sdk import SIEClient
+from sie_sdk import ModelLoadingError, ProvisioningError, SIEClient, SIEConnectionError
+from sie_sdk.client._shared import MODEL_LOADING_ERROR_CODE
 
 
 class TestTimeoutEnforcement:
@@ -21,8 +23,6 @@ class TestTimeoutEnforcement:
         provision_timeout_s. The safeguard was added to prevent scenarios where
         httpx timeout > provision_timeout, causing requests to block indefinitely.
         """
-        from sie_sdk.client._shared import MODEL_LOADING_ERROR_CODE
-
         mock_response_503 = MagicMock()
         mock_response_503.status_code = 503
         mock_response_503.headers = {"Retry-After": "0.01", "content-type": "application/json"}
@@ -61,11 +61,6 @@ class TestTimeoutEnforcement:
         the cumulative wall-clock time is tracked and the operation times out
         after provision_timeout_s.
         """
-        import time
-
-        from sie_sdk import ModelLoadingError, ProvisioningError
-        from sie_sdk.client._shared import MODEL_LOADING_ERROR_CODE
-
         mock_response_503 = MagicMock()
         mock_response_503.status_code = 503
         mock_response_503.headers = {"Retry-After": "0.01", "content-type": "application/json"}
@@ -100,10 +95,6 @@ class TestTimeoutEnforcement:
         When httpx times out (e.g., server hanging), the SDK retries but still
         enforces the overall provision_timeout_s.
         """
-        import time
-
-        from sie_sdk import SIEConnectionError
-
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             # Always raise httpx.TimeoutException
             mock_client.return_value.post = MagicMock(side_effect=httpx.TimeoutException("Request timed out"))
@@ -130,10 +121,6 @@ class TestTimeoutEnforcement:
 
         The SDK retries on httpx timeout but enforces provision_timeout_s.
         """
-        import time
-
-        from sie_sdk import ProvisioningError
-
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             # Always raise httpx.TimeoutException
             mock_client.return_value.post = MagicMock(side_effect=httpx.TimeoutException("Request timed out"))
@@ -142,14 +129,19 @@ class TestTimeoutEnforcement:
             start_time = time.monotonic()
             provision_timeout = 0.05
 
-            # With wait_for_capacity, timeout is retried until provision_timeout
-            with pytest.raises(ProvisioningError, match="exceeded"):
+            # With wait_for_capacity, timeout is retried until provision_timeout.
+            # Depending on whether the budget is exhausted before the next
+            # request or immediately after the final transport timeout, either
+            # terminal error is valid.
+            with pytest.raises((ProvisioningError, SIEConnectionError)) as exc_info:
                 client.encode(
                     "bge-m3",
                     {"text": "hello"},
                     wait_for_capacity=True,
                     provision_timeout_s=provision_timeout,
                 )
+            message = str(exc_info.value).lower()
+            assert "timeout" in message or "timed out" in message
 
             elapsed = time.monotonic() - start_time
 

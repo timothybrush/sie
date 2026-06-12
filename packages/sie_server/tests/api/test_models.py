@@ -8,6 +8,8 @@ from sie_server.api.models import router as models_router
 from sie_server.config.model import (
     EmbeddingDim,
     EncodeTask,
+    GenerateCapabilities,
+    GenerateTask,
     ModelConfig,
     ProfileConfig,
     Tasks,
@@ -38,6 +40,32 @@ def _make_config(
         ),
         max_sequence_length=max_sequence_length,
         profiles={"default": ProfileConfig(adapter_path=adapter_path, max_batch_tokens=8192)},
+    )
+
+
+def _make_generate_config(
+    sie_id: str,
+    hf_id: str,
+    *,
+    capabilities: GenerateCapabilities,
+) -> ModelConfig:
+    return ModelConfig(
+        sie_id=sie_id,
+        hf_id=hf_id,
+        tasks=Tasks(
+            generate=GenerateTask(
+                context_length=32768,
+                max_output_tokens=4096,
+                capabilities=capabilities,
+            ),
+        ),
+        profiles={
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.sglang:SGLangGenerationAdapter",
+                max_batch_tokens=16384,
+                kv_budget_tokens=8192,
+            ),
+        },
     )
 
 
@@ -240,3 +268,71 @@ class TestModelStateField:
         # a failed sibling — guard against accidental cross-talk in the
         # list serializer.
         assert by_name["model-b"].get("last_error") is None
+
+
+class TestModelCapabilitiesField:
+    """Coverage for the ``capabilities`` field on ``ModelInfo``."""
+
+    @pytest.fixture
+    def caps_client(self) -> TestClient:
+        """Client exposing a generate model and an encode-only model."""
+        registry = MagicMock(spec=ModelRegistry)
+        registry.model_names = ["gen-model", "enc-model"]
+
+        configs = {
+            "gen-model": _make_generate_config(
+                "gen-model",
+                "org/gen-model",
+                capabilities=GenerateCapabilities(
+                    grammar=["json_schema", "regex"],
+                    tools=True,
+                    code=True,
+                    sql=True,
+                    guard=False,
+                ),
+            ),
+            "enc-model": _make_config(
+                "enc-model",
+                "org/enc-model",
+                dense_dim=768,
+            ),
+        }
+
+        registry.get_config = lambda name: configs[name]
+        registry.has_model = lambda name: name in configs
+        registry.is_loaded = lambda _name: False
+        registry.is_loading = lambda _name: False
+        registry.is_unloading = lambda _name: False
+        registry.is_failed = lambda _name: False
+        registry.get_failure = lambda _name: None
+
+        app = FastAPI()
+        app.include_router(models_router)
+        app.state.registry = registry
+        return TestClient(app)
+
+    def test_generate_model_surfaces_capabilities(self, caps_client: TestClient) -> None:
+        """``code``/``sql``/``guard`` (and grammar/tools) surface for a generate model."""
+        response = caps_client.get("/v1/models/gen-model")
+        assert response.status_code == 200
+        caps = response.json()["capabilities"]
+        assert caps is not None
+        assert caps["grammar"] == ["json_schema", "regex"]
+        assert caps["tools"] is True
+        assert caps["code"] is True
+        assert caps["sql"] is True
+        assert caps["guard"] is False
+
+    def test_encode_model_has_no_capabilities(self, caps_client: TestClient) -> None:
+        """Non-generate models omit generation capabilities (``None``)."""
+        response = caps_client.get("/v1/models/enc-model")
+        assert response.status_code == 200
+        assert response.json()["capabilities"] is None
+
+    def test_list_models_includes_capabilities(self, caps_client: TestClient) -> None:
+        """``GET /v1/models`` carries per-model capabilities."""
+        response = caps_client.get("/v1/models")
+        assert response.status_code == 200
+        by_name = {m["name"]: m for m in response.json()["models"]}
+        assert by_name["gen-model"]["capabilities"]["code"] is True
+        assert by_name["enc-model"]["capabilities"] is None

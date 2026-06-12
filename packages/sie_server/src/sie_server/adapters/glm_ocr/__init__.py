@@ -3,13 +3,16 @@ from __future__ import annotations
 import gc
 import io
 import logging
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+import torch.nn.functional as F
 
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
+from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import Entity
 
 if TYPE_CHECKING:
@@ -117,9 +120,112 @@ class GlmOcrAdapter(ModelAdapter):
         self._model.to(device)  # ty: ignore[invalid-argument-type]
         self._model.eval()
 
+        # The vision tower's patch embedding is a non-overlapping nn.Conv3d
+        # (kernel == stride), i.e. a per-patch linear projection. On CUDA cuDNN
+        # dispatches it as ~one tiny kernel launch per patch (tens of thousands
+        # per page), so the GPU sits idle while a single CPU thread launches
+        # kernels — the dominant cost of every request. Rebind it to the
+        # mathematically identical F.linear (one GEMM) to remove that.
+        self._patch_vision_patch_embed()
+
         self._create_preprocessor()
 
         logger.info("GLM-OCR model loaded successfully")
+
+    def _patch_vision_patch_embed(self) -> None:
+        """Rebind the vision patch-embed Conv to an equivalent F.linear.
+
+        Finds the non-overlapping convolution (``kernel_size == stride``) inside
+        the vision tower and replaces its ``forward`` with the numerically
+        identical matmul. Self-validating: a small synthetic patch batch is run
+        through both the original conv and the matmul at load time, and the fast
+        path is kept only if the outputs match (within bf16 rounding); otherwise
+        a warning is logged and the original conv is left in place. No weights
+        are changed and the check stays off the request path.
+        """
+        if self._model is None:
+            return
+
+        # Non-overlapping convs (kernel == stride) inside the vision tower. The
+        # patch embed is one such conv, but the tower may have others — e.g. a
+        # spatial-merge ``downsample`` Conv2d (also kernel == stride). The patch
+        # embed is the pathological one (~one tiny kernel launch per patch);
+        # disambiguate by input channels: the patch embed consumes raw image
+        # channels (RGB, ≤ 4), while merge/downsample convs consume the hidden dim.
+        convs: list[tuple[str, torch.nn.Conv2d | torch.nn.Conv3d]] = []
+        for name, mod in self._model.named_modules():
+            lname = name.lower()
+            if (
+                isinstance(mod, (torch.nn.Conv2d, torch.nn.Conv3d))
+                and tuple(mod.kernel_size) == tuple(mod.stride)
+                and ("vis" in lname or "patch" in lname or "embed" in lname)
+            ):
+                convs.append((name, mod))
+
+        # Identify the patch embed strictly by structure: it is the only vision
+        # conv that consumes raw image channels (RGB). Any other kernel==stride
+        # conv (e.g. a spatial-merge downsample) consumes the hidden dim. If this
+        # is not unique we do not guess — leave the original conv in place rather
+        # than risk rebinding a module whose runtime input is not per-patch
+        # shaped (fast_forward assumes one flattened patch per row).
+        patch = [c for c in convs if c[1].in_channels <= 4]
+        if len(patch) != 1:
+            logger.warning(
+                "[glm_ocr] patch-embed rebind skipped: expected exactly one RGB-input (in_channels<=4) "
+                "vision conv, found %d among %s",
+                len(patch),
+                [n for n, _ in convs],
+            )
+            return
+
+        name, conv = patch[0]
+        out_ch = conv.out_channels
+        spatial_dims = len(conv.kernel_size)
+        in_features = conv.in_channels * math.prod(conv.kernel_size)
+        weight_2d = conv.weight.reshape(out_ch, in_features)  # view; shares storage, no copy
+        bias = conv.bias
+
+        def fast_forward(x: torch.Tensor) -> torch.Tensor:
+            n = x.shape[0]
+            out = F.linear(x.reshape(n, -1).to(weight_2d.dtype), weight_2d, bias)
+            return out.reshape(n, out_ch, *([1] * spatial_dims))
+
+        # Validate equivalence on a small synthetic patch batch at load time
+        # (off the request path) before swapping. The op is mathematically a
+        # matmul over the flattened patch, so any divergence beyond bf16 rounding
+        # means the shape assumption is wrong — keep the original conv if so.
+        with torch.inference_mode():
+            probe = torch.randn(
+                8, conv.in_channels, *conv.kernel_size, device=conv.weight.device, dtype=conv.weight.dtype
+            )
+            ref = conv(probe).float()
+            got = fast_forward(probe).float().reshape_as(ref)
+        max_abs = (ref - got).abs().max().item()
+        # The conv and the matmul are the same operation, so they differ only by
+        # low-precision (bf16) rounding — small relative to the output scale. A
+        # genuine shape mismatch instead produces differences on the order of the
+        # outputs themselves. Tolerance scaled to the output magnitude separates
+        # the two cleanly without a magic absolute constant.
+        tol = 1e-2 + 0.05 * ref.abs().max().item()
+        if not math.isfinite(max_abs) or max_abs > tol:
+            logger.warning(
+                "[glm_ocr] patch-embed rebind skipped: %s output mismatch (max_abs_diff=%.3e tol=%.3e)",
+                name,
+                max_abs,
+                tol,
+            )
+            return
+
+        conv.forward = fast_forward  # ty: ignore[invalid-assignment]
+        logger.info(
+            "[glm_ocr] rebound vision patch-embed %s (%s, kernel=%s) to F.linear (in=%d out=%d, max_abs_diff=%.3e)",
+            name,
+            type(conv).__name__,
+            tuple(conv.kernel_size),
+            in_features,
+            out_ch,
+            max_abs,
+        )
 
     def _resolve_dtype(self, device: str) -> torch.dtype:
         """Resolve dtype based on device and config."""
@@ -338,7 +444,7 @@ class GlmOcrAdapter(ModelAdapter):
         if not images or len(images) == 0:
             raise ValueError(_ERR_NO_IMAGES)
 
-        img_bytes = images[0]["data"]
+        img_bytes = media_bytes(images[0], kind="image")
         pil_img = PILImage.open(io.BytesIO(img_bytes))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")

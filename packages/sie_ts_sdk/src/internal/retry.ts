@@ -29,9 +29,11 @@ export function computeBackoffWithJitter(
 export function getRetryAfter(header: string | null): number | undefined {
   if (!header) return undefined;
 
-  // Try parsing as seconds (integer)
+  // Try parsing as seconds (integer). `Retry-After: 0` means "retry
+  // immediately" and must be honored (>= 0), not treated as invalid and
+  // replaced by the default delay.
   const seconds = Number.parseInt(header, 10);
-  if (!Number.isNaN(seconds) && seconds > 0) {
+  if (!Number.isNaN(seconds) && seconds >= 0) {
     return seconds * 1000;
   }
 

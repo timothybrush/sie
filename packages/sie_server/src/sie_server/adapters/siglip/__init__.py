@@ -3,9 +3,9 @@
 This adapter provides support for SigLIP (Sigmoid Loss for Language Image Pre-training)
 models that produce aligned embeddings for both images and text in a shared vector space.
 
-Per roadmap Project 10.4, uses transformers SiglipModel with SiglipProcessor
-for Phase 1. SigLIP differs from CLIP in using sigmoid loss instead of softmax
-and not having a separate projection_dim - it uses hidden_size directly.
+Uses transformers SiglipModel with SiglipProcessor. SigLIP differs from CLIP in
+using sigmoid loss instead of softmax and not having a separate projection_dim -
+it uses hidden_size directly.
 
 Supports two backends:
 
@@ -50,6 +50,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -376,7 +377,7 @@ class SiglipAdapter(BaseAdapter):
         pil_images = []
         for img_input in item.images or []:
             # img_input is ImageInput TypedDict with data (bytes) and optional format
-            img_bytes = img_input["data"]
+            img_bytes = media_bytes(img_input, kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             # Convert to RGB if necessary
             if pil_img.mode != "RGB":

@@ -4,8 +4,8 @@ description: >-
   SIE (Search Inference Engine) Kubernetes deployment with gateway, GPU workers,
   and observability
 type: application
-version: 0.3.4  # x-release-please-version
-appVersion: v0.3.4  # x-release-please-version
+version: 0.6.4  # x-release-please-version
+appVersion: v0.6.4  # x-release-please-version
 keywords:
   - inference
   - embedding
@@ -37,11 +37,11 @@ dependencies:
   - name: loki
     version: 6.23.x
     repository: https://grafana.github.io/helm-charts
-    condition: loki.install
+    condition: observability.logs.install,observability.logs.loki.install
   - name: alloy
     version: 0.10.x
     repository: https://grafana.github.io/helm-charts
-    condition: alloy.install
+    condition: observability.logs.install,observability.logs.alloy.install
   - name: kubernetes-event-exporter
     version: 3.6.3
     repository: oci://registry-1.docker.io/bitnamicharts
@@ -49,6 +49,19 @@ dependencies:
 
   # Config distribution
   - name: nats
-    version: "2.x"
+    version: 2.12.6
     repository: "https://nats-io.github.io/k8s/helm/charts/"
     condition: nats.install
+
+  # TLS / certificate management (opt-in; default off — see chart README §TLS / HTTPS).
+  # Version pin policy: track the latest Jetstack-supported minor at release time
+  # (currently cert-manager 1.16.x, trust-manager 0.13.x). CRD schemas can change
+  # across minors, so any bump MUST go through a PR with regenerated golden diffs.
+  - name: cert-manager
+    version: 1.16.x
+    repository: https://charts.jetstack.io
+    condition: certManagerBundle.certManager.install
+  - name: trust-manager
+    version: 0.13.x
+    repository: https://charts.jetstack.io
+    condition: certManagerBundle.trustManager.install

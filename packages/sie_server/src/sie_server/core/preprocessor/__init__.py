@@ -3,8 +3,6 @@
 This module defines the Preprocessor protocol and concrete implementations
 for text (tokenization) and images (PIL -> processor -> tensor).
 
-See roadmap.md Project 10.4 Phase 2 for design details.
-
 Performance optimizations:
 - Parallel image processing with ThreadPoolExecutor (GIL released during I/O)
 - pillow-simd detection for 4-6x faster image resizing (if installed)

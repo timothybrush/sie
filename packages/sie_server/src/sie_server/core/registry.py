@@ -34,6 +34,10 @@ from sie_server.core.loader import load_model_configs
 from sie_server.core.memory import MemoryConfig, MemoryManager
 from sie_server.core.model_loader import DEFAULT_MAX_LORAS, LoadedModel, ModelLoader
 from sie_server.core.oom import is_oom_error
+from sie_server.core.pool_isolation import (
+    validate_no_legacy_scalar_lora_id,
+    validate_pool_isolation,
+)
 from sie_server.core.postprocessor_registry import PostprocessorRegistry
 from sie_server.core.preprocessor_registry import PreprocessorRegistry
 from sie_server.core.worker import ModelWorker
@@ -73,23 +77,30 @@ class ModelRegistry:
         device: str = "cpu",
         engine_config: EngineConfig | None = None,
         enable_hot_reload: bool = True,
+        pool_name: str | None = None,
     ) -> None:
         """Initialize the registry.
 
         Args:
-            models_dir: Path to models directory (local path, s3://, or gs://).
+            models_dir: Path to models directory (local path, s3://, gs://, abfs://, or abfss://).
                        If None, registry starts empty and configs must be added manually.
             memory_config: Configuration for memory management. If None, uses defaults.
             drain_timeout_s: Timeout in seconds to wait for worker drain before unload.
             model_filter: Optional list of model names to include. If None, all models are available.
             device: Default device for memory tracking (e.g., "cuda:0", "mps", "cpu").
             enable_hot_reload: Whether to enable hot reload of model configs when models_dir is set.
+            pool_name: The worker's pool identity (``SIE_POOL``).
+                Used to gate the pool-isolation validator that rejects mixing
+                generation and non-generation models on the same worker. When
+                ``None`` the validator is skipped (e.g. unit tests without a
+                pool context).
         """
         # Store as string to handle cloud URLs
         self._models_dir: str | None = str(models_dir) if models_dir is not None else None
         self._model_filter = set(model_filter) if model_filter else None
         self._device = device
         self._enable_hot_reload = enable_hot_reload
+        self._pool_name = pool_name
         self._configs: dict[str, ModelConfig] = {}
         self._model_dirs: dict[str, Path] = {}
         self._loaded: dict[str, LoadedModel] = {}
@@ -175,6 +186,14 @@ class ModelRegistry:
                 integral_gain=ab.integral_gain,
                 window_size=ab.window_size,
                 update_interval=ab.update_interval,
+                # Starvation detector lives on the runtime params struct so
+                # it is configurable per-deployment without touching code.
+                # Engine-level defaults (see AdaptiveBatchingConfig) are
+                # tuned for production; tests override via direct
+                # AdaptiveBatchingParams construction.
+                starvation_recovery_enabled=ab.starvation_recovery_enabled,
+                starvation_window=ab.starvation_window,
+                starvation_batch_size=ab.starvation_batch_size,
             )
 
         # Build OOM recovery config from the engine config (if present).
@@ -190,6 +209,8 @@ class ModelRegistry:
             attention_backend=engine_config.attention_backend if engine_config else "auto",
             max_batch_requests=engine_config.max_batch_requests if engine_config else None,
             max_batch_wait_ms=engine_config.max_batch_wait_ms if engine_config else None,
+            coalesce_ms=engine_config.coalesce_ms if engine_config else None,
+            coalesce_ratio=engine_config.coalesce_ratio if engine_config else None,
             max_queue_size=engine_config.max_concurrent_requests if engine_config else None,
             instrumentation=engine_config.instrumentation if engine_config else False,
             max_loras_per_model=engine_config.max_loras_per_model if engine_config else DEFAULT_MAX_LORAS,
@@ -215,6 +236,19 @@ class ModelRegistry:
             )
         else:
             self._configs = all_configs
+
+        # Pool isolation. With the post-filter set in hand,
+        # reject mixed generation/non-generation pools loudly. The
+        # check is best-effort when ``pool_name`` is None (tests).
+        if self._pool_name is not None:
+            self._validate_pool_isolation_of_loaded()
+
+        # Legacy scalar ``lora_id`` exclusion fires regardless of pool_name —
+        # it's a hard invariant, not a pool-fairness concern. Multi-LoRA
+        # generation via ``adapter_options.loadtime.lora_paths`` is shipped
+        # and is not affected by this check.
+        for name, config in self._configs.items():
+            validate_no_legacy_scalar_lora_id(name=name, config=config)
 
         self._config_version += 1
 
@@ -851,6 +885,22 @@ class ModelRegistry:
             del self._loaded[name]
             device = loaded.device
 
+            # Some adapters (e.g. the SGLang generation adapter) hold an
+            # async HTTP client to a subprocess. ``unload()`` is sync and
+            # can only fire-and-forget the client close, which races the
+            # subprocess termination on the next line — the close could be
+            # cut off before its connections drain, leaking fds / wedging
+            # on a half-open socket. When the adapter exposes an awaitable
+            # ``aclose_client``, drive it to completion HERE (we're on the
+            # event loop) so the client is fully closed against the still-
+            # live subprocess before ``unload()`` terminates it.
+            aclose_client = getattr(loaded.adapter, "aclose_client", None)
+            if aclose_client is not None:
+                try:
+                    await aclose_client()
+                except Exception:  # noqa: BLE001 - close is best-effort
+                    logger.warning("aclose_client() failed during unload of '%s'", name, exc_info=True)
+
             # Adapter.unload() handles gc.collect + empty_cache
             loaded.adapter.unload()
 
@@ -929,6 +979,37 @@ class ModelRegistry:
             configs = {k: v for k, v in configs.items() if k in self._model_filter}
         return configs
 
+    def _validate_pool_isolation_of_loaded(self) -> None:
+        """Enforce pool isolation across currently-loaded configs.
+
+        Buckets configs by task class (gen vs non-gen) in a single
+        O(n) pass and asserts at most one bucket is non-empty. Raises
+        :class:`PoolIsolationError` naming the first incompatible pair
+        when both buckets are non-empty.
+
+        Called from :meth:`_load_configs_from_dir` (also reached from
+        :meth:`rescan_configs`, which fires on request-handler config
+        misses); the linear shape matters there because hot-discovery
+        storms can rescan repeatedly.
+        """
+        assert self._pool_name is not None  # caller-checked
+        gen_names: list[str] = []
+        non_gen_names: list[str] = []
+        for name, config in self._configs.items():
+            if config.tasks.generate is not None:
+                gen_names.append(name)
+            else:
+                non_gen_names.append(name)
+        if gen_names and non_gen_names:
+            # Delegate to ``validate_pool_isolation`` so the error message
+            # stays consistent with the single-config add path.
+            validate_pool_isolation(
+                candidate_name=non_gen_names[0],
+                candidate_config=self._configs[non_gen_names[0]],
+                existing_configs={gen_names[0]: self._configs[gen_names[0]]},
+                pool_name=self._pool_name,
+            )
+
     def add_config(self, config: ModelConfig, model_dir: Path | None = None) -> None:
         """Add a model config to the registry.
 
@@ -938,6 +1019,22 @@ class ModelRegistry:
             config: The model configuration.
             model_dir: Optional directory for custom adapter resolution.
         """
+        # Pool isolation. Validate before mutating
+        # ``self._configs`` so a rejected add does not leave the
+        # registry in a half-mutated state. ``None`` pool skips the
+        # check (test paths and registries running without a
+        # SIE_POOL context).
+        if self._pool_name is not None:
+            validate_pool_isolation(
+                candidate_name=config.sie_id,
+                candidate_config=config,
+                existing_configs=self._configs,
+                pool_name=self._pool_name,
+            )
+        # Legacy scalar ``lora_id`` exclusion is *not* pool-scoped (it is a
+        # hard invariant) so it fires regardless of ``self._pool_name``.
+        # Multi-LoRA generation (``loadtime.lora_paths``) is unaffected.
+        validate_no_legacy_scalar_lora_id(name=config.sie_id, config=config)
         self._configs[config.sie_id] = config
         if self._model_filter is not None:
             self._model_filter.add(config.sie_id)
@@ -1299,7 +1396,7 @@ class ModelRegistry:
             logger.debug("No models_dir, skipping hot reload")
             return
 
-        # Don't watch cloud URLs (s3://, gs://)
+        # Don't watch cloud URLs (s3://, gs://, abfs(s)://)
         if is_cloud_path(self._models_dir):
             logger.debug("Cloud models_dir, skipping hot reload (not supported)")
             return
@@ -1512,8 +1609,6 @@ class ModelRegistry:
             model: Model name.
             lora: LoRA adapter name/path.
         """
-        import asyncio
-
         loop = asyncio.get_running_loop()
 
         try:
@@ -1561,8 +1656,6 @@ class ModelRegistry:
             model: Model name.
             lora: LoRA adapter name/path.
         """
-        import asyncio
-
         loop = asyncio.get_running_loop()
 
         try:

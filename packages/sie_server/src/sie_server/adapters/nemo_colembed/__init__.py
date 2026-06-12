@@ -14,7 +14,6 @@ Key features:
 
 License: NVIDIA Non-Commercial (note in model config)
 
-Per roadmap Project 10.5 Phase 1c:
 - Full conformance with SIE preprocessor infrastructure
 - Uses NemoColEmbedPreprocessor for image preprocessing
 - Calls model.forward() directly instead of forward_passages()
@@ -38,6 +37,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from sie_server.types.inputs import Item
@@ -173,6 +173,23 @@ class NemoColEmbedAdapter(BaseAdapter):
         if isinstance(embedding_dim, int) and embedding_dim > 0:
             self._multivector_dim = embedding_dim
 
+        # FIX[#1055]: ensure the requested attention impl actually reaches the
+        # inner Qwen3-VL backbone (v2). On the sdpa fallback Qwen3-VL's vision
+        # attention runs a per-image Python loop over torch.split that
+        # serializes the batch (see ColQwen3). Safe no-op when flash already
+        # propagated, or for the v1 SigLIP+Llama path.
+        if attn_impl is not None and attn_impl != "sdpa" and hasattr(self._model, "set_attn_implementation"):
+            try:
+                self._model.set_attn_implementation(attn_impl)
+            except Exception:  # noqa: BLE001 - best-effort, keep loaded default on failure
+                logger.warning("NemoColEmbed: could not set attn=%s; keeping default", attn_impl, exc_info=True)
+
+        # FIX[#1055]: replace the Qwen3-VL vision Conv3d patch-embed with its
+        # matmul equivalent (same weights). The non-overlapping Conv3d hits a
+        # pathologically slow cuDNN path on this GPU; for the sibling ColQwen3 it
+        # was ~99.7% of the vision-tower forward. No-op for the v1 SigLIP path.
+        self._patch_vision_patch_embed()
+
         # Create preprocessor only when the model exposes v1-style attrs (image_size,
         # num_image_token). v2 (Qwen3-VL) does not, and the SigLIP+Llama-keyed
         # NemoColEmbedPreprocessor does not apply.
@@ -180,6 +197,38 @@ class NemoColEmbedAdapter(BaseAdapter):
             self._create_processor()
         else:
             logger.info("Skipping NemoColEmbedPreprocessor — model lacks v1 attrs (likely v2 backbone).")
+
+    def _patch_vision_patch_embed(self) -> None:
+        """Rebind the Qwen3-VL vision Conv3d patch-embed to its matmul equivalent.
+
+        The non-overlapping Conv3d patch projection (kernel == stride) hits a
+        pathologically slow cuDNN path on this GPU; for the sibling ColQwen3 it
+        was ~99.7% of the vision-tower forward. Reshaping to ``F.linear`` with the
+        same weights is numerically identical but runs as a fast matmul. Locates
+        the vision tower under the v2 (Qwen3-VL) backbone; no-op for the v1 path.
+        """
+        from torch.nn import functional
+
+        try:
+            visual = getattr(getattr(self._model, "model", None), "visual", None)
+            patch_embed = getattr(visual, "patch_embed", None)
+            proj = getattr(patch_embed, "proj", None)
+            if not isinstance(proj, torch.nn.Conv3d):
+                return
+            embed_dim = proj.out_channels
+            in_features = proj.in_channels * proj.kernel_size[0] * proj.kernel_size[1] * proj.kernel_size[2]
+
+            def fast_patch_embed_forward(
+                hidden_states: torch.Tensor, _pe: Any = patch_embed, _embed: int = embed_dim, _in: int = in_features
+            ) -> torch.Tensor:
+                weight = _pe.proj.weight
+                hs = hidden_states.to(weight.dtype).reshape(-1, _in)
+                return functional.linear(hs, weight.reshape(_embed, _in), _pe.proj.bias)
+
+            patch_embed.forward = fast_patch_embed_forward  # ty: ignore[invalid-assignment]
+            logger.info("NemoColEmbed: replaced vision Conv3d patch-embed with matmul equivalent")
+        except Exception:  # noqa: BLE001 - best-effort, keep the original Conv3d on failure
+            logger.warning("NemoColEmbed: could not rebind vision patch-embed; keeping Conv3d", exc_info=True)
 
     def _load_v1_dynamic(self, device: str, dtype: torch.dtype) -> Any:
         """Load v1 (SigLIP+Llama) via the explicit dynamic-module path.
@@ -297,6 +346,31 @@ class NemoColEmbedAdapter(BaseAdapter):
             num_image_token,
         )
 
+    def get_preprocessor(self) -> Any:
+        """Register BOTH a text and an image preprocessor for v1 (#1163).
+
+        v1 documents must take the conformant ``_encode_images_preprocessed`` path,
+        which requires an *image* preprocessor to be registered so the encode pipeline
+        produces a ``NemoColEmbedPayload`` (with ``pixel_values``) instead of a
+        passthrough ``ImagePayload``. Without it every doc batch falls back to the
+        model's ``forward_passages`` — which re-tiles each page inline on one thread,
+        ~3x slower than running the tiling upstream in the preprocessing thread pool.
+
+        But v1 *queries* (text) still go through ``model.forward_queries`` and rely on
+        the batched worker path; registering only the image preprocessor de-registers
+        the text one and routes queries to the unbatched direct-call path, which has
+        surfaced ``forward_queries`` failures. So we register both: the base
+        ``CharCountPreprocessor`` (text → worker-batched queries) and the
+        ``NemoColEmbedPreprocessor`` (image → conformant docs). ``model_loader``
+        registers each entry of the returned list by its ``modality``.
+
+        v2 (Qwen3-VL backbone) builds no ``_processor`` (``None``); it keeps just the
+        base text preprocessor and its native ``forward_images`` path (with #1055 fix).
+        """
+        if self._processor is None:
+            return super().get_preprocessor()
+        return [super().get_preprocessor(), self._processor]
+
     def encode(
         self,
         items: list[Item],
@@ -409,7 +483,7 @@ class NemoColEmbedAdapter(BaseAdapter):
                 raise ValueError(_ERR_NO_INPUT)
 
             # Load first image from each item (ImageInput is also a TypedDict)
-            img_bytes = item.images[0]["data"]
+            img_bytes = media_bytes(item.images[0], kind="image")
             pil_img = Image.open(io.BytesIO(img_bytes))
             if pil_img.mode != "RGB":
                 pil_img = pil_img.convert("RGB")
@@ -557,14 +631,25 @@ class NemoColEmbedAdapter(BaseAdapter):
             if self._normalize:
                 embeddings = functional.normalize(embeddings, p=2, dim=-1)
 
-            # Store results for this sub-batch (move to CPU immediately to free GPU memory)
+            # Store results for this sub-batch (move to CPU immediately to free GPU
+            # memory). Trim each item's left-padding rows before returning: the batch is
+            # left-padded, so padded positions are zeroed by the attention_mask above —
+            # but emitting them as zero vectors leaks 0-similarity rows into the late-
+            # interaction MaxSim (a 0-floor on every query token's max). Because the
+            # batcher pads inconsistently across docs, identical docs then score
+            # differently by batch and ranking is corrupted on variable-tile batches
+            # (#1163: Vidore3 Hr 0.6532 -> 0.5713). Keep only real tokens, matching the
+            # native forward_passages path (_unpack_embeddings drops zero rows likewise).
             for i in range(len(sub_batch_items)):
-                emb = embeddings[i].float().cpu().numpy()
+                keep = batch["attention_mask"][i].bool()
+                emb = embeddings[i][keep].float().cpu().numpy()
                 all_embeddings.append(emb)
 
-            # Clear GPU memory between sub-batches
-            del outputs, embeddings, batch
-            torch.cuda.empty_cache()
+            # Free this sub-batch's GPU tensors. NOTE: no per-sub-batch
+            # torch.cuda.empty_cache() — repeatedly releasing the allocator's cache and
+            # re-acquiring ~GB blocks fragments the pool and OOMs at scale on big GPUs
+            # (#1163). The sub-batch loop + immediate CPU offload already bound peak VRAM.
+            del outputs, embeddings, attention_mask, batch
 
         return EncodeOutput(
             multivector=all_embeddings,

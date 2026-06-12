@@ -205,7 +205,8 @@ export function packMessage(data: unknown): Uint8Array {
 function isNumpyArrayMap(
   obj: unknown,
 ): obj is { nd: boolean; type: string; shape: number[]; data: Uint8Array } {
-  if (typeof obj !== "object" || obj === null) {
+  // Check `obj === null` first: `typeof null` is also `"object"` in JS.
+  if (obj === null || typeof obj !== "object") {
     return false;
   }
   const map = obj as Record<string, unknown>;

@@ -32,14 +32,6 @@ use crate::http_error::{code as err_code, json_detail, json_detail_merge};
 use crate::server::AppState;
 use crate::state::model_registry::ResolveError;
 
-fn parse_model_spec(spec: &str) -> (String, String) {
-    if let Some(idx) = spec.find(":/") {
-        (spec[..idx].to_string(), spec[idx + 2..].to_string())
-    } else {
-        (String::new(), spec.to_string())
-    }
-}
-
 fn yaml_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
     let body = match serde_yaml::to_string(value) {
         Ok(body) => body,
@@ -345,7 +337,17 @@ pub async fn resolve_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResolveRequest>,
 ) -> impl IntoResponse {
-    let (parsed_bundle_override, model_name) = parse_model_spec(&req.model);
+    // Apply the same job/friendly-alias expansion the inference path uses
+    // (proxy.rs ``resolve_model_spec_with_aliases``) so a dry-run with
+    // ``model="sql"`` / ``"code"`` / ``"guard"`` resolves to the alias
+    // target — and its bundle — exactly like a real chat request, instead
+    // of failing a literal model lookup.
+    let (parsed_bundle_override, model_name) =
+        crate::handlers::proxy::resolve_model_spec_with_aliases(
+            &state.config.model_aliases,
+            &req.model,
+            |m| state.model_registry.resolve_canonical_model_name(m),
+        );
     let bundle_override = if parsed_bundle_override.is_empty() {
         req.bundle.as_deref()
     } else {
@@ -433,6 +435,7 @@ mod tests {
         Config {
             host: "127.0.0.1".to_string(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: "default".to_string(),
@@ -453,8 +456,11 @@ mod tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
+            stream_max_age_s: 120,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
@@ -696,20 +702,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn test_parse_model_spec_with_bundle_prefix() {
-        let (bundle, model) = parse_model_spec("embedding:/BAAI/bge-m3");
-        assert_eq!(bundle, "embedding");
-        assert_eq!(model, "BAAI/bge-m3");
-    }
-
-    #[test]
-    fn test_parse_model_spec_without_prefix() {
-        let (bundle, model) = parse_model_spec("BAAI/bge-m3");
-        assert_eq!(bundle, "");
-        assert_eq!(model, "BAAI/bge-m3");
-    }
-
     /// Helper: seed a model into the registry so status tests have a target.
     fn seed_model(state: &AppState, model_id: &str) {
         use crate::types::model::{ModelConfig, ProfileConfig};
@@ -808,6 +800,8 @@ mod tests {
             memory_total_bytes: Some(0),
             gpus: Vec::new(),
             pool_name: String::new(),
+            saturated: false,
+            terminated: false,
         }
     }
 
@@ -1036,6 +1030,68 @@ mod tests {
         // Config YAML body mentions the model id.
         let body = String::from_utf8(body_bytes(response).await).unwrap();
         assert!(body.contains("foo/status"), "body was: {}", body);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_config_expands_builtin_alias_to_target() {
+        // L6 regression: `POST /v1/configs/resolve` must dry-run gateway
+        // job aliases the same way inference does. With `sql` aliased to a
+        // real model, resolving `model="sql"` must yield the alias TARGET
+        // (`BAAI/bge-m3`), not a literal lookup of "sql" (which would 404).
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            bundles_dir.path().join("default.yaml"),
+            "name: default\nadapters:\n  - module\ndefault: true\n",
+        )
+        .unwrap();
+
+        let mut cfg = test_config(
+            bundles_dir.path().to_str().unwrap(),
+            models_dir.path().to_str().unwrap(),
+            None,
+        );
+        cfg.model_aliases
+            .insert("sql".to_string(), "BAAI/bge-m3".to_string());
+        let config = Arc::new(cfg);
+        let model_registry = Arc::new(ModelRegistry::new(
+            bundles_dir.path(),
+            models_dir.path(),
+            true,
+        ));
+        let state = Arc::new(AppState {
+            registry: Arc::new(WorkerRegistry::new(Duration::from_secs(30), None)),
+            config: Arc::clone(&config),
+            model_registry,
+            pool_manager: Arc::new(PoolManager::new(Vec::new())),
+            work_publisher: None,
+            demand_tracker: Arc::new(DemandTracker::new()),
+            config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+        });
+        seed_model(&state, "BAAI/bge-m3");
+        let app = create_router(Arc::clone(&state), config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/configs/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"model": "sql"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(
+            parsed["model"], "BAAI/bge-m3",
+            "alias `sql` must resolve to its target, not a literal `sql` lookup"
+        );
     }
 
     #[tokio::test]

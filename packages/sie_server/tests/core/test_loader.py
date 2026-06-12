@@ -296,6 +296,35 @@ class TestLoadAdapter:
         # Should be the right type
         assert isinstance(adapter, SentenceTransformerDenseAdapter)
 
+    def test_load_bge_m3_flag_variant_with_dense_dim(self, tmp_path: Path) -> None:
+        """BGE-M3 Flag adapter accepts dense_dim supplied by loader."""
+        config = _make_config(
+            sie_id="BAAI/bge-m3:bge_m3_flag",
+            hf_id="BAAI/bge-m3",
+            adapter_path="sie_server.adapters.bge_m3_flag:BGEM3FlagAdapter",
+            dense_dim=1024,
+            sparse_dim=250002,
+            multivector_dim=1024,
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        assert type(adapter).__name__ == "BGEM3FlagAdapter"
+
+    def test_load_qwen3_vl_embedding_accepts_dense_dim(self, tmp_path: Path) -> None:
+        """Qwen3 VL embedding adapter accepts dense_dim supplied by loader."""
+        config = _make_config(
+            sie_id="Qwen/Qwen3-VL-Embedding-2B",
+            hf_id="Qwen/Qwen3-VL-Embedding-2B",
+            adapter_path="sie_server.adapters.qwen3_vl_embedding:Qwen3VLEmbeddingAdapter",
+            dense_dim=2048,
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        assert type(adapter).__name__ == "Qwen3VLEmbeddingAdapter"
+        assert adapter.dims.dense == 2048
+
     def test_load_custom_adapter(self, tmp_path: Path) -> None:
         """Can load a custom adapter from file."""
         # Create custom adapter file
@@ -334,6 +363,85 @@ class MyCustomAdapter(ModelAdapter):
         adapter = load_adapter(config, tmp_path, device="cpu")
 
         assert adapter.model_path == "org/custom"  # type: ignore
+
+    def test_runtime_default_sampling_wired_when_adapter_accepts_it(self, tmp_path: Path) -> None:
+        """A profile's ``runtime.default_sampling`` reaches an adapter that declares the kwarg.
+
+        Regression: the block lived under ``adapter_options.runtime`` and was
+        dropped by ``_build_adapter_kwargs`` (which only spreads ``loadtime``),
+        so e.g. a ``min_new_tokens`` floor never reached SGLang.
+        """
+        adapter_file = tmp_path / "ds_adapter.py"
+        adapter_file.write_text("""
+from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
+
+class DSAdapter(ModelAdapter):
+    def __init__(self, model_name_or_path, *, default_sampling=None, **kwargs):
+        self.model_path = model_name_or_path
+        self.default_sampling = default_sampling
+
+    @property
+    def capabilities(self):
+        return ModelCapabilities(inputs=["text"], outputs=["dense"])
+
+    @property
+    def dims(self):
+        return ModelDims(dense=768)
+
+    def load(self, device: str) -> None:
+        pass
+
+    def unload(self) -> None:
+        pass
+""")
+        config = _make_config(
+            sie_id="ds-model",
+            hf_id="org/ds",
+            adapter_path="ds_adapter.py:DSAdapter",
+            adapter_options=AdapterOptions(runtime={"default_sampling": {"min_new_tokens": 10, "temperature": 0.7}}),
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        assert adapter.default_sampling == {"min_new_tokens": 10, "temperature": 0.7}  # type: ignore
+
+    def test_runtime_default_sampling_skipped_when_adapter_lacks_kwarg(self, tmp_path: Path) -> None:
+        """Adapters without a ``default_sampling`` parameter are unaffected (no kwarg leak)."""
+        adapter_file = tmp_path / "plain_adapter.py"
+        adapter_file.write_text("""
+from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
+
+class PlainAdapter(ModelAdapter):
+    def __init__(self, model_name_or_path, **kwargs):
+        self.model_path = model_name_or_path
+        self.seen_kwargs = kwargs
+
+    @property
+    def capabilities(self):
+        return ModelCapabilities(inputs=["text"], outputs=["dense"])
+
+    @property
+    def dims(self):
+        return ModelDims(dense=768)
+
+    def load(self, device: str) -> None:
+        pass
+
+    def unload(self) -> None:
+        pass
+""")
+        config = _make_config(
+            sie_id="plain-model",
+            hf_id="org/plain",
+            adapter_path="plain_adapter.py:PlainAdapter",
+            adapter_options=AdapterOptions(runtime={"default_sampling": {"min_new_tokens": 10}}),
+        )
+
+        adapter = load_adapter(config, tmp_path, device="cpu")
+
+        # **kwargs is not a named ``default_sampling`` parameter, so the guard
+        # skips it rather than leaking an unexpected kwarg.
+        assert "default_sampling" not in adapter.seen_kwargs  # type: ignore
 
     def test_invalid_adapter_path(self, tmp_path: Path) -> None:
         """Raises error for invalid adapter path."""

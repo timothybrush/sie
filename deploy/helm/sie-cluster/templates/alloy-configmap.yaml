@@ -1,4 +1,9 @@
-{{- if .Values.alloy.install }}
+{{- $logs := .Values.observability.logs -}}
+{{- $logsInstall := get $logs "install" -}}
+{{- $logsForceOn := and (kindIs "bool" $logsInstall) $logsInstall -}}
+{{- $logsForceOff := and (kindIs "bool" $logsInstall) (not $logsInstall) -}}
+{{- $alloyInstall := default false (get (get $logs "alloy") "install") -}}
+{{- if or $logsForceOn (and (not $logsForceOff) $alloyInstall) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,5 +14,6 @@ metadata:
     {{- include "sie-cluster.labels" . | nindent 4 }}
 data:
   {{ .Values.alloy.alloy.configMap.key }}: |
-    {{- .Files.Get "files/alloy/config.alloy" | nindent 4 }}
+    {{- $lokiUrl := default "http://loki:3100/loki/api/v1/push" (get (get .Values.alloy "logs") "lokiUrl") -}}
+    {{- .Files.Get "files/alloy/config.alloy" | replace "http://loki:3100/loki/api/v1/push" $lokiUrl | nindent 4 }}
 {{- end }}

@@ -2,32 +2,42 @@
 {{- if $root.Values.workers.common.imagePrepull.enabled }}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
-{{- $bundle := default $root.Values.workers.common.bundle $pool.bundle }}
 {{- $platform := default $root.Values.workers.common.platform $pool.platform }}
+{{- $rs := $root.Values.workers.common.workerSidecar }}
+{{- $rsTag := default $root.Chart.AppVersion $rs.image.tag }}
+{{- $rsImage := printf "%s:%s" $rs.image.repository $rsTag }}
+{{- range $bundleName, $bundleCfg := $pool.bundles }}
+{{- if dig "enabled" true $bundleCfg }}
+{{- $bundle := $bundleName }}
+{{- /* See worker-statefulset.yaml for the imageBundle rationale. */ -}}
+{{- $imageBundle := default $bundle $bundleCfg.imageBundle }}
 {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
-{{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $bundle }}
+{{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "sie-cluster.fullname" $root }}-image-prepull-{{ $poolName }}
+  name: {{ include "sie-cluster.fullname" $root }}-image-prepull-{{ $poolName }}-{{ $bundleName }}
   namespace: {{ include "sie-cluster.namespace" $root }}
   labels:
     {{- include "sie-cluster.labels" $root | nindent 4 }}
     app.kubernetes.io/component: image-prepull
     sie.superlinked.com/pool: {{ $poolName | quote }}
+    sie.superlinked.com/bundle: {{ $bundleName | quote }}
 spec:
   selector:
     matchLabels:
       {{- include "sie-cluster.selectorLabels" $root | nindent 6 }}
       app.kubernetes.io/component: image-prepull
       sie.superlinked.com/pool: {{ $poolName | quote }}
+      sie.superlinked.com/bundle: {{ $bundleName | quote }}
   template:
     metadata:
       labels:
         {{- include "sie-cluster.selectorLabels" $root | nindent 8 }}
         app.kubernetes.io/component: image-prepull
         sie.superlinked.com/pool: {{ $poolName | quote }}
+        sie.superlinked.com/bundle: {{ $bundleName | quote }}
     spec:
       {{- include "sie-cluster.imagePullSecrets" $root | nindent 6 }}
       automountServiceAccountToken: false
@@ -44,6 +54,19 @@ spec:
             limits:
               cpu: "10m"
               memory: "16Mi"
+        {{- if $rs.enabled }}
+        - name: pull-sie-worker-sidecar-image
+          image: {{ $rsImage }}
+          imagePullPolicy: {{ $rs.image.pullPolicy }}
+          command: ["/sie-server-sidecar", "--version"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "10m"
+              memory: "16Mi"
+        {{- end }}
       containers:
         - name: pause
           image: registry.k8s.io/pause:3.10
@@ -54,7 +77,21 @@ spec:
             limits:
               cpu: "10m"
               memory: "16Mi"
-      {{- with $pool.nodeSelector }}
+      {{- /*
+        Pin the prepull DS to the same physical nodes as the workers it pre-warms.
+        Without a nodeSelector the DS lands on every node (including small system nodes)
+        and the large worker image exhausts ephemeral storage, triggering DiskPressure
+        and evictions of co-located pods. The sie.superlinked.com/gpu-type label is
+        set by both the AWS and GCP terraform modules on GPU node groups.
+      */ -}}
+      {{- $prepullNodeSelector := dict }}
+      {{- if $pool.gpuType }}
+      {{- $_ := set $prepullNodeSelector "sie.superlinked.com/gpu-type" $pool.gpuType }}
+      {{- end }}
+      {{- range $k, $v := $pool.nodeSelector }}
+      {{- $_ := set $prepullNodeSelector $k $v }}
+      {{- end }}
+      {{- with $prepullNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -63,6 +100,8 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       priorityClassName: ""
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

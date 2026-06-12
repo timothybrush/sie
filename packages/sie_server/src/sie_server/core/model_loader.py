@@ -138,6 +138,8 @@ class ModelLoader:
         attention_backend: AttentionBackend = "auto",
         max_batch_requests: int | None = None,
         max_batch_wait_ms: float | None = None,
+        coalesce_ms: float | None = None,
+        coalesce_ratio: float | None = None,
         max_queue_size: int | None = None,
         instrumentation: bool = False,
         max_loras_per_model: int = DEFAULT_MAX_LORAS,
@@ -162,6 +164,8 @@ class ModelLoader:
         self._attention_backend = attention_backend
         self._max_batch_requests = max_batch_requests
         self._max_batch_wait_ms = max_batch_wait_ms
+        self._coalesce_ms = coalesce_ms
+        self._coalesce_ratio = coalesce_ratio
         self._max_queue_size = max_queue_size
         self._instrumentation = instrumentation
         self._max_loras_per_model = max_loras_per_model
@@ -557,11 +561,16 @@ class ModelLoader:
         Returns:
             LoadedModel containing the loaded state.
         """
-        # Get preprocessor from adapter - all adapters implement get_preprocessor()
-        preprocessor = adapter.get_preprocessor()
-
-        # Register the preprocessor based on its modality
-        if preprocessor is not None:
+        # Get preprocessor(s) from adapter - all adapters implement get_preprocessor().
+        # Most return a single preprocessor; multi-modal adapters (e.g. NemoColEmbed v1,
+        # which needs a text preprocessor for queries AND an image preprocessor for
+        # documents) may return a list. Register each by its modality.
+        preprocessors = adapter.get_preprocessor()
+        if not isinstance(preprocessors, list):
+            preprocessors = [preprocessors]
+        for preprocessor in preprocessors:
+            if preprocessor is None:
+                continue
             modality = getattr(preprocessor, "modality", None)
             if modality == "text":
                 self._preprocessor_registry._register(name, preprocessor)
@@ -570,7 +579,7 @@ class ModelLoader:
                 self._preprocessor_registry.register_image(name, preprocessor)
                 logger.info("Registered image preprocessor for model '%s'", name)
 
-        # Register postprocessors if adapter provides them (Phase 5)
+        # Register postprocessors if adapter provides them.
         if hasattr(adapter, "get_postprocessors"):
             postprocessors = adapter.get_postprocessors()
             if postprocessors:
@@ -594,6 +603,8 @@ class ModelLoader:
             max_batch_tokens=resolved.max_batch_tokens,
             max_batch_requests=self._max_batch_requests or WorkerConfig().max_batch_requests,
             max_batch_wait_ms=self._max_batch_wait_ms or WorkerConfig().max_batch_wait_ms,
+            coalesce_ms=self._coalesce_ms if self._coalesce_ms is not None else WorkerConfig().coalesce_ms,
+            coalesce_ratio=self._coalesce_ratio if self._coalesce_ratio is not None else WorkerConfig().coalesce_ratio,
             max_queue_size=self._max_queue_size or WorkerConfig().max_queue_size,
             instrumentation=self._instrumentation,
             adaptive_batching=adaptive_params,

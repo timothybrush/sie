@@ -1,0 +1,86 @@
+[
+  {
+    "id": "fp_001",
+    "label": "card_testing_microtransactions",
+    "summary": "Multiple authorizations under $5 from a single email on a new account, hitting different SKUs in rapid succession. Card testing pattern; the buyer is probing stolen card numbers.",
+    "outcome": "blocked",
+    "loss_usd": 0
+  },
+  {
+    "id": "fp_002",
+    "label": "high_value_first_purchase_express_shipping",
+    "summary": "First-ever order on a brand-new email, single high-margin SKU above $400, customer demands overnight shipping to a residential reshipper address. Classic chargeback profile.",
+    "outcome": "chargeback",
+    "loss_usd": 489
+  },
+  {
+    "id": "fp_003",
+    "label": "billing_shipping_mismatch_high_risk_country",
+    "summary": "Billing address in one country, shipping to a freight forwarder in a high-risk fraud destination. Card BIN does not match billing country.",
+    "outcome": "chargeback",
+    "loss_usd": 1340
+  },
+  {
+    "id": "fp_004",
+    "label": "velocity_same_card_multiple_emails",
+    "summary": "Same payment card used across five different customer accounts within an hour, all shipping to slightly varied addresses on the same block.",
+    "outcome": "blocked",
+    "loss_usd": 0
+  },
+  {
+    "id": "fp_005",
+    "label": "disposable_email_domain",
+    "summary": "Customer signs up with a disposable email provider (mailinator, guerrillamail, tempmail). Order is electronics or gift cards.",
+    "outcome": "chargeback",
+    "loss_usd": 220
+  },
+  {
+    "id": "fp_006",
+    "label": "gift_card_resale",
+    "summary": "Cart consists exclusively of digital gift cards or store credit, paid with a new card on a new account.",
+    "outcome": "chargeback",
+    "loss_usd": 500
+  },
+  {
+    "id": "fp_007",
+    "label": "ip_geo_billing_mismatch",
+    "summary": "Buyer's IP geolocates to a country thousands of miles from the billing address, no prior order history, paying with a freshly added card.",
+    "outcome": "review_then_chargeback",
+    "loss_usd": 612
+  },
+  {
+    "id": "fp_008",
+    "label": "stolen_link_credentials",
+    "summary": "Stripe Link account with established history suddenly orders shipped to a never-before-seen address, payment method updated minutes earlier.",
+    "outcome": "chargeback",
+    "loss_usd": 980
+  },
+  {
+    "id": "fp_009",
+    "label": "promo_code_abuse_multiple_accounts",
+    "summary": "Same shipping address receives orders from many different email accounts, each one using a first-order promo code.",
+    "outcome": "promo_reversed",
+    "loss_usd": 60
+  },
+  {
+    "id": "fp_010",
+    "label": "synthetic_identity_new_email",
+    "summary": "Brand-new email created today, billing name and shipping name do not match, paying with a card issued less than 30 days ago.",
+    "outcome": "blocked",
+    "loss_usd": 0
+  },
+  {
+    "id": "fp_011",
+    "label": "high_velocity_existing_account",
+    "summary": "Established Link customer suddenly places 4 high-value orders in a 30-minute window, each to a different shipping address.",
+    "outcome": "account_takeover",
+    "loss_usd": 1850
+  },
+  {
+    "id": "fp_012",
+    "label": "subscription_signup_disposable_card",
+    "summary": "New subscription signup using a virtual one-time-use card number, cancellation initiated minutes after the first charge succeeds.",
+    "outcome": "refunded",
+    "loss_usd": 0
+  }
+]

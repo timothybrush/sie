@@ -1,0 +1,325 @@
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+inputs:
+  # Qwen3.6-27B is a unified vision-language model (Gated DeltaNet + Gated
+  # Attention with an integrated vision encoder; same hybrid family as
+  # Qwen3.5-4B but scaled to 64 layers / hidden_size=5120). The wire
+  # surface accepts text+image via the OpenAI chat-completions schema
+  # (``image_url`` content parts); video is documented by Qwen but not
+  # yet wired through the SIE gateway.
+  text: true
+  image: true
+  audio: false
+  video: false
+tasks:
+  generate:
+    # Native context length is 262,144 tokens (YaRN extends to ~1M).
+    # Default to 4096 here — this matches the empirically-calibrated
+    # reference point in the profile comments below
+    # (mem_fraction_static=0.93, weight 51.05 GB + kvcache 11.63 GB).
+    # 8192 was the original optimistic default but SGLang's
+    # init_memory_pool refused to fit it inside the conservative
+    # mem_fraction envelope on H100-80GB even when bumped to 0.97 —
+    # NEXTN speculative-decoding draft KV pushes the total past the
+    # available headroom. Raise both context_length AND
+    # mem_fraction_static together if you need longer contexts;
+    # benchmarking and prod requests today fit comfortably in 4096.
+    context_length: 4096
+    max_output_tokens: 4096
+    capabilities:
+      # Same constraint as Qwen3.5-4B: SGLang's outlines_backend does
+      # not implement ebnf. xgrammar smoke would pass all three; flip
+      # ``grammar_backend: xgrammar`` and re-add ``"ebnf"`` here if a
+      # consumer needs it.
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      tools: true
+      # Validated on code + text-to-SQL — MEASURED on Modal H100 (bf16 no-spec,
+      # greedy+min_tokens=10; accuracy is GPU-invariant + FP8≈BF16 per ADR
+      # 0001): HumanEval 0.933, MBPP 0.81 (beats the 4B code default 0.866/0.74),
+      # Spider exec-acc 0.693. See code_sql_tools/measured_baseline.json.
+      # Informational (not request-gated); surfaces the high-end code/SQL option.
+      code: true
+      # CAVEAT: this flag is precision-agnostic, but FP8 weight quant regresses
+      # SQL ~13pts (Spider 0.71 BF16 -> 0.58 FP8, same-subset control; see the
+      # ADR + baseline). Code/tools/MC are FP8-safe. The default rtx-pro-6000
+      # profile is FP8, so route SQL-critical traffic to the BF16+NEXTN variant
+      # (the 96GB card fits it). The `:profile` variant suffix can't route by
+      # precision (it's stripped before worker dispatch), so deploy the BF16
+      # variant under a distinct bundle and point the `sql` job alias at it via
+      # a bundle-qualified target, e.g.
+      # SIE_GATEWAY_MODEL_ALIASES={"sql":"<bf16-bundle>:/Qwen/Qwen3.6-27B"}
+      # (gateway resolve_model_spec_with_aliases; see ADR 0001).
+      sql: true
+    # Qwen3.6 emits ``<think>...</think>`` reasoning by default. We
+    # disable it for the OpenAI-compat path so visible output is the
+    # answer only. Operators wanting CoT can flip this profile-side.
+    chat_template_kwargs:
+      enable_thinking: false
+    prewarm_grammars:
+      # Bare pattern, NOT anchored — Outlines regexes are implicitly
+      # anchored and its FSM engine rejects ``^``/``$``. See the
+      # Qwen3.5-4B model card for the full back-story.
+      - name: yes_no
+        kind: regex
+        value: "(yes|no)"
+      - name: short_answer
+        kind: json_schema
+        value:
+          type: object
+          properties:
+            answer:
+              type: string
+          required: [answer]
+max_sequence_length: 4096
+# ── KV-cache math (placeholder, pending Modal calibration) ──
+#
+# Qwen3.6-27B layer breakdown (per model card / config.json):
+#   * 64 layers in a 16 × (3 × DeltaNet + 1 × GatedAttention) pattern
+#   * 16 KV-bearing Gated-Attention layers (4 KV heads × head_dim=256)
+#   * 48 recurrent Gated-DeltaNet layers — managed by SGLang's mamba
+#     scheduler under ``--mamba-scheduler-strategy extra_buffer``
+#
+# BF16 weights ≈ 27e9 × 2 B ≈ 54 GB before activations / KV.
+#   * L4 (22 GB)        → infeasible
+#   * A100-40GB (40 GB) → infeasible BF16; would need FP8 or TP2
+#   * H100-80GB         → primary target (single-GPU, BF16)
+#   * H100×2 (160 GB)   → for context >32k or large concurrencies
+#
+# ``kv_budget_tokens`` is a conservative analytical placeholder pending
+# the first /get_server_info dump from tools/smoke_qwen36_27b.py on
+# Modal. Re-calibrate from the empirical token_capacity before relying
+# on these numbers in production.
+profiles:
+  # L4 / A100-40GB profiles intentionally omitted — Qwen3.6-27B's BF16
+  # weights (~54 GB) do not fit. Add an FP8 or TP2 profile if those
+  # tiers become required.
+  default:
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Conservative H100-80GB placeholder pending the first
+    # /get_server_info dump from tools/smoke_qwen36_27b.py on Modal.
+    # Empirical reference point (2026-05-27 smoke, mem_fraction_static=0.93,
+    # context_length=4096, no-spec): SGLang reported
+    # ``weight=51.05 GB, kvcache=11.63 GB, token_capacity=190,543``.
+    # Sizing here at ~1/12 of that capacity to leave room for NEXTN
+    # draft KV + grammar/Outlines compile arena once spec is re-enabled.
+    # Re-calibrate after a smoke run on this profile's actual settings.
+    # Halved from 16384 to leave more H100-80GB headroom for the NEXTN
+    # draft activation arena. 8192 KV slots × ~64 KB/token ≈ 0.5 GB —
+    # plenty for the realistic per-request concurrency on this profile.
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        # 0.95 paired with ``context_length: 4096`` + the *smaller*
+        # NEXTN draft below (num_steps=2 / num_draft_tokens=2 vs the
+        # 3/4 model-card default). The 0.93+default-draft cell still
+        # OOM'd ``init_memory_pool`` because verification batch grows
+        # with num_steps × num_draft_tokens; halving both shrinks the
+        # activation arena enough to fit.
+        mem_fraction_static: 0.95
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        # MTP/NEXTN per the Qwen3.x model-card recipe (SGLang implements
+        # NEXTN under the EAGLE codepath; ``/server_info`` reports
+        # ``speculative_algorithm: EAGLE``). Smaller-draft variant
+        # (num_steps=2 / num_draft_tokens=2 vs the model-card 3/4) so
+        # the verification batch fits inside H100-80GB at ctx=4096 +
+        # mfs=0.95. The 3/4 default reliably OOM'd
+        # ``init_memory_pool`` even at mfs=0.97 — the trade is a
+        # slightly smaller speculative window for the ability to fit at
+        # all. Re-tune (or re-enable 3/4) once FP8 / TP=2 is wired up.
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 2
+          eagle_topk: 1
+          num_draft_tokens: 2
+        # ``--mamba-scheduler-strategy extra_buffer`` is the required
+        # pair-flag for NEXTN spec on the hybrid Gated-DeltaNet
+        # architecture. With spec disabled it's also harmless to keep,
+        # so we leave it for when spec is re-enabled.
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  h100:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # Same H100-80GB target as ``default``; this profile widens
+    # ``max_batch_tokens`` for batch-heavy workloads once calibration
+    # confirms KV headroom.
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        # Same as ``default`` — see that profile's mfs comment.
+        mem_fraction_static: 0.93
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        # ``--disable-overlap-schedule`` is the required pair-flag for
+        # NEXTN + mamba-scheduler ``extra_buffer`` on the hybrid Gated-
+        # DeltaNet architecture (same constraint as Qwen3.5-4B).
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  # RTX PRO 6000 (96 GB GDDR7, Blackwell Server Edition, sm_120) profile.
+  # FP8-first for max throughput: ``--quantization fp8`` (SGLang online
+  # dynamic FP8 quant of the BF16 checkpoint) via the ``extra_launch_args``
+  # passthrough — ``compute_precision`` can only express the ``--dtype``
+  # axis (float16/bfloat16/float32), not the orthogonal ``--quantization``
+  # flag, so FP8 rides the same escape hatch already used for the mamba
+  # scheduler. FP8 halves weight memory (~54 → ~27 GB), which frees room
+  # for the *model-card* NEXTN 3/4 draft (num_steps=3 / num_draft_tokens=4)
+  # that OOM'd ``init_memory_pool`` on H100-80GB even at mfs=0.97. The +16 GB
+  # over H100 plus the FP8 weight saving is what makes 3/4 fit here.
+  #
+  # ACCURACY CONTRACT: FP8 is lossy. This profile is validated to within the
+  # Wilson 95% CI of the *BF16* baseline on all four generation tasks (see
+  # docs/adr/0001). If FP8 misses parity after bounded tuning, fall back to
+  # BF16 + NEXTN 3/4 (drop the ``--quantization fp8`` pair below; the 96 GB
+  # still fits the 3/4 draft in BF16). KV cache stays BF16 here — add
+  # ``--kv-cache-dtype fp8_e4m3`` only if memory/throughput needs it AND
+  # accuracy still holds (KV FP8 is usually the first thing to cost accuracy).
+  #
+  # Standalone block (no ``extends``): production ``resolve_profile`` does a
+  # full-replace of ``loadtime`` for extending profiles, so a partial child
+  # would drop inherited launch flags and desync the via-SIE path from the
+  # bare-SGLang bench control.
+  rtx-pro-6000:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    # FP8 weights (~27 GB) + 96 GB total leaves generous KV/draft headroom;
+    # start conservative and raise after the first /get_server_info dump on
+    # the actual RTX-PRO-6000 smoke.
+    kv_budget_tokens: 16384
+    adapter_options:
+      loadtime:
+        # 0.90 is a conservative starting point — FP8 weights free enough
+        # memory that the 3/4 NEXTN verification batch should fit with room
+        # to spare. Iterate upward (smoke ``--mem-fraction-static``) once the
+        # first boot confirms Blackwell sm_120 + FP8 GEMM kernels are present.
+        mem_fraction_static: 0.90
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        # triton attention matches the rest of the Qwen3.x family. Blackwell
+        # (sm_120) kernel coverage for triton + FP8 + NEXTN is the first thing
+        # the boot smoke verifies; switch to flashinfer here if triton lacks
+        # sm_120 coverage in the pinned SGLang build.
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        # Model-card NEXTN 3/4 — restored here (vs ``default``'s conservative
+        # 2/2) because FP8 + 96 GB fits the larger verification batch that
+        # OOM'd on H100-80GB.
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        # ``--quantization fp8`` rides the passthrough (see header comment).
+        # The mamba-scheduler + overlap pair-flags are the required NEXTN
+        # companions on the hybrid Gated-DeltaNet architecture. List is the
+        # FULL set (production full-replaces ``extra_launch_args``, not merge).
+        extra_launch_args:
+          - "--quantization"
+          - "fp8"
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        # Qwen3.6-27B empty-response fix baked in: under greedy/low-temp the
+        # chat template emits EOS as the FIRST token on a large fraction of
+        # prompts (n=50 6000 smoke: casehold 23/50, gpqa 29/50 came back
+        # EMPTY). The floor ``min_new_tokens>=1`` fixes it — validated on the
+        # 6000: min_tokens=10 → 0/50 empty on all four tasks, accuracy within
+        # Wilson 95% CI of the BF16 baseline. ``min_new_tokens`` is the
+        # SGLang-native key; the adapter merges this dict via ``setdefault``,
+        # so a request-supplied ``min_tokens`` still wins. NOTE: this only
+        # takes effect because ``runtime.default_sampling`` is now wired into
+        # the adapter (core/loader.py); before that fix a key here was a
+        # silent no-op and chat clients had to pass ``min_tokens`` themselves.
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # No-speculative baseline — for SIE-vs-raw-SGLang ablation cells so
+  # spec-decoding's contribution can be measured independently. Keeps
+  # the same ``extra_launch_args`` as ``default`` / ``h100`` so a config
+  # diff between them shows only the ``speculative`` block (the intent
+  # of the ablation), matching Qwen3.5-4B's convention.
+  no-spec:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.6-27B
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mamba-scheduler-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"

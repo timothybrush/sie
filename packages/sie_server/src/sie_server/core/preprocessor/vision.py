@@ -19,12 +19,14 @@ from sie_server.core.prepared import (
     Florence2Payload,
     GlmOcrPayload,
     LightOnOCRPayload,
+    MinerUVLPayload,
     NemoColEmbedPayload,
     PaddleOCRVLPayload,
     PreparedBatch,
     PreparedItem,
 )
 from sie_server.core.preprocessor.base import get_image_executor
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from sie_server.config.model import ModelConfig
@@ -241,7 +243,7 @@ class NemoColEmbedPreprocessor:
 
             # Load image from bytes
             img_input = item.images[0]
-            pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+            pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
             original_size = pil_img.size
 
             # Convert to RGB if needed
@@ -385,6 +387,83 @@ class NemoColEmbedPreprocessor:
         }
 
 
+# Florence-2 dispatches behaviour on a single leading task token. The processor
+# asserts that region/OCR task tokens (e.g. <OCR_WITH_REGION>) stand alone, so an
+# instruction must never be appended to them — a free-text instruction is a
+# question and is answered through DocVQA instead.
+_FLORENCE2_DOCVQA = "<DocVQA>"
+_FLORENCE2_PHRASE_GROUNDING = "<CAPTION_TO_PHRASE_GROUNDING>"
+_FLORENCE2_TASK_TOKENS = frozenset(
+    {
+        "<OCR>",
+        "<OCR_WITH_REGION>",
+        "<OD>",
+        "<CAPTION>",
+        "<DETAILED_CAPTION>",
+        "<MORE_DETAILED_CAPTION>",
+        "<DENSE_REGION_CAPTION>",
+        "<REGION_PROPOSAL>",
+        "<CAPTION_TO_PHRASE_GROUNDING>",
+        "<DocVQA>",
+        "<REFERRING_EXPRESSION_SEGMENTATION>",
+        "<REGION_TO_SEGMENTATION>",
+        "<OPEN_VOCABULARY_DETECTION>",
+        "<REGION_TO_CATEGORY>",
+        "<REGION_TO_DESCRIPTION>",
+        "<REGION_TO_OCR>",
+    }
+)
+
+
+def _leading_florence2_task_token(text: str) -> str | None:
+    """Return the leading Florence-2 ``<TASK>`` token of ``text``, or None."""
+    if not text.startswith("<"):
+        return None
+    end = text.find(">")
+    if end == -1:
+        return None
+    token = text[: end + 1]
+    return token if token in _FLORENCE2_TASK_TOKENS else None
+
+
+def resolve_florence2_prompt(
+    task: str,
+    labels: list[str] | None,
+    instruction: str | None,
+) -> tuple[str, str]:
+    """Resolve the Florence-2 prompt and its effective task token.
+
+    Florence-2 selects its task from a single leading token. A free-text
+    ``instruction`` is a question, so it is answered via DocVQA unless it already
+    carries an explicit task token (which is then used verbatim). The configured
+    ``task`` is used only when no instruction is supplied; appending an
+    instruction to a region/OCR task is invalid (the processor asserts that such
+    tokens must stand alone) and so is never done.
+
+    Args:
+        task: Configured task token (e.g. ``<OCR_WITH_REGION>``).
+        labels: Optional labels, appended for phrase grounding.
+        instruction: Optional free-text instruction or explicit ``<TASK>`` prompt.
+
+    Returns:
+        Tuple of (prompt, effective_task): the prompt string fed to the processor
+        and the task token to use when post-processing the generated text.
+    """
+    if instruction:
+        instr = instruction.strip()
+        token = _leading_florence2_task_token(instr)
+        if token is not None:
+            body = instr[len(token) :].strip()
+            return (f"{token}{body}" if body else token), token
+        return f"{_FLORENCE2_DOCVQA}{instr}", _FLORENCE2_DOCVQA
+
+    if task == _FLORENCE2_PHRASE_GROUNDING and labels:
+        label_text = ", ".join(labels)
+        return f"{task}{label_text}", task
+
+    return task, task
+
+
 class Florence2Preprocessor:
     """Preprocessor for Florence-2 document understanding model.
 
@@ -447,7 +526,7 @@ class Florence2Preprocessor:
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -494,10 +573,9 @@ class Florence2Preprocessor:
         Returns:
             PreparedBatch with Florence2Payload items.
         """
-        # Build prompt
-        prompt = task or self._default_task
-        if instruction:
-            prompt = f"{prompt}{instruction}"
+        # Build prompt. A free-text instruction is answered via DocVQA; it is
+        # never appended to a region/OCR task token (see resolve_florence2_prompt).
+        prompt, _ = resolve_florence2_prompt(task or self._default_task, None, instruction)
 
         # Single item: process directly (no thread pool overhead)
         if len(items) == 1:
@@ -642,7 +720,7 @@ class DonutPreprocessor:
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -853,7 +931,7 @@ class LightOnOCRPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":
@@ -1034,7 +1112,7 @@ class GlmOcrPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":
@@ -1207,19 +1285,15 @@ class DetectionPreprocessor:
         """
         from PIL import Image as PILImage
 
-        from sie_server.types.inputs import is_image_input
-
         if not item.images:
             logger.warning("DetectionPreprocessor: item %d has no images", index)
             return None
 
         img = item.images[0]
-        if not is_image_input(img):
-            logger.warning("DetectionPreprocessor: item %d has non-ImageInput image", index)
-            return None
-
-        # Load image from bytes - PIL releases GIL during decode
-        pil_img = PILImage.open(io.BytesIO(img["data"]))
+        # Load image from bytes - PIL releases GIL during decode. media_bytes
+        # raises InvalidMediaError (-> 400 INVALID_INPUT) on a non-bytes payload
+        # rather than silently dropping the item or hitting a raw TypeError.
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         # Convert to RGB if needed
@@ -1397,7 +1471,7 @@ class PaddleOCRVLPreprocessor:
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(img_input["data"]))
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
         original_size = (pil_img.width, pil_img.height)
 
         if pil_img.mode != "RGB":
@@ -1469,6 +1543,180 @@ class PaddleOCRVLPreprocessor:
         patch packing); batching multiple images requires careful grid handling
         that the model's own path does not expose. This collate emits the first
         item's tensors, matching LightOnOCR's approach.
+        """
+        import torch
+
+        if not prepared:
+            return {
+                "pixel_values": torch.tensor([]),
+                "input_ids": torch.tensor([]),
+                "attention_mask": torch.tensor([]),
+                "image_grid_thw": torch.tensor([]),
+            }
+
+        p = prepared[0]
+        pixel_values = p.payload.pixel_values
+        if dtype is not None:
+            pixel_values = pixel_values.to(dtype=dtype)
+
+        return {
+            "pixel_values": pixel_values.to(device),
+            "input_ids": p.payload.input_ids.unsqueeze(0).to(device),
+            "attention_mask": p.payload.attention_mask.unsqueeze(0).to(device),
+            "image_grid_thw": p.payload.image_grid_thw.to(device),
+        }
+
+
+# Canonical task -> prompt mapping from upstream mineru_vl_utils.mineru_client
+# (``DEFAULT_PROMPTS``). Bracketed task names (``[default]``, ``[layout]``)
+# mirror upstream's convention. The leading newline is intentional — preserve
+# verbatim. Keep in sync with ``adapters/mineru_vl/__init__.py::_TASK_PROMPTS``.
+_MINERU_VL_TASK_PROMPTS: dict[str, str] = {
+    "[default]": "\nText Recognition:",
+    "table": "\nTable Recognition:",
+    "equation": "\nFormula Recognition:",
+    "image": "\nImage Analysis:",
+    "chart": "\nImage Analysis:",
+    "[layout]": "\nLayout Detection:",
+}
+
+
+class MinerUVLPreprocessor:
+    """Preprocessor for MinerU2.5-Pro-2604-1.2B document OCR VLM.
+
+    Builds a Qwen2-VL chat-template prompt keyed by task ([default]/table/
+    equation/image/chart/[layout]) and runs the HuggingFace processor
+    (Qwen2VLProcessor + Qwen2VLImageProcessorFast) to produce pixel_values,
+    input_ids, attention_mask, and image_grid_thw.
+
+    Thread-safe: PIL and HuggingFace processors handle concurrent calls.
+    """
+
+    def __init__(
+        self,
+        processor: Any,
+        model_name: str,
+        *,
+        default_task: str = "[default]",
+    ) -> None:
+        if default_task not in _MINERU_VL_TASK_PROMPTS:
+            msg = f"default_task {default_task!r} must be one of {tuple(_MINERU_VL_TASK_PROMPTS)}"
+            raise ValueError(msg)
+        self._processor = processor
+        self._model_name = model_name
+        self._default_task = default_task
+
+    @property
+    def modality(self) -> str:
+        return "image"
+
+    def _task_prompt(self, task: str | None, instruction: str | None) -> str:
+        """Resolve the text prompt for the user message.
+
+        Instruction overrides the task-based prompt when provided.
+        """
+        if instruction:
+            return instruction
+        resolved_task = task or self._default_task
+        return _MINERU_VL_TASK_PROMPTS.get(resolved_task, _MINERU_VL_TASK_PROMPTS[self._default_task])
+
+    def _build_messages(self, prompt_text: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+
+    def _process_single_image(
+        self,
+        item: Item,
+        index: int,
+        text: str,
+    ) -> PreparedItem[MinerUVLPayload] | None:
+        from PIL import Image as PILImage
+
+        if not item.images:
+            logger.warning("MinerUVLPreprocessor: item %d has no images", index)
+            return None
+
+        img_input = item.images[0]
+        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        original_size = (pil_img.width, pil_img.height)
+
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+
+        inputs = self._processor(
+            text=text,
+            images=[pil_img],
+            return_tensors="pt",
+        )
+
+        payload = MinerUVLPayload(
+            pixel_values=inputs["pixel_values"],
+            input_ids=inputs["input_ids"].squeeze(0),
+            attention_mask=inputs["attention_mask"].squeeze(0),
+            image_grid_thw=inputs["image_grid_thw"],
+            original_size=original_size,
+        )
+        return PreparedItem(payload=payload, cost=1, original_index=index)
+
+    def prepare(
+        self,
+        items: list[Item],
+        *,
+        config: ModelConfig,
+        is_query: bool = False,
+        instruction: str | None = None,
+        task: str | None = None,
+    ) -> PreparedBatch[MinerUVLPayload]:
+        prompt_text = self._task_prompt(task, instruction)
+        messages = self._build_messages(prompt_text)
+        text = self._processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
+        if len(items) == 1:
+            result = self._process_single_image(items[0], 0, text)
+            if result is None:
+                return PreparedBatch(items=[], total_cost=0, modality="image")
+            return PreparedBatch(items=[result], total_cost=1, modality="image")
+
+        executor = get_image_executor()
+        futures = [executor.submit(self._process_single_image, item, i, text) for i, item in enumerate(items)]
+
+        prepared_items: list[PreparedItem[MinerUVLPayload]] = []
+        for future in futures:
+            result = future.result()
+            if result is not None:
+                prepared_items.append(result)
+
+        return PreparedBatch(
+            items=prepared_items,
+            total_cost=len(prepared_items),
+            modality="image",
+        )
+
+    def collate(
+        self,
+        prepared: list[PreparedItem[MinerUVLPayload]],
+        *,
+        device: str,
+        dtype: Any = None,
+    ) -> dict[str, Any]:
+        """Collate items into batched tensors.
+
+        MinerU2.5-Pro processes one image at a time (variable-size inputs via
+        Qwen2-VL native-resolution patch packing); batching multiple images
+        requires careful grid handling that the model's own path does not
+        expose. This collate emits the first item's tensors, matching
+        PaddleOCR-VL / LightOnOCR.
         """
         import torch
 

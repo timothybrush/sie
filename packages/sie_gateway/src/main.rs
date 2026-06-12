@@ -1,5 +1,6 @@
 mod config;
 mod discovery;
+mod endpoint;
 mod error;
 mod handlers;
 mod health_mode;
@@ -7,8 +8,10 @@ mod http_error;
 mod metrics;
 mod middleware;
 mod nats;
+mod observability;
 mod openapi;
 mod queue;
+mod routing;
 mod server;
 mod state;
 mod types;
@@ -20,6 +23,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::watch;
 use tracing::info;
 
 use config::Config;
@@ -33,7 +37,6 @@ use server::AppState;
 use state::model_registry::ModelRegistry;
 use state::pool_manager::PoolManager;
 use state::worker_registry::WorkerRegistry;
-use types::PoolState;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -149,36 +152,22 @@ async fn main() {
                 cfg.models_dir = dir;
             }
 
-            setup_logging(&cfg.log_level, cfg.json_logs);
+            // Initialise tracing + OpenTelemetry. Always installs the
+            // global W3C trace-context propagator (even without an
+            // OTLP exporter) so inbound `traceparent` headers
+            // continue to flow through the work envelope.
+            observability::tracing::init_tracing(&cfg.log_level, cfg.json_logs);
 
-            if let Err(e) = run_server(cfg).await {
+            let result = run_server(cfg).await;
+            if let Err(e) = result {
                 tracing::error!(error = %e, "server error");
+                // Flush the terminal error span/log before the process exits.
+                observability::tracing::shutdown_tracing();
                 std::process::exit(1);
             }
+            // Flush any pending spans before the process exits.
+            observability::tracing::shutdown_tracing();
         }
-    }
-}
-
-fn setup_logging(level: &str, json: bool) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let level_str = match level.to_lowercase().as_str() {
-            "debug" => "debug",
-            "warn" | "warning" => "warn",
-            "error" => "error",
-            _ => "info",
-        };
-        EnvFilter::new(level_str)
-    });
-
-    if json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }
 
@@ -191,6 +180,12 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // before any proxied traffic has landed. See `init_metric_families`
     // for why dashboards on a freshly booted gateway need this.
     metrics::init_metric_families();
+
+    // Surface a loud warning if the operator has opted in
+    // to raw routing-key logging. The default (flag unset) emits only
+    // the `xxh:` prefix, which is the privacy contract documented in
+    // `routing::fmt_key_hash`.
+    routing::warn_if_raw_logging_enabled();
 
     // Log auth and NATS producer-trust configuration findings; does
     // not fail startup.
@@ -248,9 +243,19 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let registry = Arc::new(WorkerRegistry::new(
+    // `on_worker_degraded` is wired now (no-op closure) so future
+    // direct-dispatch ring-cache invalidation can attach here without
+    // a follow-up PR re-touching this construction site.
+    let on_worker_degraded: Option<state::worker_registry::OnWorkerDegraded> =
+        Some(Arc::new(|_w: &types::WorkerState| {
+            // Ring snapshots are rebuilt per-request today (see
+            // `WorkerRegistry::ring_snapshot_for`); when a cache layer
+            // lands it should invalidate from this callback.
+        }));
+    let registry = Arc::new(WorkerRegistry::with_callbacks(
         Duration::from_secs(15),
         on_worker_healthy,
+        on_worker_degraded,
     ));
 
     // Set up discovery
@@ -291,9 +296,9 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     //
     // `async_nats::Subscriber` survives reconnects transparently, so
     // `start_subscription` is a one-shot and we don't need to wire it
-    // to `reconnect_notify` the way health and inbox do — those two
-    // actually need to rebuild JetStream/request-reply state after a
-    // server restart, but Core pub/sub subscriptions auto-resume.
+    // to `reconnect_notify` the way the inbox does — request-reply state
+    // needs an explicit rebuild after a server restart, while Core pub/sub
+    // subscriptions normally auto-resume.
     // Staleness caused by messages published during a disconnect is
     // covered by `state::config_poller`'s epoch drift detection.
     if !config.nats_url.is_empty() {
@@ -304,12 +309,13 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Set up health manager based on mode. WebSocket health is the supported
-    // product path; NATS health is an internal/experimental consumer until
-    // workers publish `sie.health.>` by default.
+    // Set up health manager based on mode. Helm selects NATS health for the
+    // worker-sidecar queue path so the registry receives queue pool names and
+    // bundle config hashes from `sie.health.>` heartbeats.
     //
-    // Core NATS subscriptions are resumed by the client on reconnect; do not spawn
-    // duplicate `NatsHealthManager::start` loops on `reconnect_notify` (see PR review).
+    // Core NATS subscriptions normally resume on reconnect. The health manager
+    // also supervises a terminated `sie.health.>` stream and resubscribes from
+    // inside its own task, so do not spawn duplicate `start` loops here.
     let mut ws_manager: Option<Arc<WsHealthManager>> = None;
     let mut nats_health_manager: Option<Arc<NatsHealthManager>> = None;
     let mut use_ws = true;
@@ -340,10 +346,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 "unsupported gateway health mode requested; falling back to WS"
             );
         }
-        HealthModeDisposition::TryNatsExperimental => {
-            tracing::warn!(
-                "NATS health mode is experimental/internal and requires workers to publish sie.health.>; if no publisher exists, the worker registry can remain empty"
-            );
+        HealthModeDisposition::TryNats => {
             if let Some(client) = nats_manager.get_client().await {
                 info!("using NATS health mode (shared connection)");
                 let nats_mgr = Arc::new(NatsHealthManager::new(Arc::clone(&registry)));
@@ -391,6 +394,20 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     if pools_enabled {
         pool_manager.create_default_pool().await;
+        if !config.static_queue_pools.is_empty() {
+            match pool_manager
+                .sync_static_pools(&config.static_queue_pools)
+                .await
+            {
+                Ok(count) if count > 0 => {
+                    info!(count = count, "synced static Helm queue pools");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
         // Restore pools from K8s backend on startup
         match pool_manager.restore_from_k8s().await {
             Ok(count) if count > 0 => {
@@ -496,13 +513,14 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             match nats_manager.get_client().await {
                 Some(client) => {
                     let jetstream = async_nats::jetstream::new(client.clone());
-                    let payload_store = create_payload_store(&config.payload_store_url).await;
+                    let payload_store = create_payload_store(&config.payload_store_url).await?;
                     let publisher = Arc::new(queue::publisher::WorkPublisher::new(
                         jetstream,
                         nats_manager.router_id().to_string(),
                         payload_store,
                         Duration::from_secs_f64(config.request_timeout),
                         config.max_stream_pending,
+                        Duration::from_secs(config.stream_max_age_s),
                     ));
 
                     if let Err(e) = publisher.start_inbox_subscription(&client).await {
@@ -562,13 +580,12 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                     _ = notify.notified() => {}
                 }
                 let pools = pm.list_pools().await;
-                let has_pending = pools.iter().any(|p| p.status.state == PoolState::Pending);
-                if !has_pending {
+                if pools.is_empty() {
                     continue;
                 }
 
                 let workers = reg.healthy_workers().await;
-                let worker_tuples: Vec<(String, String, String, String)> = workers
+                let worker_tuples: Vec<(String, String, String, String, String)> = workers
                     .iter()
                     .map(|w| {
                         (
@@ -576,14 +593,13 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                             w.url.clone(),
                             w.machine_profile.clone(),
                             w.bundle.clone(),
+                            w.pool_name.clone(),
                         )
                     })
                     .collect();
 
                 for pool in &pools {
-                    if pool.status.state == PoolState::Pending {
-                        pm.assign_workers(&pool.spec.name, &worker_tuples).await;
-                    }
+                    pm.assign_workers(&pool.spec.name, &worker_tuples).await;
                 }
             }
         });
@@ -635,7 +651,10 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         config_epoch: config_epoch.clone(),
     });
 
-    let app = server::create_router(state, Arc::clone(&config));
+    let app = server::create_router(Arc::clone(&state), Arc::clone(&config));
+    let metrics_app = config
+        .metrics_port
+        .map(|_| server::create_metrics_router(Arc::clone(&state)));
 
     info!(
         addr = %addr,
@@ -644,11 +663,39 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         "starting SIE Gateway"
     );
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let listener = TcpListener::bind(&addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let metrics_handle = match (config.metrics_port, metrics_app) {
+        (Some(metrics_port), Some(metrics_app)) => {
+            let metrics_addr = format!("{}:{}", config.host, metrics_port);
+            let metrics_listener = TcpListener::bind(&metrics_addr).await?;
+            let metrics_shutdown = shutdown_rx.clone();
+            info!(
+                addr = %metrics_addr,
+                "starting SIE Gateway metrics listener"
+            );
+            Some(tokio::spawn(async move {
+                axum::serve(metrics_listener, metrics_app)
+                    .with_graceful_shutdown(wait_for_shutdown(metrics_shutdown))
+                    .await
+            }))
+        }
+        _ => None,
+    };
+
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx_for_signal.send(true);
+        })
+        .await;
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = metrics_handle {
+        handle.await??;
+    }
+    serve_result?;
 
     info!("server stopped");
 
@@ -693,6 +740,14 @@ async fn shutdown_signal() {
         }
         _ = terminate => {
             info!("shutdown signal received (SIGTERM)");
+        }
+    }
+}
+
+async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            break;
         }
     }
 }

@@ -34,11 +34,26 @@ pub struct WorkerState {
     pub memory_total_bytes: i64,
     pub last_heartbeat: Instant,
     pub pool_name: String,
+    /// Saturation flag, orthogonal to `health`. A saturated
+    /// worker is *healthy* (live, heartbeating) but its admission
+    /// capacity is full; the gateway must skip it for HRW direct
+    /// dispatch and fall back to the pool. Hysteresis lives on the
+    /// worker side (90/70 thresholds); the gateway just consumes the
+    /// bool.
+    pub saturated: bool,
 }
 
 impl WorkerState {
     pub fn healthy(&self) -> bool {
         self.health == WorkerHealth::Healthy
+    }
+
+    /// Eligible for HRW direct dispatch: healthy *and* not saturated.
+    /// Saturated workers stay in the registry (so the pool fallback
+    /// still drains to them via the bundle index) but are excluded
+    /// from the per-`(model, pool)` HRW ring.
+    pub fn eligible_for_dispatch(&self) -> bool {
+        self.healthy() && !self.saturated
     }
 
     #[allow(dead_code)]
@@ -168,6 +183,18 @@ pub struct WorkerStatusMessage {
     /// Compact top-level memory total (fallback when gpus array is empty)
     #[serde(default)]
     pub memory_total_bytes: Option<i64>,
+    /// Saturation signal. `true` ⇒ the worker is at or above
+    /// its admission high-water mark and the gateway should exclude it
+    /// from the HRW ring until it drops below the low-water mark.
+    /// Defaults to `false` for backward compatibility with workers
+    /// running pre-routing builds.
+    #[serde(default)]
+    pub saturated: bool,
+    /// Graceful worker shutdown tombstone. When true, the gateway should
+    /// remove this worker from the live registry instead of marking it
+    /// unhealthy. Defaults to false for older workers.
+    #[serde(default)]
+    pub terminated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,7 +230,42 @@ mod tests {
             memory_total_bytes: mem_total,
             last_heartbeat: Instant::now(),
             pool_name: String::new(),
+            saturated: false,
         }
+    }
+
+    #[test]
+    fn test_eligible_for_dispatch_requires_healthy_and_not_saturated() {
+        let mut w = make_worker(WorkerHealth::Healthy, 0, 0);
+        assert!(w.eligible_for_dispatch());
+        w.saturated = true;
+        assert!(!w.eligible_for_dispatch());
+        w.saturated = false;
+        w.health = WorkerHealth::Unhealthy;
+        assert!(!w.eligible_for_dispatch());
+    }
+
+    #[test]
+    fn test_worker_status_message_deserialize_saturated_default_false() {
+        let json = r#"{"ready": true}"#;
+        let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
+        assert!(!msg.saturated);
+        assert!(!msg.terminated);
+    }
+
+    #[test]
+    fn test_worker_status_message_deserialize_saturated_true() {
+        let json = r#"{"ready": true, "saturated": true}"#;
+        let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.saturated);
+    }
+
+    #[test]
+    fn test_worker_status_message_deserialize_terminated_true() {
+        let json = r#"{"ready": false, "terminated": true}"#;
+        let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
+        assert!(!msg.ready);
+        assert!(msg.terminated);
     }
 
     #[test]
@@ -248,6 +310,7 @@ mod tests {
         assert!(msg.loaded_models.is_empty());
         assert!(msg.models.is_empty());
         assert!(msg.gpus.is_empty());
+        assert!(!msg.terminated);
     }
 
     #[test]

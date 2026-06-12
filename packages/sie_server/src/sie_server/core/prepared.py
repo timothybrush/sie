@@ -4,7 +4,7 @@ This module defines the core abstractions for preprocessing items before
 batching and inference. These types generalize TokenizedItem to support
 text, images, audio, and mixed-modality inputs.
 
-See roadmap.md Project 10.4 Phase 2 for design details.
+Prepared batches carry modality-specific payloads through the batching layer.
 """
 
 from __future__ import annotations
@@ -298,6 +298,26 @@ class PaddleOCRVLPayload(Payload):
 
 
 PaddleOCRVLPreparedItem = PreparedItem[PaddleOCRVLPayload]
+
+
+@dataclass(slots=True)
+class MinerUVLPayload(Payload):
+    """Preprocessed MinerU2.5-Pro input ready for extraction.
+
+    MinerU2.5-Pro-2604-1.2B is a Qwen2-VL document parser. The processor
+    (Qwen2VLProcessor with Qwen2VLImageProcessorFast) tokenizes a Qwen2-VL
+    chat-template prompt and emits ``image_grid_thw`` alongside
+    ``pixel_values`` for native-resolution patch packing.
+    """
+
+    pixel_values: Any  # torch.Tensor
+    input_ids: Any  # torch.Tensor [seq_len]
+    attention_mask: Any  # torch.Tensor [seq_len]
+    image_grid_thw: Any  # torch.Tensor [1, 3] — (temporal, height, width) grid
+    original_size: tuple[int, int]
+
+
+MinerUVLPreparedItem = PreparedItem[MinerUVLPayload]
 
 
 @dataclass(slots=True)

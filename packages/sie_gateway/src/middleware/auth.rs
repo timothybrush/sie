@@ -19,9 +19,11 @@ use crate::config::Config;
 /// intentionally NOT in this list — see `EXEMPT_OPERATIONAL_PATHS`.
 const EXEMPT_PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 
-/// Public API description. Keep client-codegen and discovery usable even
-/// when request auth is enabled.
-const EXEMPT_DOC_PATHS: &[&str] = &["/openapi.json"];
+/// Public API description + rendered reference. Keep client-codegen,
+/// discovery, and the browsable `/docs` page usable even when request auth
+/// is enabled. The Redoc page is read-only (no in-browser request console),
+/// so exempting it carries no token-leak risk.
+const EXEMPT_DOC_PATHS: &[&str] = &["/openapi.json", "/docs", "/docs/redoc.standalone.js"];
 
 /// Paths that expose operational data (status page, rich `/health`,
 /// `/metrics`, `/ws/*`). Exempt from auth only when
@@ -287,6 +289,8 @@ mod tests {
         assert!(EXEMPT_PROBE_PATHS.contains(&"/healthz"));
         assert!(EXEMPT_PROBE_PATHS.contains(&"/readyz"));
         assert!(EXEMPT_DOC_PATHS.contains(&"/openapi.json"));
+        assert!(EXEMPT_DOC_PATHS.contains(&"/docs"));
+        assert!(EXEMPT_DOC_PATHS.contains(&"/docs/redoc.standalone.js"));
         assert!(!EXEMPT_PROBE_PATHS.contains(&"/health"));
         assert!(!EXEMPT_PROBE_PATHS.contains(&"/metrics"));
         assert!(EXEMPT_OPERATIONAL_PATHS.contains(&"/"));
@@ -319,6 +323,7 @@ mod tests {
         Arc::new(Config {
             host: String::new(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: String::new(),
@@ -339,8 +344,11 @@ mod tests {
             multi_router: false,
             request_timeout: 0.0,
             max_stream_pending: 0,
+            stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,

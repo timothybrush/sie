@@ -1,7 +1,7 @@
 /**
  * Image handling utilities for the SIE TypeScript SDK.
  *
- * Per design.md Section 4.3, images are serialized as bytes for transport.
+ * Images are serialized as bytes for transport.
  * This module handles conversion from various input formats to Uint8Array.
  *
  * Supported input formats:
@@ -33,7 +33,6 @@ export type ImageInput = Uint8Array | ArrayBuffer | Blob | string;
 
 /**
  * Wire format for images sent to the server.
- * Per design.md Section 4.3.
  */
 export interface ImageWireFormat {
   data: Uint8Array;
@@ -114,7 +113,7 @@ function base64ToBytes(base64: string): Uint8Array {
 /**
  * Convert image bytes to wire format for transport.
  *
- * Per design.md Section 4.3, images are sent as:
+ * Images are sent as:
  * `{ data: <bytes>, format: "jpeg" | "png" | "webp" }`
  *
  * @param input - Image data in any supported format

@@ -2,20 +2,93 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures_util::future::try_join_all;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
 use rmp::decode::read_str_from_slice;
 use rmp::Marker;
 
 use super::payload_store::PayloadStore;
+use super::streaming::{
+    ChunkApplied, ChunkEnvelope, ChunkError, NakEnvelope, StreamCollector, StreamOutcome,
+};
+use crate::endpoint::InferenceEndpoint;
 use crate::metrics;
 
 const PAYLOAD_OFFLOAD_THRESHOLD: usize = 1_024 * 1_024; // 1 MB
+
+// H9 — first-chunk-fallback rate limit defaults.
+//
+// The gateway republishes generation work to the pool subject when the
+// direct-dispatched worker doesn't send a first chunk within the
+// first-chunk window. Without bounds an in-cluster outage (cold workers,
+// model-load storm) trips the fallback for every request in flight,
+// doubling the JetStream pressure on the pool stream and amplifying the
+// load that already caused the timeouts. The token bucket caps the
+// fallback rate per (model, pool); requests beyond the burst are refused
+// with a 504 so the client can decide whether to retry.
+//
+// 5 / sec sustained with a burst of 10 covers a healthy cluster's
+// occasional cold-start fallbacks without rate-limiting them, while
+// preventing a runaway storm from consuming the pool stream's pending
+// budget. Values are tunable per deployment via the constructor in a
+// future iteration; the constants here are the "safe default" the audit
+// recommended.
+const FALLBACK_RATE_PER_SEC_DEFAULT: f64 = 5.0;
+const FALLBACK_BURST_DEFAULT: f64 = 10.0;
+
+/// Simple monotonic-time token bucket. Not thread-safe on its own; the
+/// caller wraps a single instance in the appropriate concurrency
+/// primitive (the publisher uses ``DashMap<key, Mutex<TokenBucket>>``).
+///
+/// ``try_take`` returns true and decrements the available tokens by one
+/// when at least one whole token is available; otherwise it returns
+/// false without mutating state. Tokens accrue continuously at
+/// ``rate_per_sec`` up to ``burst``.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Currently available tokens (fractional). May briefly exceed
+    /// ``burst`` if the system clock is set backwards — capped on the
+    /// next refill.
+    tokens: f64,
+    /// Steady-state refill rate.
+    rate_per_sec: f64,
+    /// Maximum tokens. ``rate_per_sec * window + 1`` is the upper bound
+    /// on bursts the bucket will permit before refusing.
+    burst: f64,
+    /// Last accrual computation timestamp.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            rate_per_sec,
+            burst,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Parameters extracted from the request body for top-level WorkItem fields.
 ///
@@ -39,64 +112,306 @@ pub struct WorkParams {
     pub labels: Option<Vec<String>>,
     pub output_schema: Option<serde_json::Value>,
     pub query_item: Option<rmpv::Value>,
+    /// Generate-only typed params (walking-skeleton wire shape). Mutually exclusive
+    /// with the encode/score/extract fields above; populated only when
+    /// ``endpoint == "generate"``.
+    pub generate: Option<GenerateParams>,
+    /// Routing-affinity hint. Carried onto the work
+    /// envelope and made visible to routing logic without
+    /// unpacking ``generate``. Currently read-but-ignored by the worker.
+    pub routing_key: Option<String>,
+    /// Prompt-cache hint. Same semantics as
+    /// :attr:`routing_key`.
+    pub prompt_cache_key: Option<String>,
 }
 
-/// Work item published to JetStream for queue mode.
-/// Serialized as a msgpack **map** (named fields) to match the Python WorkItem TypedDict
-/// that the worker consumer expects (`wi.get("operation")` etc.).
+/// Discriminated input for a generate work item.
+///
+/// The original wire shape was ``{prompt: String, ...}`` flat under
+/// ``GenerateParams``. The chat-completions surface introduces an
+/// OpenAI-shaped ``{messages: [...], ...}`` variant; the two are
+/// mutually exclusive on a single work item. Both shapes still
+/// serialise / deserialise as flat keys under :class:`GenerateParams`
+/// (``#[serde(untagged)]`` + ``#[serde(flatten)]`` on the enclosing
+/// field) so a prompt-only worker receiving a chat-shaped published
+/// prompt item is wire-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkItem {
-    pub work_item_id: String,
-    pub request_id: String,
-    pub item_index: u32,
-    pub total_items: u32,
-    pub operation: String,
-    pub model_id: String,
-    #[serde(default)]
-    pub profile_id: String,
-    pub pool_name: String,
-    pub machine_profile: String,
-    /// Per-item payload. Carried as `rmpv::Value` so msgpack request
-    /// bodies (especially those with `bin`/`ext` fields such as
-    /// encoded numpy arrays) can round-trip to the worker byte-for-
-    /// byte, without the old
-    /// `msgpack → rmpv::Value → serde_json::Value → msgpack` detour
-    /// that used to expand every `bin` into a `Vec<Number>`.
-    #[serde(default)]
-    pub item: Option<rmpv::Value>,
-    #[serde(default)]
-    pub payload_ref: Option<String>,
-    #[serde(default)]
-    pub output_types: Option<Vec<String>>,
-    #[serde(default)]
-    pub instruction: Option<String>,
-    #[serde(default)]
-    pub is_query: bool,
-    #[serde(default)]
-    pub options: Option<serde_json::Value>,
-    /// Score query. Same rationale as `item` above.
-    #[serde(default)]
-    pub query_item: Option<rmpv::Value>,
-    #[serde(default)]
-    pub query_payload_ref: Option<String>,
-    /// Score items. Same rationale as `item` above.
-    #[serde(default)]
-    pub score_items: Option<Vec<rmpv::Value>>,
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    #[serde(default)]
-    pub output_schema: Option<serde_json::Value>,
-    #[serde(default)]
-    pub bundle_config_hash: String,
-    #[serde(default)]
-    pub router_id: String,
-    pub reply_subject: String,
-    /// Epoch seconds (f64) when the work item was created (for queue latency tracking).
-    #[serde(default)]
-    pub timestamp: f64,
+#[serde(untagged)]
+pub enum GenerateInput {
+    /// Raw prompt string — prompt wire shape.
+    Prompt { prompt: String },
+    /// OpenAI-shaped chat messages. The worker renders the
+    /// chat template with the model's tokenizer before forwarding to
+    /// the generation adapter.
+    Messages { messages: Vec<ChatMessage> },
 }
 
-/// Borrowed, serialize-only view of a [`WorkItem`].
+impl Default for GenerateInput {
+    fn default() -> Self {
+        GenerateInput::Prompt {
+            prompt: String::new(),
+        }
+    }
+}
+
+/// One image attached to a chat message, extracted from an OpenAI
+/// ``image_url`` data URI at the gateway.
+///
+/// ``data`` is the **base64 payload string**, NOT raw bytes. This is
+/// deliberate: the generate work item travels through the sidecar's
+/// ``WorkItem.generate: serde_json::Value``, and ``serde_json::Value``
+/// cannot hold a msgpack ``bin`` (rmp_serde rejects it with "invalid type:
+/// byte array"). A base64 string round-trips cleanly through
+/// ``serde_json::Value`` with no sidecar changes. The worker base64-decodes
+/// it back to bytes (see ``_parse_message_images_field``).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImage {
+    /// Base64-encoded image bytes (standard alphabet, no ``data:`` prefix).
+    pub data: String,
+    /// Format hint parsed from the data-URI MIME subtype (e.g. ``"png"``).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+/// One ordered content part of a multimodal chat message — either a text
+/// fragment or an image placeholder (the bytes ride the message's flat
+/// ``images`` list, consumed in order as ``Image`` parts are encountered).
+/// Serializes internally-tagged so the worker reads ``{"type":"text",…}`` /
+/// ``{"type":"image"}`` and round-trips through ``serde_json::Value`` on the
+/// sidecar (no msgpack ``bin`` — same constraint as :struct:`ChatImage`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    Image,
+}
+
+/// One chat message in the OpenAI request shape. Role is validated
+/// against the allowed set at the gateway; ``content`` carries the text
+/// (multi-part text parts are concatenated). Any ``image_url`` parts are
+/// decoded into ``images`` and gated on the model's vision capability
+/// after model resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+    /// Assistant tool-call requests (OpenAI shape), preserved across a
+    /// multi-turn tool exchange so the worker can replay them into the
+    /// chat template. ``None`` on plain messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Links a ``role:"tool"`` result message back to the assistant
+    /// tool-call it answers. Required by OpenAI on tool messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Vision input: images decoded from the message's ``image_url`` /
+    /// ``input_image`` content parts. ``None`` on text-only messages. The
+    /// worker renders one placeholder per image, in order, and forwards the
+    /// bytes to the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ChatImage>>,
+    /// Ordered content layout for multimodal messages: the original
+    /// text↔image interleaving from the OpenAI ``content`` parts array.
+    /// ``None`` on text-only / non-interleaved-legacy messages — the worker
+    /// then falls back to the images-first ``content`` + ``images`` render.
+    /// When present, the worker emits one image placeholder per ``Image`` part
+    /// *in place*, pulling bytes from ``images`` in order; only placeholder
+    /// positions change (the flat ``images`` list / ``image_data`` to the
+    /// engine is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_parts: Option<Vec<ContentPart>>,
+}
+
+/// Structured-output grammar.
+///
+/// Wire shape mirrors the Python ``sie_server.types.grammar.GrammarSpec``
+/// dataclass. Serde discriminates on ``kind`` (``"json_schema"`` |
+/// ``"regex"``) and carries the schema-or-pattern payload under
+/// ``value`` plus optional ``label`` / ``strict`` from the OpenAI
+/// ``response_format.json_schema`` wrapper.
+///
+/// The two variants are mutually exclusive on a single request; the
+/// gateway's :func:`handlers::grammar::parse_grammar` is the only place
+/// that builds these and enforces all safety caps (payload size, schema
+/// depth, regex length, JSON-Schema reject-list) before the worker sees
+/// the grammar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GrammarSpec {
+    JsonSchema {
+        value: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+    Regex {
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+    /// EBNF / context-free grammar. Forwarded to the worker which
+    /// dispatches to Outlines or XGrammar (both support EBNF natively).
+    /// Subject to :const:`MAX_GRAMMAR_BYTES` at the gateway; no
+    /// further structural walk is performed (the gateway does not
+    /// parse EBNF — the worker's backend is the authority).
+    Ebnf {
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+}
+
+/// Generation parameters carried verbatim from the HTTP request body
+/// through the work envelope to the worker's ``StreamingProcessor``.
+///
+/// ``input`` flattens into the parent map so the on-the-wire shape stays
+/// ``{prompt | messages, max_new_tokens, ...}`` — backwards-compatible
+/// with the original streaming work items.
+///
+/// `routing_key` / `prompt_cache_key` are caller-supplied
+/// affinity hints used by the gateway for HRW direct-dispatch (xxh3
+/// hash → per-worker subject). The raw strings are forwarded to the
+/// worker so it can use them for cache lookups; the gateway hashes them
+/// before any logging.
+///
+/// **Privacy contract:** `safety_identifier` is intentionally absent.
+/// The HTTP layer parses it and discards it without logging the value.
+/// Adding it here would put potentially-PII strings on the JetStream wire.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GenerateParams {
+    #[serde(flatten)]
+    pub input: GenerateInput,
+    pub max_new_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    /// OpenAI ``frequency_penalty``: range validated upstream to
+    /// ``[-2.0, 2.0]``. Forwarded verbatim to the worker; absent → the
+    /// worker uses the sampler default (typically 0.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    /// OpenAI ``presence_penalty``: same shape and validation as
+    /// :attr:`frequency_penalty`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    /// Non-OpenAI ``top_k`` (Together / Fireworks / vLLM extension):
+    /// integer ``>= 1``, gateway-validated. Forwarded to SGLang's
+    /// ``sampling_params["top_k"]``. Absent → top-k disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Non-OpenAI ``repetition_penalty``: float in ``(0.0, 2.0]``,
+    /// gateway-validated. Forwarded to SGLang's
+    /// ``sampling_params["repetition_penalty"]``. Absent → sampler default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f64>,
+    /// SGLang ``sampling_params["min_new_tokens"]``: integer ``>= 0``,
+    /// gateway-validated. Minimum tokens the model must emit before
+    /// any stop condition can fire. Absent → sampler default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+    /// Per-request kwargs forwarded to the tokenizer's
+    /// ``apply_chat_template``. Worker merges them on top of the model
+    /// YAML defaults (YAML wins on conflict). Validated as a JSON
+    /// object by the gateway. Absent → only YAML defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Structured-output spec. Absent when the request omitted the
+    /// ``grammar`` field (SIE-native) or ``response_format`` (OpenAI
+    /// chat). Populated by :func:`handlers::grammar::parse_grammar`
+    /// after all gateway-side safety caps have passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<GrammarSpec>,
+    /// Caller-supplied routing affinity hint. Highest-priority input
+    /// to the HRW key resolution in `crate::routing::key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+    /// OpenAI-compatible cache-key hint. Second-priority input to HRW
+    /// key resolution; also passed verbatim so the worker can use it
+    /// for adapter-level cache lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// OpenAI ``tools``: non-empty array of ``{type: "function",
+    /// function: {name, description?, parameters?}}``. Forwarded
+    /// verbatim to the worker; the worker uses presence (rather than
+    /// the schemas themselves) to enable the
+    /// ``parse_tool_call_stream`` pipeline. The gateway has run the
+    /// JSON-Schema safety walker on each ``function.parameters``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI ``tool_choice``: one of ``"auto"`` / ``"none"`` /
+    /// ``"required"`` or ``{type:"function", function:{name}}``.
+    /// Informational on the worker today (Qwen3's chat template emits
+    /// ``<tool_call>`` blocks based on the model's own decision); we
+    /// still plumb it so future sampler-level constraints can read it
+    /// without a wire-shape bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI ``parallel_tool_calls`` (default ``true``). Currently
+    /// informational; surfaced on the envelope so worker-side
+    /// observability can label requests by parallelism intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// OpenAI ``seed`` — sampler determinism hint. Best-effort:
+    /// kernel non-determinism, batching order, and KV-cache reuse all
+    /// defeat exact reproducibility. Forwarded to the worker which
+    /// sets it on the SGLang ``sampling_params``. Absent → SGLang's
+    /// own (non-deterministic) default. Gateway-validated as a u64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// OpenAI ``logit_bias`` — per-token additive bias on the
+    /// sampler. Keys are token-id strings (OpenAI's wire shape), values
+    /// are floats in ``[-100.0, 100.0]``. Gateway clamps the map size
+    /// and per-value range; the worker forwards verbatim to SGLang's
+    /// ``logit_bias`` sampling-param. Absent → unbiased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::BTreeMap<String, f64>>,
+    /// OpenAI ``logprobs`` flag — when ``true`` the worker requests
+    /// per-token log-probabilities from SGLang and surfaces them on
+    /// each generation chunk. Absent or ``false`` → no logprobs in
+    /// the response (``choices[i].logprobs: null``).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// OpenAI ``top_logprobs`` — how many alternative tokens to
+    /// surface per position. Range ``[0, 20]`` per OpenAI's spec;
+    /// gateway clamps. Requires ``logprobs: true``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    /// OpenAI ``n`` — number of candidate generations. ``1`` is the
+    /// gateway default. ``n>1`` is supported only on non-streaming
+    /// requests; the chat handler returns 400 for ``n>1 && stream:true``.
+    /// Forwarded to the worker which sets SGLang's ``sampling_params.n``
+    /// and surfaces ``n`` outputs in a single ``WorkResult``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// OpenAI ``best_of``: generate this many candidates server-side and return
+    /// the top ``n`` ranked by cumulative logprob. Must satisfy ``best_of >= n``.
+    /// Non-streaming only. ``None`` → behaves as ``best_of == n``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_of: Option<u32>,
+    /// Whether the client requested SSE streaming. The worker only needs this
+    /// for ``n>1``: streaming fans the candidates out as per-``choice_index``
+    /// delta chunks, vs. the single terminal ``candidates[]`` array used for the
+    /// non-streaming aggregate. ``false``/absent → unchanged single-candidate
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
+    /// Multi-LoRA: the public served-name of a LoRA adapter to apply (declared
+    /// in the model profile's ``lora_paths``). ``None`` → the base model.
+    /// Forwarded to the worker, which passes it as SGLang's
+    /// ``sampling_params.lora_path`` (in-batch per-request adapter selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora_adapter: Option<String>,
+}
+
+/// Borrowed, serialize-only view of the worker work-item envelope.
 ///
 /// Used on the publish hot path to avoid cloning per-item the fields
 /// that every item in a batch shares (pool/model/gpu/router_id/
@@ -106,12 +421,11 @@ pub struct WorkItem {
 /// this saves roughly `7N` small-string clones plus `4N` deep
 /// `Option<Vec<_>> / Option<serde_json::Value>` clones.
 ///
-/// The field names, order, and serde attributes are kept identical
-/// to [`WorkItem`] so that `rmp_serde::to_vec_named(&WorkItemRef)`
-/// produces the same msgpack wire bytes as encoding the equivalent
-/// owned `WorkItem`. Deserialization is intentionally not supported
-/// — results arrive as `WorkResult`, and inbound `WorkItem`s (only
-/// in tests) still use the owned form.
+/// The field names, order, and serde attributes are guarded by tests
+/// against an owned envelope shape so `rmp_serde::to_vec_named(&WorkItemRef)`
+/// keeps producing the msgpack map the Python worker consumes.
+/// Deserialization is intentionally not supported; results arrive as
+/// `WorkResult`.
 #[derive(Debug, Serialize)]
 struct WorkItemRef<'a> {
     pub work_item_id: &'a str,
@@ -121,6 +435,7 @@ struct WorkItemRef<'a> {
     pub operation: &'a str,
     pub model_id: &'a str,
     pub profile_id: &'a str,
+    pub engine: &'a str,
     pub pool_name: &'a str,
     pub machine_profile: &'a str,
     pub item: Option<&'a rmpv::Value>,
@@ -134,10 +449,23 @@ struct WorkItemRef<'a> {
     pub score_items: Option<&'a [rmpv::Value]>,
     pub labels: Option<&'a [String]>,
     pub output_schema: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<&'a GenerateParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
     pub bundle_config_hash: &'a str,
     pub router_id: &'a str,
     pub reply_subject: &'a str,
     pub timestamp: f64,
+    /// W3C Trace Context. Skipped on serialisation when `None`,
+    /// preserving the compact pre-observability wire shape when no
+    /// trace context is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<&'a str>,
 }
 
 /// Per-request context that every [`WorkItemRef`] in a batch borrows
@@ -150,11 +478,18 @@ struct WorkItemShared<'a> {
     model: &'a str,
     pool: &'a str,
     gpu: &'a str,
+    engine: &'a str,
     bundle_config_hash: &'a str,
     router_id: &'a str,
     reply_subject: &'a str,
     params: &'a WorkParams,
     timestamp: f64,
+    /// W3C trace context captured once at publish-call time. The
+    /// shared block is what every per-item [`WorkItemRef`] borrows
+    /// from, so the propagator runs once per request rather than
+    /// once per fan-out item.
+    traceparent: Option<&'a str>,
+    tracestate: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +534,7 @@ pub struct WorkPublisher {
     payload_store: Arc<dyn PayloadStore>,
     result_timeout: Duration,
     max_stream_pending: u64,
+    stream_max_age: Duration,
     /// Pools we've already `get_or_create_stream`'d for, keyed by pool
     /// name so we skip the admin-API round trip on subsequent
     /// requests. The value is the pre-computed JetStream stream name
@@ -211,7 +547,35 @@ pub struct WorkPublisher {
     /// don't fail-open during the initial monitor interval.
     stream_info_cache: DashMap<String, CachedStreamInfo>,
     pending_results: DashMap<String, ResultCollector>,
+    /// Streaming aggregator. Keyed on ``request_id`` like
+    /// ``pending_results`` but holds the per-chunk state for one
+    /// generation request. Populated by ``publish_generate_streaming``
+    /// and drained by ``handle_inbox`` when chunk envelopes arrive.
+    pending_streams: DashMap<String, StreamCollector>,
+    /// Request ids whose generate work item was offloaded to the object
+    /// store (``payload_ref`` set, ``generate`` blanked). The blob lives at
+    /// ``{request_id}_0.bin`` and must be deleted once the stream finishes —
+    /// promptly at the terminal funnel (``handle_chunk``) and, as a backstop
+    /// for failure/timeout terminations, reconciled against ``pending_streams``
+    /// by the periodic ``cleanup_expired`` sweep.
+    offloaded_streams: DashSet<String>,
+    /// Core NATS client (cancel publishes use core NATS, not
+    /// JetStream). Populated lazily by
+    /// :meth:`start_inbox_subscription`; reads on the cancel path
+    /// tolerate ``None`` (cancellation simply becomes a no-op).
+    nats_client: tokio::sync::RwLock<Option<async_nats::Client>>,
     inbox_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// H9 — first-chunk-fallback rate-limit buckets, keyed by
+    /// ``"{model}|{pool}"``. Each bucket gates calls into
+    /// [`Self::republish_to_pool`] tagged with the
+    /// ``first_chunk_timeout`` reason. The NAK-driven republish path
+    /// bypasses the bucket because that path is already throttled by
+    /// the worker's own NAK rate. Wrapped in ``std::sync::Mutex``
+    /// because the critical section is purely CPU-bound (refill +
+    /// compare) and we don't hold it across awaits.
+    fallback_buckets: DashMap<String, std::sync::Mutex<TokenBucket>>,
+    fallback_rate_per_sec: f64,
+    fallback_burst: f64,
 }
 
 struct ResultCollector {
@@ -227,10 +591,20 @@ fn stream_name(pool: &str) -> String {
     format!("WORK_POOL_{}", pool)
 }
 
-/// Normalize a model ID for use as a single NATS subject token.
+fn canonical_stream_subjects(observed: Vec<String>, desired: &str) -> Option<Vec<String>> {
+    if observed.len() == 1 && observed.first().is_some_and(|subject| subject == desired) {
+        None
+    } else {
+        Some(vec![desired.to_string()])
+    }
+}
+
+/// Normalize a model ID or operator-provided lane id for use as a single
+/// NATS subject token.
 ///
-/// The workers' JetStream pull consumer filters on `sie.work.*.{pool}`, which
-/// matches **exactly one token** in the model-ID position. NATS subject tokens
+/// The workers' JetStream pull consumer filters on
+/// `sie.work.{pool}.{machine_profile}.{bundle}.*`, which matches
+/// **exactly one token** in the model-ID position. NATS subject tokens
 /// legally contain `/` but MUST NOT contain `.`, `*`, `>`, or whitespace.
 /// Without this normalization, a model with `.` in its id (e.g.
 /// `vidore/colqwen2.5-v0.2`) would expand into multiple tokens, the publish
@@ -257,14 +631,200 @@ fn normalize_model_id(model_id: &str) -> String {
             '/' => out.push_str("__"),
             '.' => out.push_str("_dot_"),
             '*' | '>' | ' ' => out.push('_'),
+            // Control chars (`\n`, `\r`, `\t`, …) are whitespace/illegal
+            // in a NATS subject token but are not caught by the literal
+            // arms above. Map them to `_` too so the empty-registry
+            // fallback path (which can interpolate an unsanitized model
+            // id) can't emit a malformed subject.
+            c if c.is_control() => out.push('_'),
             c => out.push(c),
         }
     }
     out
 }
 
-fn work_subject(model: &str, pool: &str) -> String {
-    format!("sie.work.{}.{}", normalize_model_id(model), pool)
+fn work_subject(pool: &str, machine_profile: &str, bundle: &str, model: &str) -> String {
+    format!(
+        "sie.work.{}.{}.{}.{}",
+        pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model)
+    )
+}
+
+/// Per-worker subject `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`.
+///
+/// Matches `sie_sdk.queue_types.work_worker_subject` so workers and
+/// the gateway agree on the wire-level subject. The pool stream
+/// filters on `sie.work.{pool}.*.*.*`, so this worker-addressed subject
+/// cannot be captured by it — exactly the double-delivery guarantee
+/// the design requires.
+fn work_subject_worker(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+    worker_id: &str,
+) -> String {
+    // Worker ids are operator-controlled (set via `WorkerStatusMessage.name`,
+    // ultimately sourced from `SIE_WORKER_ID` / `HOSTNAME` / `POD_NAME` on the
+    // worker side) and would otherwise be interpolated verbatim into a NATS
+    // subject — an id containing `.`, `*`, `>`, or whitespace would produce
+    // an illegal subject and every HRW pick that landed on it would fail
+    // with "no responders". Apply the same scrub as the model id so wonky
+    // names (notably Kubernetes pod hostnames like
+    // `sie-worker-7d9f-default-0.sie-worker.default.svc`) degrade to
+    // deterministic underscore-joined tokens instead of disappearing from
+    // the cluster.
+    //
+    // CROSS-LANGUAGE CONTRACT (workstream G-M5): this normalization MUST
+    // produce byte-identical output to `sie_sdk.queue_types.normalize_worker_id`
+    // in Python (which delegates to `normalize_model_id` for exactly this
+    // reason). If you change the mapping here, mirror the change in the
+    // Python helper or direct-dispatch will silently miss every worker whose
+    // raw id contains the newly-changed character.
+    format!(
+        "sie.work.{}.{}.{}.{}.{}",
+        pool,
+        normalize_model_id(machine_profile),
+        normalize_model_id(bundle),
+        normalize_model_id(model),
+        normalize_model_id(worker_id)
+    )
+}
+
+/// Where a `WorkItem` should be published.
+///
+/// Direct-dispatch: when the HRW pick yields an
+/// eligible worker, the gateway publishes to that worker's per-worker
+/// subject. When no worker is eligible (empty ring, key resolution
+/// missed, post-NAK / post-timeout republish), it falls back to the
+/// pool subject — same target the original walking-skeleton code always used.
+#[derive(Debug, Clone)]
+pub enum PublishTarget {
+    /// Direct-dispatch to a specific worker. Subject:
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`.
+    Worker {
+        pool: String,
+        machine_profile: String,
+        bundle: String,
+        model: String,
+        worker_id: String,
+    },
+    /// Pool fan-out — any worker subscribed to
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.*` can pick it up.
+    Pool {
+        pool: String,
+        machine_profile: String,
+        bundle: String,
+        model: String,
+    },
+}
+
+impl PublishTarget {
+    /// Resolve the JetStream subject for this target.
+    pub fn subject(&self) -> String {
+        match self {
+            PublishTarget::Worker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                worker_id,
+            } => work_subject_worker(pool, machine_profile, bundle, model, worker_id),
+            PublishTarget::Pool {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+            } => work_subject(pool, machine_profile, bundle, model),
+        }
+    }
+
+    /// Stable metric label describing the target kind. Wired up to
+    /// publish-side metrics in a follow-up; carried in the API
+    /// surface now so future callers don't have to extend `PublishTarget`.
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self {
+            PublishTarget::Worker { .. } => "worker",
+            PublishTarget::Pool { .. } => "pool",
+        }
+    }
+
+    /// Build the `Pool` fallback that corresponds to a `Worker` target.
+    /// Carried in the API for admission-control use cases that may need to
+    /// materialise the fallback target outside `republish_to_pool`.
+    #[allow(dead_code)]
+    pub fn as_pool_fallback(&self) -> PublishTarget {
+        match self {
+            PublishTarget::Worker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                ..
+            }
+            | PublishTarget::Pool {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+            } => PublishTarget::Pool {
+                pool: pool.clone(),
+                machine_profile: machine_profile.clone(),
+                bundle: bundle.clone(),
+                model: model.clone(),
+            },
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            PublishTarget::Worker { model, .. } | PublishTarget::Pool { model, .. } => model,
+        }
+    }
+
+    pub fn pool(&self) -> &str {
+        match self {
+            PublishTarget::Worker { pool, .. } | PublishTarget::Pool { pool, .. } => pool,
+        }
+    }
+
+    pub fn machine_profile(&self) -> &str {
+        match self {
+            PublishTarget::Worker {
+                machine_profile, ..
+            }
+            | PublishTarget::Pool {
+                machine_profile, ..
+            } => machine_profile,
+        }
+    }
+}
+
+/// Peek the top-level `kind` discriminator on an already-decoded
+/// `rmpv::Value`. Returns `Some("chunk")` / `Some("nak")` / `Some(...)`
+/// for a map carrying a string `kind`, or `None` for a non-map value
+/// (e.g. the array-shaped `WorkResult`) or a map without a string
+/// `kind`. Lets `handle_inbox` dispatch on the decoded value without a
+/// second decode from the raw slice.
+fn envelope_kind(value: &rmpv::Value) -> Option<&str> {
+    let rmpv::Value::Map(entries) = value else {
+        return None;
+    };
+    for (k, v) in entries {
+        if let rmpv::Value::String(s) = k {
+            if s.as_str() == Some("kind") {
+                return match v {
+                    rmpv::Value::String(s) => s.as_str(),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
 }
 
 /// Fast-path extraction of `request_id` from raw msgpack bytes.
@@ -498,6 +1058,32 @@ fn skip_msgpack_value(data: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Outcome of [`WorkPublisher::republish_to_pool_outcome`].
+///
+/// The legacy [`WorkPublisher::republish_to_pool`] wrapper collapses the
+/// non-`Republished` arms to `false`, but `handle_nak` needs to tell
+/// "already republished" apart from "no collector / no payload": a NAK
+/// that arrives after the request already fell back to the pool means the
+/// item has been retried as far as it can be, so the client should get a
+/// 429 immediately rather than hang until the first-chunk timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepublishOutcome {
+    /// The item was re-issued to the pool subject.
+    Republished,
+    /// A prior NAK/timeout already republished this request; nothing was
+    /// done now.
+    AlreadyRepublished,
+    /// Nothing could be republished: no live collector, no cached
+    /// payload, or no fallback subject.
+    NotPossible,
+    /// H9 — the per-(model, pool) first-chunk-fallback token bucket
+    /// was empty; the republish was deliberately refused so the
+    /// fallback rate stays bounded under a cold-start storm. Callers
+    /// should surface a 504 to the client (the request has already
+    /// failed-over once; we won't safely re-fallback now).
+    RateLimited,
+}
+
 impl WorkPublisher {
     pub fn new(
         jetstream: jetstream::Context,
@@ -505,6 +1091,7 @@ impl WorkPublisher {
         payload_store: Arc<dyn PayloadStore>,
         result_timeout: Duration,
         max_stream_pending: u64,
+        stream_max_age: Duration,
     ) -> Self {
         Self {
             jetstream,
@@ -512,11 +1099,44 @@ impl WorkPublisher {
             payload_store,
             result_timeout,
             max_stream_pending,
+            stream_max_age,
             ensured_streams: DashMap::new(),
             stream_info_cache: DashMap::new(),
             pending_results: DashMap::new(),
+            pending_streams: DashMap::new(),
+            offloaded_streams: DashSet::new(),
+            nats_client: tokio::sync::RwLock::new(None),
             inbox_handle: tokio::sync::Mutex::new(None),
+            fallback_buckets: DashMap::new(),
+            fallback_rate_per_sec: FALLBACK_RATE_PER_SEC_DEFAULT,
+            fallback_burst: FALLBACK_BURST_DEFAULT,
         }
+    }
+
+    /// Try to consume one first-chunk-fallback token for ``(model, pool)``.
+    /// Returns true when a republish is permitted, false when the bucket is
+    /// empty (the caller MUST surface a 504 / refused-republish outcome).
+    /// Helper exposed so the `first_chunk_timeout`-driven call sites in
+    /// `republish_to_pool_outcome` and any future fallback entry-points
+    /// share the same bucket state.
+    fn try_take_fallback_token(&self, model: &str, pool: &str) -> bool {
+        let key = format!("{}|{}", model, pool);
+        let bucket = self.fallback_buckets.entry(key).or_insert_with(|| {
+            std::sync::Mutex::new(TokenBucket::new(
+                self.fallback_rate_per_sec,
+                self.fallback_burst,
+            ))
+        });
+        // Lock is a plain (non-async) ``std::sync::Mutex``; the critical
+        // section is a few additions + a comparison, so we never hold it
+        // across an ``await``. Poisoning means an earlier panic in the
+        // critical section — treat as "deny" so a panicked process state
+        // doesn't silently allow unbounded fallbacks.
+        let mut guard = match bucket.value().lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        guard.try_take()
     }
 
     #[allow(dead_code)]
@@ -535,7 +1155,8 @@ impl WorkPublisher {
         }
 
         let name = stream_name(pool);
-        let subjects = vec![format!("sie.work.*.{}", pool)];
+        let desired_subject = format!("sie.work.{}.*.*.*", pool);
+        let subjects = vec![desired_subject.clone()];
 
         let mut stream = self
             .jetstream
@@ -544,12 +1165,34 @@ impl WorkPublisher {
                 subjects,
                 retention: jetstream::stream::RetentionPolicy::WorkQueue,
                 storage: jetstream::stream::StorageType::Memory,
-                max_age: Duration::from_secs(60),
+                max_age: self.stream_max_age,
                 max_messages: 100_000,
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("create/get stream {}: {}", name, e))?;
+        let observed_subjects = stream.cached_info().config.subjects.clone();
+        if let Some(updated_subjects) =
+            canonical_stream_subjects(observed_subjects.clone(), &desired_subject)
+        {
+            let mut updated = stream.cached_info().config.clone();
+            updated.subjects = updated_subjects;
+            self.jetstream
+                .update_stream(updated)
+                .await
+                .map_err(|e| format!("update stream {} subjects: {}", name, e))?;
+            stream = self
+                .jetstream
+                .get_stream(name.clone())
+                .await
+                .map_err(|e| format!("refresh stream {} after subject update: {}", name, e))?;
+            info!(
+                stream = %name,
+                observed_subjects = ?observed_subjects,
+                desired_subject = %desired_subject,
+                "reconciled JetStream stream subjects to canonical queue lane routing"
+            );
+        }
 
         // Prime the backpressure cache so the very first request to
         // this pool sees real consumer/pending numbers instead of
@@ -585,6 +1228,16 @@ impl WorkPublisher {
 
     /// Check backpressure from cached stream info (lock-free DashMap read).
     /// Actual NATS stream.info() calls happen in the background monitor task.
+    ///
+    /// **Direct-dispatch caveat:** this check measures the pool stream's
+    /// pending count. When HRW routes to a worker's private subject
+    /// (`sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`)
+    /// the pool count can read low while the chosen worker's inbox is
+    /// saturated. The first-chunk timeout in `proxy::stream_generate_response`
+    /// is the safety net: on timeout, `republish_to_pool` redrives the work
+    /// item onto the lane's pool subject so any healthy matching worker can
+    /// pick it up. Tighter per-worker admission is M5+ work (tracked
+    /// alongside the §6 mixed-pool fairness scheduler).
     fn check_backpressure(&self, pool: &str) -> Result<(), String> {
         if let Some(info) = self.stream_info_cache.get(pool) {
             if info.num_consumers == 0 {
@@ -664,7 +1317,8 @@ impl WorkPublisher {
         pool: &str,
         endpoint: &str,
         model: &str,
-        _bundle: &str,
+        bundle: &str,
+        engine: &str,
         gpu: &str,
         bundle_config_hash: &str,
         items: Vec<rmpv::Value>,
@@ -685,13 +1339,13 @@ impl WorkPublisher {
         // extra fields. v4 gave us uniqueness but nothing else.
         let request_id = uuid::Uuid::now_v7().to_string();
         let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
-        let total_items = if endpoint == "score" {
+        let total_items = if endpoint == "score" || endpoint == "generate" {
             1
         } else {
             items.len() as u32
         };
 
-        let subject = work_subject(model, pool);
+        let subject = work_subject(pool, gpu, bundle, model);
 
         // Set up result collector (DashMap — lock-free per-key insert)
         let (tx, rx) = oneshot::channel();
@@ -713,6 +1367,11 @@ impl WorkPublisher {
             .unwrap_or_default()
             .as_secs_f64();
 
+        // Generation queue fallback carries trace context. Encode /
+        // score / extract intentionally keep the pre-generation queue
+        // hot path and wire shape: no OTel lookup, no envelope fields.
+        let (traceparent, tracestate) = Self::trace_context_for_endpoint(endpoint);
+
         // Every work item in a request shares the same pool / model /
         // params block. `WorkItemRef` borrows these values so we don't
         // pay N × `Option<Vec<String>> / Option<serde_json::Value>`
@@ -723,11 +1382,14 @@ impl WorkPublisher {
             model,
             pool,
             gpu,
+            engine,
             bundle_config_hash,
             router_id: &self.router_id,
             reply_subject: &reply_subject,
             params,
             timestamp,
+            traceparent: traceparent.as_deref(),
+            tracestate: tracestate.as_deref(),
         };
 
         // Running publishes concurrently via `try_join_all` means
@@ -735,12 +1397,20 @@ impl WorkPublisher {
         // so on any error we have to unwind the collector entry
         // and whatever payloads the successful siblings already
         // wrote to the offload store, otherwise both leak until
-        // the result-timeout sweep kicks in (review feedback on
-        // PR #716).
+        // the result-timeout sweep kicks in.
         let publish_outcome = if endpoint == "score" {
             self.publish_score(&shared, items, &subject)
                 .await
                 .map(|ack| vec![ack])
+        } else if endpoint == "generate" {
+            // Discard the cached encoded bytes — this code path is
+            // the batch-style publish used by other callers; the
+            // streaming generate path takes its own dedicated branch
+            // in `publish_generate_streaming` and is the only place
+            // that needs the bytes for direct-dispatch republishing.
+            self.publish_generate(&shared, &subject)
+                .await
+                .map(|(ack, _encoded)| vec![ack])
         } else {
             // JetStream publishes issue the send-and-receive-ack cycle
             // asynchronously per message, so a batch of N items that
@@ -797,6 +1467,18 @@ impl WorkPublisher {
         Ok((request_id, rx))
     }
 
+    fn trace_context_for_endpoint(endpoint: &str) -> (Option<String>, Option<String>) {
+        if Self::should_propagate_queue_trace(endpoint) {
+            crate::observability::propagation::inject_current_context()
+        } else {
+            (None, None)
+        }
+    }
+
+    fn should_propagate_queue_trace(endpoint: &str) -> bool {
+        InferenceEndpoint::from_label(endpoint).injects_queue_trace_context()
+    }
+
     /// Publish the single work item for a score request.
     ///
     /// The score endpoint collapses the whole request into one work
@@ -824,6 +1506,7 @@ impl WorkPublisher {
             operation: shared.endpoint,
             model_id: shared.model,
             profile_id: "default",
+            engine: shared.engine,
             pool_name: shared.pool,
             machine_profile: shared.gpu,
             item: None,
@@ -837,10 +1520,15 @@ impl WorkPublisher {
             score_items: Some(&score_items),
             labels: shared.params.labels.as_deref(),
             output_schema: shared.params.output_schema.as_ref(),
+            generate: shared.params.generate.as_ref(),
+            routing_key: shared.params.routing_key.as_deref(),
+            prompt_cache_key: shared.params.prompt_cache_key.as_deref(),
             bundle_config_hash: shared.bundle_config_hash,
             router_id: shared.router_id,
             reply_subject: shared.reply_subject,
             timestamp: shared.timestamp,
+            traceparent: shared.traceparent,
+            tracestate: shared.tracestate,
         };
 
         let mut encoded =
@@ -884,6 +1572,576 @@ impl WorkPublisher {
             .map_err(|e| format!("publish score work item: {}", e))
     }
 
+    /// Publish a generation work item and wire up a streaming collector.
+    /// Replaces the walking-skeleton path: instead of a one-shot
+    /// ``WorkResult`` collector, this installs a [`StreamCollector`]
+    /// that accumulates per-chunk envelopes and fires a
+    /// [`StreamOutcome`] when the worker emits a terminal chunk.
+    ///
+    /// Returns the request id plus a receiver for the outcome. The
+    /// caller should await with whatever timeout / cancellation logic
+    /// is appropriate; the gateway-side timeout taxonomy lives in
+    /// ``handlers/proxy.rs`` (Phase F).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_generate_streaming(
+        &self,
+        target: PublishTarget,
+        engine: &str,
+        bundle_config_hash: &str,
+        params: &WorkParams,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<StreamOutcome>,
+            std::sync::Arc<tokio::sync::Notify>,
+        ),
+        String,
+    > {
+        let model = target.model().to_string();
+        let pool = target.pool().to_string();
+        let machine_profile = target.machine_profile().to_string();
+        // Reuse the same JetStream stream + backpressure plumbing as
+        // the batch path. The stream collector replaces ResultCollector.
+        self.ensure_stream(&pool).await?;
+        self.check_backpressure(&pool)?;
+
+        if params.generate.is_none() {
+            return Err("generate request missing 'prompt' / 'max_new_tokens'".to_string());
+        }
+
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
+        let subject = target.subject();
+        let pool_fallback_subject = target.as_pool_fallback().subject();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Set up the streaming aggregator before publishing the work so
+        // that a fast worker can't beat us to the inbox.
+        let (tx, rx) = oneshot::channel::<StreamOutcome>();
+        let mut collector = StreamCollector::new(tx, model.clone(), pool.clone());
+        collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
+        // Capture the activity handle before the collector moves into
+        // ``pending_streams`` so the caller never has to re-look it up
+        // (eliminates the .expect() race window where an error path
+        // could remove the collector before the handler retrieves it).
+        let activity = collector.activity_handle();
+        self.pending_streams.insert(request_id.clone(), collector);
+
+        // M5: capture the W3C Trace Context once for envelope injection.
+        let (traceparent, tracestate) = crate::observability::propagation::inject_current_context();
+
+        let shared = WorkItemShared {
+            request_id: &request_id,
+            endpoint: "generate",
+            model: &model,
+            pool: &pool,
+            gpu: &machine_profile,
+            engine,
+            bundle_config_hash,
+            router_id: &self.router_id,
+            reply_subject: &reply_subject,
+            params,
+            timestamp,
+            traceparent: traceparent.as_deref(),
+            tracestate: tracestate.as_deref(),
+        };
+
+        let publish_started = Instant::now();
+        let (ack, encoded) = match self.publish_generate(&shared, &subject).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.pending_streams.remove(&request_id);
+                return Err(e);
+            }
+        };
+        // Cache the encoded payload on the collector so
+        // ``republish_to_pool`` can re-issue the same item without
+        // re-running the full serialization pipeline.
+        if let Some(mut entry) = self.pending_streams.get_mut(&request_id) {
+            entry.encoded_payload = Some(encoded);
+        }
+
+        // Fire-and-forget ack monitoring, matching the encode/score path.
+        tokio::spawn(async move {
+            if let Err(e) = ack.await {
+                warn!(error = %e, "JetStream ack failed for generate (message may be lost)");
+                metrics::QUEUE_ACK_FAILURES.inc();
+            }
+        });
+
+        metrics::QUEUE_PUBLISH_SECONDS
+            .with_label_values(&["generate"])
+            .observe(publish_started.elapsed().as_secs_f64());
+        metrics::QUEUE_ITEMS_PUBLISHED
+            .with_label_values(&["generate"])
+            .observe(1.0);
+
+        Ok((request_id, rx, activity))
+    }
+
+    /// Streaming-SSE variant of [`Self::publish_generate_streaming`].
+    /// Installs a per-chunk broadcast tap on the collector *before*
+    /// publishing the work item, so an SSE handler can subscribe to
+    /// every non-stale chunk delivered through ``handle_chunk``
+    /// without racing against early arrivals. Returns the request id,
+    /// the terminal-outcome receiver (unchanged from the
+    /// non-SSE path — the SSE handler uses the broadcast receiver for
+    /// per-chunk forwarding, but the oneshot remains the canonical
+    /// completion signal for cancel-guard defuse and timing
+    /// accounting), and the broadcast receiver to forward chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_generate_streaming_sse(
+        &self,
+        target: PublishTarget,
+        engine: &str,
+        bundle_config_hash: &str,
+        params: &WorkParams,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<StreamOutcome>,
+            broadcast::Receiver<ChunkEnvelope>,
+        ),
+        String,
+    > {
+        let model = target.model().to_string();
+        let pool = target.pool().to_string();
+        let machine_profile = target.machine_profile().to_string();
+        self.ensure_stream(&pool).await?;
+        self.check_backpressure(&pool)?;
+
+        if params.generate.is_none() {
+            return Err("generate request missing 'prompt' / 'max_new_tokens'".to_string());
+        }
+
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
+        let subject = target.subject();
+        let pool_fallback_subject = target.as_pool_fallback().subject();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Install the collector + broadcast tap atomically before
+        // publishing so no chunk envelope can race past the
+        // subscriber.
+        let (tx, rx) = oneshot::channel::<StreamOutcome>();
+        let mut collector = StreamCollector::new(tx, model.clone(), pool.clone());
+        collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
+        let chunk_rx = collector.install_chunk_tap();
+        self.pending_streams.insert(request_id.clone(), collector);
+
+        // M5: capture the W3C Trace Context once for envelope injection.
+        let (traceparent, tracestate) = crate::observability::propagation::inject_current_context();
+
+        let shared = WorkItemShared {
+            request_id: &request_id,
+            endpoint: "generate",
+            model: &model,
+            pool: &pool,
+            gpu: &machine_profile,
+            engine,
+            bundle_config_hash,
+            router_id: &self.router_id,
+            reply_subject: &reply_subject,
+            params,
+            timestamp,
+            traceparent: traceparent.as_deref(),
+            tracestate: tracestate.as_deref(),
+        };
+
+        let publish_started = Instant::now();
+        let (ack, encoded) = match self.publish_generate(&shared, &subject).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.pending_streams.remove(&request_id);
+                return Err(e);
+            }
+        };
+        if let Some(mut entry) = self.pending_streams.get_mut(&request_id) {
+            entry.encoded_payload = Some(encoded);
+        }
+        tokio::spawn(async move {
+            if let Err(e) = ack.await {
+                warn!(error = %e, "JetStream ack failed for generate-sse (message may be lost)");
+                metrics::QUEUE_ACK_FAILURES.inc();
+            }
+        });
+
+        metrics::QUEUE_PUBLISH_SECONDS
+            .with_label_values(&["generate"])
+            .observe(publish_started.elapsed().as_secs_f64());
+        metrics::QUEUE_ITEMS_PUBLISHED
+            .with_label_values(&["generate"])
+            .observe(1.0);
+
+        Ok((request_id, rx, chunk_rx))
+    }
+
+    /// Forcibly drop a streaming collector — used by the HTTP handler
+    /// when the client disconnects or a timeout fires, so the inbox
+    /// subscriber stops accumulating chunks that nobody will read.
+    pub fn drop_pending_stream(&self, request_id: &str) {
+        self.pending_streams.remove(request_id);
+    }
+
+    /// Terminate an in-flight streaming request with a synthetic
+    /// error outcome and fire the result sender so the HTTP handler
+    /// returns immediately. Used by :meth:`handle_nak` when both the
+    /// direct-dispatched worker NAKed *and* the pool republish failed
+    /// — the request is unrecoverable, and the existing first-chunk
+    /// timeout would otherwise make the client wait the full window
+    /// for a response we already know will fail.
+    ///
+    /// The synthesised :class:`StreamOutcome` carries ``error =
+    /// Some({code, message})``; the HTTP handler maps the code to
+    /// the canonical OpenAI error envelope and HTTP status.
+    fn fail_pending_stream(&self, request_id: &str, code: &str, message: &str) {
+        let Some((_, mut collector)) = self.pending_streams.remove(request_id) else {
+            return;
+        };
+        let outcome = crate::queue::streaming::StreamOutcome {
+            text: String::new(),
+            finish_reason: "error".to_string(),
+            usage: None,
+            attempt_id: collector.current_attempt_id.clone().unwrap_or_default(),
+            ttft_ms: None,
+            tpot_ms: None,
+            error: Some(crate::queue::streaming::ChunkError {
+                code: code.to_string(),
+                message: message.to_string(),
+            }),
+            tool_calls: None,
+            logprobs: None,
+            candidates: Vec::new(),
+        };
+        if let Some(sender) = collector.sender.take() {
+            if sender.send(outcome).is_err() {
+                debug!(
+                    request_id = %request_id,
+                    "terminal-error outcome receiver dropped (client likely disconnected)"
+                );
+            }
+        }
+    }
+
+    /// Cancel signal. Publishes an empty message on the core
+    /// NATS subject ``cancel.{router_id}.{request_id}`` so any worker
+    /// currently processing this request stops driving the adapter and
+    /// emits a terminal ``finish_reason: "cancelled"`` chunk. Best-
+    /// effort: silently no-ops if the core NATS client is not yet
+    /// available (deployments without an active NATS connection).
+    pub async fn publish_cancel(&self, request_id: &str) {
+        let client_opt = { self.nats_client.read().await.clone() };
+        let Some(client) = client_opt else {
+            return;
+        };
+        let subject = format!("cancel.{}.{}", self.router_id, request_id);
+        if let Err(e) = client.publish(subject, Vec::new().into()).await {
+            warn!(error = %e, request_id = %request_id, "failed to publish cancel signal");
+        }
+    }
+
+    /// Returns ``true`` iff the streaming collector for ``request_id``
+    /// has already observed at least one chunk — used to label
+    /// cancellation metrics (`before_first_chunk` vs `mid_stream`).
+    pub fn stream_observed_first_chunk(&self, request_id: &str) -> bool {
+        self.pending_streams
+            .get(request_id)
+            .map(|entry| entry.value().first_chunk_at.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of the collector's timing state for inter-chunk timeout
+    /// arming. Returns ``(first_chunk_at, last_chunk_at)``.
+    pub fn stream_chunk_timing(
+        &self,
+        request_id: &str,
+    ) -> Option<(Option<Instant>, Option<Instant>)> {
+        self.pending_streams
+            .get(request_id)
+            .map(|entry| (entry.value().first_chunk_at, entry.value().last_chunk_at))
+    }
+
+    /// Publish a single generation work item (walking-skeleton path).
+    ///
+    /// Mirrors ``publish_score``: one WorkItem per HTTP request, no fan-out.
+    /// All sampling fields live under ``shared.params.generate`` and travel
+    /// through the typed ``WorkItemRef.generate`` field; the worker reads
+    /// them via ``WorkItem.get("generate")`` in
+    /// ``processors/streaming.py:StreamingProcessor.process``.
+    async fn publish_generate(
+        &self,
+        shared: &WorkItemShared<'_>,
+        subject: &str,
+    ) -> Result<(jetstream::context::PublishAckFuture, Vec<u8>), String> {
+        if shared.params.generate.is_none() {
+            return Err("generate request missing 'prompt' / 'max_new_tokens'".to_string());
+        }
+
+        let work_item_id = format!("{}.0", shared.request_id);
+        let mut ref_item = WorkItemRef {
+            work_item_id: &work_item_id,
+            request_id: shared.request_id,
+            item_index: 0,
+            total_items: 1,
+            operation: shared.endpoint,
+            model_id: shared.model,
+            profile_id: "default",
+            engine: shared.engine,
+            pool_name: shared.pool,
+            machine_profile: shared.gpu,
+            item: None,
+            payload_ref: None,
+            output_types: shared.params.output_types.as_deref(),
+            instruction: shared.params.instruction.as_deref(),
+            is_query: shared.params.is_query,
+            options: shared.params.options.as_ref(),
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: shared.params.labels.as_deref(),
+            output_schema: shared.params.output_schema.as_ref(),
+            generate: shared.params.generate.as_ref(),
+            routing_key: shared.params.routing_key.as_deref(),
+            prompt_cache_key: shared.params.prompt_cache_key.as_deref(),
+            bundle_config_hash: shared.bundle_config_hash,
+            router_id: shared.router_id,
+            reply_subject: shared.reply_subject,
+            timestamp: shared.timestamp,
+            traceparent: shared.traceparent,
+            tracestate: shared.tracestate,
+        };
+
+        let mut encoded =
+            rmp_serde::to_vec_named(&ref_item).map_err(|e| format!("msgpack encode: {}", e))?;
+
+        // Offload large generate work items (e.g. multi-MB document images) to
+        // the object store so they don't exceed NATS's max payload — mirrors
+        // the encode/score paths. The blob is the ``generate`` params alone
+        // (base64-string image data, so it stays serde_json::Value-decodable on
+        // the sidecar). ``payload_ref`` lives at ``{request_id}_0.bin``; the
+        // sidecar fetches + inlines it before handing the work item to Python.
+        let offload_key;
+        if encoded.len() > PAYLOAD_OFFLOAD_THRESHOLD {
+            let generate = shared
+                .params
+                .generate
+                .as_ref()
+                .ok_or_else(|| "generate request missing params for offload".to_string())?;
+            let gen_blob = rmp_serde::to_vec_named(generate)
+                .map_err(|e| format!("msgpack encode offloaded generate: {}", e))?;
+            offload_key = format!("{}_0.bin", shared.request_id);
+            if let Err(e) = self.payload_store.put(&offload_key, &gen_blob).await {
+                warn!(error = %e, "failed to offload generate payload, sending inline");
+            } else {
+                ref_item.generate = None;
+                ref_item.payload_ref = Some(&offload_key);
+                encoded = rmp_serde::to_vec_named(&ref_item)
+                    .map_err(|e| format!("msgpack encode offloaded generate item: {}", e))?;
+                self.offloaded_streams.insert(shared.request_id.to_string());
+                metrics::QUEUE_PAYLOAD_OFFLOADS.inc();
+            }
+        }
+
+        // Defense-in-depth dedup: stamp `Nats-Msg-Id` = request_id so a
+        // gateway-side retry (or a duplicate publish racing on the same
+        // request) collapses to a single message inside the stream's
+        // dedup window. This is the *initial* attempt, so the bare
+        // request_id is the right identity; the pool-republish path uses
+        // a generation-suffixed id (see `republish_to_pool`) precisely so
+        // it is NOT swallowed as a duplicate of this publish.
+        let ack = self
+            .jetstream
+            .send_publish(
+                subject.to_string(),
+                jetstream::message::PublishMessage::build()
+                    .message_id(shared.request_id)
+                    .payload(encoded.clone().into()),
+            )
+            .await
+            .map_err(|e| format!("publish generate work item: {}", e))?;
+        Ok((ack, encoded))
+    }
+
+    /// Re-issue a previously-published generation item to the
+    /// pool subject after a NAK or first-chunk timeout. Idempotent via
+    /// the per-collector ``republished`` guard so a concurrent NAK +
+    /// timeout race cannot double-publish.
+    ///
+    /// Returns `Ok(true)` if the item was republished, `Ok(false)` if
+    /// nothing was done (no collector, no cached payload, or already
+    /// republished), and `Err` only on a NATS publish failure.
+    ///
+    /// Thin wrapper over [`Self::republish_to_pool_outcome`] that keeps
+    /// the historical `bool` contract for callers (the first-chunk-timeout
+    /// paths in `proxy.rs` / `sse.rs`) that only need "did we republish".
+    ///
+    /// H9 — a refused republish (token bucket empty) collapses to
+    /// `Ok(false)` for backward compatibility; callers that need to
+    /// distinguish "refused / rate-limited" from "nothing to do"
+    /// should call [`Self::republish_to_pool_status`] instead. The
+    /// metric `sie_gateway_generation_fallback_refused_total` records
+    /// the rate-limit case independently of either contract.
+    pub async fn republish_to_pool(
+        &self,
+        request_id: &str,
+        reason: &'static str,
+    ) -> Result<bool, String> {
+        Ok(matches!(
+            self.republish_to_pool_outcome(request_id, reason).await?,
+            RepublishOutcome::Republished
+        ))
+    }
+
+    /// Three-state variant of [`Self::republish_to_pool`] for the
+    /// first-chunk-timeout call sites that need to distinguish "rate
+    /// limited" (surface a 504) from "nothing was republished" (surface
+    /// the underlying first_chunk timeout). Returns ``Ok(true)`` on a
+    /// successful republish, ``Ok(false)`` on any non-rate-limit
+    /// no-op, and ``Err(...)`` for the rate-limit refusal so the call
+    /// site doesn't have to introduce a new sentinel type. The error
+    /// string is wire-stable: ``"fallback_rate_limited"``.
+    #[allow(dead_code)] // reserved for future proxy.rs/sse.rs adoption (H9)
+    pub async fn republish_to_pool_or_rate_limited(
+        &self,
+        request_id: &str,
+        reason: &'static str,
+    ) -> Result<bool, String> {
+        match self.republish_to_pool_outcome(request_id, reason).await? {
+            RepublishOutcome::Republished => Ok(true),
+            RepublishOutcome::RateLimited => Err("fallback_rate_limited".to_string()),
+            RepublishOutcome::AlreadyRepublished | RepublishOutcome::NotPossible => Ok(false),
+        }
+    }
+
+    /// Republish variant that distinguishes "already republished" from
+    /// "nothing to republish" (see [`RepublishOutcome`]). `handle_nak`
+    /// uses it to surface a 429 when a NAK lands on a request that has
+    /// already fallen back to the pool.
+    async fn republish_to_pool_outcome(
+        &self,
+        request_id: &str,
+        reason: &'static str,
+    ) -> Result<RepublishOutcome, String> {
+        // Take a short lock to: check + flip `republished`, copy out
+        // the encoded bytes + the pool subject, bump the attempt
+        // generation. We drop the entry lock before awaiting the
+        // JetStream publish to avoid holding the DashMap shard.
+        let (subject, payload, generation, model, pool) = {
+            let Some(mut entry) = self.pending_streams.get_mut(request_id) else {
+                return Ok(RepublishOutcome::NotPossible);
+            };
+            if entry.republished {
+                return Ok(RepublishOutcome::AlreadyRepublished);
+            }
+            let Some(subject) = entry.pool_fallback_subject.clone() else {
+                return Ok(RepublishOutcome::NotPossible);
+            };
+            let Some(payload) = entry.encoded_payload.clone() else {
+                return Ok(RepublishOutcome::NotPossible);
+            };
+            // H9 — gate the first-chunk-fallback path on a per-(model,
+            // pool) token bucket. Skipped for the NAK-driven reasons
+            // because that path is already self-throttled by the
+            // worker's own NAK rate; rate-limiting it again would
+            // surface a noisy 429/504 during a single misbehaving
+            // worker draining its queue. The check happens BEFORE we
+            // flip ``entry.republished`` so a refused attempt can be
+            // retried after the bucket refills (the deadline-armed
+            // caller in proxy.rs/sse.rs already breaks out on the
+            // refused signal — no spin).
+            if reason == "first_chunk_timeout"
+                && !self.try_take_fallback_token(entry.model.as_str(), entry.pool.as_str())
+            {
+                metrics::GENERATION_FALLBACK_REFUSED_TOTAL
+                    .with_label_values(&[
+                        &metrics::sanitize_model_label(entry.model.as_str()),
+                        &metrics::sanitize_label(entry.pool.as_str()),
+                        "rate_limited",
+                    ])
+                    .inc();
+                return Ok(RepublishOutcome::RateLimited);
+            }
+            entry.republished = true;
+            let gen = entry.bump_attempt_generation();
+            (
+                subject,
+                payload,
+                gen,
+                entry.model.clone(),
+                entry.pool.clone(),
+            )
+        };
+
+        info!(
+            request_id = %request_id,
+            reason = reason,
+            generation = generation,
+            subject = %subject,
+            "republishing generate item to pool"
+        );
+
+        // Defense-in-depth dedup: stamp a generation-suffixed
+        // `Nats-Msg-Id`. It must differ from the initial publish's
+        // `request_id` (and from any earlier republish) so JetStream's
+        // dedup window does NOT swallow the republish as a duplicate of
+        // the original — that would silently break the fallback. The
+        // `attempt_generation` monotonically increases per republish, so
+        // `{request_id}#{generation}` is unique per attempt while still
+        // collapsing an accidental duplicate republish of the *same*
+        // generation.
+        let msg_id = format!("{}#{}", request_id, generation);
+        match self
+            .jetstream
+            .send_publish(
+                subject.clone(),
+                jetstream::message::PublishMessage::build()
+                    .message_id(&msg_id)
+                    .payload(payload.into()),
+            )
+            .await
+        {
+            Ok(ack) => {
+                metrics::ROUTING_FALLBACK_TOTAL
+                    .with_label_values(&[
+                        &metrics::sanitize_model_label(model.as_str()),
+                        &metrics::sanitize_label(pool.as_str()),
+                        reason,
+                    ])
+                    .inc();
+                // Drive the ack to completion in the background; failure
+                // here just becomes a delivery loss surfaced by the
+                // existing inter-chunk timeout.
+                tokio::spawn(async move {
+                    if let Err(e) = ack.await {
+                        warn!(error = %e, "JetStream ack failed for republish");
+                        metrics::QUEUE_ACK_FAILURES.inc();
+                    }
+                });
+                Ok(RepublishOutcome::Republished)
+            }
+            Err(e) => {
+                // Roll back the `republished`/`attempt_generation`
+                // flip so a downstream NAK or first-chunk-timeout can
+                // retry. Without this, the request hangs until
+                // overall-timeout: subsequent `republish_to_pool` calls
+                // hit the `entry.republished` short-circuit at the top
+                // and return `AlreadyRepublished`, but the worker never
+                // received anything to begin with.
+                if let Some(mut entry) = self.pending_streams.get_mut(request_id) {
+                    entry.republished = false;
+                    entry.rewind_attempt_generation();
+                }
+                Err(format!("republish to pool failed: {}", e))
+            }
+        }
+    }
+
     /// Publish one work item of an encode / extract / other fan-out
     /// endpoint. Returns the per-item JetStream `PublishAckFuture` so
     /// callers can await acks in the background.
@@ -904,6 +2162,7 @@ impl WorkPublisher {
             operation: shared.endpoint,
             model_id: shared.model,
             profile_id: "default",
+            engine: shared.engine,
             pool_name: shared.pool,
             machine_profile: shared.gpu,
             item: Some(&item_value),
@@ -917,10 +2176,15 @@ impl WorkPublisher {
             score_items: None,
             labels: shared.params.labels.as_deref(),
             output_schema: shared.params.output_schema.as_ref(),
+            generate: shared.params.generate.as_ref(),
+            routing_key: shared.params.routing_key.as_deref(),
+            prompt_cache_key: shared.params.prompt_cache_key.as_deref(),
             bundle_config_hash: shared.bundle_config_hash,
             router_id: shared.router_id,
             reply_subject: shared.reply_subject,
             timestamp: shared.timestamp,
+            traceparent: shared.traceparent,
+            tracestate: shared.tracestate,
         };
 
         let mut encoded =
@@ -1003,6 +2267,14 @@ impl WorkPublisher {
         self: &Arc<Self>,
         client: &async_nats::Client,
     ) -> Result<(), String> {
+        // Stash the client so the cancel path can publish
+        // ``cancel.{router_id}.{request_id}`` without re-acquiring a
+        // handle from the nats manager.
+        {
+            let mut slot = self.nats_client.write().await;
+            *slot = Some(client.clone());
+        }
+
         let inbox_subject = format!("_INBOX.{}.>", self.router_id);
 
         let subscriber = client
@@ -1032,7 +2304,9 @@ impl WorkPublisher {
             // Fast-path: extract request_id without full deserialization.
             // DashMap contains_key is lock-free.
             if let Some(request_id) = extract_request_id_fast(&msg.payload) {
-                if !self.pending_results.contains_key(request_id) {
+                if !self.pending_results.contains_key(request_id)
+                    && !self.pending_streams.contains_key(request_id)
+                {
                     debug!(
                         request_id = %request_id,
                         "fast-path skip: result for unknown request"
@@ -1042,18 +2316,234 @@ impl WorkPublisher {
                 }
             }
 
-            let result: WorkResult = match rmp_serde::from_slice(&msg.payload) {
-                Ok(r) => r,
+            // Decode the msgpack payload exactly once into an
+            // `rmpv::Value`, peek the `kind` discriminator on the decoded
+            // value, then convert the *same* value into the typed
+            // envelope via `rmpv::ext::from_value` — no second decode
+            // from the raw slice. The previous code re-decoded the
+            // payload up to three times per chunk (`is_chunk_envelope`
+            // peek + `is_nak_envelope` peek + the typed `from_slice`),
+            // which is the hot path for streaming generation.
+            let value: rmpv::Value = match rmp_serde::from_slice(&msg.payload) {
+                Ok(v) => v,
                 Err(e) => {
-                    warn!(error = %e, "failed to decode inbox result");
+                    warn!(error = %e, "failed to decode inbox payload");
                     continue;
                 }
             };
 
-            self.handle_result(result).await;
+            match envelope_kind(&value) {
+                // Chunk envelopes feed the streaming aggregator.
+                Some("chunk") => match rmpv::ext::from_value::<ChunkEnvelope>(value) {
+                    Ok(chunk) => self.handle_chunk(chunk).await,
+                    Err(e) => warn!(error = %e, "failed to decode chunk envelope"),
+                },
+                // Worker-emitted NAK. The publisher republishes the
+                // cached work item to the pool subject; if the republish
+                // fails we surface a transport-style terminal outcome to
+                // the HTTP handler.
+                Some("nak") => match rmpv::ext::from_value::<NakEnvelope>(value) {
+                    Ok(nak) => self.handle_nak(nak).await,
+                    Err(e) => warn!(error = %e, "failed to decode nak envelope"),
+                },
+                // Anything else (encode/score/extract WorkResults — an
+                // array-shaped payload, or a map with an unknown/absent
+                // `kind`) flows to the ResultCollector path.
+                _ => match rmpv::ext::from_value::<WorkResult>(value) {
+                    Ok(result) => self.handle_result(result).await,
+                    Err(e) => warn!(error = %e, "failed to decode inbox result"),
+                },
+            }
         }
 
         warn!("inbox subscription ended");
+    }
+
+    /// Handle a worker-emitted NAK envelope.
+    ///
+    /// Maps the envelope's ``reason`` field into one of a small
+    /// closed set of metric labels so dashboards can distinguish
+    /// the failure mode (KV budget vs. model-not-loaded vs.
+    /// worker-shutting-down) without unbounded cardinality.
+    /// Unknown reasons fall through to the generic ``nak`` bucket so
+    /// we never lose data on a forward-compat addition.
+    async fn handle_nak(&self, nak: NakEnvelope) {
+        let reason: &'static str = match nak.reason.as_str() {
+            "kv_budget" => "nak_kv_budget",
+            "model_not_loaded" => "nak_model_not_loaded",
+            "worker_shutting_down" => "nak_worker_shutting_down",
+            other => {
+                // Surface unknown reasons via a warn so a future worker
+                // adding a new reason without a matching gateway update is
+                // visible in logs. Production degrades gracefully via the
+                // `"nak"` catch-all bucket (bounded cardinality). We do
+                // NOT `debug_assert!` here: a newer worker emitting a
+                // not-yet-known reason is a legitimate forward-compat
+                // scenario, and the assert would crash debug/test builds
+                // for any non-empty unknown reason rather than degrade.
+                tracing::warn!(
+                    request_id = %nak.request_id,
+                    reason = %other,
+                    "unknown NAK reason — bucketing as `nak`"
+                );
+                "nak"
+            }
+        };
+        match self
+            .republish_to_pool_outcome(&nak.request_id, reason)
+            .await
+        {
+            Ok(RepublishOutcome::Republished) => debug!(
+                request_id = %nak.request_id,
+                reason = %nak.reason,
+                "NAK observed, republished to pool"
+            ),
+            Ok(RepublishOutcome::AlreadyRepublished) => {
+                // The request already fell back to the pool (via an
+                // earlier NAK or the first-chunk timeout) and is now
+                // being NAKed again. There is nothing further to retry,
+                // so don't leave the client hanging until the first-chunk
+                // timeout — surface a 429 immediately, mirroring the
+                // pool-republish-failed arm below.
+                let (model, pool) = self
+                    .pending_streams
+                    .get(&nak.request_id)
+                    .map(|e| (e.value().model.clone(), e.value().pool.clone()))
+                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+                metrics::RATE_LIMIT_TOTAL
+                    .with_label_values(&[
+                        &metrics::sanitize_model_label(&model),
+                        &metrics::sanitize_label(&pool),
+                        "kv_pool_saturated",
+                    ])
+                    .inc();
+                warn!(
+                    request_id = %nak.request_id,
+                    reason = %nak.reason,
+                    "NAK on already-republished request — surfacing 429 to client"
+                );
+                self.fail_pending_stream(
+                    &nak.request_id,
+                    "rate_limit_exceeded",
+                    "KV cache saturated and request already retried on the pool",
+                );
+            }
+            Ok(RepublishOutcome::NotPossible) => debug!(
+                request_id = %nak.request_id,
+                "NAK observed but no republish performed (no collector or payload)"
+            ),
+            Ok(RepublishOutcome::RateLimited) => {
+                // H9 — only the `first_chunk_timeout` reason path
+                // exercises the bucket; the NAK path always supplies
+                // a NAK-reason string and never trips this arm. Log
+                // defensively in case a future refactor routes a NAK
+                // through the bucket, so the request isn't silently
+                // stranded.
+                warn!(
+                    request_id = %nak.request_id,
+                    reason = %nak.reason,
+                    "NAK republish unexpectedly rate-limited — surfacing 429 to client"
+                );
+                self.fail_pending_stream(
+                    &nak.request_id,
+                    "rate_limit_exceeded",
+                    "fallback rate limit reached during NAK republish",
+                );
+            }
+            Err(e) => {
+                // Pool republish failed for an already-NAKed request:
+                // both the direct-dispatched worker and the pool target
+                // are unable to service the request. Surface a typed
+                // ``rate_limit_exceeded`` outcome so the HTTP handler
+                // returns 429 + Retry-After immediately instead of
+                // waiting out the first-chunk timeout.
+                // Fall back to ``unknown`` labels rather than the
+                // empty string when the entry was already torn down by
+                // a concurrent terminal — avoids polluting the metric
+                // with empty label series that don't render in
+                // dashboards.
+                let (model, pool) = self
+                    .pending_streams
+                    .get(&nak.request_id)
+                    .map(|e| (e.value().model.clone(), e.value().pool.clone()))
+                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+                metrics::RATE_LIMIT_TOTAL
+                    .with_label_values(&[
+                        &metrics::sanitize_model_label(&model),
+                        &metrics::sanitize_label(&pool),
+                        "kv_pool_saturated",
+                    ])
+                    .inc();
+                warn!(
+                    error = %e,
+                    request_id = %nak.request_id,
+                    reason = %nak.reason,
+                    "NAK republish to pool failed — surfacing 429 to client"
+                );
+                self.fail_pending_stream(
+                    &nak.request_id,
+                    "rate_limit_exceeded",
+                    "KV cache saturated and pool republish failed",
+                );
+            }
+        }
+    }
+
+    /// Apply a streaming chunk envelope to the per-request collector.
+    /// On terminal chunks, fire the outcome sender and remove the entry.
+    async fn handle_chunk(&self, chunk: ChunkEnvelope) {
+        let request_id = chunk.request_id.clone();
+        let applied = {
+            let mut entry = match self.pending_streams.get_mut(&request_id) {
+                Some(e) => e,
+                None => {
+                    debug!(request_id = %request_id, "stream chunk for unknown request");
+                    return;
+                }
+            };
+            entry.value_mut().apply(chunk)
+        };
+
+        match applied {
+            ChunkApplied::Terminal => {
+                if let Some((_, mut collector)) = self.pending_streams.remove(&request_id) {
+                    let wait_secs = collector.published_at.elapsed().as_secs_f64();
+                    let outcome = collector.build_outcome();
+                    if let (Some(sender), Some(outcome)) = (collector.sender.take(), outcome) {
+                        if sender.send(outcome).is_err() {
+                            debug!(
+                                request_id = %request_id,
+                                "terminal outcome receiver dropped (client likely disconnected)"
+                            );
+                        }
+                    }
+                    metrics::QUEUE_RESULT_WAIT
+                        .with_label_values(&["generate"])
+                        .observe(wait_secs);
+                    // Stream finished — drop any offloaded generate blob now
+                    // (the periodic reconcile is only the failure-path backstop).
+                    self.cleanup_offloaded_generate(&request_id).await;
+                }
+            }
+            ChunkApplied::SeqGap => {
+                // H6: a per-attempt seq gap means a required content
+                // chunk was lost on the worker → gateway transport.
+                // Mirror the worker's no-silent-drop guarantee on the
+                // gateway side: fail the pending stream with
+                // ``transport_failure`` so the client sees an explicit
+                // error rather than a silently shortened completion.
+                warn!(
+                    request_id = %request_id,
+                    "streaming seq gap detected — failing pending stream as transport_failure"
+                );
+                self.fail_pending_stream(
+                    &request_id,
+                    "transport_failure",
+                    "streaming chunk sequence gap (missing chunk between worker and gateway)",
+                );
+            }
+            ChunkApplied::Delta | ChunkApplied::Stale | ChunkApplied::Duplicate => {}
+        }
     }
 
     /// Drain pending result collectors on graceful shutdown.
@@ -1063,11 +2553,11 @@ impl WorkPublisher {
         let poll_interval = Duration::from_millis(100);
 
         loop {
-            if self.pending_results.is_empty() {
+            if self.pending_results.is_empty() && self.pending_streams.is_empty() {
                 info!("all pending queue results drained");
                 return;
             }
-            let count = self.pending_results.len();
+            let count = self.pending_results.len() + self.pending_streams.len();
             if Instant::now() >= deadline {
                 warn!(
                     remaining = count,
@@ -1084,6 +2574,7 @@ impl WorkPublisher {
 
         // Force-complete remaining collectors so senders don't leak
         self.cleanup_expired().await;
+        self.cleanup_pending_streams().await;
     }
 
     /// Clean up expired result collectors.
@@ -1102,10 +2593,111 @@ impl WorkPublisher {
                 warn!(request_id = %key, "result collector timed out");
                 let results: Vec<WorkResult> = collector.results.drain(..).flatten().collect();
                 if let Some(sender) = collector.sender.take() {
-                    let _ = sender.send(results);
+                    if sender.send(results).is_err() {
+                        debug!(
+                            request_id = %key,
+                            "expired-result receiver dropped (client likely disconnected)"
+                        );
+                    }
                 }
             }
             self.cleanup_offloaded_payloads(key, *total).await;
+        }
+
+        // Reconcile offloaded generate blobs: any tracked request whose stream
+        // is no longer pending has terminated (success cleans up at the
+        // terminal funnel; this is the backstop for failure/timeout paths,
+        // including the sync ``fail_pending_stream`` which can't await).
+        //
+        // Check BOTH in-flight maps: ``publish_generate`` is shared with the
+        // batch generate arm (``publish_work``), which tracks requests in
+        // ``pending_results`` rather than ``pending_streams``. Excluding only
+        // ``pending_streams`` would let this sweep delete a batch request's
+        // offloaded blob mid-flight and break redelivery. (That arm is dead
+        // today — all generate goes through the streaming path — but this keeps
+        // the reconcile correct if it's ever wired up.)
+        let orphaned: Vec<String> = self
+            .offloaded_streams
+            .iter()
+            .filter(|id| {
+                !self.pending_streams.contains_key(id.key())
+                    && !self.pending_results.contains_key(id.key())
+            })
+            .map(|id| id.key().clone())
+            .collect();
+        for request_id in orphaned {
+            self.cleanup_offloaded_generate(&request_id).await;
+        }
+    }
+
+    /// Delete an offloaded generate blob (``{request_id}_0.bin``) and drop its
+    /// tracking entry. Best-effort + idempotent: a no-op when the request had
+    /// no offload, so it is safe to call on every stream termination.
+    async fn cleanup_offloaded_generate(&self, request_id: &str) {
+        // No-op for non-offloaded requests.
+        if !self.offloaded_streams.contains(request_id) {
+            return;
+        }
+        let key = format!("{request_id}_0.bin");
+        // Delete the blob FIRST and only drop the tracker on success, so a
+        // transient delete failure leaves the entry for the next periodic
+        // reconcile to retry instead of leaking the blob.
+        match self.payload_store.delete(&key).await {
+            Ok(()) => {
+                self.offloaded_streams.remove(request_id);
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "failed to delete offloaded generate payload; will retry on next reconcile"
+                );
+            }
+        }
+    }
+
+    async fn cleanup_pending_streams(&self) {
+        let expired: Vec<String> = self
+            .pending_streams
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for key in expired {
+            if let Some((_, mut collector)) = self.pending_streams.remove(&key) {
+                warn!(request_id = %key, "stream collector timed out");
+                let wait_secs = collector.published_at.elapsed().as_secs_f64();
+                let outcome = collector.build_outcome().unwrap_or_else(|| StreamOutcome {
+                    text: String::new(),
+                    finish_reason: "error".to_string(),
+                    usage: None,
+                    attempt_id: collector.current_attempt_id.clone().unwrap_or_default(),
+                    ttft_ms: None,
+                    tpot_ms: None,
+                    error: Some(ChunkError {
+                        code: "shutdown".to_string(),
+                        message: "gateway shutdown before stream completed".to_string(),
+                    }),
+                    tool_calls: None,
+                    logprobs: None,
+                    candidates: Vec::new(),
+                });
+                if let Some(sender) = collector.sender.take() {
+                    if sender.send(outcome).is_err() {
+                        debug!(
+                            request_id = %key,
+                            "shutdown-drain receiver dropped (client likely disconnected)"
+                        );
+                    }
+                }
+                metrics::QUEUE_RESULT_WAIT
+                    .with_label_values(&["generate"])
+                    .observe(wait_secs);
+                // Drop any offloaded blob for this shutdown-dropped stream. The
+                // periodic reconcile filters against ``pending_streams``, so an
+                // entry removed here would otherwise be missed at shutdown.
+                self.cleanup_offloaded_generate(&key).await;
+            }
         }
     }
 
@@ -1157,10 +2749,95 @@ pub fn encode_response(
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct WorkItem {
+        pub work_item_id: String,
+        pub request_id: String,
+        pub item_index: u32,
+        pub total_items: u32,
+        pub operation: String,
+        pub model_id: String,
+        #[serde(default)]
+        pub profile_id: String,
+        #[serde(default)]
+        pub engine: String,
+        pub pool_name: String,
+        pub machine_profile: String,
+        #[serde(default)]
+        pub item: Option<rmpv::Value>,
+        #[serde(default)]
+        pub payload_ref: Option<String>,
+        #[serde(default)]
+        pub output_types: Option<Vec<String>>,
+        #[serde(default)]
+        pub instruction: Option<String>,
+        #[serde(default)]
+        pub is_query: bool,
+        #[serde(default)]
+        pub options: Option<serde_json::Value>,
+        #[serde(default)]
+        pub query_item: Option<rmpv::Value>,
+        #[serde(default)]
+        pub query_payload_ref: Option<String>,
+        #[serde(default)]
+        pub score_items: Option<Vec<rmpv::Value>>,
+        #[serde(default)]
+        pub labels: Option<Vec<String>>,
+        #[serde(default)]
+        pub output_schema: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generate: Option<GenerateParams>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routing_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prompt_cache_key: Option<String>,
+        #[serde(default)]
+        pub bundle_config_hash: String,
+        #[serde(default)]
+        pub router_id: String,
+        pub reply_subject: String,
+        #[serde(default)]
+        pub timestamp: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub traceparent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tracestate: Option<String>,
+    }
+
     #[test]
     fn test_stream_name() {
         assert_eq!(stream_name("default"), "WORK_POOL_default");
         assert_eq!(stream_name("eval-l4"), "WORK_POOL_eval-l4");
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_replaces_legacy_subject() {
+        let observed = vec!["sie.work.*.default".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_drops_extra_subjects() {
+        let observed = vec![
+            "sie.work.*.default".to_string(),
+            "sie.work.other.*.*.*".to_string(),
+        ];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            Some(vec!["sie.work.default.*.*.*".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_canonical_stream_subjects_noops_when_exact() {
+        let observed = vec!["sie.work.default.*.*.*".to_string()];
+        assert_eq!(
+            canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
+            None
+        );
     }
 
     #[test]
@@ -1180,35 +2857,87 @@ mod tests {
         assert_eq!(normalize_model_id("a b"), "a_b");
     }
 
+    /// Cross-language fixture for the worker_id normalization contract.
+    ///
+    /// Mirrors `packages/sie_sdk/tests/test_worker_id_normalization.py` —
+    /// both languages share the same NATS subject and the two sides MUST
+    /// produce byte-identical tokens or direct-dispatch silently misses
+    /// (workstream G-M5).
+    ///
+    /// Worker IDs flow through `normalize_model_id` (same function as the
+    /// model id, since both targets are single NATS subject tokens with
+    /// the same legality rules). Case is **preserved** intentionally —
+    /// NATS subjects are case-sensitive and operator-set worker names
+    /// commonly include mixed case; lowercasing would surprise operators
+    /// and force a cross-language migration with no benefit.
+    #[test]
+    fn test_worker_id_normalization_cross_language() {
+        // unchanged: clean ascii with hyphens
+        assert_eq!(normalize_model_id("worker-1"), "worker-1");
+        // case preserved (NOT lowercased — see doc comment above)
+        assert_eq!(normalize_model_id("Worker-1"), "Worker-1");
+        assert_eq!(normalize_model_id("WORKER"), "WORKER");
+        // dotted Kubernetes pod hostname → each dot → "_dot_"
+        assert_eq!(
+            normalize_model_id("sie-worker-7d9f-default-0.sie-worker.default.svc"),
+            "sie-worker-7d9f-default-0_dot_sie-worker_dot_default_dot_svc"
+        );
+        // whitespace → "_"
+        assert_eq!(normalize_model_id("my worker"), "my_worker");
+        // wildcard tokens → "_". Each `.` → `_dot_` and `*` → `_`, so
+        // `worker.*.foo` = `worker` + `_dot_` + `_` + `_dot_` + `foo`.
+        assert_eq!(normalize_model_id("worker.*.foo"), "worker_dot___dot_foo");
+        // leading/trailing whitespace is preserved as `_` (we do NOT trim —
+        // Python helper rejects whitespace-only ids upstream; non-empty
+        // padding is mapped through the same scrub).
+        assert_eq!(normalize_model_id("  worker-1  "), "__worker-1__");
+        // consecutive separators are NOT collapsed (no benefit; would
+        // diverge from Python and break this fixture)
+        assert_eq!(normalize_model_id("worker--1"), "worker--1");
+    }
+
     #[test]
     fn test_work_subject() {
         assert_eq!(
-            work_subject("BAAI/bge-m3", "default"),
-            "sie.work.BAAI__bge-m3.default"
+            work_subject("default", "rtx6000", "default", "BAAI/bge-m3"),
+            "sie.work.default.rtx6000.default.BAAI__bge-m3"
         );
         assert_eq!(
-            work_subject("my-model", "eval-l4"),
-            "sie.work.my-model.eval-l4"
+            work_subject("eval-l4", "l4-spot", "sglang", "my-model"),
+            "sie.work.eval-l4.l4-spot.sglang.my-model"
+        );
+        assert_eq!(
+            work_subject_worker(
+                "default",
+                "rtx6000",
+                "sglang",
+                "Qwen/Qwen3.6-27B",
+                "worker-0.svc"
+            ),
+            "sie.work.default.rtx6000.sglang.Qwen__Qwen3_dot_6-27B.worker-0_dot_svc"
         );
     }
 
-    /// Regression: model IDs containing `.` must produce exactly 4
-    /// subject tokens (`sie`, `work`, `{normalized_model}`, `{pool}`) so
-    /// the worker's consumer filter `sie.work.*.{pool}` matches them.
+    /// Regression: model IDs containing `.` must produce exactly 6
+    /// subject tokens (`sie`, `work`, `{pool}`, `{machine_profile}`,
+    /// `{bundle}`, `{normalized_model}`) so the worker's consumer filter
+    /// `sie.work.{pool}.{machine_profile}.{bundle}.*` matches them.
     #[test]
     fn test_work_subject_token_count_with_dotted_model() {
-        let subj = work_subject("vidore/colqwen2.5-v0.2", "l4");
+        let subj = work_subject("default", "l4", "default", "vidore/colqwen2.5-v0.2");
         let tokens: Vec<&str> = subj.split('.').collect();
         assert_eq!(
             tokens.len(),
-            4,
-            "subject {subj} must have 4 tokens to match sie.work.*.{{pool}}"
+            6,
+            "subject {subj} must have 6 tokens to match sie.work.{{pool}}.{{machine_profile}}.{{bundle}}.*"
         );
         assert_eq!(tokens[0], "sie");
         assert_eq!(tokens[1], "work");
+        assert_eq!(tokens[2], "default");
         assert_eq!(tokens[3], "l4");
-        // Token[2] contains no '.' (it's the normalized model id).
-        assert!(!tokens[2].contains('.'));
+        assert_eq!(tokens[4], "default");
+        // Token[5] contains no '.' (it's the normalized model id).
+        assert!(!tokens[5].contains('.'));
     }
 
     #[test]
@@ -1221,6 +2950,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "BAAI/bge-m3".to_string(),
             profile_id: String::new(),
+            engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
@@ -1237,10 +2967,15 @@ mod tests {
             score_items: None,
             labels: None,
             output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
             bundle_config_hash: "abc123".to_string(),
             router_id: "router-1".to_string(),
             reply_subject: "_INBOX.r1.req-1".to_string(),
             timestamp: 1700000000.0,
+            traceparent: None,
+            tracestate: None,
         };
 
         let encoded = rmp_serde::to_vec_named(&item).unwrap();
@@ -1266,6 +3001,25 @@ mod tests {
         assert_eq!(decoded.bundle_config_hash, "abc123");
         assert_eq!(decoded.router_id, "router-1");
         assert_eq!(decoded.reply_subject, "_INBOX.r1.req-1");
+        assert_eq!(decoded.engine, "pytorch");
+    }
+
+    #[test]
+    fn test_work_item_engine_back_compat() {
+        let mut without_engine = serde_json::Map::new();
+        without_engine.insert("work_item_id".into(), "req-1.0".into());
+        without_engine.insert("request_id".into(), "req-1".into());
+        without_engine.insert("item_index".into(), 0.into());
+        without_engine.insert("total_items".into(), 1.into());
+        without_engine.insert("operation".into(), "encode".into());
+        without_engine.insert("model_id".into(), "m".into());
+        without_engine.insert("pool_name".into(), "default".into());
+        without_engine.insert("machine_profile".into(), "".into());
+        without_engine.insert("reply_subject".into(), "_INBOX.x.y".into());
+        let encoded = rmp_serde::to_vec_named(&without_engine).unwrap();
+        let decoded: WorkItem = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.engine, "");
+        assert_eq!(decoded.operation, "encode");
     }
 
     /// Regression: `WorkItemRef` is the borrowed view we use on the
@@ -1283,6 +3037,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "BAAI/bge-m3".to_string(),
             profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
@@ -1299,10 +3054,15 @@ mod tests {
             score_items: None,
             labels: Some(vec!["exp-a".to_string()]),
             output_schema: Some(serde_json::json!({"kind": "dense"})),
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
             bundle_config_hash: "hash123".to_string(),
             router_id: "router-1".to_string(),
             reply_subject: "_INBOX.router-1.req-ref".to_string(),
             timestamp: 1_700_000_000.5,
+            traceparent: None,
+            tracestate: None,
         };
 
         let item_value = owned.item.clone().unwrap();
@@ -1319,6 +3079,7 @@ mod tests {
             operation: &owned.operation,
             model_id: &owned.model_id,
             profile_id: &owned.profile_id,
+            engine: &owned.engine,
             pool_name: &owned.pool_name,
             machine_profile: &owned.machine_profile,
             item: Some(&item_value),
@@ -1332,10 +3093,15 @@ mod tests {
             score_items: None,
             labels: Some(&labels),
             output_schema: Some(&output_schema),
+            generate: None,
+            routing_key: owned.routing_key.as_deref(),
+            prompt_cache_key: owned.prompt_cache_key.as_deref(),
             bundle_config_hash: &owned.bundle_config_hash,
             router_id: &owned.router_id,
             reply_subject: &owned.reply_subject,
             timestamp: owned.timestamp,
+            traceparent: owned.traceparent.as_deref(),
+            tracestate: owned.tracestate.as_deref(),
         };
 
         let owned_bytes = rmp_serde::to_vec_named(&owned).unwrap();
@@ -1390,6 +3156,7 @@ mod tests {
             operation: "encode".to_string(),
             model_id: "model".to_string(),
             profile_id: String::new(),
+            engine: String::new(),
             pool_name: "default".to_string(),
             machine_profile: String::new(),
             item: None,
@@ -1403,10 +3170,15 @@ mod tests {
             score_items: None,
             labels: None,
             output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
             bundle_config_hash: String::new(),
             router_id: String::new(),
             reply_subject: "_INBOX.r1.req-2".to_string(),
             timestamp: 0.0,
+            traceparent: None,
+            tracestate: None,
         };
 
         let encoded = rmp_serde::to_vec_named(&item).unwrap();
@@ -1613,5 +3385,640 @@ mod tests {
         let data = [0xc2, 0x03];
         let rest = skip_msgpack_value(&data).unwrap();
         assert_eq!(rest, &[0x03]);
+    }
+
+    // ── GenerateInput wire-shape regression ──────────────────────
+
+    /// Original prompt-only wire shape: a flat ``{prompt, max_new_tokens, ...}`` map
+    /// must still decode into ``GenerateParams { input: Prompt }``. That
+    /// guarantees in-flight prompt-only work items remain readable after
+    /// the chat-completions surface deploys the enum.
+    #[test]
+    fn test_generate_params_decodes_slice02_prompt_shape() {
+        let wire = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("prompt"),
+                rmpv::Value::from("hello world"),
+            ),
+            (
+                rmpv::Value::from("max_new_tokens"),
+                rmpv::Value::Integer(32u64.into()),
+            ),
+            (rmpv::Value::from("temperature"), rmpv::Value::F64(0.7)),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+        let decoded: GenerateParams = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded.input {
+            GenerateInput::Prompt { prompt } => assert_eq!(prompt, "hello world"),
+            GenerateInput::Messages { .. } => panic!("expected Prompt variant"),
+        }
+        assert_eq!(decoded.max_new_tokens, 32);
+        assert_eq!(decoded.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_generate_params_decodes_messages_shape() {
+        let wire = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("messages"),
+                rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                    (rmpv::Value::from("role"), rmpv::Value::from("user")),
+                    (rmpv::Value::from("content"), rmpv::Value::from("hi")),
+                ])]),
+            ),
+            (
+                rmpv::Value::from("max_new_tokens"),
+                rmpv::Value::Integer(8u64.into()),
+            ),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+        let decoded: GenerateParams = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded.input {
+            GenerateInput::Messages { messages } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, "user");
+                assert_eq!(messages[0].content, "hi");
+            }
+            GenerateInput::Prompt { .. } => panic!("expected Messages variant"),
+        }
+        assert_eq!(decoded.max_new_tokens, 8);
+    }
+
+    /// CRITICAL transport invariant: a generate work item carrying images
+    /// must decode as ``serde_json::Value`` — that's the type the sidecar's
+    /// ``WorkItem.generate`` uses, and ``serde_json::Value`` CANNOT hold a
+    /// msgpack ``bin`` (rmp_serde errors "invalid type: byte array"). Image
+    /// bytes therefore travel as a base64 *string* in ``ChatImage.data``.
+    /// This test pins that contract: had ``ChatImage.data`` been
+    /// ``#[serde(with = "serde_bytes")]`` (bin), the serde_json decode below
+    /// would fail and the feature would break through the real
+    /// NATS→sidecar→worker path.
+    #[test]
+    fn test_chat_message_images_survive_sidecar_serde_json_value() {
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "what is this?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![ChatImage {
+                data: "aGVsbG8=".to_string(), // base64 of b"hello"
+                format: Some("png".to_string()),
+            }]),
+            content_parts: None,
+        };
+        let mp = rmp_serde::to_vec_named(&msg).unwrap();
+        // (1) sidecar step: decode as serde_json::Value — MUST succeed.
+        let as_value: serde_json::Value = rmp_serde::from_slice(&mp)
+            .expect("ChatMessage with images must decode as serde_json::Value (no msgpack bin)");
+        assert_eq!(as_value["images"][0]["data"], "aGVsbG8=");
+        // (2) sidecar re-encode → worker typed decode: base64 survives.
+        let mp2 = rmp_serde::to_vec_named(&as_value).unwrap();
+        let back: ChatMessage = rmp_serde::from_slice(&mp2).unwrap();
+        let imgs = back.images.expect("images survive round-trip");
+        assert_eq!(imgs[0].data, "aGVsbG8=");
+        assert_eq!(imgs[0].format.as_deref(), Some("png"));
+    }
+
+    /// ``content_parts`` (the #1294 interleaving layout) must survive the same
+    /// NATS→sidecar(``serde_json::Value``)→worker round-trip, preserving the
+    /// text↔image ORDER and the internally-tagged shape the worker parses
+    /// (``{"type":"text","text":…}`` / ``{"type":"image"}``).
+    #[test]
+    fn test_content_parts_ordering_survives_sidecar_round_trip() {
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "Page 1:Page 2:which has a cat?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![
+                ChatImage {
+                    data: "aW1nQQ==".to_string(),
+                    format: Some("png".to_string()),
+                },
+                ChatImage {
+                    data: "aW1nQg==".to_string(),
+                    format: Some("png".to_string()),
+                },
+            ]),
+            content_parts: Some(vec![
+                ContentPart::Text {
+                    text: "Page 1:".to_string(),
+                },
+                ContentPart::Image,
+                ContentPart::Text {
+                    text: "Page 2:".to_string(),
+                },
+                ContentPart::Image,
+                ContentPart::Text {
+                    text: "which has a cat?".to_string(),
+                },
+            ]),
+        };
+        let mp = rmp_serde::to_vec_named(&msg).unwrap();
+        // (1) sidecar step: decode as serde_json::Value — MUST succeed.
+        let as_value: serde_json::Value = rmp_serde::from_slice(&mp).expect(
+            "ChatMessage with content_parts must decode as serde_json::Value (no msgpack bin)",
+        );
+        let parts = as_value["content_parts"]
+            .as_array()
+            .expect("content_parts is an array");
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Page 1:");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[3]["type"], "image");
+        assert_eq!(parts[4]["text"], "which has a cat?");
+        // (2) sidecar re-encode → worker typed decode: order survives.
+        let mp2 = rmp_serde::to_vec_named(&as_value).unwrap();
+        let back: ChatMessage = rmp_serde::from_slice(&mp2).unwrap();
+        let back_parts = back
+            .content_parts
+            .expect("content_parts survive round-trip");
+        assert!(matches!(&back_parts[0], ContentPart::Text { text } if text == "Page 1:"));
+        assert!(matches!(back_parts[1], ContentPart::Image));
+        assert!(matches!(back_parts[3], ContentPart::Image));
+        assert!(matches!(&back_parts[4], ContentPart::Text { text } if text == "which has a cat?"));
+    }
+
+    /// A round-trip through msgpack must preserve the shape — verifies
+    /// that the ``flatten`` / ``untagged`` combination encodes the input
+    /// arm back into the flat wire shape rather than nesting it under
+    /// an ``input:`` key.
+    #[test]
+    fn test_generate_params_prompt_round_trips_flat() {
+        let params = GenerateParams {
+            input: GenerateInput::Prompt {
+                prompt: "hi".to_string(),
+            },
+            max_new_tokens: 16,
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&params).unwrap();
+        // Decode back as raw value to assert the flat key set.
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let map = match &value {
+            rmpv::Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let keys: Vec<&str> = map
+            .iter()
+            .filter_map(|(k, _)| match k {
+                rmpv::Value::String(s) => s.as_str(),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&"prompt"), "missing prompt key in {keys:?}");
+        assert!(
+            keys.contains(&"max_new_tokens"),
+            "missing max_new_tokens in {keys:?}"
+        );
+        assert!(!keys.contains(&"input"), "input wrapper leaked: {keys:?}");
+        assert!(!keys.contains(&"messages"), "messages leaked: {keys:?}");
+    }
+
+    /// Routing-affinity fields appear on the wire when set; otherwise they
+    /// are omitted entirely (``skip_serializing_if = "Option::is_none"``)
+    /// so a prompt-only worker decoding the bytes still sees the same key
+    /// set it expects.
+    #[test]
+    fn test_work_item_omits_inert_routing_fields_when_none() {
+        let item = WorkItem {
+            work_item_id: "req-x.0".to_string(),
+            request_id: "req-x".to_string(),
+            item_index: 0,
+            total_items: 1,
+            operation: "generate".to_string(),
+            model_id: "m".to_string(),
+            profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
+            pool_name: "p".to_string(),
+            machine_profile: "g".to_string(),
+            item: None,
+            payload_ref: None,
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: None,
+            output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+            bundle_config_hash: String::new(),
+            router_id: String::new(),
+            reply_subject: "_INBOX.r.req-x".to_string(),
+            timestamp: 1.0,
+            traceparent: None,
+            tracestate: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&item).unwrap();
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let map = match &value {
+            rmpv::Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let keys: Vec<&str> = map
+            .iter()
+            .filter_map(|(k, _)| match k {
+                rmpv::Value::String(s) => s.as_str(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !keys.contains(&"routing_key"),
+            "routing_key leaked when None"
+        );
+        assert!(
+            !keys.contains(&"prompt_cache_key"),
+            "prompt_cache_key leaked when None"
+        );
+    }
+
+    // ── GrammarSpec wire shape ────────────────────────────────────────
+
+    /// Pin the JSON wire shape for ``GrammarSpec::JsonSchema`` against
+    /// the Python ``sie_server.types.grammar.GrammarSpec`` dataclass.
+    /// Worker-side deserialization reads ``{kind, value, label?,
+    /// strict?}`` — any change here is a wire-break.
+    #[test]
+    fn test_grammar_spec_json_schema_round_trip() {
+        let spec = GrammarSpec::JsonSchema {
+            value: serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+            label: Some("math_response".to_string()),
+            strict: Some(true),
+        };
+        let encoded = serde_json::to_value(&spec).expect("serialize");
+        // Wire shape check — these field names are Python-readable.
+        assert_eq!(encoded["kind"], "json_schema");
+        assert_eq!(encoded["value"]["type"], "object");
+        assert_eq!(encoded["label"], "math_response");
+        assert_eq!(encoded["strict"], true);
+        let decoded: GrammarSpec = serde_json::from_value(encoded).expect("round-trip deserialize");
+        assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn test_grammar_spec_regex_round_trip() {
+        let spec = GrammarSpec::Regex {
+            value: r"[A-Z]{3}-\d{4}".to_string(),
+            label: None,
+            strict: None,
+        };
+        let encoded = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(encoded["kind"], "regex");
+        assert_eq!(encoded["value"], r"[A-Z]{3}-\d{4}");
+        // None fields skip-serialise so the worker doesn't see explicit
+        // nulls.
+        let obj = encoded.as_object().expect("object");
+        assert!(!obj.contains_key("label"));
+        assert!(!obj.contains_key("strict"));
+        let decoded: GrammarSpec = serde_json::from_value(encoded).expect("round-trip deserialize");
+        assert_eq!(decoded, spec);
+    }
+
+    /// :class:`GenerateParams` carries the grammar through the work
+    /// envelope; absence must serialise as field-omitted (not ``null``)
+    /// so a prompt-only worker decoding a grammar-bearing work item does not
+    /// trip over an unexpected key.
+    #[test]
+    fn test_generate_params_omits_absent_grammar() {
+        let params = GenerateParams {
+            input: GenerateInput::Prompt {
+                prompt: "Hi".to_string(),
+            },
+            max_new_tokens: 8,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&params).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("grammar"),
+            "grammar must skip-serialise when None: {v}"
+        );
+    }
+
+    #[test]
+    fn test_generate_params_carries_grammar_when_present() {
+        let params = GenerateParams {
+            input: GenerateInput::Prompt {
+                prompt: "Hi".to_string(),
+            },
+            max_new_tokens: 8,
+            grammar: Some(GrammarSpec::Regex {
+                value: r"\d+".to_string(),
+                label: None,
+                strict: None,
+            }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(v["grammar"]["kind"], "regex");
+        assert_eq!(v["grammar"]["value"], r"\d+");
+    }
+
+    // ── M5: W3C Trace Context envelope round-trip ────────────────────
+
+    /// When the gateway has captured a `traceparent` from the inbound
+    /// request, it must land on the work envelope verbatim so the
+    /// worker can extract it and continue the trace. The two fields
+    /// are paired in the wire shape so a single round-trip exercises
+    /// both.
+    #[test]
+    fn test_work_item_carries_traceparent_when_set() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let ts = "vendor=value";
+        let item = WorkItem {
+            work_item_id: "req-tp.0".to_string(),
+            request_id: "req-tp".to_string(),
+            item_index: 0,
+            total_items: 1,
+            operation: "generate".to_string(),
+            model_id: "m".to_string(),
+            profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
+            pool_name: "p".to_string(),
+            machine_profile: "g".to_string(),
+            item: None,
+            payload_ref: None,
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: None,
+            output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+            bundle_config_hash: String::new(),
+            router_id: String::new(),
+            reply_subject: "_INBOX.r.req-tp".to_string(),
+            timestamp: 1.0,
+            traceparent: Some(tp.to_string()),
+            tracestate: Some(ts.to_string()),
+        };
+        let bytes = rmp_serde::to_vec_named(&item).unwrap();
+        let decoded: WorkItem = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.traceparent.as_deref(), Some(tp));
+        assert_eq!(decoded.tracestate.as_deref(), Some(ts));
+    }
+
+    /// Backward-compat: when both trace fields are absent, the
+    /// msgpack must omit them entirely (not encode `null`), so a
+    /// pre-M5 worker reading the bytes sees its expected key set.
+    #[test]
+    fn test_work_item_omits_trace_fields_when_none() {
+        let item = WorkItem {
+            work_item_id: "req-tp2.0".to_string(),
+            request_id: "req-tp2".to_string(),
+            item_index: 0,
+            total_items: 1,
+            operation: "generate".to_string(),
+            model_id: "m".to_string(),
+            profile_id: "default".to_string(),
+            engine: "pytorch".to_string(),
+            pool_name: "p".to_string(),
+            machine_profile: "g".to_string(),
+            item: None,
+            payload_ref: None,
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: None,
+            output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+            bundle_config_hash: String::new(),
+            router_id: String::new(),
+            reply_subject: "_INBOX.r.req-tp2".to_string(),
+            timestamp: 1.0,
+            traceparent: None,
+            tracestate: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&item).unwrap();
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let map = match &value {
+            rmpv::Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let keys: Vec<&str> = map
+            .iter()
+            .filter_map(|(k, _)| match k {
+                rmpv::Value::String(s) => s.as_str(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !keys.contains(&"traceparent"),
+            "traceparent leaked when None: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"tracestate"),
+            "tracestate leaked when None: {keys:?}"
+        );
+    }
+
+    /// End-to-end gateway round-trip: an active span on the gateway
+    /// side must yield a `traceparent` on the envelope. Uses the same
+    /// `inject_current_context` helper the publisher calls in
+    /// production, so this locks the integration point.
+    #[test]
+    fn test_inject_current_context_with_active_span_populates_envelope() {
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry::Context;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::TracerProvider;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = TracerProvider::builder().build();
+        let tracer = provider.tracer("gateway-test");
+        let span = tracer.start("gateway.proxy_chat");
+        let cx = Context::current().with_span(span);
+        let _guard = cx.attach();
+
+        let (tp, _ts) = crate::observability::propagation::inject_current_context();
+        let tp = tp.expect("active span must produce a traceparent");
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+        assert_eq!(parts[1].len(), 32, "trace_id is 32 hex chars");
+        assert_eq!(parts[2].len(), 16, "span_id is 16 hex chars");
+    }
+
+    #[test]
+    fn test_queue_trace_context_stays_off_for_non_generation() {
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry::Context;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::TracerProvider;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = TracerProvider::builder().build();
+        let tracer = provider.tracer("gateway-test");
+        let span = tracer.start("gateway.proxy_request");
+        let cx = Context::current().with_span(span);
+        let _guard = cx.attach();
+
+        for endpoint in InferenceEndpoint::NON_GENERATION_QUEUE_LABELS {
+            assert!(
+                !WorkPublisher::should_propagate_queue_trace(endpoint),
+                "{endpoint} must keep the pre-generation queue hot path"
+            );
+            let (tp, ts) = WorkPublisher::trace_context_for_endpoint(endpoint);
+            assert!(tp.is_none(), "{endpoint} unexpectedly injected traceparent");
+            assert!(ts.is_none(), "{endpoint} unexpectedly injected tracestate");
+        }
+        let (tp, ts) = WorkPublisher::trace_context_for_endpoint("unknown");
+        assert!(
+            tp.is_none(),
+            "unknown endpoint unexpectedly injected traceparent"
+        );
+        assert!(
+            ts.is_none(),
+            "unknown endpoint unexpectedly injected tracestate"
+        );
+    }
+
+    #[test]
+    fn test_queue_trace_context_is_generation_only() {
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry::Context;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::TracerProvider;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = TracerProvider::builder().build();
+        let tracer = provider.tracer("gateway-test");
+        let span = tracer.start("gateway.proxy_generate");
+        let cx = Context::current().with_span(span);
+        let _guard = cx.attach();
+
+        assert!(WorkPublisher::should_propagate_queue_trace("generate"));
+        let (tp, _ts) = WorkPublisher::trace_context_for_endpoint("generate");
+        let tp = tp.expect("generate queue fallback should propagate traceparent");
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+    }
+
+    // ----- H9 — first-chunk-fallback rate limit ---------------------
+
+    /// The bucket admits exactly ``burst`` tokens immediately, then
+    /// refuses until the rate refills enough for the next whole token.
+    /// Refilling is driven by monotonic time so the test sleeps briefly
+    /// to advance the clock; the timing window is generous enough to
+    /// avoid flakes on a loaded CI runner.
+    #[test]
+    fn test_token_bucket_burst_and_refill() {
+        let mut bucket = TokenBucket::new(10.0, 3.0); // 10/s, burst 3
+                                                      // Burst exhausted in three takes.
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take(), "burst exceeded — must refuse");
+
+        // Sleep ~120ms — at 10/s that's >=1 token of refill.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(bucket.try_take(), "expected refill to permit one more take");
+    }
+
+    /// Regression for the burst cap: the bucket must NOT accumulate
+    /// tokens above ``burst`` even when idle for a long stretch. Without
+    /// the cap a quiet system would let a single noisy request drain
+    /// hours of accrued tokens at once.
+    #[test]
+    fn test_token_bucket_caps_at_burst() {
+        let mut bucket = TokenBucket::new(100.0, 2.0); // very fast refill, tiny burst
+        std::thread::sleep(Duration::from_millis(50)); // would refill 5 tokens uncapped
+                                                       // Two takes succeed (burst), the third refuses (no overflow stored).
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(
+            !bucket.try_take(),
+            "burst cap must be enforced even after a long idle window"
+        );
+    }
+
+    /// Property: drop a flurry of N > burst tries with zero sleep —
+    /// exactly ``burst`` succeed. Mirrors the gateway-side scenario where
+    /// a cold-start storm fires more first-chunk timeouts than the rate
+    /// permits and we want a deterministic, bounded number of republishes.
+    #[test]
+    fn test_token_bucket_drops_excess_attempts() {
+        let mut bucket = TokenBucket::new(5.0, 4.0); // 5/s, burst 4
+        let mut admitted = 0usize;
+        for _ in 0..20 {
+            if bucket.try_take() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 4,
+            "exactly burst-many attempts admit when the test runs faster than the refill rate"
+        );
+    }
+
+    /// Key-isolation test for the per-(model, pool) bucket map: the
+    /// rate limit must NOT cross-talk between distinct key tuples.
+    /// Models the gateway-side scenario where one pool is in a fallback
+    /// storm and a different pool's healthy traffic must be unaffected.
+    /// We exercise the keying logic directly via the same DashMap +
+    /// TokenBucket types the production code uses — no NATS / JetStream
+    /// dependency, no I/O.
+    #[test]
+    fn test_fallback_rate_limit_isolates_keys_and_drops_excess() {
+        let buckets: DashMap<String, std::sync::Mutex<TokenBucket>> = DashMap::new();
+        let rate = FALLBACK_RATE_PER_SEC_DEFAULT;
+        let burst = FALLBACK_BURST_DEFAULT;
+
+        fn try_take(
+            buckets: &DashMap<String, std::sync::Mutex<TokenBucket>>,
+            rate: f64,
+            burst: f64,
+            model: &str,
+            pool: &str,
+        ) -> bool {
+            let key = format!("{}|{}", model, pool);
+            let entry = buckets
+                .entry(key)
+                .or_insert_with(|| std::sync::Mutex::new(TokenBucket::new(rate, burst)));
+            let admitted = entry.value().lock().unwrap().try_take();
+            admitted
+        }
+
+        // Same key — admit exactly burst, then refuse.
+        let mut admitted_a = 0usize;
+        for _ in 0..30 {
+            if try_take(&buckets, rate, burst, "model-A", "pool-1") {
+                admitted_a += 1;
+            }
+        }
+        assert_eq!(admitted_a, burst as usize);
+
+        // Different model on same pool → independent bucket → full burst.
+        let mut admitted_b = 0usize;
+        for _ in 0..30 {
+            if try_take(&buckets, rate, burst, "model-B", "pool-1") {
+                admitted_b += 1;
+            }
+        }
+        assert_eq!(admitted_b, burst as usize);
+
+        // Different pool on same model → also independent.
+        let mut admitted_c = 0usize;
+        for _ in 0..30 {
+            if try_take(&buckets, rate, burst, "model-A", "pool-2") {
+                admitted_c += 1;
+            }
+        }
+        assert_eq!(admitted_c, burst as usize);
     }
 }

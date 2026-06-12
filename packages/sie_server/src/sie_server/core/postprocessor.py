@@ -1,8 +1,5 @@
 """Postprocessor protocol and implementations for output type coercion.
 
-See DESIGN.md Section 7.3.2 for specification.
-See product/roadmap.md Project 10.12 for design rationale.
-
 Postprocessors transform EncodeOutput in-place to add/convert output types:
 - MuveraPostprocessor: multivector -> dense (for ColBERT/ColPali)
 - Future: Int8Postprocessor, BinaryPostprocessor for quantization

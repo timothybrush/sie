@@ -21,6 +21,9 @@
       },
       "AssignedWorker": {
         "properties": {
+          "bundle": {
+            "type": "string"
+          },
           "gpu": {
             "type": "string"
           },
@@ -142,6 +145,559 @@
         ],
         "type": "object"
       },
+      "ChatCompletionChoice": {
+        "properties": {
+          "finish_reason": {
+            "description": "One of ``\"stop\" | \"length\" | \"tool_calls\"``. The chat surface collapses\nunknown SIE-native finish reasons to ``stop`` so strict OpenAI clients\nstill parse the response. ``_close_choice`` coerces a length-truncated\ncandidate that also produced a tool call to ``\"tool_calls\"`` per the\nOpenAI convention.",
+            "type": "string"
+          },
+          "index": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatCompletionChoiceMessage"
+          }
+        },
+        "required": [
+          "index",
+          "message",
+          "finish_reason"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionChoiceMessage": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "description": "Per-candidate tool-call list. Present when the model\nemitted one or more tool calls for this choice; absent otherwise.\nEach entry has the OpenAI shape ``{id, type:\"function\",\nfunction:{name, arguments}}`` where ``arguments`` is a JSON-encoded string."
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionMessage": {
+        "description": "One chat message in an OpenAI chat-completions request.\n\nPer the strict allow-list parser, ``content`` is either a\nplain string OR a list of content parts (``{type:\"text\"|\"input_text\",\ntext:\"...\"}``). ``image_url`` / ``input_image`` parts carrying a base64\n``data:`` URI are accepted for generation models declaring ``inputs.image`` (non-vision\nmodels reject 400 ``unsupported_field``; remote URLs reject 400\n``invalid_request``). Assistant messages that carry ``tool_calls`` may set\n``content: null``.\n\n``tool_calls`` is accepted only on ``role:\"assistant\"`` messages; each\nentry has the validated shape ``{id, type:\"function\", function:{name, arguments}}``\nwhere ``arguments`` is a JSON-encoded string (OpenAI convention).\n``tool_call_id`` is required on ``role:\"tool\"`` messages and rejected\non every other role.",
+        "properties": {
+          "content": {
+            "description": "Either a string or an array of content parts (`{type:\"text\"|\"input_text\", text:\"...\"}`). Image parts (`image_url` / `input_image`) carrying a base64 `data:` URI are accepted for generation models that declare `inputs.image`; non-vision models reject with 400 unsupported_field and remote (non-`data:`) URLs reject with 400 invalid_request. May be `null` on a `role:\"assistant\"` message that carries `tool_calls`.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "properties": {
+                    "image_url": {
+                      "description": "Image payload for `image_url` / `input_image` parts: a base64 `data:` URI, either as a bare string or as `{ \"url\": \"data:...\" }`. Remote (non-`data:`) URLs reject with 400 invalid_request.",
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "properties": {
+                            "url": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "text",
+                        "input_text",
+                        "image_url",
+                        "input_image"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "description": "One of ``\"system\" | \"user\" | \"assistant\" | \"tool\" | \"developer\"``.\n``tool`` carries multi-turn tool-call replay; ``developer`` is OpenAI's\nnewer alias for ``system`` and is normalized to ``system``. Any other\nrole rejects with 400 ``invalid_request``.",
+            "type": "string"
+          },
+          "tool_call_id": {
+            "description": "Required on `role:\"tool\"` messages (matches the assistant turn's `tool_calls[].id`). Rejected on every other role with 400 invalid_request.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_calls": {
+            "description": "OpenAI tool-call replay on `role:\"assistant\"` messages. Each entry MUST match `{id, type:\"function\", function:{name, arguments}}`; `arguments` is a JSON-encoded string. Rejected on other roles with 400.",
+            "items": {
+              "properties": {
+                "function": {
+                  "properties": {
+                    "arguments": {
+                      "description": "JSON-encoded argument string (OpenAI convention).",
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "arguments"
+                  ],
+                  "type": "object"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "function"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "function"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionRequest": {
+        "description": "OpenAI-compatible ``POST /v1/chat/completions`` request.\n\n**Strict allow-list:** unknown top-level fields reject with 400\n``unsupported_field``. Type-invalid values for accepted fields reject\nwith 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``functions`` / ``function_call`` — deprecated by OpenAI; use ``tools`` instead.\n- ``modalities``, ``audio``, ``metadata``, ``store``, ``service_tier``,\n  ``prediction``, ``reasoning_effort``, ``verbosity`` — out of scope.\n\n**Streaming:** ``stream: true`` is supported (SSE ``chat.completion.chunk``).\n``n > 1`` streaming fans candidates out as per-``choice_index``-tagged delta\nchunks with a per-choice closure carrying ``finish_reason`` (and a per-choice\n``delta.role:\"assistant\"`` once per choice) before the single global ``[DONE]``.",
+        "properties": {
+          "best_of": {
+            "description": "Generate this many candidates and return the top `n` by cumulative logprob. Integer in [1, 128]. Cross-field rule: `best_of >= n` (otherwise 400 invalid_request). Rejected with 400 unsupported_field when `stream: true` (mirrors OpenAI).",
+            "format": "int32",
+            "maximum": 128,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "chat_template_kwargs": {
+            "description": "Per-request overrides for kwargs passed to the tokenizer's\n``apply_chat_template`` call. Object whose entries are merged on\ntop of the model YAML's ``chat_template_kwargs`` (the YAML wins\nfor keys present in both — adjust the YAML when a request needs\nto defeat a baked-in default). Typical use: pass\n``{\"enable_thinking\": false}`` to the Qwen3 family to suppress\n``<think>`` reasoning on a per-request basis. Absent → only the\nmodel YAML's defaults apply."
+          },
+          "frequency_penalty": {
+            "description": "OpenAI ``frequency_penalty`` in ``[-2.0, 2.0]``; out-of-range or\nnon-numeric values yield 400 ``invalid_request``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "logit_bias": {
+            "additionalProperties": {
+              "format": "double",
+              "maximum": 100.0,
+              "minimum": -100.0,
+              "type": "number"
+            },
+            "description": "OpenAI `logit_bias` — `{token_id_string: bias_float}`. Keys must parse as integer token ids; values must be finite numbers in [-100.0, 100.0]. Map size capped at 1024 keys (request rejects with 400 invalid_request beyond the cap).",
+            "maxProperties": 1024,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "logprobs": {
+            "description": "Return per-token logprobs. Boolean. When true, the chosen token's logprob (and optionally a top-N list via `top_logprobs`) rides on each `choices[].logprobs` entry.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "lora_adapter": {
+            "description": "SIE extension: non-empty served-name of a LoRA adapter declared in the model profile's `lora_paths`. Absent → the base model. Unknown name → 400 with `param:\"lora_adapter\"`. The gateway forwards it to the worker as a top-level `lora_path` generation kwarg (SGLang then selects the adapter by served name; the sampling-params placement is an SGLang implementation detail, not part of the SIE wire contract).",
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_completion_tokens": {
+            "description": "Preferred output-token cap. Falls back to ``max_tokens`` when\nabsent. When BOTH are omitted the gateway applies a default\n(1024, override via ``SIE_GATEWAY_DEFAULT_MAX_TOKENS``) rather\nthan rejecting — matching OpenAI, where this field is optional.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "description": "Legacy compatibility — ``max_completion_tokens`` wins when both\nare present. Optional; see ``max_completion_tokens`` for the\nbehaviour when neither is supplied.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionMessage"
+            },
+            "type": "array"
+          },
+          "min_tokens": {
+            "description": "SGLang ``sampling_params.min_new_tokens``: integer ``>= 0`` capping\nhow many tokens the model must emit before any stop condition can\nfire. Use to work around models that occasionally emit the stop\ntoken as the very first decoded token (e.g. Qwen3.6 thinking-off\nunder greedy decode). Absent → sampler default (no minimum).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "n": {
+            "description": "Number of candidate completions in [1, 128]. n>1 returns a multi-entry choices array; streaming with n>1 is supported (per-choice_index delta chunks + per-choice closure chunks ride before the single global [DONE]).",
+            "format": "int32",
+            "maximum": 128,
+            "minimum": 1,
+            "nullable": true,
+            "type": "integer"
+          },
+          "parallel_tool_calls": {
+            "description": "OpenAI `parallel_tool_calls` — boolean controlling whether the model may emit multiple tool calls per turn.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "presence_penalty": {
+            "description": "OpenAI ``presence_penalty`` in ``[-2.0, 2.0]``; same validation as\n``frequency_penalty``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "prompt_cache_key": {
+            "description": "Prompt-cache hint; plumbed onto the work envelope and\nignored by the worker on the chat-completions surface.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repetition_penalty": {
+            "description": "Non-OpenAI `repetition_penalty`: float in (0.0, 2.0] (1.0 = no penalty). Absent → sampler default.",
+            "exclusiveMinimum": 0.0,
+            "format": "float",
+            "maximum": 2.0,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "response_format": {
+            "description": "OpenAI `response_format` — translated into a grammar spec on the worker. Accepted shapes: `{type:\"text\"}`, `{type:\"json_object\"}`, `{type:\"json_schema\", json_schema:{...}}`. Cannot be combined with a forcing `tool_choice` (`\"required\"` or a named function) — two competing grammars on one request reject with 400 invalid_request.",
+            "properties": {
+              "json_schema": {
+                "type": "object"
+              },
+              "type": {
+                "enum": [
+                  "text",
+                  "json_object",
+                  "json_schema"
+                ],
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "routing_key": {
+            "description": "Routing affinity hint; same plumbing as\n``prompt_cache_key``.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "safety_identifier": {
+            "description": "Accepted and silently ignored (never logged, never forwarded).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seed": {
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). Plumbed to the worker as SGLang's `sampling_params.seed`. Non-integer values reject with 400 invalid_request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop": {
+            "description": "Either a string or an array of strings, mirroring OpenAI.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "stream": {
+            "description": "SSE streaming. When true, the response is a stream of `chat.completion.chunk` events terminated by `data: [DONE]`. For n > 1: per-`choice_index` delta chunks include a per-choice `delta.role:\"assistant\"` once per choice; per-choice closure chunks carry the `finish_reason` for that choice before the global `[DONE]`. Non-boolean values reject with 400 invalid_request.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "stream_options": {
+            "additionalProperties": false,
+            "description": "OpenAI `stream_options`. Accepted sub-key: `include_usage` (boolean — when true, the gateway emits a terminal `usage` frame before `[DONE]`). Any other sub-key rejects with 400 unsupported_field. Legal with `stream:false` (options ignored).",
+            "properties": {
+              "include_usage": {
+                "description": "Emit a terminal `usage` frame before `[DONE]`.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "temperature": {
+            "description": "Sampling temperature. Finite number ``>= 0``; non-finite values reject.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tool_choice": {
+            "description": "OpenAI `tool_choice`. One of: `\"auto\"`, `\"none\"`, `\"required\"`, or `{type:\"function\", function:{name}}` (named function). Requires `tools` to be set (otherwise 400 invalid_request). `\"required\"` and named-function choices cannot be combined with `response_format` (two competing grammars; 400 invalid_request).",
+            "oneOf": [
+              {
+                "enum": [
+                  "auto",
+                  "none",
+                  "required"
+                ],
+                "type": "string"
+              },
+              {
+                "properties": {
+                  "function": {
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "type": {
+                    "enum": [
+                      "function"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "function"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "tools": {
+            "description": "OpenAI tool-calling. Array of tool specs; each tool must match `{type:\"function\", function:{name, parameters, description?}}`. With n > 1, per-candidate `tool_calls` surface on `choices[i].message.tool_calls` (non-streaming) or ride on each `choices[].delta` (streaming).",
+            "items": {
+              "properties": {
+                "function": {
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ],
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "function"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "function"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "top_k": {
+            "description": "Non-OpenAI `top_k` (Together / Fireworks / vLLM extension): integer >= 1. Absent → top-k disabled (model default).",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_logprobs": {
+            "description": "Number of alternative top tokens to return alongside each chosen token's logprob. Integer in [0, 20]. Requires `logprobs: true` when > 0 (OpenAI rule; 400 invalid_request otherwise).",
+            "format": "int32",
+            "maximum": 20,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_p": {
+            "description": "Nucleus sampling. Finite number in ``(0, 1]``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "user": {
+            "description": "OpenAI `user` — Sensitive PII. Accepted-and-dropped: debug-logged only, never persisted, never forwarded to the worker.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-sensitive": true
+          }
+        },
+        "required": [
+          "model",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionResponse": {
+        "properties": {
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionChoice"
+            },
+            "type": "array"
+          },
+          "created": {
+            "description": "Epoch seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Always ``\"chatcmpl-<request_id>\"``.",
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "object": {
+            "description": "Always ``\"chat.completion\"`` on the non-streaming endpoint.",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ChatCompletionUsage"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionUsage": {
+        "properties": {
+          "completion_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
+      },
       "ClusterSummary": {
         "properties": {
           "gpu_count": {
@@ -166,6 +722,103 @@
           "gpu_count",
           "models_loaded",
           "total_qps"
+        ],
+        "type": "object"
+      },
+      "CompletionsRequest": {
+        "description": "OpenAI-compatible ``POST /v1/completions`` request (legacy raw-prompt surface).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``echo`` — rejected with 400 ``unsupported_field``.\n- ``suffix`` — rejected with 400 ``unsupported_field``.\n- ``logprobs`` — rejected with 400 ``unsupported_field`` (the legacy\n  ``{tokens, token_logprobs}`` response shape is a follow-up; chat\n  ``logprobs`` is available on ``/v1/chat/completions``).\n- ``best_of`` — rejected with 400 ``unsupported_field`` (use chat).\n- ``n > 1`` — rejected with 400 ``unsupported_field`` (chat is the\n  multi-candidate surface). ``n == 1`` (or absent) is a no-op.\n- Batched array ``prompt`` — rejected with 400 ``unsupported_field``;\n  send one prompt string.\n\n**Streaming:** ``stream: true`` is supported (SSE ``text_completion``).\n\n**Response body wire change:** the always-null ``logprobs`` field has\nbeen dropped from the response body; SDKs that destructure\n``choices[].logprobs`` should treat absence as the new normal.",
+        "properties": {
+          "frequency_penalty": {
+            "description": "In ``[-2.0, 2.0]``; out-of-range or non-numeric values yield 400.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "description": "Positive integer; defaults to 16 (OpenAI's documented default for\ncompletions) when absent.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "n": {
+            "description": "Single-candidate only: integer `1` (or absent) accepted; `n > 1` rejects with 400 unsupported_field (use chat for multi-candidate). `n == 0` rejects with 400 invalid_request.",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "presence_penalty": {
+            "description": "In ``[-2.0, 2.0]``; out-of-range or non-numeric values yield 400.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "Single prompt string. Batched array prompts reject with 400\n``unsupported_field``.",
+            "type": "string"
+          },
+          "seed": {
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). Non-integer values reject with 400 invalid_request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop": {
+            "description": "Either a string or an array of strings, mirroring OpenAI.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "stream": {
+            "description": "SSE streaming. When true, the response is a stream of `text_completion` events terminated by `data: [DONE]`. Non-boolean values reject with 400 invalid_request.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "temperature": {
+            "description": "Sampling temperature. Finite number ``>= 0``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "top_p": {
+            "description": "Nucleus sampling. Finite number in ``(0, 1]``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "prompt"
         ],
         "type": "object"
       },
@@ -228,6 +881,28 @@
         "type": "object"
       },
       "CreatePoolRequest": {
+        "anyOf": [
+          {
+            "properties": {
+              "gpus": {
+                "minProperties": 1
+              }
+            },
+            "required": [
+              "gpus"
+            ]
+          },
+          {
+            "properties": {
+              "gpu_caps": {
+                "minProperties": 1
+              }
+            },
+            "required": [
+              "gpu_caps"
+            ]
+          }
+        ],
         "properties": {
           "bundle": {
             "type": [
@@ -235,13 +910,23 @@
               "null"
             ]
           },
+          "gpu_caps": {
+            "additionalProperties": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "gpus": {
             "additionalProperties": {
               "format": "int32",
               "minimum": 0,
               "type": "integer"
             },
-            "minProperties": 1,
             "propertyNames": {
               "type": "string"
             },
@@ -265,8 +950,7 @@
           }
         },
         "required": [
-          "name",
-          "gpus"
+          "name"
         ],
         "type": "object"
       },
@@ -677,6 +1361,157 @@
         ],
         "type": "object"
       },
+      "GenerateRequest": {
+        "description": "SIE-native blocking text-generation request.",
+        "properties": {
+          "frequency_penalty": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "grammar": {
+            "description": "Optional grammar object accepted by the gateway grammar validator."
+          },
+          "max_new_tokens": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "presence_penalty": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "prompt": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "prompt_cache_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "routing_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "safety_identifier": {
+            "description": "Sensitive PII - parsed and dropped, never logged or forwarded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop": {
+            "description": "Stop sequences for the native generate surface.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "top_p": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "prompt",
+          "max_new_tokens"
+        ],
+        "type": "object"
+      },
+      "GenerateResponse": {
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "finish_reason": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "tpot_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ttft_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GenerateUsage"
+              }
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "text",
+          "finish_reason",
+          "attempt_id"
+        ],
+        "type": "object"
+      },
+      "GenerateUsage": {
+        "properties": {
+          "completion_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
+      },
       "GpuNotConfiguredDetail": {
         "description": "``detail`` when the caller's ``X-SIE-MACHINE-PROFILE`` GPU is not in the gateway allow-list.",
         "properties": {
@@ -918,6 +1753,72 @@
         ],
         "type": "object"
       },
+      "ModelCapabilitiesWire": {
+        "description": "Capability summary surfaced on each entry of ``GET /v1/models``.\n\nMirrors the JSON shape constructed in\n``types/model.rs::to_model_info_value``. All fields are optional —\ntheir presence depends on what the model config declares.\n\nThese flags indicate that a model *supports* a task — they are NOT a\nprecision-independent quality SLA. A flag is true at the model level even\nwhen quality is profile/precision-dependent (e.g. ``sql`` quality regresses\nunder FP8; route SQL-critical traffic to a BF16 bundle via the ``sql``\nalias). Treat them as \"can do this\", not \"guaranteed to score X\".",
+        "properties": {
+          "code": {
+            "description": "Whether the model is validated for code generation — backs the\n``model=\"code\"`` alias. Informational only; never request-gated.",
+            "type": "boolean"
+          },
+          "grammar": {
+            "description": "Grammar kinds the model's active backend supports\n(``json_schema`` | ``regex`` | ``ebnf``). EBNF presence depends\non the backend: SGLang's Outlines backend does not implement\nEBNF, so a profile with ``grammar_backend: outlines`` advertises\nonly ``[\"json_schema\", \"regex\"]``; xgrammar/llguidance profiles\nadvertise all three.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "guard": {
+            "description": "Whether the model is a content-moderation / policy-check guard —\nbacks the ``model=\"guard\"`` alias. Informational only; never\nrequest-gated.",
+            "type": "boolean"
+          },
+          "lora_adapters": {
+            "description": "Union of LoRA served-names across profiles. Back-compat summary\nfor consumers that don't care about profile scope; validation\nMUST go through ``profile_lora_adapters``.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "profile_lora_adapters": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "Per-profile LoRA breakdown — keyed by profile name. Added by\nM10 so consumers needing precise routing scope don't have to\nreverse-engineer it from the union. The validation gate uses\nthis map; ``lora_adapters`` is for display only.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "sql": {
+            "description": "Whether the model targets the SQL path — backs the ``model=\"sql\"``\nalias. Informational only; never request-gated. Precision-sensitive:\nSQL quality can regress sharply under FP8, so this model-level flag is a\nsupport signal, not a per-profile quality guarantee.",
+            "type": "boolean"
+          },
+          "tools": {
+            "description": "Whether the model supports tool / function calling.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "sql",
+          "guard"
+        ],
+        "type": "object"
+      },
       "ModelConfigStatusResponse": {
         "properties": {
           "all_bundles_acked": {
@@ -989,6 +1890,17 @@
       "ModelInfoWire": {
         "description": "Wire shape aligned with ``sie_server`` ``ModelInfo`` for ``GET /v1/models``.",
         "properties": {
+          "capabilities": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ModelCapabilitiesWire",
+                "description": "Advertised model capabilities. Consumers use this to discover\nwhich features the model supports before composing a request.\n\nValidation is profile-scoped per ADR-0001 / M10 — clients\nselecting a specific profile must check\n``capabilities.profile_lora_adapters[profile_name]``, not the\n``capabilities.lora_adapters`` union summary."
+              }
+            ]
+          },
           "dims": {
             "additionalProperties": {
               "format": "int64",
@@ -1077,15 +1989,30 @@
         "type": "object"
       },
       "ModelsResponse": {
+        "description": "Response for `GET /v1/models`.\n\nHybrid shape: `object` + `data` is the OpenAI list format (consumed\nby vanilla OpenAI clients and Open WebUI for model discovery);\n`models` is the richer native shape consumed by the SIE Python/TS\nSDKs. Both describe the same set of models.",
         "properties": {
+          "data": {
+            "description": "OpenAI-shaped model objects for ecosystem compatibility.",
+            "items": {
+              "$ref": "#/components/schemas/OpenAiModelObject"
+            },
+            "type": "array"
+          },
           "models": {
+            "description": "Native SIE model info (capabilities, dims, profiles).",
             "items": {
               "$ref": "#/components/schemas/ModelInfoWire"
             },
             "type": "array"
+          },
+          "object": {
+            "description": "Always `\"list\"` (OpenAI list envelope).",
+            "type": "string"
           }
         },
         "required": [
+          "object",
+          "data",
           "models"
         ],
         "type": "object"
@@ -1263,6 +2190,75 @@
         ],
         "type": "object"
       },
+      "OpenAIErrorBody": {
+        "description": "OpenAI-shaped error body used by ``/v1/generate/{model}`` and\n``/v1/chat/completions``.",
+        "properties": {
+          "code": {
+            "description": "SIE-native discriminator, see ``http_error::openai_code``.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "param": {
+            "description": "Offending field name (e.g. ``\"messages\"``, ``\"max_completion_tokens\"``).\n``null`` when the error is not field-specific.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "description": "One of the stable types in ``http_error::openai_type``.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "type",
+          "code"
+        ],
+        "type": "object"
+      },
+      "OpenAIErrorEnvelope": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/OpenAIErrorBody"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "OpenAiModelObject": {
+        "description": "One OpenAI-shaped model object in the `data` array of\n`GET /v1/models`. Present for OpenAI-ecosystem compatibility; native\nSIE consumers read the richer [`ModelInfoWire`] entries under\n`models` instead.",
+        "properties": {
+          "created": {
+            "description": "Unix epoch seconds. SIE has no per-model creation time, so this\nis a fixed sentinel; OpenAI clients use it only for display.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Model id — the same string `/v1/chat/completions` accepts as `model`.",
+            "type": "string"
+          },
+          "object": {
+            "description": "Always `\"model\"`.",
+            "type": "string"
+          },
+          "owned_by": {
+            "description": "Always `\"sie\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by"
+        ],
+        "type": "object"
+      },
       "OutputDtype": {
         "enum": [
           "float32",
@@ -1317,6 +2313,17 @@
               "string",
               "null"
             ]
+          },
+          "gpu_caps": {
+            "additionalProperties": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "gpus": {
             "additionalProperties": {
@@ -1560,6 +2567,121 @@
         ],
         "type": "object"
       },
+      "ResponsesRequest": {
+        "description": "OpenAI-compatible ``POST /v1/responses`` request (Responses MVP).\n\n**Strict allow-list**: unknown fields reject with 400\n``unsupported_field``. Type-invalid values reject with 400 ``invalid_request``.\n\n**Known-rejected fields**:\n- ``tools`` / ``tool_choice`` — rejected with 400 ``unsupported_field``.\n- ``previous_response_id`` — rejected with 400 ``unsupported_field``\n  (Responses MVP is stateless single-turn).\n- ``reasoning`` — rejected with 400 ``unsupported_field``.\n- ``background`` — rejected with 400 ``unsupported_field``.\n- ``metadata`` — rejected with 400 ``unsupported_field``.\n- ``instructions`` — rejected with 400 ``unsupported_field``.\n- ``stream: true`` — rejected with 400 ``unsupported_field`` (SSE on\n  Responses is deferred; use ``stream: false`` or omit).\n- Multimodal ``image_url`` / ``input_image`` content parts on the array\n  form — rejected with 400 ``unsupported_field``: the Responses surface is\n  text-only. (Vision input is supported on ``/v1/chat/completions``.)",
+        "properties": {
+          "input": {
+            "description": "Either a string prompt OR an array of `{role, content}` messages (array-input support). Array form: `role` is one of `\"system\" | \"user\" | \"assistant\" | \"developer\"` (\"developer\" normalizes to \"system\"). `content` is a string or an array of text-only content parts; image parts (`image_url` / `input_image`) reject with 400 unsupported_field. The array must not be empty.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "properties": {
+                    "content": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "items": {
+                            "properties": {
+                              "text": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "text",
+                                  "input_text"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      ]
+                    },
+                    "role": {
+                      "enum": [
+                        "system",
+                        "user",
+                        "assistant",
+                        "developer"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "content"
+                  ],
+                  "type": "object"
+                },
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "max_output_tokens": {
+            "description": "Defaults to 16 (mirroring completions) when absent. Positive integer.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "seed": {
+            "description": "Best-effort determinism seed (i64 reinterpreted as u64). Non-integer values reject with 400 invalid_request.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stream": {
+            "description": "Accepted only as `false` (or absent). `true` rejects with 400 unsupported_field because Responses SSE is not supported yet.",
+            "enum": [
+              false,
+              null
+            ],
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "temperature": {
+            "description": "Sampling temperature. Finite number ``>= 0``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "top_p": {
+            "description": "Nucleus sampling. Finite number in ``(0, 1]``.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "input"
+        ],
+        "type": "object"
+      },
       "ScoreEntry": {
         "properties": {
           "item_id": {
@@ -1786,7 +2908,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.3.4"
+    "version": "0.6.4"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -1828,6 +2950,21 @@
         "summary": "Static HTML status page",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/docs": {
+      "get": {
+        "operationId": "docs_ui",
+        "responses": {
+          "200": {
+            "description": "Rendered API reference (Redoc)"
+          }
+        },
+        "security": [],
+        "summary": "Rendered, human-browsable API reference (Redoc) over the live\n`/openapi.json`. Auth-exempt (documentation, like `/openapi.json`) and\nread-only — no in-browser request console, so no token-leak surface.",
+        "tags": [
+          "docs"
         ]
       }
     },
@@ -1972,6 +3109,214 @@
         "security": [],
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "description": "OpenAI-compatible chat completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. Streaming (`stream: true`) is supported and emits SSE `chat.completion.chunk` events; `n > 1` streaming fans candidates out as per-`choice_index` delta chunks with per-choice closure chunks (each carrying `finish_reason`) before the single global `[DONE]`. Content is either a string or an array of content parts; image parts (`image_url` / `input_image`) with a base64 `data:` URI are accepted for generation models declaring `inputs.image` (non-vision/encode-only models reject 400 `unsupported_field`; remote URLs reject 400 `invalid_request`). `lora_adapter` is forwarded to the worker as a top-level `lora_path` generation kwarg.",
+        "operationId": "proxy_chat",
+        "parameters": [
+          {
+            "description": "Preferred GPU or machine profile",
+            "in": "header",
+            "name": "X-SIE-MACHINE-PROFILE",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit pool routing override",
+            "in": "header",
+            "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Client SDK version for skew warnings",
+            "in": "header",
+            "name": "X-SIE-SDK-Version",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                }
+              }
+            },
+            "description": "Chat completion response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid or unsupported request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token (inference token)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Model not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StandardApiError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Worker emitted malformed response; gateway auth enabled but no tokens configured"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Queue unavailable"
+          }
+        },
+        "tags": [
+          "inference"
+        ]
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "description": "OpenAI-compatible legacy Completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `stream: true` is supported (SSE `text_completion`). Known-rejected fields: `echo`, `suffix`, `logprobs`, `best_of`, `n > 1`, batched array `prompt` — each rejects with 400 `unsupported_field`. The response body no longer carries the always-null `logprobs` field.",
+        "operationId": "proxy_completions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompletionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Text completion response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid or unsupported request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token (inference token)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Model not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StandardApiError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Worker emitted malformed response; gateway auth enabled but no tokens configured"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Queue unavailable"
+          }
+        },
+        "summary": "`/v1/completions` — legacy OpenAI Completions (single-candidate, raw-prompt).",
+        "tags": [
+          "inference"
         ]
       }
     },
@@ -2327,7 +3672,7 @@
     },
     "/v1/embeddings": {
       "post": {
-        "description": "OpenAI-compatible embeddings proxy. A 200 response contains one embedding per input; partial or truncated internal encode success is treated as a 500 INTERNAL_ERROR instead of returning a partial 200.",
+        "description": "OpenAI-compatible embeddings proxy. A 200 response contains one embedding per input; partial or truncated internal encode success is treated as a 500 INTERNAL_ERROR instead of returning a partial 200. Every error path returns the OpenAI `{error:{message,type,param,code}}` envelope (inner SIE-native encode failures are translated), so an `openai`-client error handler works unchanged.",
         "operationId": "proxy_openai_embeddings",
         "parameters": [
           {
@@ -2346,6 +3691,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -2490,7 +3847,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StandardApiError"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2510,7 +3867,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StandardApiError"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2520,7 +3877,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BundleConflictResponse"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2530,7 +3887,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StandardApiError"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2542,7 +3899,7 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "$ref": "#/components/schemas/InferenceInternalServerErrorResponse"
+                      "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                     },
                     {
                       "$ref": "#/components/schemas/StandardApiError"
@@ -2557,7 +3914,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GatewayModelLoadFailedResponse"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2593,7 +3950,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/InferenceServiceUnavailableResponse"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2629,7 +3986,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StandardApiError"
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
                 }
               }
             },
@@ -2671,6 +4028,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -3036,6 +4405,18 @@
             }
           },
           {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Client SDK version for skew warnings",
             "in": "header",
             "name": "X-SIE-SDK-Version",
@@ -3353,6 +4734,162 @@
         "x-sie-axum-catch-all": "/v1/extract/{*model}"
       }
     },
+    "/v1/generate/{model}": {
+      "post": {
+        "description": "Blocking text generation (walking-skeleton surface). The model path parameter must use the SIE-safe ID (e.g. ``Qwen__Qwen3-4B-Instruct``); HF-style slashes are rejected with 400.",
+        "operationId": "proxy_generate",
+        "parameters": [
+          {
+            "description": "Model id. Runtime route is Axum catch-all `/v1/generate/{*model}`; clients using this OpenAPI path template should percent-encode slashes in model ids, for example `BAAI%2Fbge-m3`.",
+            "in": "path",
+            "name": "model",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Preferred GPU or machine profile",
+            "in": "header",
+            "name": "X-SIE-MACHINE-PROFILE",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit pool routing override",
+            "in": "header",
+            "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Client SDK version for skew warnings",
+            "in": "header",
+            "name": "X-SIE-SDK-Version",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerateResponse"
+                }
+              }
+            },
+            "description": "Generated text response"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningResponse"
+                }
+              }
+            },
+            "description": "Worker provisioning in progress"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token (inference token)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Model not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StandardApiError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Worker emitted malformed response; gateway auth enabled but no tokens configured"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Queue unavailable or model loading"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Generation timeout"
+          }
+        },
+        "tags": [
+          "inference"
+        ],
+        "x-sie-axum-catch-all": "/v1/generate/{*model}"
+      }
+    },
     "/v1/models": {
       "get": {
         "operationId": "get_models",
@@ -3456,6 +4993,47 @@
         "x-sie-axum-catch-all": "/v1/models/{*model}"
       }
     },
+    "/v1/moderations": {
+      "post": {
+        "description": "OpenAI-compatible moderations endpoint. Not implemented: SIE serves operator-provided models only and has no moderation model or governance store yet (Tier 0). The route is registered so the surface is discoverable and returns an explicit 501 `not_implemented` rather than a 404 — never a silent 'not flagged', which would be an unsafe lie about content safety.",
+        "operationId": "proxy_moderations",
+        "responses": {
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token (inference token)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Gateway auth enabled but no tokens configured"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Moderations not implemented"
+          }
+        },
+        "tags": [
+          "inference"
+        ]
+      }
+    },
     "/v1/pools": {
       "get": {
         "operationId": "list_pools",
@@ -3516,7 +5094,7 @@
                 }
               }
             },
-            "description": "Pool created"
+            "description": "Pool created, renewed, or updated"
           },
           "400": {
             "content": {
@@ -3765,6 +5343,88 @@
         ]
       }
     },
+    "/v1/responses": {
+      "post": {
+        "description": "OpenAI Responses API (MVP). Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `input` is either a string prompt OR an array of `{role, content}` messages. Known-rejected fields: `tools`, `tool_choice`, `previous_response_id`, `reasoning`, `background`, `metadata`, `instructions` — each rejects with 400 `unsupported_field`. `stream: true` is rejected (Responses SSE is deferred). Multimodal image content parts reject with 400 `unsupported_field` on the array form.",
+        "operationId": "proxy_responses",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response object"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid or unsupported request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StandardApiError"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token (inference token)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Model not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StandardApiError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Worker emitted malformed response; gateway auth enabled but no tokens configured"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAIErrorEnvelope"
+                }
+              }
+            },
+            "description": "Queue unavailable"
+          }
+        },
+        "summary": "`/v1/responses` — OpenAI Responses API (MVP, stateless single-turn).",
+        "tags": [
+          "inference"
+        ]
+      }
+    },
     "/v1/score/{model}": {
       "post": {
         "description": "Mixed-success batches return 200 with only successful items; the response carries no per-item error envelope. For per-item error visibility, send single-item batches.",
@@ -3795,6 +5455,18 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit engine routing override",
+            "in": "header",
+            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [

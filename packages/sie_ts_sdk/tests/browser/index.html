@@ -61,7 +61,7 @@
 
       // Check that we can instantiate the client
       const client = new SIEClient('http://localhost:8080');
-      addLog('Client instantiated: ' + (client !== null));
+      addLog('Client instantiated: ' + (client instanceof SIEClient));
       addLog('Client has encode method: ' + (typeof client.encode === 'function'));
       addLog('Client has score method: ' + (typeof client.score === 'function'));
       addLog('Client has extract method: ' + (typeof client.extract === 'function'));

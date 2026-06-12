@@ -3,7 +3,7 @@
 Provides MaxSim computation for client-side scoring when query and document
 multivectors are already available (e.g., retrieved from a vector database).
 
-Per DESIGN.md Section 8.4, this enables the "encode once, score many" pattern:
+This enables the "encode once, score many" pattern:
 1. Encode documents once and store multivectors in a vector DB
 2. At query time, encode query and compute MaxSim locally
 3. Avoid re-encoding documents for each query

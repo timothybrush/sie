@@ -7,6 +7,10 @@ use tracing::{info, warn};
 use crate::state::worker_registry::WorkerRegistry;
 use crate::types::WorkerStatusMessage;
 
+const HEALTH_SUBJECT: &str = "sie.health.>";
+const RESUBSCRIBE_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(30);
+
 pub struct NatsHealthManager {
     registry: Arc<WorkerRegistry>,
     cancel_tx: tokio::sync::watch::Sender<()>,
@@ -28,14 +32,15 @@ impl NatsHealthManager {
         &self,
         client: &async_nats::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sub = client.subscribe("sie.health.>").await?;
-        info!("subscribed to sie.health.>");
+        let sub = subscribe_health(client).await?;
+        info!(subject = HEALTH_SUBJECT, "subscribed to NATS health");
 
         let registry = Arc::clone(&self.registry);
+        let client = client.clone();
         let mut cancel_rx = self.cancel_rx.clone();
 
         tokio::spawn(async move {
-            run_subscription(registry, sub, &mut cancel_rx).await;
+            run_subscription_supervised(registry, client, sub, &mut cancel_rx).await;
         });
 
         Ok(())
@@ -50,9 +55,12 @@ impl NatsHealthManager {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let unhealthy = registry.check_heartbeats().await;
-                        for url in &unhealthy {
+                        let sweep = registry.check_heartbeats().await;
+                        for url in &sweep.unhealthy {
                             warn!(url = %url, "worker missed heartbeat (NATS)");
+                        }
+                        for url in &sweep.evicted {
+                            info!(url = %url, "evicted stale worker after missed heartbeats (NATS)");
                         }
                     }
                     _ = cancel_rx.changed() => {
@@ -69,29 +77,135 @@ impl NatsHealthManager {
     }
 }
 
-async fn run_subscription(
+async fn subscribe_health(
+    client: &async_nats::Client,
+) -> Result<async_nats::Subscriber, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(client.subscribe(HEALTH_SUBJECT).await?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionExit {
+    Ended { messages: u64 },
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct ResubscribeBackoff {
+    initial: Duration,
+    next: Duration,
+    max: Duration,
+}
+
+impl ResubscribeBackoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            next: initial,
+            max,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.checked_mul(2).unwrap_or(self.max).min(self.max);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = self.initial;
+    }
+}
+
+async fn run_subscription_supervised(
+    registry: Arc<WorkerRegistry>,
+    client: async_nats::Client,
+    initial_sub: async_nats::Subscriber,
+    cancel_rx: &mut tokio::sync::watch::Receiver<()>,
+) {
+    let mut backoff = ResubscribeBackoff::new(RESUBSCRIBE_INITIAL_DELAY, RESUBSCRIBE_MAX_DELAY);
+    let mut next_sub = Some(initial_sub);
+
+    loop {
+        let sub = match next_sub.take() {
+            Some(sub) => sub,
+            None => match subscribe_health(&client).await {
+                Ok(sub) => {
+                    info!(subject = HEALTH_SUBJECT, "resubscribed to NATS health");
+                    sub
+                }
+                Err(error) => {
+                    let delay = backoff.next_delay();
+                    warn!(
+                        subject = HEALTH_SUBJECT,
+                        error = %error,
+                        delay_ms = delay.as_millis() as u64,
+                        "failed to resubscribe to NATS health"
+                    );
+                    if sleep_or_cancel(delay, cancel_rx).await {
+                        info!("NATS health subscription cancelled");
+                        return;
+                    }
+                    continue;
+                }
+            },
+        };
+
+        match run_subscription_until_end(Arc::clone(&registry), sub, cancel_rx).await {
+            SubscriptionExit::Cancelled => return,
+            SubscriptionExit::Ended { messages } => {
+                if messages > 0 {
+                    backoff.reset();
+                }
+                let delay = backoff.next_delay();
+                warn!(
+                    subject = HEALTH_SUBJECT,
+                    messages,
+                    delay_ms = delay.as_millis() as u64,
+                    "NATS health subscription stream ended; resubscribing"
+                );
+                if sleep_or_cancel(delay, cancel_rx).await {
+                    info!("NATS health subscription cancelled");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_or_cancel(
+    delay: Duration,
+    cancel_rx: &mut tokio::sync::watch::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = cancel_rx.changed() => true,
+    }
+}
+
+async fn run_subscription_until_end(
     registry: Arc<WorkerRegistry>,
     mut sub: async_nats::Subscriber,
     cancel_rx: &mut tokio::sync::watch::Receiver<()>,
-) {
+) -> SubscriptionExit {
     info!("NATS health subscription handler started");
+    let mut messages = 0u64;
 
     loop {
         tokio::select! {
             msg = sub.next() => {
                 match msg {
                     Some(msg) => {
+                        messages = messages.saturating_add(1);
                         handle_nats_message(&registry, msg).await;
                     }
                     None => {
-                        warn!("NATS subscription stream ended");
-                        break;
+                        return SubscriptionExit::Ended { messages };
                     }
                 }
             }
             _ = cancel_rx.changed() => {
                 info!("NATS health subscription cancelled");
-                break;
+                return SubscriptionExit::Cancelled;
             }
         }
     }
@@ -113,6 +227,14 @@ async fn handle_nats_message(registry: &WorkerRegistry, msg: async_nats::Message
         return;
     };
 
+    handle_status_message(registry, subject, status).await;
+}
+
+async fn handle_status_message(
+    registry: &WorkerRegistry,
+    subject: &str,
+    status: WorkerStatusMessage,
+) {
     // Extract worker URL from the message or subject
     // The subject format is sie.health.<worker_identifier>
     // The worker URL should be in the message payload or derivable from the worker name
@@ -125,6 +247,15 @@ async fn handle_nats_message(registry: &WorkerRegistry, msg: async_nats::Message
         );
         return;
     };
+
+    if status.terminated {
+        if registry.remove_worker(&worker_url).await {
+            info!(url = %worker_url, subject = %subject, "worker removed via NATS tombstone");
+        } else {
+            info!(url = %worker_url, subject = %subject, "NATS tombstone for unknown worker ignored");
+        }
+        return;
+    }
 
     let became_healthy = registry.update_worker(&worker_url, status).await;
     if became_healthy {
@@ -155,4 +286,64 @@ fn extract_worker_url_from_status(status: &WorkerStatusMessage, subject: &str) -
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn status(ready: bool) -> WorkerStatusMessage {
+        WorkerStatusMessage {
+            name: "worker-1".into(),
+            ready,
+            gpu_count: 1,
+            machine_profile: "rtx6000".into(),
+            pool_name: "default".into(),
+            bundle: "sglang".into(),
+            bundle_config_hash: "hash".into(),
+            loaded_models: vec![],
+            models: vec![],
+            gpus: vec![],
+            queue_depth: None,
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            saturated: false,
+            terminated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_removes_registered_worker() {
+        let registry = WorkerRegistry::new(Duration::from_secs(15), None);
+        handle_status_message(&registry, "sie.health.worker-1", status(true)).await;
+        assert_eq!(registry.workers().await.len(), 1);
+
+        let mut tombstone = status(false);
+        tombstone.terminated = true;
+        handle_status_message(&registry, "sie.health.worker-1", tombstone).await;
+
+        assert!(registry.workers().await.is_empty());
+        assert!(registry.healthy_workers().await.is_empty());
+    }
+
+    #[test]
+    fn resubscribe_backoff_doubles_to_cap() {
+        let mut backoff = ResubscribeBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(4));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resubscribe_backoff_reset_returns_to_initial_delay() {
+        let mut backoff = ResubscribeBackoff::new(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
 }

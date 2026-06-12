@@ -33,6 +33,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
+from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import Entity
 
 if TYPE_CHECKING:
@@ -284,8 +285,6 @@ class DonutAdapter(BaseAdapter):
         Returns:
             ExtractOutput with entities.
         """
-        import re
-
         from sie_server.core.prepared import DonutPayload, PreparedItem
 
         all_entities = []
@@ -379,7 +378,7 @@ class DonutAdapter(BaseAdapter):
             raise ValueError(_ERR_NO_IMAGES)
 
         # Load image
-        img_bytes = images[0]["data"]
+        img_bytes = media_bytes(images[0], kind="image")
         pil_img = PILImage.open(io.BytesIO(img_bytes))
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")

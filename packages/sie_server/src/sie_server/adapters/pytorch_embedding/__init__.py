@@ -8,7 +8,7 @@ Supports:
 - Encoder-based models (when using CLS or mean pooling)
 - Configurable attention: SDPA (default) or Flash Attention 2
 
-Performance notes (see DESIGN.md Section 6.3):
+Performance notes:
 - SDPA is 20-25% faster for sequences <512 tokens
 - FA2 is faster for sequences >512 tokens
 - Default is SDPA since standard retrieval workloads have short texts
@@ -91,11 +91,13 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         compute_precision: ComputePrecision = "bfloat16",
         attn_implementation: AttnImplementation = "sdpa",
         trust_remote_code: bool = True,
+        revision: str | None = None,
         query_template: str | None = None,
         doc_template: str | None = None,
         default_instruction: str | None = None,
         forward_kwargs: dict[str, Any] | None = None,
         uses_legacy_transformers_cache: bool = False,
+        dense_dim: int | None = None,
     ) -> None:
         r"""Initialize the adapter.
 
@@ -113,6 +115,9 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
                 Use "eager" for models that don't support SDPA (e.g., Stella).
                 For typical retrieval workloads, SDPA is 20-25% faster.
             trust_remote_code: Whether to trust remote code in model files.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin
+                when loading the tokenizer and model. If None, the default
+                branch is used. Forwarded to ``from_pretrained(..., revision=...)``.
             query_template: Template for formatting queries. Use {instruction} and
                 {text} placeholders. Example: "Instruct: {instruction}\nQuery: {text}"
                 If None, queries are passed as-is.
@@ -127,6 +132,8 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             uses_legacy_transformers_cache: If True, disable the KV cache after
                 loading by setting model.config.use_cache = False. Required for
                 models that use the legacy transformers cache API (pre-4.54).
+            dense_dim: Catalog-declared dense embedding dimension. If provided,
+                validated against the loaded model's hidden size.
         """
         self._model_name_or_path = str(model_name_or_path)
         self._pooling = pooling
@@ -135,16 +142,18 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._compute_precision = compute_precision
         self._attn_implementation = attn_implementation
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._query_template = query_template
         self._doc_template = doc_template
         self._default_instruction = default_instruction
         self._forward_kwargs = forward_kwargs or {}
         self._uses_legacy_transformers_cache = uses_legacy_transformers_cache
+        self._configured_dense_dim = dense_dim
 
         self._model: PreTrainedModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
         self._device: str | None = None
-        self._dense_dim: int | None = None
+        self._dense_dim: int | None = dense_dim
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -158,12 +167,13 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         dtype, attn_impl = self._resolve_dtype_and_attn(device)
 
         logger.info(
-            "Loading %s on device=%s with dtype=%s, attn=%s, pooling=%s",
+            "Loading %s on device=%s with dtype=%s, attn=%s, pooling=%s, revision=%s",
             self._model_name_or_path,
             device,
             dtype,
             attn_impl,
             self._pooling,
+            self._revision,
         )
 
         # Determine padding side based on pooling strategy
@@ -172,11 +182,17 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         hf_token = os.environ.get("HF_TOKEN")
 
         # Load tokenizer
+        shared_kwargs: dict[str, Any] = {
+            "trust_remote_code": self._trust_remote_code,
+            "token": hf_token,
+        }
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
             padding_side=padding_side,
-            trust_remote_code=self._trust_remote_code,
-            token=hf_token,
+            **shared_kwargs,
         )
 
         # Load model with configured attention implementation
@@ -184,8 +200,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=attn_impl,
-            trust_remote_code=self._trust_remote_code,
-            token=hf_token,
+            **shared_kwargs,
         )
         # Disable KV cache for models using the legacy transformers cache API
         if self._uses_legacy_transformers_cache:
@@ -193,8 +208,17 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._model.to(device)
         self._model.eval()
 
-        # Get embedding dimension from model config
-        self._dense_dim = self._model.config.hidden_size
+        self._dense_dim = self._validate_or_set_dense_dim(self._model.config.hidden_size)
+
+    def _validate_or_set_dense_dim(self, observed_dim: int) -> int:
+        """Validate observed model width against configured dense_dim."""
+        if self._configured_dense_dim is not None and observed_dim != self._configured_dense_dim:
+            msg = (
+                "PyTorch embedding dimension mismatch: "
+                f"configured dense_dim={self._configured_dense_dim}, model hidden_size={observed_dim}"
+            )
+            raise ValueError(msg)
+        return observed_dim
 
     def _resolve_dtype_and_attn(self, device: str) -> tuple[torch.dtype, str]:
         """Resolve dtype and attention implementation based on device and config.

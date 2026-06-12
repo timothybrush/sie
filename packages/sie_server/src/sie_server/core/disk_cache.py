@@ -5,7 +5,7 @@ Uses huggingface_hub's scan_cache_dir() for inspection and
 delete_revisions() for eviction. LRU ordering is based on
 blob_last_accessed timestamps.
 
-Per DESIGN.md Section 5.4 (extended to disk):
+Disk cache eviction behavior:
 - Reactive LRU eviction when disk pressure exceeds threshold
 - Check disk usage before downloading new models
 - Evict least-recently-accessed models to make space

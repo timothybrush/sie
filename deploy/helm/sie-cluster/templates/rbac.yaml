@@ -31,7 +31,7 @@ subjects:
     namespace: {{ include "sie-cluster.namespace" . }}
 ---
 # Role for gateway to manage resource pools (ConfigMaps + Leases)
-# Per DESIGN.md Section 10.3: Pools use ConfigMap for spec/status, Lease for TTL
+# Pools use ConfigMap for spec/status and Lease for TTL
 # See: Rust gateway pool management
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

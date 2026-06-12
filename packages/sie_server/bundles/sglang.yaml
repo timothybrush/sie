@@ -1,8 +1,66 @@
 name: sglang
 priority: 20
 adapters:
-- sie_server.adapters.sglang
+- sie_server.adapters.sglang.generation
 deps:
   # SGLang 0.5.6+ includes all deps at base level (fixed from 0.4.x extras bug)
   # See: https://github.com/sgl-project/sglang/issues/4869
-  sglang: '>=0.5.6'
+  #
+  # Qwen3.5-4B + Qwen3.6-27B compatibility:
+  #
+  # ``sglang==0.5.10.post1`` is the canonical target for the Qwen3.x hybrid
+  # Gated-DeltaNet + Gated-Attention family on the current
+  # L4 / A100-40GB / H100 fleet. Qwen3.6-27B uses the same ``qwen3_5``
+  # model class shipped in 0.5.10 — the architecture (64 layers, hybrid
+  # Gated DeltaNet + Gated Attention, MTP/NEXTN) is identical, only the
+  # parameter count differs.
+  #
+  # SGLang 0.5.10 was evaluated against CUDA 12.9 + Qwen3.6-27B on Modal
+  # H100 (2026-05-27): server boots, loads weights, but the bundled
+  # ``sglang/jit_kernel/csrc/elementwise/activation.cuh`` has a C++
+  # template bug (``select_kernel<true>(type)`` is parsed as a class-
+  # template substitution, not a function-template call) that the
+  # stricter ``nvcc`` shipped with CUDA 12.9 rejects at first activation.
+  # 0.5.11 is also dev-only on the sglang docs wheel index — not on
+  # PyPI. Park the 0.5.11 bump until upstream cuts a stable release with
+  # the JIT header fixed; 0.5.10.post1 covers Qwen3.6-27B today.
+  #
+  #   * grammar backends: ``xgrammar`` / ``outlines`` / ``llguidance`` / ``none``
+  #   * ``sgl_kernel`` covers SM_80 / SM_89 / SM_90 / SM_100 via gencode.
+  #   * torch==2.9.1 (CUDA 12.9 wheels); ``cuda-python==12.9``.
+  sglang: '==0.5.10.post1'
+  #
+  # Grammar backend deps — pinned to exactly what SGLang 0.5.10 imports
+  # internally to prevent silent pip resolution drift.
+  #
+  # XGrammar is SGLang 0.5.10's other supported grammar backend; it pins
+  # ``xgrammar==0.1.32`` exactly. That release also brought the
+  # structured-output VRAM-leak fix (PR #20697) and grammar-error
+  # propagation (PR #20467). Kept available as the fallback backend.
+  xgrammar: '==0.1.32'
+  #
+  # ``outlines==0.1.11`` is a hard transitive dep of sglang==0.5.10.post1. We
+  # declare it explicitly at bundle level so the surface is visible.
+  # ``outlines-core`` (a separate package) is a transitive of outlines
+  # and intentionally NOT pinned here — pinning ``outlines-core`` directly
+  # was a bug in the previous bundle revision (it does not give us any
+  # grammar functionality on its own).
+  #
+  # Outlines IS the active grammar backend for Qwen3.5 (partner
+  # requirement). Earlier revisions said "do not switch Qwen3.5 to
+  # outlines" because the worker-side ``compile_outlines`` preflight
+  # crashed with ``'TokenizersBackend' object has no attribute
+  # 'vocabulary'``: it passed the raw transformers==5.3.0 tokenizer
+  # (now a ``TokenizersBackend``) to Outlines' processor factories, which
+  # require an Outlines ``Tokenizer`` adapter exposing ``.vocabulary``.
+  # ``compile_outlines`` now wraps the tokenizer in Outlines'
+  # ``TransformerTokenizer`` first (the same wrap SGLang's
+  # ``OutlinesGrammarBackend`` does internally), so the mismatch is gone
+  # for json_schema/regex; ebnf is forwarded straight to SGLang. See
+  # ``processors/grammar_compile.py`` ("Tokenizer adapter").
+  outlines: '==0.1.11'
+  #
+  # llguidance is the third grammar backend (regex / json_schema / ebnf).
+  # Pinned to SGLang 0.5.10's compatible range. Kept available as the
+  # fallback if a future model regresses on xgrammar.
+  llguidance: '>=0.7.11,<0.8.0'

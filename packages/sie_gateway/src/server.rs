@@ -41,6 +41,9 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .route("/metrics", get(metrics_handler))
         // API description
         .route("/openapi.json", get(openapi::openapi_json))
+        // Rendered API reference (Redoc) + its vendored, self-contained bundle.
+        .route("/docs", get(openapi::docs_ui))
+        .route("/docs/redoc.standalone.js", get(openapi::redoc_asset))
         // Models endpoints. `{*model}` accepts slash-bearing IDs.
         .route("/v1/models", get(models::get_models))
         .route("/v1/models/{*model}", get(models::get_model))
@@ -74,10 +77,19 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         // WebSocket cluster status
         .route("/ws/cluster-status", get(health::ws_cluster_status))
         .route("/v1/embeddings", post(proxy::proxy_openai_embeddings))
+        .route("/v1/chat/completions", post(proxy::proxy_chat))
+        // OpenAI legacy Completions — raw-prompt continuation (non-streaming).
+        .route("/v1/completions", post(proxy::proxy_completions))
+        // OpenAI Responses API (MVP: string input, non-streaming).
+        .route("/v1/responses", post(proxy::proxy_responses))
+        // OpenAI moderations surface — registered but not implemented (501)
+        // until a moderation model + governance store land (Tier 0).
+        .route("/v1/moderations", post(proxy::proxy_moderations))
         // Proxy endpoints - use wildcard for model path
         .route("/v1/encode/{*model}", post(proxy::proxy_encode))
         .route("/v1/score/{*model}", post(proxy::proxy_score))
         .route("/v1/extract/{*model}", post(proxy::proxy_extract))
+        .route("/v1/generate/{*model}", post(proxy::proxy_generate))
         .layer(AuditLayer::new())
         .layer(AuthLayer::new(config))
         // MetricsLayer is appended last so it becomes the outermost
@@ -87,6 +99,12 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         // unmatched routes). This is what closes the "only success
         // path was counted" gap that used to live inside proxy.rs.
         .layer(MetricsLayer::new())
+        .with_state(state)
+}
+
+pub fn create_metrics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -107,6 +125,7 @@ pub(crate) async fn metrics_handler(
             name: w.name.clone(),
             machine_profile: w.machine_profile.clone(),
             bundle: w.bundle.clone(),
+            pool_name: w.pool_name.clone(),
             queue_depth: w.queue_depth,
             memory_used_bytes: w.memory_used_bytes,
             healthy: w.healthy(),
@@ -114,17 +133,21 @@ pub(crate) async fn metrics_handler(
         .collect();
     metrics::update_worker_metrics(&snapshots);
 
-    // Clear PENDING_DEMAND only for WorkerGroups that now have healthy workers.
-    let healthy_worker_groups: std::collections::HashSet<(String, String)> = snapshots
+    // Clear PENDING_DEMAND only for queue lanes that now have healthy workers.
+    let healthy_worker_groups: std::collections::HashSet<(String, String, String)> = snapshots
         .iter()
-        .filter(|w| w.healthy && !w.machine_profile.is_empty())
+        .filter(|w| w.healthy && !w.pool_name.is_empty() && !w.machine_profile.is_empty())
         .map(|w| {
             let bundle = if w.bundle.is_empty() {
                 "default"
             } else {
                 w.bundle.as_str()
             };
-            (w.machine_profile.to_lowercase(), bundle.to_lowercase())
+            (
+                w.pool_name.to_lowercase(),
+                w.machine_profile.to_lowercase(),
+                bundle.to_lowercase(),
+            )
         })
         .collect();
     metrics::clear_fulfilled_demand(&healthy_worker_groups, &state.demand_tracker);

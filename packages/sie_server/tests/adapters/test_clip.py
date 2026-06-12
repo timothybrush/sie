@@ -67,6 +67,15 @@ class TestCLIPAdapter:
         dims = adapter.dims
         assert dims.dense is None
 
+    def test_accepts_dense_dim_kwarg(self) -> None:
+        """Construction with dense_dim= must not raise (loader contract)."""
+        adapter = CLIPAdapter(
+            "openai/clip-vit-base-patch32",
+            dense_dim=512,
+        )
+        assert adapter._configured_dense_dim == 512
+        assert adapter.dims.dense == 512
+
     def test_encode_before_load_raises(self, adapter: CLIPAdapter) -> None:
         """Encode before load raises error."""
         items = [Item(text="hello")]
@@ -94,25 +103,60 @@ class TestCLIPAdapter:
         with pytest.raises(ValueError, match="Unsupported output types"):
             adapter.encode(items, output_types=["multivector"])
 
-    @patch("transformers.CLIPModel")
-    @patch("transformers.CLIPProcessor")
+    @patch("transformers.CLIPModel.from_pretrained")
+    @patch("transformers.CLIPProcessor.from_pretrained")
     def test_load(
         self,
-        mock_processor_class: MagicMock,
-        mock_model_class: MagicMock,
+        mock_processor_from_pretrained: MagicMock,
+        mock_model_from_pretrained: MagicMock,
         adapter: CLIPAdapter,
         mock_clip_model: MagicMock,
         mock_clip_processor: MagicMock,
     ) -> None:
         """Load initializes the model."""
-        mock_model_class.from_pretrained.return_value = mock_clip_model
-        mock_processor_class.from_pretrained.return_value = mock_clip_processor
+        mock_model_from_pretrained.return_value = mock_clip_model
+        mock_processor_from_pretrained.return_value = mock_clip_processor
 
         adapter.load("cpu")
 
-        mock_model_class.from_pretrained.assert_called_once()
-        mock_processor_class.from_pretrained.assert_called_once()
+        mock_model_from_pretrained.assert_called_once()
+        mock_processor_from_pretrained.assert_called_once()
         assert adapter.dims.dense == 512
+
+    @patch("transformers.CLIPModel.from_pretrained")
+    @patch("transformers.CLIPProcessor.from_pretrained")
+    def test_load_accepts_matching_dense_dim(
+        self,
+        mock_processor_from_pretrained: MagicMock,
+        mock_model_from_pretrained: MagicMock,
+        mock_clip_model: MagicMock,
+        mock_clip_processor: MagicMock,
+    ) -> None:
+        """Load accepts catalog dense_dim when it matches projection_dim."""
+        adapter = CLIPAdapter("openai/clip-vit-base-patch32", dense_dim=512)
+        mock_model_from_pretrained.return_value = mock_clip_model
+        mock_processor_from_pretrained.return_value = mock_clip_processor
+
+        adapter.load("cpu")
+
+        assert adapter.dims.dense == 512
+
+    @patch("transformers.CLIPModel.from_pretrained")
+    @patch("transformers.CLIPProcessor.from_pretrained")
+    def test_load_rejects_dense_dim_mismatch(
+        self,
+        mock_processor_from_pretrained: MagicMock,
+        mock_model_from_pretrained: MagicMock,
+        mock_clip_model: MagicMock,
+        mock_clip_processor: MagicMock,
+    ) -> None:
+        """Load rejects catalog dense_dim when it differs from projection_dim."""
+        adapter = CLIPAdapter("openai/clip-vit-base-patch32", dense_dim=768)
+        mock_model_from_pretrained.return_value = mock_clip_model
+        mock_processor_from_pretrained.return_value = mock_clip_processor
+
+        with pytest.raises(ValueError, match="configured dense_dim=768, model projection_dim=512"):
+            adapter.load("cpu")
 
     @patch("sie_server.adapters.clip.torch")
     def test_unload(self, mock_torch: MagicMock, adapter: CLIPAdapter) -> None:

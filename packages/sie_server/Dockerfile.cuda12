@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# SIE Server - CUDA 12.4 Image
+# SIE Server - CUDA 12 Image
 # Build from repo root:
 #   docker build -f packages/sie_server/Dockerfile.cuda12 -t sie-server:cuda12-default .
 #   docker build -f packages/sie_server/Dockerfile.cuda12 --build-arg BUNDLE=sglang -t sie-server:cuda12-sglang .
@@ -8,7 +8,7 @@ ARG BUNDLE=default
 ARG UV_VERSION=0.9.28
 
 # =============================================================================
-# Stage 1: uv + standalone Python 3.12 (no deadsnakes PPA)
+# Dependency image: uv and standalone Python 3.12
 # =============================================================================
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS deps
 
@@ -59,12 +59,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -e ".[gpu-metrics]"
 
 # =============================================================================
-# Stage 2: Base - source install + shared-venv finalization (no BUNDLE)
+# Shared CUDA base: source install and venv finalization
 # =============================================================================
 # Everything here is bundle-agnostic, so bundle-specific builds of a given
-# platform share every base-stage layer in local BuildKit cache and in
+# platform share every base image layer in local BuildKit cache and in
 # content-addressed registry layers.
 FROM deps AS base
+
+# Source-layer cache key. A rebuild once shipped STALE code: buildx
+# reused a cached source-COPY layer even though the .py files had
+# changed, so the demo had to overlay patched files by hand. Tie the
+# source layers to an explicit revision arg the CI passes per commit
+# (``--build-arg SIE_SRC_REV=$(git rev-parse --short HEAD)``) so any
+# commit forces these layers — and the editable reinstall below — to
+# rebuild. The expensive dependency install lives in the ``deps`` stage
+# ABOVE this line, so it stays cached. Bundles of the same commit share
+# the same SIE_SRC_REV, so cross-bundle layer dedup is preserved.
+ARG SIE_SRC_REV=dev
+RUN echo "sie source revision: ${SIE_SRC_REV}"
 
 COPY packages/sie_sdk/src /tmp/sie_sdk/src
 COPY packages/sie_server/src src/
@@ -114,7 +126,7 @@ RUN set -eux; \
     find /app/.venv -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 3: Builder - bundle-specific deps
+# Bundle dependency builder: bundle-specific deps
 # =============================================================================
 FROM base AS builder
 
@@ -161,11 +173,19 @@ RUN set -eux; \
     find /app/bundle-libs -exec touch -h -d @0 {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 4: Runtime
+# Runtime image
 # =============================================================================
-# Use base CUDA image (not devel/runtime) — PyTorch wheels bundle CUDA libs,
-# cuDNN ships inside torch. Saves ~2GB vs `runtime` variant.
-FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime
+# Runtime base selection is bundle-scoped. Most CUDA bundles stay on the
+# smaller CUDA base runtime; SGLang-family bundles need the devel toolkit
+# because flashinfer/tvm_ffi perform runtime JIT through nvcc on first decode.
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime-default
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04 AS runtime-transformers5
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04 AS runtime-sglang
+ENV CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+FROM runtime-sglang AS runtime-sglang-embedding
+
+FROM runtime-${BUNDLE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -175,15 +195,29 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libgomp1: torch OpenMP runtime.
 # libspatialindex-c6: rtree (docling dep) dlopens libspatialindex_c.so; the
 #   rtree==1.4.1 wheel only bundles the C++ core, not the C wrapper.
+# libgl1 libglib2.0-0 libice6 libsm6 libx11-6 libxcb1 libxext6: docling-ibm-models'
+#   TableFormer imports cv2 during DoclingAdapter.load() pre-warm; the
+#   opencv-python wheel unconditionally dlopens an X11 + libGL + glib chain at
+#   import even in headless usage. Without these, every docling extract crashes
+#   with "ImportError: libxcb.so.1: cannot open shared object file" (issue #1028).
+# ninja-build: flashinfer invokes ninja during first-use SGLang kernel JIT.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gcc \
     libc6-dev \
+    libgl1 \
+    libglib2.0-0 \
     libgomp1 \
+    libice6 \
     libnuma1 \
-    libspatialindex-c6
+    libsm6 \
+    libspatialindex-c6 \
+    ninja-build \
+    libx11-6 \
+    libxcb1 \
+    libxext6
 
 RUN groupadd -g 1000 sie && useradd -u 1000 -g sie -m sie
 
@@ -211,8 +245,13 @@ RUN set -e; \
 # (the sie user is added in the runtime stage filesystem but --link layers
 # are created in isolation from the destination stage state).
 COPY --link --from=base --chown=1000:1000 /app/.venv /app/.venv
-COPY --link --from=base --chown=1000:1000 /app/src /app/src
-COPY --link --from=base --chown=1000:1000 /tmp/sie_sdk/src /tmp/sie_sdk/src
+# Source trees are copied WITHOUT --link. ``COPY --link --from=<stage>``
+# layers are cached on a digest that, in the buildx versions this image
+# was built with, did not reliably invalidate when the upstream source
+# changed — the stale-code bug above. These trees are small, so dropping
+# --link costs negligible dedup while guaranteeing edited code ships.
+COPY --from=base --chown=1000:1000 /app/src /app/src
+COPY --from=base --chown=1000:1000 /tmp/sie_sdk/src /tmp/sie_sdk/src
 COPY --link --from=base --chown=1000:1000 /app/models /app/models
 COPY --link --from=base --chown=1000:1000 /app/bundles /app/bundles
 # Bundle-specific extras — last layer so shared layers above stay cached.

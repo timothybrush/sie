@@ -16,6 +16,7 @@ import type {
   Entity,
   ExtractResult,
   Item,
+  ModelCapabilities,
   ModelInfo,
   ScoreEntry,
   ScoreResult,
@@ -393,6 +394,33 @@ describe("ModelInfo - model discovery", () => {
 
     expect(canRequestSparse(model)).toBe(true);
     expect(canProcessImage(model)).toBe(false);
+  });
+
+  it("surfaces generation capabilities for code/sql/guard discovery", () => {
+    // User scenario: "Show generation models that support text-to-SQL"
+    const capabilities: ModelCapabilities = {
+      grammar: ["json_schema", "regex"],
+      tools: true,
+      lora_adapters: ["sql-lora"],
+      profile_lora_adapters: { default: ["sql-lora"] },
+      code: true,
+      sql: true,
+      guard: false,
+    };
+
+    const model: ModelInfo = {
+      name: "qwen3-4b",
+      loaded: true,
+      inputs: ["text"],
+      outputs: ["text"],
+      capabilities,
+    };
+
+    expect(model.capabilities?.code).toBe(true);
+    expect(model.capabilities?.sql).toBe(true);
+    expect(model.capabilities?.guard).toBe(false);
+    expect(model.capabilities?.grammar).toEqual(["json_schema", "regex"]);
+    expect(model.capabilities?.profile_lora_adapters?.default).toEqual(["sql-lora"]);
   });
 });
 

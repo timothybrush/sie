@@ -17,6 +17,8 @@ import type {
   EncodeResult,
   Entity,
   ExtractResult,
+  FinishReason,
+  GenerateResult,
   Relation,
   ScoreEntry,
   ScoreResult,
@@ -428,6 +430,86 @@ export function parseExtractResult(data: WireExtractResult): ExtractResult {
  */
 export function parseExtractResults(data: unknown[]): ExtractResult[] {
   return (data as WireExtractResult[]).map(parseExtractResult);
+}
+
+interface WireUsageBlock {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
+interface WireGenerateResult {
+  model?: string;
+  text?: string;
+  finish_reason?: string;
+  usage?: WireUsageBlock;
+  attempt_id?: string;
+  ttft_ms?: number;
+  tpot_ms?: number;
+}
+
+/**
+ * Describe an unknown value's runtime type for error messages, mirroring
+ * the granularity of Python's ``type(x).__name__`` (``typeof null`` is
+ * ``"object"`` in JS, so disambiguate ``null`` explicitly).
+ */
+function describeType(value: unknown): string {
+  if (value === null) return "null";
+  return typeof value;
+}
+
+/**
+ * Parse the gateway's streaming generate response envelope into a
+ * :class:`GenerateResult`. Tolerant of missing *optional* fields for
+ * forward compat with future surface extensions.
+ *
+ * ``model`` and ``text`` are required strings: a missing or non-string
+ * value is surfaced as a {@link RequestError} rather than being silently
+ * coerced to an empty string. A truncated / malformed envelope must not
+ * look like a legitimate empty completion (silent data loss). This mirrors
+ * the Python SDK's ``_parse_generate_result`` contract.
+ */
+/**
+ * Coerce a wire-format token count into a safe non-negative integer.
+ *
+ * The wire `usage` envelope is untyped JSON, so a malformed payload can carry
+ * a string (`"5"`), a float (`3.9`), `null`, or a missing field. The previous
+ * `?? 0` only guarded null/undefined, letting strings/floats leak verbatim
+ * into the SDK's `number`-typed fields. We mirror the Python SDK's int
+ * coercion: keep only finite numbers and truncate toward zero; everything
+ * else (string, NaN, Infinity, null) becomes `0`.
+ */
+function coerceTokenCount(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : 0;
+}
+
+export function parseGenerateResult(data: Record<string, unknown>): GenerateResult {
+  const wire = data as WireGenerateResult;
+  if (typeof wire.model !== "string") {
+    throw new RequestError(
+      `Generate response missing string 'model' field: got ${describeType(wire.model)}`,
+    );
+  }
+  if (typeof wire.text !== "string") {
+    throw new RequestError(
+      `Generate response missing string 'text' field: got ${describeType(wire.text)}`,
+    );
+  }
+  const usage = wire.usage ?? {};
+  const finish = (wire.finish_reason ?? "stop") as FinishReason;
+  return {
+    model: wire.model,
+    text: wire.text,
+    finishReason: finish,
+    usage: {
+      promptTokens: coerceTokenCount(usage.prompt_tokens),
+      completionTokens: coerceTokenCount(usage.completion_tokens),
+      totalTokens: coerceTokenCount(usage.total_tokens),
+    },
+    attemptId: wire.attempt_id,
+    ttftMs: wire.ttft_ms,
+    tpotMs: wire.tpot_ms,
+  };
 }
 
 // Wire format types for capacity

@@ -6,8 +6,6 @@ The ModelWorker manages a single model's inference pipeline:
 3. Runs inference on batches via operation handlers
 4. Fans out results to waiting futures
 
-See DESIGN.md Section 5.3.
-
 Architecture:
 - ModelWorker: Manages lifecycle, batching, FCFS scheduling, stats
 - OperationHandler: Abstract interface for operation-specific logic
@@ -45,7 +43,7 @@ from sie_server.core.worker.types import (
 )
 
 try:
-    from prometheus_client import Gauge, Histogram
+    from prometheus_client import Counter, Gauge, Histogram
 
     GPU_BATCH_ITEMS = Histogram(
         "sie_gpu_batch_items",
@@ -89,6 +87,40 @@ try:
         "Batch request efficiency: actual_batch_size / max_batch_requests",
         ["model"],
         buckets=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0],
+    )
+    ADAPTIVE_STARVATION_STREAK = Gauge(
+        "sie_adaptive_starvation_streak",
+        "Current consecutive-tiny-batch streak tracked by the adaptive controller",
+        ["model"],
+    )
+    ADAPTIVE_STARVATION_RESETS = Counter(
+        "sie_adaptive_starvation_resets_total",
+        "Total number of starvation-triggered controller resets",
+        ["model"],
+    )
+    # Queue-depth visibility for the Python-side adaptive batcher.
+    #
+    # Counterpart to the Rust-side `sie_worker_ipc_mux_inflight` gauge:
+    # together they bracket the path between Rust dispatch and the GPU.
+    # A regression where Rust caching/multiplexing removes its own
+    # back-pressure shows up here as a wider distribution of items
+    # waiting at dispatch time, even though the GPU sees the same
+    # batch size and total throughput. This is the metric to watch
+    # when tuning `SIE_IPC_MUX_MAX_INFLIGHT_PER_POD` — a healthy cap
+    # keeps the histogram concentrated near 0–1 batches deep.
+    MODEL_LOOP_PENDING_AT_DISPATCH = Histogram(
+        "sie_model_loop_pending_at_dispatch",
+        "Total items pending across all LoRA batchers at the moment a "
+        "batch is dispatched to the model adapter (i.e. queue depth "
+        "observed by the model loop, NOT including the items being "
+        "dispatched).",
+        ["model"],
+        buckets=[0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    )
+    MODEL_LOOP_PENDING_GAUGE = Gauge(
+        "sie_model_loop_pending",
+        "Current items pending across all LoRA batchers; sampled at every model-loop iteration.",
+        ["model"],
     )
     _HAS_BATCH_METRICS = True
 except ImportError:
@@ -158,6 +190,23 @@ class ModelWorker:
         self._postprocessor_registry = postprocessor_registry
         self._registry_callbacks = registry_callbacks
 
+        # Pass-through mode: skip BatchFormer / FCFS / adaptive batching;
+        # every ``submit*`` becomes one GPU forward pass. Env var wins so we
+        # can flip it without redeploying with a new WorkerConfig. See the
+        # comment on ``WorkerConfig.passthrough_mode`` for the rationale and
+        # the cluster-wide alignment with the worker-sidecar's owner role.
+        env_passthrough = os.environ.get("SIE_WORKER_PASSTHROUGH", "").lower() in ("1", "true", "yes")
+        self._passthrough_mode = self._config.passthrough_mode or env_passthrough
+        # Async lock so concurrent passthrough submits serialise across the
+        # ``set_active_lora -> _process_batch`` pair. The single-thread
+        # inference executor would already serialise the GPU calls, but the
+        # adapter's active-LoRA state lives on the asyncio thread and would
+        # race otherwise (lora_A set, lora_B set, A's inference runs with B
+        # active). Held only for the synchronous ``set_active_lora`` and the
+        # ``await _process_batch`` body — the executor handoff itself does
+        # NOT extend this lock further than needed.
+        self._passthrough_lock = asyncio.Lock()
+
         # Initialize operation handlers (dependency injection point)
         if handlers is not None:
             self._handlers: dict[str, OperationHandler[Any]] = handlers
@@ -173,12 +222,19 @@ class ModelWorker:
             max_batch_tokens=self._config.max_batch_tokens,
             max_batch_requests=self._config.max_batch_requests,
             max_batch_wait_ms=self._config.max_batch_wait_ms,
+            coalesce_ms=self._config.coalesce_ms,
+            coalesce_ratio=self._config.coalesce_ratio,
         )
 
         # Per-LoRA batchers: None = base model, "lora-name" = specific LoRA
-        # Each LoRA gets its own batcher for FCFS fairness
+        # Each LoRA gets its own batcher for FCFS fairness. In passthrough
+        # mode the dict stays empty — the dispatcher path bypasses these
+        # entirely and the GPU batch is the IPC frame as it arrived. We
+        # still keep the field for shape-compat with code that reads
+        # ``self._batchers`` (e.g. shutdown, instrumentation).
         self._batchers: dict[str | None, BatchFormer[HasCost, RequestMetadata]] = {}
-        self._batchers[None] = BatchFormer(self._batch_config)  # Base model batcher
+        if not self._passthrough_mode:
+            self._batchers[None] = BatchFormer(self._batch_config)  # Base model batcher
 
         # Thread pool for running inference (doesn't block event loop)
         self._inference_executor = ThreadPoolExecutor(
@@ -186,13 +242,34 @@ class ModelWorker:
             thread_name_prefix="inference",
         )
 
-        # Adaptive batching controller (optional, off by default)
+        # Adaptive batching controller (optional, off by default).
+        # Forced off in passthrough mode: there's no ``_process_loop`` to
+        # observe batch fill / latency feedback, and the sidecar runs its
+        # own adaptive batcher one IPC hop upstream. Competing controllers
+        # can make batch-size feedback oscillate.
         ab = self._config.adaptive_batching
-        if ab.enabled:
+        if ab.enabled and not self._passthrough_mode:
             self._latency_tracker: LatencyTracker | None = LatencyTracker(
                 window_size=ab.window_size,
             )
             self._efficiency_tracker: BatchEfficiencyTracker | None = BatchEfficiencyTracker()
+            # min_batch_cost is a *floor* on how small the cost knob can get,
+            # not a ceiling. The old value of min(256, max_batch_tokens) was
+            # effectively always 256, which lets the PI loop shrink each
+            # batch down to a single item whenever p50 stays above target —
+            # and under scale-out load (queue latency >> target) p50 *always*
+            # stays above target, so cost collapses to 256 and the GPU runs
+            # 1-item forwards at ~30k tok/s/pod. Instead, anchor the floor
+            # to a quarter of max_batch_tokens so even a fully-collapsed
+            # knob still packs ~10 items per forward on the default gte
+            # (16384 / 4 = 4096 tokens ≈ 10 items of ~400 tokens each).
+            # For tiny max_batch_tokens (<1024), keep the legacy 256 floor
+            # so adapters with genuinely small budgets aren't forced above
+            # their configured ceiling. See
+            # packages/sie_server_sidecar/docs/architecture-guide.md for
+            # the related queue-mode regression guard.
+            cost_floor = max(256, self._config.max_batch_tokens // 4)
+            cost_floor = min(cost_floor, self._config.max_batch_tokens)
             self._adaptive_controller: AdaptiveBatchController | None = AdaptiveBatchController(
                 target_p50_ms=ab.target_p50_ms,
                 calibration_multiplier=ab.calibration_multiplier,
@@ -200,14 +277,15 @@ class ModelWorker:
                 max_target_p50_ms=ab.max_target_p50_ms,
                 min_wait_ms=ab.min_wait_ms,
                 max_wait_ms=ab.max_wait_ms,
-                min_batch_cost=min(256, self._config.max_batch_tokens),
-                max_batch_cost=max(
-                    min(256, self._config.max_batch_tokens), self._config.max_batch_tokens * 4
-                ),  # allow up to 4x growth
+                min_batch_cost=cost_floor,
+                max_batch_cost=max(cost_floor, self._config.max_batch_tokens * 4),
                 gain=ab.gain,
                 integral_gain=ab.integral_gain,
                 cost_gain=ab.gain * 0.5,  # cost knob is more conservative
                 update_interval=ab.update_interval,
+                starvation_recovery_enabled=ab.starvation_recovery_enabled,
+                starvation_window=ab.starvation_window,
+                starvation_batch_size=ab.starvation_batch_size,
                 _current_wait_ms=self._config.max_batch_wait_ms,
                 _current_batch_cost=self._config.max_batch_tokens,
             )
@@ -294,6 +372,18 @@ class ModelWorker:
             logger.info("ModelWorker instrumentation enabled")
 
         self._running = True
+        # Passthrough mode owns its own dispatch path inside ``submit*`` —
+        # no background loop, no FCFS scheduling, no adaptive controller.
+        # We still flip ``_running`` so the existing ``stop()`` path works
+        # and ``_check_queue_capacity`` accepts work.
+        if self._passthrough_mode:
+            logger.info(
+                "ModelWorker started (passthrough mode: no internal batcher / "
+                "no _process_loop / no adaptive controller — every submit() is "
+                "one GPU forward pass)"
+            )
+            return
+
         self._process_task = asyncio.create_task(
             self._process_loop(),
             name="model-worker-process",
@@ -533,6 +623,12 @@ class ModelWorker:
         if not self._running:
             msg = "ModelWorker is not running"
             raise RuntimeError(msg)
+        # In passthrough mode there is no queue to fill — every submit
+        # runs synchronously to GPU under the passthrough lock, so back-
+        # pressure happens at the lock acquisition rather than via a
+        # depth check. The worker-sidecar enforces the per-pod inflight cap.
+        if self._passthrough_mode:
+            return
         max_queue = self._config.max_queue_size
         if max_queue > 0:
             current_pending = self.pending_count
@@ -575,8 +671,52 @@ class ModelWorker:
         Returns:
             The future from metadata that will resolve to WorkerResult.
         """
+        if self._passthrough_mode:
+            return await self._submit_passthrough(prepared_items, metadata, lora)
+
         batcher = self._get_batcher(lora)
         await batcher.submit_many([(item, metadata) for item in prepared_items])
+        return metadata.future
+
+    async def _submit_passthrough(
+        self,
+        prepared_items: Sequence[HasCost],
+        metadata: RequestMetadata,
+        lora: str | None,
+    ) -> asyncio.Future[WorkerResult]:
+        """Run the IPC frame as exactly one GPU forward pass.
+
+        Builds a synthetic ``FormattedBatch`` directly from ``prepared_items``
+        — bypassing the BatchFormer / FCFS / adaptive controller entirely
+        — and dispatches it through the existing ``_process_batch`` path so
+        operation handlers, postprocessors and timing instrumentation all
+        keep working unchanged.
+
+        Concurrency: held under ``_passthrough_lock`` so concurrent submits
+        to different LoRAs cannot interleave the (``set_active_lora`` →
+        ``_process_batch``) pair, which otherwise races on the adapter's
+        active-LoRA state. The single-thread inference executor would
+        already serialise the GPU work — the lock specifically protects
+        the LoRA-set-then-forward atomicity.
+        """
+        # Cost is a sequence-of-protocol read, no I/O — safe outside the lock.
+        items_list = list(prepared_items)
+        total_cost = sum(item.cost for item in items_list)
+        # ``_process_batch`` keys metadata identity by ``id(metadata)`` so a
+        # single shared metadata reference (one per request, N items) is
+        # fine; the existing ``_complete_requests`` only fires the future
+        # once all items have results regardless of how many slots share it.
+        metadata_per_item: list[RequestMetadata] = [metadata] * len(items_list)
+        synthetic_batch: FormattedBatch[HasCost, RequestMetadata] = FormattedBatch(
+            items=items_list,
+            metadata=metadata_per_item,
+            total_cost=total_cost,
+        )
+
+        async with self._passthrough_lock:
+            self._adapter.set_active_lora(lora)
+            await self._process_batch(synthetic_batch)
+
         return metadata.future
 
     # =========================================================================
@@ -658,6 +798,16 @@ class ModelWorker:
 
                 batch_wait_ms = (time.monotonic() - batch_wait_start) * 1000
 
+                # Queue-depth observation. Captured AFTER the batch is
+                # pulled so it reflects items still waiting once we
+                # commit to dispatching this batch — that's the figure
+                # we want when reasoning about Rust-side back-pressure.
+                if _HAS_BATCH_METRICS:
+                    pending_after_pull = sum(b.pending_count for b in self._batchers.values())
+                    _label_name = self._model_name or "unknown"
+                    MODEL_LOOP_PENDING_AT_DISPATCH.labels(model=_label_name).observe(pending_after_pull)
+                    MODEL_LOOP_PENDING_GAUGE.labels(model=_label_name).set(pending_after_pull)
+
                 # Set active LoRA before processing batch
                 # This allows adapters to switch to the correct LoRA adapter
                 self._adapter.set_active_lora(active_lora)
@@ -730,7 +880,8 @@ class ModelWorker:
                 if self._adaptive_controller is not None and self._latency_tracker is not None:
                     observed_p50 = self._latency_tracker.p50()
                     fill_ratio = self._efficiency_tracker.mean_fill_ratio() if self._efficiency_tracker else None
-                    new_wait, new_cost = self._adaptive_controller.step(observed_p50, fill_ratio)
+                    prev_resets = self._adaptive_controller.starvation_resets
+                    new_wait, new_cost = self._adaptive_controller.step(observed_p50, fill_ratio, batch_size=batch.size)
                     self._batch_config.max_batch_wait_ms = new_wait
                     self._batch_config.max_batch_cost = new_cost
 
@@ -745,6 +896,10 @@ class ModelWorker:
                                 ADAPTIVE_HEADROOM.labels(model=_label).set(target - observed_p50)
                         if fill_ratio is not None:
                             ADAPTIVE_FILL_RATIO.labels(model=_label).set(fill_ratio)
+                        ADAPTIVE_STARVATION_STREAK.labels(model=_label).set(self._adaptive_controller.starvation_streak)
+                        reset_delta = self._adaptive_controller.starvation_resets - prev_resets
+                        if reset_delta > 0:
+                            ADAPTIVE_STARVATION_RESETS.labels(model=_label).inc(reset_delta)
 
                 # Log every 10 batches at INFO level for visibility
                 if self._stats.batches_processed % 10 == 0:

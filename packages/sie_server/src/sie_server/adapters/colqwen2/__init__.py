@@ -34,6 +34,7 @@ from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -301,10 +302,8 @@ class ColQwen2Adapter(BaseAdapter):
             return self._encode_text(item.text)
         if has_images:
             return self._encode_images(self._load_images(item))
-        if has_text:
-            return self._encode_text(item.text)
-
-        raise ValueError(_ERR_NO_INPUT)
+        # The top guard guarantees has_text once we get here.
+        return self._encode_text(item.text)
 
     # ------------------------------------------------------------------
     # Image encoding
@@ -315,7 +314,7 @@ class ColQwen2Adapter(BaseAdapter):
 
         pil_images = []
         for img_input in item.images or []:
-            pil_img = Image.open(io.BytesIO(img_input["data"]))
+            pil_img = Image.open(io.BytesIO(media_bytes(img_input, kind="image")))
             if pil_img.mode != "RGB":
                 pil_img = pil_img.convert("RGB")
             pil_images.append(pil_img)
@@ -392,7 +391,11 @@ class ColQwen2Adapter(BaseAdapter):
 
         results = [embeddings[i].float().cpu().numpy() for i in range(len(images))]
 
+        # Free GPU memory from intermediate tensors to prevent OOM on
+        # subsequent encode calls (L4 22GB GPUs are tight for VLM models).
         del embeddings, batch
+        if self._device and self._device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
         return results
 

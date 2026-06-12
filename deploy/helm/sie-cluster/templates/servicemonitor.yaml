@@ -1,12 +1,43 @@
 {{- if .Values.serviceMonitor.enabled }}
-# ServiceMonitor for Prometheus Operator
-# Scrapes metrics from the gateway, sie-config, and all worker pools (any
-# service that exposes the `http` port under the chart's common selector
-# labels).
+{{/*
+Per-component ServiceMonitors. A single monitor with the shared
+`sie-cluster.selectorLabels` selector matches the gateway, config, and
+worker Services; only the worker Service exposes the `worker-metrics` port,
+so Prometheus would log scrape failures against gateway/config for that
+port. Split into one ServiceMonitor per component so each monitor only
+scrapes the ports it knows exist.
+*/}}
+# Gateway ServiceMonitor
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "sie-cluster.fullname" . }}
+  name: {{ include "sie-cluster.fullname" . }}-gateway
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  jobLabel: sie.superlinked.com/prometheus-job
+  selector:
+    matchLabels:
+      {{- include "sie-cluster.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway-metrics
+  namespaceSelector:
+    matchNames:
+      - {{ include "sie-cluster.namespace" . }}
+  endpoints:
+    - port: gateway-metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+---
+# Worker ServiceMonitor (Python + optional worker-sidecar)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sie-cluster.fullname" . }}-worker
   namespace: {{ include "sie-cluster.namespace" . }}
   labels:
     {{- include "sie-cluster.labels" . | nindent 4 }}
@@ -16,7 +47,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      {{- include "sie-cluster.selectorLabels" . | nindent 6 }}
+      {{- include "sie-cluster.worker.selectorLabels" . | nindent 6 }}
   namespaceSelector:
     matchNames:
       - {{ include "sie-cluster.namespace" . }}
@@ -25,4 +56,12 @@ spec:
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics
+    {{- if .Values.workers.common.workerSidecar.enabled }}
+    # worker-sidecar metrics (NATS pull loop, backend routing,
+    # circuit breaker state, per-backend latency histograms).
+    - port: worker-metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+    {{- end }}
 {{- end }}

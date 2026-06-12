@@ -8,16 +8,18 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
-def _scan_model_adapters(models_dir: Path) -> dict[str, set[str]]:
+def _scan_model_adapters(models_dir: Path) -> dict[str, tuple[set[str], str | None]]:
     """Scan model config YAMLs and return adapter modules per model.
 
     Args:
         models_dir: Path to the models directory containing *.yaml configs.
 
     Returns:
-        Dict mapping model name to set of adapter module paths.
+        Dict mapping model name to ``(modules, pool)`` where ``modules`` is
+        the set of adapter module paths declared by the model profiles and
+        ``pool`` is the optional configured pool name.
     """
-    result: dict[str, set[str]] = {}
+    result: dict[str, tuple[set[str], str | None]] = {}
     if not models_dir.exists():
         return result
 
@@ -35,12 +37,13 @@ def _scan_model_adapters(models_dir: Path) -> dict[str, set[str]]:
             if module_path:
                 modules.add(module_path)
         if modules:
-            result[model_name] = modules
+            pool = model_data.get("pool")
+            result[model_name] = (modules, pool if isinstance(pool, str) else None)
 
     return result
 
 
-def match_bundle_models(bundle_path: Path, models_dir: Path) -> list[str]:
+def match_bundle_models(bundle_path: Path, models_dir: Path, *, pool_name: str | None = None) -> list[str]:
     """Match models to a bundle by adapter module paths.
 
     Loads the bundle YAML to get its adapter module list, then scans
@@ -62,13 +65,21 @@ def match_bundle_models(bundle_path: Path, models_dir: Path) -> list[str]:
         return []
 
     model_adapters = _scan_model_adapters(models_dir)
-    return [name for name, modules in model_adapters.items() if modules & adapter_modules]
+    matches: list[str] = []
+    for name, (modules, pool) in model_adapters.items():
+        if pool_name is not None and (pool or "default") != pool_name:
+            continue
+        if modules & adapter_modules:
+            matches.append(name)
+    return matches
 
 
 def find_bundle_for_models(
     model_names: list[str],
     bundles_dir: Path,
     models_dir: Path,
+    *,
+    pool_name: str | None = None,
 ) -> str | None:
     """Find the best bundle whose adapters cover the given models.
 
@@ -81,6 +92,11 @@ def find_bundle_for_models(
         model_names: List of model names to match.
         bundles_dir: Path to the bundles directory.
         models_dir: Path to the models directory containing *.yaml configs.
+        pool_name: Optional pool filter. When set, models whose declared
+            pool does not match are excluded from the adapter-set used to
+            select a bundle. Mirrors :func:`match_bundle_models`'s
+            ``pool_name`` filter so pool isolation holds at the
+            bundle-resolution layer too.
 
     Returns:
         Bundle name (without .yaml) of the best match, or None if no bundle
@@ -93,7 +109,10 @@ def find_bundle_for_models(
     model_adapters = _scan_model_adapters(models_dir)
     needed_adapters: set[str] = set()
     for name in model_names:
-        needed_adapters |= model_adapters.get(name, set())
+        modules, pool = model_adapters.get(name, (set(), None))
+        if pool_name is not None and (pool or "default") != pool_name:
+            continue
+        needed_adapters |= modules
 
     if not needed_adapters:
         return None

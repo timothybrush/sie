@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::env;
 
+use serde::Deserialize;
+
+use crate::types::pool::PoolSpec;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // Server
     pub host: String,
     pub port: u16,
+    pub metrics_port: Option<u16>,
 
     // Discovery
     pub worker_urls: Vec<String>,
@@ -53,11 +58,23 @@ pub struct Config {
     // Tuning
     pub request_timeout: f64,
     pub max_stream_pending: u64,
+    pub stream_max_age_s: u64,
 
     // Configured GPUs (survives scale-to-zero)
     pub configured_gpus: Vec<String>,
     // Pre-computed lowercase→original map for GPU profile resolution (avoids HashMap rebuild per request)
     pub gpu_profile_map: HashMap<String, String>,
+
+    // Helm-declared queue pools that are long-lived admission boundaries.
+    // API-created pools remain lease-based; these specs do not expire.
+    pub static_queue_pools: Vec<PoolSpec>,
+
+    // Job/friendly model aliases: lowercase alias → canonical model id. Lets a
+    // caller request `model: "code"` and have it resolve to the recommended
+    // model before the registry lookup. Ships with built-in defaults (see
+    // `build_model_aliases`); extend/override via `SIE_GATEWAY_MODEL_ALIASES`
+    // (JSON map). Mirrors the `SIE_GATEWAY_GPU_ALIASES` mechanism.
+    pub model_aliases: HashMap<String, String>,
 
     // Model registry paths (filesystem seed; same volume mounted into sie-config
     // for consistency, but the gateway never writes to them).
@@ -76,7 +93,8 @@ pub struct Config {
     // share one admin secret in-cluster.
     pub config_service_token: Option<String>,
 
-    // Payload store (local path, s3://bucket/prefix, or gs://bucket/prefix)
+    // Payload store (local path, s3://bucket/prefix, gs://bucket/prefix, or
+    // abfs(s)://container@account.dfs.core.windows.net/prefix)
     pub payload_store_url: String,
 }
 
@@ -92,6 +110,10 @@ fn env_int(key: &str, fallback: u16) -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(fallback)
+}
+
+fn env_optional_int(key: &str) -> Option<u16> {
+    env::var(key).ok().and_then(|s| s.parse().ok())
 }
 
 fn env_float(key: &str, fallback: f64) -> f64 {
@@ -119,6 +141,138 @@ fn env_csv(key: &str) -> Vec<String> {
     }
 }
 
+fn env_json_string_map(key: &str) -> HashMap<String, String> {
+    match env::var(key) {
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str::<HashMap<String, String>>(&s).unwrap_or_default()
+        }
+        _ => HashMap::new(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StaticQueuePoolEnvSpec {
+    #[serde(default)]
+    bundle: Option<String>,
+    #[serde(default)]
+    gpus: HashMap<String, u32>,
+    #[serde(default, alias = "gpu_caps")]
+    gpu_caps: HashMap<String, u32>,
+    #[serde(default, alias = "minimum_worker_count")]
+    minimum_worker_count: u32,
+}
+
+fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
+    let parsed = match env::var(key) {
+        Ok(s) if !s.trim().is_empty() => {
+            match serde_json::from_str::<HashMap<String, StaticQueuePoolEnvSpec>>(&s) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    panic!("failed to parse {key}: {error}; fix or unset {key}")
+                }
+            }
+        }
+        _ => HashMap::new(),
+    };
+
+    let mut specs: Vec<PoolSpec> = parsed
+        .into_iter()
+        .filter_map(|(name, spec)| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let bundle = spec.bundle.and_then(|bundle| {
+                let bundle = bundle.trim().to_string();
+                if bundle.is_empty() {
+                    None
+                } else {
+                    Some(bundle)
+                }
+            });
+            Some(PoolSpec {
+                name,
+                bundle,
+                gpus: spec.gpus,
+                gpu_caps: spec.gpu_caps,
+                ttl_seconds: None,
+                minimum_worker_count: spec.minimum_worker_count,
+            })
+        })
+        .collect();
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    specs
+}
+
+/// Job/friendly model aliases: lowercase alias → model id (or `bundle:/model`).
+///
+/// Ships with built-in defaults so `model="code"` works without operator
+/// config (and makes "each agent job routes to the right model" true by
+/// default). `SIE_GATEWAY_MODEL_ALIASES` (a JSON map) extends or overrides
+/// them. Empty alias/target pairs are skipped; aliases are stored lowercased
+/// because resolution lowercases the lookup.
+///
+/// A target may be a bare model id (`Org/Model`) or a bundle-qualified spec
+/// (`bundle:/Org/Model`). The bundle form lets an operator pin a precision /
+/// profile bundle for a job — e.g. map `sql` to a BF16 bundle that avoids the
+/// FP8 SQL-accuracy regression (ADR 0001), since the `:profile` variant suffix
+/// is stripped before worker dispatch and so cannot itself route by precision.
+/// `resolve_model_spec_with_aliases` (proxy.rs) applies the bundle.
+fn build_model_aliases(overrides: HashMap<String, String>) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    // Built-in: the code-generation job → the model with a MEASURED
+    // HumanEval/MBPP pass@1 baseline that also serves reliably
+    // (Qwen3-4B-Instruct-2507: 0.866 / 0.74). Qwen3.5-4B is stronger on paper
+    // but its NEXTN/hybrid serving path does not come up reliably yet, so it is
+    // not the default until measured + its serving init is fixed.
+    map.insert(
+        "code".to_string(),
+        "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+    );
+    // Text-to-SQL job → an ebnf-grammar-capable LLM for the "any LLM + SQL
+    // grammar" path. Repoint to SQLCoder once that model is onboarded.
+    map.insert("sql".to_string(), "Qwen/Qwen3-4B-Instruct-2507".to_string());
+    // CHECK POLICY job → a generative guard model that emits a safe/unsafe
+    // verdict. Granite Guardian 3.0 2B (Apache-2.0, ungated) measured on
+    // ToxicChat via the generation gate; serves on the same SGLang path.
+    map.insert(
+        "guard".to_string(),
+        "ibm-granite/granite-guardian-3.0-2b".to_string(),
+    );
+    for (alias, target) in overrides {
+        let alias = alias.trim().to_lowercase();
+        let target = target.trim().to_string();
+        if alias.is_empty() || target.is_empty() {
+            continue;
+        }
+        map.insert(alias, target);
+    }
+    map
+}
+
+fn build_gpu_profile_map(
+    configured_gpus: &[String],
+    aliases: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = configured_gpus
+        .iter()
+        .map(|g| (g.to_lowercase(), g.clone()))
+        .collect();
+
+    for (alias, profile) in aliases {
+        let alias = alias.trim();
+        let profile = profile.trim();
+        if alias.is_empty() || profile.is_empty() {
+            continue;
+        }
+        map.entry(alias.to_lowercase())
+            .or_insert_with(|| profile.to_string());
+    }
+
+    map
+}
+
 fn env_default(key: &str, fallback: &str) -> String {
     match env::var(key) {
         Ok(v) if !v.is_empty() => v,
@@ -132,10 +286,17 @@ impl Config {
         if auth_tokens.is_empty() {
             auth_tokens = env_csv("SIE_AUTH_TOKEN");
         }
+        let configured_gpus = env_csv("SIE_GATEWAY_CONFIGURED_GPUS");
+        let gpu_profile_map = build_gpu_profile_map(
+            &configured_gpus,
+            env_json_string_map("SIE_GATEWAY_GPU_ALIASES"),
+        );
+        let model_aliases = build_model_aliases(env_json_string_map("SIE_GATEWAY_MODEL_ALIASES"));
 
         Self {
             host: "0.0.0.0".to_string(),
             port: 8080,
+            metrics_port: env_optional_int("SIE_METRICS_PORT"),
 
             worker_urls: env_csv("SIE_GATEWAY_WORKERS"),
             use_kubernetes: env_bool("SIE_GATEWAY_KUBERNETES"),
@@ -176,12 +337,12 @@ impl Config {
 
             request_timeout: env_float("SIE_GATEWAY_REQUEST_TIMEOUT", 30.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
+            stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 120),
 
-            configured_gpus: env_csv("SIE_GATEWAY_CONFIGURED_GPUS"),
-            gpu_profile_map: {
-                let gpus = env_csv("SIE_GATEWAY_CONFIGURED_GPUS");
-                gpus.iter().map(|g| (g.to_lowercase(), g.clone())).collect()
-            },
+            configured_gpus,
+            gpu_profile_map,
+            static_queue_pools: env_static_queue_pools("SIE_GATEWAY_STATIC_QUEUE_POOLS"),
+            model_aliases,
 
             bundles_dir: env_default("SIE_BUNDLES_DIR", "bundles"),
             models_dir: env_default("SIE_MODELS_DIR", "models"),
@@ -203,7 +364,7 @@ impl Config {
                 }
             },
 
-            payload_store_url: env_default("SIE_PAYLOAD_STORE_URL", "payload_store"),
+            payload_store_url: env_default("SIE_PAYLOAD_STORE_URL", ""),
         }
     }
 
@@ -446,6 +607,142 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_env_json_string_map() {
+        with_env(&[("_TEST_JSON_MAP", r#"{"l4":"l4-spot"}"#)], || {
+            let result = env_json_string_map("_TEST_JSON_MAP");
+            assert_eq!(result.get("l4"), Some(&"l4-spot".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_env_json_string_map_invalid_is_empty() {
+        with_env(&[("_TEST_JSON_MAP", "not-json")], || {
+            assert!(env_json_string_map("_TEST_JSON_MAP").is_empty());
+        });
+    }
+
+    #[test]
+    fn test_env_static_queue_pools_accepts_helm_shape() {
+        with_env(
+            &[(
+                "_TEST_STATIC_QUEUE_POOLS",
+                r#"{
+                    "companyA": {
+                        "gpus": {"l4": 0},
+                        "gpuCaps": {},
+                        "minimumWorkerCount": 1
+                    },
+                    "companyB": {
+                        "bundle": "sglang",
+                        "gpus": {"a100": 1},
+                        "gpu_caps": {"a100": 2},
+                        "minimum_worker_count": 2
+                    }
+                }"#,
+            )],
+            || {
+                let result = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
+
+                assert_eq!(result.len(), 2);
+                assert_eq!(result[0].name, "companyA");
+                assert_eq!(result[0].gpus.get("l4"), Some(&0));
+                assert!(result[0].gpu_caps.is_empty());
+                assert_eq!(result[0].minimum_worker_count, 1);
+                assert_eq!(result[0].ttl_seconds, None);
+
+                assert_eq!(result[1].name, "companyB");
+                assert_eq!(result[1].bundle.as_deref(), Some("sglang"));
+                assert_eq!(result[1].gpus.get("a100"), Some(&1));
+                assert_eq!(result[1].gpu_caps.get("a100"), Some(&2));
+                assert_eq!(result[1].minimum_worker_count, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_static_queue_pools_invalid_panics() {
+        with_env(&[("_TEST_STATIC_QUEUE_POOLS", "not-json")], || {
+            let result = std::panic::catch_unwind(|| {
+                let _ = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
+            });
+            let panic = result.expect_err("invalid static queue pool JSON must fail fast");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains("failed to parse _TEST_STATIC_QUEUE_POOLS"));
+        });
+    }
+
+    #[test]
+    fn test_build_gpu_profile_map_preserves_canonical_and_aliases() {
+        let mut aliases = HashMap::new();
+        aliases.insert("l4".to_string(), "l4-spot".to_string());
+
+        let result = build_gpu_profile_map(&["l4-spot".to_string()], aliases);
+
+        assert_eq!(result.get("l4-spot"), Some(&"l4-spot".to_string()));
+        assert_eq!(result.get("l4"), Some(&"l4-spot".to_string()));
+    }
+
+    #[test]
+    fn test_build_model_aliases_has_builtin_code_default() {
+        let result = build_model_aliases(HashMap::new());
+        assert_eq!(
+            result.get("code"),
+            Some(&"Qwen/Qwen3-4B-Instruct-2507".to_string())
+        );
+        assert_eq!(
+            result.get("sql"),
+            Some(&"Qwen/Qwen3-4B-Instruct-2507".to_string())
+        );
+        assert_eq!(
+            result.get("guard"),
+            Some(&"ibm-granite/granite-guardian-3.0-2b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_model_aliases_env_overrides_and_extends() {
+        let mut overrides = HashMap::new();
+        overrides.insert("code".to_string(), "Org/Coder".to_string()); // override default
+        overrides.insert("SQL".to_string(), "Org/SQLModel".to_string()); // extend + lowercased
+        overrides.insert("blank".to_string(), "".to_string()); // skipped (empty target)
+
+        let result = build_model_aliases(overrides);
+
+        assert_eq!(result.get("code"), Some(&"Org/Coder".to_string()));
+        assert_eq!(result.get("sql"), Some(&"Org/SQLModel".to_string()));
+        assert!(!result.contains_key("blank"));
+    }
+
+    #[test]
+    fn test_build_gpu_profile_map_does_not_override_canonical_profile() {
+        let mut aliases = HashMap::new();
+        aliases.insert("l4".to_string(), "l4-spot".to_string());
+
+        let result = build_gpu_profile_map(&["l4".to_string(), "l4-spot".to_string()], aliases);
+
+        assert_eq!(result.get("l4"), Some(&"l4".to_string()));
+    }
+
+    #[test]
+    fn test_config_load_uses_gpu_aliases() {
+        with_env(
+            &[
+                ("SIE_GATEWAY_CONFIGURED_GPUS", "l4-spot"),
+                ("SIE_GATEWAY_GPU_ALIASES", r#"{"l4":"l4-spot"}"#),
+            ],
+            || {
+                let cfg = Config::load();
+                assert_eq!(cfg.configured_gpus, vec!["l4-spot"]);
+                assert_eq!(cfg.gpu_profile_map.get("l4"), Some(&"l4-spot".to_string()));
+            },
+        );
+    }
+
     // ── env_default ────────────────────────────────────────────────
 
     #[test]
@@ -517,7 +814,7 @@ mod tests {
     fn test_payload_store_url_default() {
         without_env(&["SIE_PAYLOAD_STORE_URL"], || {
             let cfg = Config::load();
-            assert_eq!(cfg.payload_store_url, "payload_store");
+            assert_eq!(cfg.payload_store_url, "");
         });
     }
 
@@ -530,6 +827,54 @@ mod tests {
                 assert_eq!(cfg.payload_store_url, "s3://my-bucket/payloads");
             },
         );
+    }
+
+    #[test]
+    fn test_metrics_port_from_env() {
+        with_env(&[("SIE_METRICS_PORT", "9090")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, Some(9090));
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_unset_is_none() {
+        without_env(&["SIE_METRICS_PORT"], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_invalid_is_none() {
+        with_env(&[("SIE_METRICS_PORT", "not-a-number")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
+    fn test_metrics_port_out_of_range_is_none() {
+        with_env(&[("SIE_METRICS_PORT", "70000")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.metrics_port, None);
+        });
+    }
+
+    #[test]
+    fn test_stream_max_age_default_matches_worker_contract() {
+        without_env(&["SIE_STREAM_MAX_AGE_S"], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.stream_max_age_s, 120);
+        });
+    }
+
+    #[test]
+    fn test_stream_max_age_from_env() {
+        with_env(&[("SIE_STREAM_MAX_AGE_S", "240")], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.stream_max_age_s, 240);
+        });
     }
 
     #[test]
@@ -561,6 +906,7 @@ mod tests {
         let mut cfg = Config {
             host: String::new(),
             port: 0,
+            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: String::new(),
@@ -581,8 +927,11 @@ mod tests {
             multi_router: false,
             request_timeout: 0.0,
             max_stream_pending: 0,
+            stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            static_queue_pools: Vec::new(),
+            model_aliases: HashMap::new(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,

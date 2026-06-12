@@ -1,6 +1,6 @@
 {
   "name": "@superlinked/sie-lancedb",
-  "version": "0.3.4",
+  "version": "0.6.4",
   "description": "SIE embedding function and reranker for LanceDB",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -36,10 +36,10 @@
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@lancedb/lancedb": "^0.17.0",
-    "apache-arrow": "^18.0.0",
-    "tsup": "^8.3.5",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "apache-arrow": "^18.1.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
   },
   "engines": {
     "node": ">=22.0.0"

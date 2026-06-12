@@ -2,7 +2,7 @@
 
 Device-agnostic memory monitoring and LRU tracking for CUDA, MPS, and CPU.
 
-Per DESIGN.md Section 5.4:
+Memory management behavior:
 - Reactive LRU eviction without static VRAM budgets
 - Try to load model → If OOM, evict LRU model and retry
 - After each batch, check memory usage; evict if above threshold
@@ -462,7 +462,7 @@ class MemoryManager:
     async def check_memory_pressure(self) -> list[str]:
         """Check memory pressure and return models that should be evicted.
 
-        Async wrapper for use in async request handlers (per DESIGN.md).
+        Async wrapper for use in async request handlers.
         The underlying check is fast and non-blocking.
 
         Returns:
