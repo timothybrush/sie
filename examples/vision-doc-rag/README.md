@@ -43,9 +43,10 @@ data/multivectors.npz     # page multivectors from ingest.py
   without `instruction` to OCR the same page for a display snippet. The OCR
   snippet is UX-only; it never enters ranking.
 - `score` optional - `Qwen/Qwen3-VL-Reranker-2B` second-stage rerank over
-  `(query text, page image)`. Off by default while we wait for an upstream
-  adapter fix; flip `search.visual_rerank: true` in `config.yaml` to enable it
-  on a cluster that's ready.
+  `(query text, page image)`. Off by default while we wait for upstream fixes
+  (image inputs on the SDK `score()` path and the cluster-side visual rerank
+  adapter); flip `search.visual_rerank: true` in `config.yaml` to enable it on
+  a stack that has them.
 
 ## Run it
 
