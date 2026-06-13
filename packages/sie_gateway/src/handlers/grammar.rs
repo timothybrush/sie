@@ -7,7 +7,8 @@
 //! * Payload size cap (64 KiB)
 //! * JSON Schema nesting-depth cap (16)
 //! * Regex length cap (4 KiB)
-//! * JSON Schema reject-list (``$ref``, ``$dynamicRef``, ``if/then/else``,
+//! * Internal JSON Schema ``$ref`` dereferencing (``#/...`` only)
+//! * JSON Schema reject-list (``$dynamicRef``, ``if/then/else``,
 //!   ``unevaluatedProperties``, ``dependentSchemas``)
 //! * Mutual exclusivity of ``json_schema`` and ``regex``
 //!
@@ -17,16 +18,14 @@
 //! The worker is downstream and assumes the gateway has already
 //! filtered — it does not re-check these caps.
 //!
-//! ``$ref`` rejection note: the spec wording is "external ``$ref``";
-//! v1 rejects **all** ``$ref`` (including internal ``#/...``) for
-//! implementation simplicity. The error message and the OpenAPI spec
-//! both call this out; this can be refined if customer pressure justifies
-//! the JSON-pointer resolver.
+//! ``$ref`` support is deliberately bounded to internal JSON pointers
+//! (``#/...``). External documents, unresolved pointers, and recursive
+//! reference cycles are rejected before the worker sees the schema.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::http_error::{json_openai_error, openai_code as oai_code, openai_type as oai_type};
 use crate::metrics;
@@ -117,7 +116,6 @@ pub const MAX_EBNF_LEN: usize = 8 * 1024;
 /// compile cost. Each rejection names the keyword in ``param`` so
 /// callers can fix their schema without trial-and-error.
 const UNSUPPORTED_KEYWORDS: &[&str] = &[
-    "$ref",
     "$dynamicRef",
     "if",
     "then",
@@ -226,11 +224,27 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
 
     if has_schema {
         let schema = obj.get("json_schema").expect("checked above");
-        if let Err(resp) = walk_schema(schema, "grammar.json_schema", 0) {
+        let resolved_schema = match dereference_schema_refs(schema, "grammar.json_schema") {
+            Ok(schema) => schema,
+            Err(resp) => return GrammarParseResult::Err(resp),
+        };
+        let serialized_len =
+            json_schema_grammar_len(&resolved_schema, label.as_deref(), strict).unwrap_or(0);
+        if serialized_len > MAX_GRAMMAR_BYTES {
+            metrics::record_grammar_reject("payload_size");
+            return GrammarParseResult::Err(bad_request(
+                format!(
+                    "grammar payload {serialized_len} bytes exceeds limit ({MAX_GRAMMAR_BYTES} bytes)"
+                ),
+                "grammar",
+                oai_code::INVALID_REQUEST,
+            ));
+        }
+        if let Err(resp) = walk_schema(&resolved_schema, "grammar.json_schema", 0) {
             return GrammarParseResult::Err(resp);
         }
         GrammarParseResult::Ok(GrammarSpec::JsonSchema {
-            value: schema.clone(),
+            value: resolved_schema,
             label,
             strict,
         })
@@ -290,6 +304,225 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
     }
 }
 
+fn json_schema_grammar_len(
+    schema: &Value,
+    label: Option<&str>,
+    strict: Option<bool>,
+) -> Result<usize, serde_json::Error> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("json_schema".to_string(), schema.clone());
+    if let Some(label) = label {
+        obj.insert("label".to_string(), Value::String(label.to_string()));
+    }
+    if let Some(strict) = strict {
+        obj.insert("strict".to_string(), Value::Bool(strict));
+    }
+    serde_json::to_vec(&Value::Object(obj)).map(|b| b.len())
+}
+
+#[allow(clippy::result_large_err)]
+fn dereference_schema_refs(schema: &Value, path: &str) -> Result<Value, Response> {
+    let mut visited: usize = 0;
+    let mut stack: Vec<String> = Vec::new();
+    dereference_schema_refs_inner(
+        schema,
+        schema,
+        path,
+        &mut visited,
+        &mut stack,
+        SchemaResolveContext::Schema,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaResolveContext {
+    Schema,
+    SchemaMap,
+    SchemaArray,
+    Other,
+}
+
+#[allow(clippy::result_large_err)]
+fn dereference_schema_refs_inner(
+    root: &Value,
+    v: &Value,
+    path: &str,
+    visited: &mut usize,
+    stack: &mut Vec<String>,
+    context: SchemaResolveContext,
+) -> Result<Value, Response> {
+    *visited = visited.saturating_add(1);
+    if *visited > MAX_SCHEMA_NODES {
+        metrics::record_grammar_reject("node_count");
+        return Err(bad_request(
+            format!("JSON Schema node count exceeds limit ({MAX_SCHEMA_NODES})"),
+            path,
+            oai_code::INVALID_REQUEST,
+        ));
+    }
+
+    match v {
+        Value::Object(map) => {
+            if context == SchemaResolveContext::Schema && map.contains_key("$ref") {
+                let ref_value = map.get("$ref").expect("checked above");
+                let ref_param = format!("{path}.$ref");
+                let Some(ref_str) = ref_value.as_str() else {
+                    metrics::record_grammar_reject("malformed");
+                    return Err(bad_request(
+                        "'$ref' must be a string".to_string(),
+                        &ref_param,
+                        oai_code::INVALID_REQUEST,
+                    ));
+                };
+                let Some(pointer) = ref_str.strip_prefix('#') else {
+                    metrics::record_grammar_reject("unsupported_keyword");
+                    return Err(bad_request(
+                        "external '$ref' is not supported".to_string(),
+                        &ref_param,
+                        oai_code::UNSUPPORTED_FIELD,
+                    ));
+                };
+                if !pointer.is_empty() && !pointer.starts_with('/') {
+                    metrics::record_grammar_reject("unsupported_keyword");
+                    return Err(bad_request(
+                        "only internal JSON-pointer '$ref' values are supported".to_string(),
+                        &ref_param,
+                        oai_code::UNSUPPORTED_FIELD,
+                    ));
+                }
+                if stack.iter().any(|p| p == pointer) {
+                    metrics::record_grammar_reject("ref_cycle");
+                    return Err(bad_request(
+                        format!("recursive '$ref' cycle detected at {ref_str:?}"),
+                        &ref_param,
+                        oai_code::INVALID_REQUEST,
+                    ));
+                }
+                let Some(target) = root.pointer(pointer) else {
+                    metrics::record_grammar_reject("ref_unresolved");
+                    return Err(bad_request(
+                        format!("unresolved internal '$ref' {ref_str:?}"),
+                        &ref_param,
+                        oai_code::INVALID_REQUEST,
+                    ));
+                };
+
+                stack.push(pointer.to_string());
+                let resolved = dereference_schema_refs_inner(
+                    root,
+                    target,
+                    path,
+                    visited,
+                    stack,
+                    SchemaResolveContext::Schema,
+                )?;
+                stack.pop();
+
+                let mut siblings = serde_json::Map::new();
+                for (k, child) in map {
+                    if k == "$ref" || k == "$defs" || k == "definitions" {
+                        continue;
+                    }
+                    let child_path = format!("{path}.{k}");
+                    let child_context = schema_child_resolve_context(context, k);
+                    siblings.insert(
+                        k.clone(),
+                        dereference_schema_refs_inner(
+                            root,
+                            child,
+                            &child_path,
+                            visited,
+                            stack,
+                            child_context,
+                        )?,
+                    );
+                }
+
+                if siblings.is_empty() {
+                    return Ok(resolved);
+                }
+
+                // JSON Schema evaluates $ref siblings alongside the
+                // referenced schema. Preserve that intersection instead
+                // of overwriting same-named object keywords such as
+                // properties, required, or allOf.
+                Ok(json!({"allOf": [resolved, Value::Object(siblings)]}))
+            } else {
+                let mut out = serde_json::Map::new();
+                for (k, child) in map {
+                    if context == SchemaResolveContext::Schema
+                        && (k == "$defs" || k == "definitions")
+                    {
+                        continue;
+                    }
+                    let child_path = format!("{path}.{k}");
+                    let child_context = schema_child_resolve_context(context, k);
+                    out.insert(
+                        k.clone(),
+                        dereference_schema_refs_inner(
+                            root,
+                            child,
+                            &child_path,
+                            visited,
+                            stack,
+                            child_context,
+                        )?,
+                    );
+                }
+                Ok(Value::Object(out))
+            }
+        }
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, child) in arr.iter().enumerate() {
+                let child_path = format!("{path}[{i}]");
+                let child_context = if matches!(
+                    context,
+                    SchemaResolveContext::Schema | SchemaResolveContext::SchemaArray
+                ) {
+                    SchemaResolveContext::Schema
+                } else {
+                    SchemaResolveContext::Other
+                };
+                out.push(dereference_schema_refs_inner(
+                    root,
+                    child,
+                    &child_path,
+                    visited,
+                    stack,
+                    child_context,
+                )?);
+            }
+            Ok(Value::Array(out))
+        }
+        _ => Ok(v.clone()),
+    }
+}
+
+fn schema_child_resolve_context(parent: SchemaResolveContext, key: &str) -> SchemaResolveContext {
+    match parent {
+        SchemaResolveContext::Schema => match key {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                SchemaResolveContext::SchemaMap
+            }
+            "oneOf" | "anyOf" | "allOf" | "prefixItems" => SchemaResolveContext::SchemaArray,
+            "items"
+            | "additionalProperties"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else" => SchemaResolveContext::Schema,
+            _ => SchemaResolveContext::Other,
+        },
+        SchemaResolveContext::SchemaMap => SchemaResolveContext::Schema,
+        SchemaResolveContext::SchemaArray | SchemaResolveContext::Other => {
+            SchemaResolveContext::Other
+        }
+    }
+}
+
 /// Recursive walk over a JSON-Schema-shaped value. Enforces depth and
 /// rejects the unsupported keywords listed in
 /// :const:`UNSUPPORTED_KEYWORDS`.
@@ -336,16 +569,7 @@ fn walk_schema_inner(
                 if map.contains_key(kw) {
                     metrics::record_grammar_reject("unsupported_keyword");
                     let param = format!("{path}.{kw}");
-                    let message = if kw == "$ref" {
-                        // Grammar v1 blanket-rejects all ``$ref``,
-                        // including internal ``#/...``. The spec
-                        // wording is "external ``$ref``"; later revisions may
-                        // refine. Documented in OpenAPI.
-                        "'$ref' is not supported (the grammar surface rejects all $ref including internal)"
-                            .to_string()
-                    } else {
-                        format!("JSON Schema keyword '{kw}' is not supported")
-                    };
+                    let message = format!("JSON Schema keyword '{kw}' is not supported");
                     return Err(bad_request(message, &param, oai_code::UNSUPPORTED_FIELD));
                 }
             }
@@ -485,12 +709,146 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parse_grammar_rejects_dollar_ref() {
+    #[test]
+    fn test_parse_grammar_dereferences_internal_dollar_ref() {
         let v = json!({
             "json_schema": {
                 "type": "object",
+                "$defs": {
+                    "Foo": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    }
+                },
                 "properties": {"a": {"$ref": "#/$defs/Foo"}},
+            }
+        });
+        let spec = ok_or_panic(parse_grammar(&v));
+        let GrammarSpec::JsonSchema { value, .. } = spec else {
+            panic!("expected JsonSchema");
+        };
+        assert_eq!(
+            value["properties"]["a"]["properties"]["name"]["type"],
+            "string"
+        );
+        assert!(
+            value.get("$defs").is_none(),
+            "$defs should be stripped after inlining"
+        );
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(
+            !encoded.contains("\"$ref\""),
+            "schema should be fully dereferenced: {encoded}"
+        );
+    }
+
+    #[test]
+    fn test_parse_grammar_preserves_dollar_ref_sibling_constraints() {
+        let v = json!({
+            "json_schema": {
+                "type": "object",
+                "$defs": {
+                    "Foo": {
+                        "type": "object",
+                        "properties": {"base": {"type": "string"}},
+                        "required": ["base"],
+                    }
+                },
+                "properties": {
+                    "item": {
+                        "$ref": "#/$defs/Foo",
+                        "type": "object",
+                        "properties": {"extra": {"type": "integer"}},
+                        "required": ["extra"],
+                    }
+                },
+            }
+        });
+        let spec = ok_or_panic(parse_grammar(&v));
+        let GrammarSpec::JsonSchema { value, .. } = spec else {
+            panic!("expected JsonSchema");
+        };
+        let all_of = value["properties"]["item"]["allOf"]
+            .as_array()
+            .expect("ref sibling schema should be represented as allOf");
+        assert_eq!(all_of.len(), 2);
+        assert_eq!(all_of[0]["properties"]["base"]["type"], "string");
+        assert_eq!(all_of[0]["required"], json!(["base"]));
+        assert_eq!(all_of[1]["properties"]["extra"]["type"], "integer");
+        assert_eq!(all_of[1]["required"], json!(["extra"]));
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(
+            !encoded.contains("\"$ref\"") && !encoded.contains("\"$defs\""),
+            "schema should be fully dereferenced: {encoded}"
+        );
+    }
+
+    #[test]
+    fn test_parse_grammar_dereferences_pydantic_openai_style_schema() {
+        let v = json!({
+            "json_schema": {
+                "$defs": {
+                    "Step": {
+                        "type": "object",
+                        "properties": {
+                            "explanation": {"type": "string"},
+                            "output": {"type": "string"},
+                        },
+                        "required": ["explanation", "output"],
+                        "additionalProperties": false,
+                    }
+                },
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Step"},
+                    },
+                    "single": {
+                        "$ref": "#/$defs/Step",
+                        "description": "one step",
+                    },
+                    "final_answer": {"type": "string"},
+                },
+                "required": ["steps", "single", "final_answer"],
+                "additionalProperties": false,
+            }
+        });
+        let spec = ok_or_panic(parse_grammar(&v));
+        let GrammarSpec::JsonSchema { value, .. } = spec else {
+            panic!("expected JsonSchema");
+        };
+        assert_eq!(
+            value["properties"]["steps"]["items"]["properties"]["explanation"]["type"],
+            "string"
+        );
+        assert_eq!(
+            value["properties"]["steps"]["items"]["additionalProperties"],
+            false
+        );
+        let single_all_of = value["properties"]["single"]["allOf"]
+            .as_array()
+            .expect("Pydantic ref sibling should be preserved as allOf");
+        assert_eq!(
+            single_all_of[0]["properties"]["explanation"]["type"],
+            "string"
+        );
+        assert_eq!(single_all_of[1]["description"], "one step");
+        assert_eq!(value["additionalProperties"], false);
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(
+            !encoded.contains("\"$ref\"") && !encoded.contains("\"$defs\""),
+            "schema should be fully dereferenced: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_grammar_rejects_external_dollar_ref() {
+        let v = json!({
+            "json_schema": {
+                "type": "object",
+                "properties": {"a": {"$ref": "https://example.com/schemas/foo.json"}},
             }
         });
         let body = err_or_panic(parse_grammar(&v)).await;
@@ -500,7 +858,31 @@ mod tests {
             "grammar.json_schema.properties.a.$ref"
         );
         let msg = body["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("$ref"), "msg should mention $ref: {msg}");
+        assert!(
+            msg.contains("external"),
+            "msg should mention external refs: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_grammar_rejects_recursive_dollar_ref_cycle() {
+        let v = json!({
+            "json_schema": {
+                "$defs": {
+                    "A": {"$ref": "#/$defs/B"},
+                    "B": {"$ref": "#/$defs/A"},
+                },
+                "properties": {"a": {"$ref": "#/$defs/A"}},
+            }
+        });
+        let body = err_or_panic(parse_grammar(&v)).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(
+            body["error"]["param"],
+            "grammar.json_schema.properties.a.$ref"
+        );
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("cycle"), "msg should mention cycle: {msg}");
     }
 
     #[tokio::test]

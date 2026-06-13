@@ -307,7 +307,7 @@ class EngineConfig(BaseSettings):
     memory_pressure_threshold_percent: Annotated[
         int,
         Field(ge=50, le=99, description="VRAM usage percent that triggers LRU eviction"),
-    ] = 85
+    ] = 95
     idle_evict_s: Annotated[
         int | None,
         Field(
@@ -315,7 +315,7 @@ class EngineConfig(BaseSettings):
             le=86400,
             description=(
                 "Unload models that have been idle (no requests) for this many seconds. "
-                "Additive to the 85% pressure monitor: catches cold models before they "
+                "Additive to the pressure monitor: catches cold models before they "
                 "build up and become eviction candidates under load. "
                 "None disables (default); set ``SIE_IDLE_EVICT_S=300`` for a 5-minute TTL."
             ),

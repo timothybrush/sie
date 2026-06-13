@@ -94,6 +94,11 @@ def _encode_config(
     )
 
 
+def _with_pool(config: ModelConfig, pool: str) -> ModelConfig:
+    config.pool = pool
+    return config
+
+
 def _gen_config_multi_profile(
     sie_id: str = "Qwen/Qwen3-4B-Instruct-2507",
     *,
@@ -230,15 +235,15 @@ class TestRegistryHook:
     def test_add_config_generation_with_scalar_lora_id_rejects(self) -> None:
         registry = ModelRegistry(pool_name="p1")
         with pytest.raises(LegacyScalarLoraIdError):
-            registry.add_config(_gen_config(lora_id="org/qwen-lora"))
+            registry.add_config(_with_pool(_gen_config(lora_id="org/qwen-lora"), "p1"))
 
     def test_add_config_generation_without_scalar_lora_id_accepted(self) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_gen_config())
+        registry.add_config(_with_pool(_gen_config(), "p1"))
 
     def test_add_config_encode_with_scalar_lora_id_accepted(self) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_encode_config(lora_id="org/bge-lora"))
+        registry.add_config(_with_pool(_encode_config(lora_id="org/bge-lora"), "p1"))
 
     def test_validator_fires_without_pool_name(self) -> None:
         """Legacy scalar check is not pool-scoped — fires when SIE_POOL unset."""
@@ -249,7 +254,7 @@ class TestRegistryHook:
     def test_failed_add_does_not_mutate_state(self) -> None:
         registry = ModelRegistry(pool_name="p1")
         try:
-            registry.add_config(_gen_config(lora_id="org/qwen-lora"))
+            registry.add_config(_with_pool(_gen_config(lora_id="org/qwen-lora"), "p1"))
         except LegacyScalarLoraIdError:
             pass
         assert "Qwen/Qwen3-4B-Instruct-2507" not in registry.model_names

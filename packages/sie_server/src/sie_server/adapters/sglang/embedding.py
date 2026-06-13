@@ -51,7 +51,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
     - Supports last-token pooling only (standard for LLM embeddings)
 
     Note: This adapter starts SGLang as a subprocess server during load().
-    Signal handlers in SGLang require main thread execution.
+    The child process owns its own main thread and signal handlers, so parent
+    load can run in the registry's model-load executor.
 
     Example:
         adapter = SGLangEmbeddingAdapter(
@@ -64,8 +65,10 @@ class SGLangEmbeddingAdapter(BaseAdapter):
 
     spec = AdapterSpec(inputs=("text",), outputs=("dense",), unload_fields=("_process", "_server_url", "_dense_dim"))
 
-    # SGLang uses signal handlers that require main thread execution
-    requires_main_thread: bool = True
+    # The SGLang child process owns signal handling; parent load must not block
+    # the uvicorn event loop while polling child readiness.
+    requires_main_thread: bool = False
+    manages_own_load_timeout: bool = True
 
     def _check_loaded(self) -> None:
         if self._server_url is None:

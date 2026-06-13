@@ -186,7 +186,7 @@ pub static PROVISIONING_RESPONSES: LazyLock<CounterVec> = LazyLock::new(|| {
     CounterVec::new(
         Opts::new(
             "sie_gateway_provisioning_responses_total",
-            "202 provisioning responses",
+            "Provisioning responses returned when no ready worker exists",
         ),
         &["machine_profile"],
     )
@@ -979,8 +979,9 @@ pub fn update_worker_metrics(workers: &[WorkerSnapshot]) {
         } else {
             unhealthy_count += 1;
         }
+        let pool_name = w.pool_name.trim().to_ascii_lowercase();
         WORKER_QUEUE_DEPTH
-            .with_label_values(&[&w.pool_name, &w.name, &w.machine_profile, &w.bundle])
+            .with_label_values(&[&pool_name, &w.name, &w.machine_profile, &w.bundle])
             .set(w.queue_depth as f64);
         WORKER_MEMORY_USED
             .with_label_values(&[&w.name, &w.machine_profile, &w.bundle])
@@ -990,7 +991,7 @@ pub fn update_worker_metrics(workers: &[WorkerSnapshot]) {
         // `kv_reserved_tokens`; seeding 0.0 keeps the series visible
         // (and ghost-free, thanks to the reset above).
         KV_RESERVATION_KNOWN
-            .with_label_values(&[&w.pool_name, &w.name])
+            .with_label_values(&[&pool_name, &w.name])
             .set(0.0);
     }
 
@@ -1330,6 +1331,43 @@ mod tests {
         let unhealthy = WORKER_COUNT.with_label_values(&["unhealthy"]).get();
         assert!((healthy - 1.0).abs() < f64::EPSILON);
         assert!((unhealthy - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_worker_metrics_canonicalizes_pool_label_case() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        update_worker_metrics(&[WorkerSnapshot {
+            name: "w1".to_string(),
+            machine_profile: "l4".to_string(),
+            bundle: "default".to_string(),
+            pool_name: "Customer-Acme".to_string(),
+            queue_depth: 5,
+            memory_used_bytes: 1000,
+            healthy: true,
+        }]);
+
+        let canonical = WORKER_QUEUE_DEPTH
+            .with_label_values(&["customer-acme", "w1", "l4", "default"])
+            .get();
+        assert!((canonical - 5.0).abs() < f64::EPSILON);
+
+        let families = REGISTRY.gather();
+        let mixed_case_present = families
+            .iter()
+            .filter(|mf| mf.name() == "sie_gateway_worker_queue_depth")
+            .flat_map(|mf| mf.get_metric().iter())
+            .any(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "pool" && l.value() == "Customer-Acme")
+            });
+        assert!(
+            !mixed_case_present,
+            "worker queue-depth labels must use canonical lowercase pool names"
+        );
     }
 
     #[test]

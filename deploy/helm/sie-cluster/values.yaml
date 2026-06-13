@@ -361,6 +361,8 @@ workers:
     # should consume from a dedicated logical queue namespace / tenant pool
     # such as `customer-acme`, in which case callers must send that pool
     # explicitly (SDK `gpu="customer-acme/l4"`).
+    # Queue pool values are rendered and routed in lowercase so NATS/KEDA
+    # labels stay canonical even if an override uses mixed case.
     queuePool: default
 
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
@@ -405,7 +407,7 @@ workers:
     #
     #   # Proactive idle-eviction TTL (seconds, default disabled).
     #   # Unloads models that have been idle longer than this threshold.
-    #   # Additive to the 85% pressure monitor; helps free cold weights
+    #   # Additive to the pressure monitor; helps free cold weights
     #   # before pressure builds up under load.
     #   - name: SIE_IDLE_EVICT_S
     #     value: "300"
@@ -421,9 +423,12 @@ workers:
     # path/port are contracts owned by the template: startup→/healthz (cheap,
     # process-alive), liveness→/livez (GPU-aware; restarts a wedged CUDA context,
     # issue #1025), readiness→/readyz (ready flag + GPU). Only the timing fields
-    # below are overridable. The liveness threshold is deliberately generous
-    # (30s × 3 = 90s, 10s timeout) so a momentarily busy GPU is not mistaken for
-    # a wedge.
+    # below are overridable. The liveness threshold must tolerate long GPU model
+    # startup as well as brief contention: /livez runs a CUDA probe, so it can
+    # block while an engine-backed adapter such as SGLang is loading. Keep this
+    # above SGLang's default 900s startup timeout (30s x 36 = 1080s) so the
+    # adapter reaches its cleanup-safe timeout instead of kubelet killing the pod
+    # mid-load.
     #
     # Defaults are tightened to reduce kubelet probe-poll latency on the
     # cold-start path (issue #814):
@@ -440,7 +445,7 @@ workers:
         initialDelaySeconds: 10
         periodSeconds: 30
         timeoutSeconds: 10
-        failureThreshold: 3
+        failureThreshold: 36
       readiness:
         periodSeconds: 2
         timeoutSeconds: 10
@@ -1081,14 +1086,15 @@ queueRouting:
   # Messages older than this are discarded. Set higher for slow model loads.
   streamMaxAgeSec: 120
   # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
-  # queue namespaces. Keys are queue pool names. Use this when
+  # queue namespaces. Keys are queue pool names; names are normalized to
+  # lowercase before gateway storage/routing. Use this when
   # poolAdmission.enabled=true and a worker group sets a named non-default
   # workers.pools.<name>.queuePool but the pool is static/deploy-owned rather
   # than created through the expiring /v1/pools API.
   #
   # Example:
   # staticQueuePools:
-  #   companyA:
+  #   company-a:
   #     gpus:
   #       l4: 0
   #     gpuCaps: {}

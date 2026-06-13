@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
 use crate::routing::hrw::RingSnapshot;
+use crate::state::pool_manager::normalize_pool_name;
 use crate::types::{
     ClusterStatus, ModelInfo, WorkerHealth, WorkerInfo, WorkerState, WorkerStatusMessage,
 };
@@ -625,7 +626,7 @@ impl WorkerRegistry {
                 continue;
             }
             return Some(QueueRoute {
-                pool_name: w.pool_name.clone(),
+                pool_name: normalize_pool_name(&w.pool_name),
                 machine_profile: w.machine_profile.clone(),
             });
         }
@@ -1418,6 +1419,21 @@ mod tests {
 
         let pool = reg.resolve_queue_pool("default", "l4-spot", "").await;
         assert_eq!(pool, Some("pool-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_queue_pool_canonicalizes_worker_pool_case() {
+        let reg = registry();
+        let mut msg = make_msg(true);
+        msg.pool_name = "Customer-Acme".into();
+        msg.bundle = "default".into();
+        msg.machine_profile = "l4-spot".into();
+        reg.update_worker("http://w1:8080", msg).await;
+
+        let pool = reg
+            .resolve_queue_pool_in_pool("default", "l4-spot", "customer-acme", "")
+            .await;
+        assert_eq!(pool, Some("customer-acme".to_string()));
     }
 
     #[tokio::test]

@@ -80,7 +80,7 @@ data:
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
 {{- $machineProfile := default $poolName $pool.machineProfile }}
-{{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool }}
+{{- $queuePool := default (default "default" $root.Values.workers.common.queuePool) $pool.queuePool | lower }}
 {{- range $bundleName, $bundleCfg := $pool.bundles }}
 {{- if dig "enabled" true $bundleCfg }}
 {{- $bundle := $bundleName }}

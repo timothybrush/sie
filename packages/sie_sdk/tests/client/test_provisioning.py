@@ -8,7 +8,7 @@ from sie_sdk import ServerError, SIEAsyncClient, SIEClient
 
 
 class TestProvisioningRetry:
-    """Tests for 202 provisioning retry functionality."""
+    """Tests for 503 PROVISIONING retry functionality."""
 
     def test_machine_profile_header_sent_when_gpu_specified(self) -> None:
         """X-SIE-MACHINE-PROFILE header is sent when gpu parameter provided."""
@@ -28,13 +28,17 @@ class TestProvisioningRetry:
             assert call_args.kwargs["headers"]["X-SIE-MACHINE-PROFILE"] == "l4"
             client.close()
 
-    def test_202_raises_provisioning_error_without_wait(self) -> None:
-        """202 response raises ProvisioningError when wait_for_capacity=False."""
+    def test_503_provisioning_raises_provisioning_error_without_wait(self) -> None:
+        """503 PROVISIONING raises ProvisioningError when wait_for_capacity=False."""
         from sie_sdk import ProvisioningError
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
 
         mock_response = MagicMock()
-        mock_response.status_code = 202
-        mock_response.headers = {"Retry-After": "30"}
+        mock_response.status_code = 503
+        mock_response.headers = {"Retry-After": "30", "content-type": "application/json"}
+        mock_response.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post = MagicMock(return_value=mock_response)
@@ -47,12 +51,17 @@ class TestProvisioningRetry:
             assert exc_info.value.retry_after == 30.0
             client.close()
 
-    def test_202_retries_with_wait_for_capacity(self) -> None:
-        """202 response is retried when wait_for_capacity=True."""
-        # First response is 202, second is 200
-        mock_response_202 = MagicMock()
-        mock_response_202.status_code = 202
-        mock_response_202.headers = {"Retry-After": "0.01"}  # Short delay for test
+    def test_503_provisioning_retries_with_wait_for_capacity(self) -> None:
+        """503 PROVISIONING is retried when wait_for_capacity=True."""
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
+
+        # First response is 503 PROVISIONING, second is 200
+        mock_response_503 = MagicMock()
+        mock_response_503.status_code = 503
+        mock_response_503.headers = {"Retry-After": "0.01", "content-type": "application/json"}
+        mock_response_503.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         mock_response_200 = MagicMock()
         mock_response_200.status_code = 200
@@ -60,7 +69,7 @@ class TestProvisioningRetry:
         mock_response_200.content = msgpack.packb({"items": [{"dense": {"values": np.zeros(1024)}}]}, use_bin_type=True)
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
-            mock_client.return_value.post = MagicMock(side_effect=[mock_response_202, mock_response_200])
+            mock_client.return_value.post = MagicMock(side_effect=[mock_response_503, mock_response_200])
             client = SIEClient("http://localhost:8080")
 
             result = client.encode(
@@ -76,17 +85,21 @@ class TestProvisioningRetry:
             assert mock_client.return_value.post.call_count == 2
             client.close()
 
-    def test_202_timeout_raises_provisioning_error(self) -> None:
+    def test_503_provisioning_timeout_raises_provisioning_error(self) -> None:
         """Provisioning timeout raises ProvisioningError."""
         from sie_sdk import ProvisioningError
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
 
-        mock_response_202 = MagicMock()
-        mock_response_202.status_code = 202
-        mock_response_202.headers = {"Retry-After": "0.01"}
+        mock_response_503 = MagicMock()
+        mock_response_503.status_code = 503
+        mock_response_503.headers = {"Retry-After": "0.01", "content-type": "application/json"}
+        mock_response_503.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
-            # Always return 202
-            mock_client.return_value.post = MagicMock(return_value=mock_response_202)
+            # Always return 503 PROVISIONING
+            mock_client.return_value.post = MagicMock(return_value=mock_response_503)
             client = SIEClient("http://localhost:8080")
 
             with pytest.raises(ProvisioningError) as exc_info:
@@ -104,10 +117,14 @@ class TestProvisioningRetry:
     def test_retry_after_header_parsed(self) -> None:
         """Retry-After header is correctly parsed."""
         from sie_sdk import ProvisioningError
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
 
         mock_response = MagicMock()
-        mock_response.status_code = 202
-        mock_response.headers = {"Retry-After": "60"}
+        mock_response.status_code = 503
+        mock_response.headers = {"Retry-After": "60", "content-type": "application/json"}
+        mock_response.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post = MagicMock(return_value=mock_response)
@@ -122,10 +139,14 @@ class TestProvisioningRetry:
     def test_missing_retry_after_uses_default(self) -> None:
         """Missing Retry-After header uses None."""
         from sie_sdk import ProvisioningError
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
 
         mock_response = MagicMock()
-        mock_response.status_code = 202
-        mock_response.headers = {}  # No Retry-After
+        mock_response.status_code = 503
+        mock_response.headers = {"content-type": "application/json"}  # No Retry-After
+        mock_response.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post = MagicMock(return_value=mock_response)
@@ -138,10 +159,15 @@ class TestProvisioningRetry:
             client.close()
 
     def test_default_wait_for_capacity_is_true(self) -> None:
-        """Default wait_for_capacity is True, so 202 is retried automatically."""
-        mock_response_202 = MagicMock()
-        mock_response_202.status_code = 202
-        mock_response_202.headers = {"Retry-After": "0.01"}
+        """Default wait_for_capacity is True, so 503 PROVISIONING is retried automatically."""
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
+
+        mock_response_503 = MagicMock()
+        mock_response_503.status_code = 503
+        mock_response_503.headers = {"Retry-After": "0.01", "content-type": "application/json"}
+        mock_response_503.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         mock_response_200 = MagicMock()
         mock_response_200.status_code = 200
@@ -149,7 +175,7 @@ class TestProvisioningRetry:
         mock_response_200.content = msgpack.packb({"items": [{"dense": {"values": np.zeros(1024)}}]}, use_bin_type=True)
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
-            mock_client.return_value.post = MagicMock(side_effect=[mock_response_202, mock_response_200])
+            mock_client.return_value.post = MagicMock(side_effect=[mock_response_503, mock_response_200])
             client = SIEClient("http://localhost:8080")
 
             # No explicit wait_for_capacity -- default should be True now
@@ -165,12 +191,16 @@ class TestProvisioningRetry:
             client.close()
 
     def test_explicit_wait_for_capacity_false_still_works(self) -> None:
-        """Explicitly setting wait_for_capacity=False still raises ProvisioningError on 202."""
+        """Explicitly setting wait_for_capacity=False raises ProvisioningError on 503 PROVISIONING."""
         from sie_sdk import ProvisioningError
+        from sie_sdk.client._shared import PROVISIONING_ERROR_CODE
 
         mock_response = MagicMock()
-        mock_response.status_code = 202
-        mock_response.headers = {"Retry-After": "30"}
+        mock_response.status_code = 503
+        mock_response.headers = {"Retry-After": "30", "content-type": "application/json"}
+        mock_response.json.return_value = {
+            "error": {"code": PROVISIONING_ERROR_CODE, "message": "Server is provisioning"}
+        }
 
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post = MagicMock(return_value=mock_response)

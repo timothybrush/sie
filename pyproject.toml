@@ -93,6 +93,7 @@ sie-sdk = { workspace = true }
 sie-bench = { workspace = true }
 sie-admin = { workspace = true }
 sie-config = { workspace = true }
+sie-mcp = { workspace = true }
 
 [tool.uv.workspace]
 # Note: packages/sie_ts_sdk is TypeScript, not Python
@@ -101,8 +102,10 @@ members = [
   "packages/sie_admin",
   "packages/sie_bench",
   "packages/sie_config",
+  "packages/sie_mcp",
   "packages/sie_sdk",
   "packages/sie_server",
+  "packages/sie_tools",
   "integrations/sie_chroma",
   "integrations/sie_crewai",
   "integrations/sie_dspy",
@@ -117,8 +120,8 @@ members = [
 [tool.pytest.ini_options]
 # Note: integrations are NOT in testpaths because each has its own conftest.py
 # which causes pytest plugin conflicts. Run with: mise run test integrations/
-testpaths = ["packages/sie_server/tests", "packages/sie_sdk/tests", "packages/sie_bench/tests", "packages/sie_admin/tests", "packages/sie_config/tests", "tools/mise_tasks/tests", "tools/quality_eval/tests"]
-pythonpath = ["packages/sie_server/src", "packages/sie_sdk/src", "packages/sie_bench/src", "packages/sie_admin/src", "packages/sie_config/src", "tools/mise_tasks"]
+testpaths = ["packages/sie_server/tests", "packages/sie_sdk/tests", "packages/sie_bench/tests", "packages/sie_admin/tests", "packages/sie_config/tests", "packages/sie_mcp/tests", "packages/sie_tools/tests", "tools/mise_tasks/tests", "tools/quality_eval/tests"]
+pythonpath = ["packages/sie_server/src", "packages/sie_sdk/src", "packages/sie_bench/src", "packages/sie_admin/src", "packages/sie_config/src", "packages/sie_mcp/src", "packages/sie_tools/src", "tools/mise_tasks"]
 addopts = "-m 'not integration and not docker and not model' --import-mode=importlib"
 asyncio_mode = "auto"
 markers = [
@@ -380,6 +383,11 @@ ignore = [
     "PLR2004", # Magic values in threshold constants and display logic
     "S311",    # Pseudo-random generator is fine for synthetic text generation
     "T201",    # Script output is intentional
+]
+# Token-reduction benchmark — self-contained `uv run --script` tools (issue #1311)
+"tools/token_bench/**/*" = [
+    "INP001",  # Standalone scripts, not a package
+    "S603",    # subprocess.run with literal soffice argv (no shell, full path)
 ]
 # Rust scheduler replay harness (dev tool, not production)
 "scripts/perf/replay-scheduler-trace.py" = [

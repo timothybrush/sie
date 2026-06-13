@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from sie_sdk import SIEAsyncClient, SIEClient, SIEConnectionError
-from sie_sdk.client.errors import RequestError, ServerError
+from sie_sdk.client.errors import ProvisioningError, RequestError, ServerError
 
 
 def _ok_response(payload: dict) -> MagicMock:
@@ -48,11 +48,24 @@ def _resp_503_model_loading() -> MagicMock:
     return response
 
 
-def _resp_202() -> MagicMock:
+def _resp_503_provisioning() -> MagicMock:
     response = MagicMock()
-    response.status_code = 202
+    response.status_code = 503
     response.headers = {"Retry-After": "0.01", "content-type": "application/json"}
-    response.json.return_value = {"detail": {"message": "provisioning"}}
+    response.json.return_value = {"error": {"code": "PROVISIONING", "message": "provisioning"}}
+    response.content = json.dumps(response.json.return_value).encode("utf-8")
+    return response
+
+
+def _resp_503_openai_provisioning() -> MagicMock:
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {
+        "Retry-After": "0.01",
+        "X-SIE-Error-Code": "PROVISIONING",
+        "content-type": "application/json",
+    }
+    response.json.return_value = {"error": {"code": "provisioning", "message": "provisioning"}}
     response.content = json.dumps(response.json.return_value).encode("utf-8")
     return response
 
@@ -71,6 +84,15 @@ def _aio_resp(status: int, body: dict, headers: dict | None = None) -> object:
     from sie_sdk.client.async_ import _AioResponse
 
     return _AioResponse(status, json.dumps(body).encode("utf-8"), headers or {"content-type": "application/json"})
+
+
+def test_openai_provisioning_header_is_classified_as_provisioning() -> None:
+    from sie_sdk.client._shared import get_error_code, handle_error
+
+    response = _resp_503_openai_provisioning()
+    assert get_error_code(response) == "PROVISIONING"
+    with pytest.raises(ProvisioningError):
+        handle_error(response)
 
 
 def _make_session_post(seq_source: AsyncMock):
@@ -237,14 +259,17 @@ class TestSyncGenerate:
             assert excinfo.value.status_code == 504
             client.close()
 
-    def test_generate_still_retries_202_provisioning(self) -> None:
-        # 202 is pre-execution (no capacity yet, nothing generated), so it is
-        # safe to retry under wait_for_capacity even on the non-idempotent path.
+    def test_generate_still_retries_503_provisioning(self) -> None:
+        # 503 PROVISIONING is pre-execution (no capacity yet, nothing
+        # generated), so it is safe to retry under wait_for_capacity even on
+        # the non-idempotent path.
         with (
             patch("sie_sdk.client.sync.httpx.Client") as mock_client,
             patch("sie_sdk.client.sync.time.sleep"),
         ):
-            mock_client.return_value.post = MagicMock(side_effect=[_resp_202(), _ok_response(_ok_envelope())])
+            mock_client.return_value.post = MagicMock(
+                side_effect=[_resp_503_provisioning(), _ok_response(_ok_envelope())]
+            )
             client = SIEClient("http://localhost:8080")
             result = client.generate("m", prompt="hi", max_new_tokens=8, provision_timeout_s=10)
             assert result["text"] == "ok"

@@ -130,7 +130,6 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         crate::types::pool::PoolSpec,
         crate::types::pool::PoolStatus,
         crate::types::pool::PoolState,
-        ProvisioningResponse,
         Relation,
         ResolveBundleConflictDetail,
         ResolveBundleConflictResponse,
@@ -259,6 +258,17 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
         .and_then(|schemas| schemas.get_mut("CreatePoolRequest"))
     {
         create_pool["required"] = json!(["name"]);
+        if let Some(name_schema) = create_pool
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut("name"))
+        {
+            name_schema["minLength"] = json!(1);
+            name_schema["maxLength"] = json!(128);
+            name_schema["pattern"] = json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$");
+            name_schema["description"] = json!(
+                "Pool name used in gpu=\"pool/machine_profile\" routing. Names are stored and routed in lowercase. Only ASCII letters, digits, '_' and '-' are allowed; '_default' is reserved."
+            );
+        }
         create_pool["anyOf"] = json!([
             {
                 "required": ["gpus"],
@@ -1035,11 +1045,6 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
         "X-Postprocessing-Time": header("Worker-reported postprocessing time in milliseconds, when available"),
         "X-Payload-Fetch-Time": header("Worker-reported offloaded payload fetch time in milliseconds, when available")
     });
-    let provisioning_headers = json!({
-        "Retry-After": header("Suggested retry delay in seconds"),
-        "X-SIE-Version": header("Gateway package version that handled the request"),
-        "X-SIE-Server-Version": header("Gateway-compatible server version advertised by this gateway")
-    });
     let retryable_error_headers = json!({
         "Retry-After": header("Suggested retry delay in seconds, when retryable"),
         "X-SIE-Error-Code": header("SDK-stable gateway or worker error code"),
@@ -1057,6 +1062,7 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
         "/v1/encode/{model}",
         "/v1/score/{model}",
         "/v1/extract/{model}",
+        "/v1/generate/{model}",
     ] {
         let Some(responses) = paths
             .get_mut(path)
@@ -1068,9 +1074,6 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
         };
         if let Some(response) = responses.get_mut("200") {
             merge_headers(response, &queue_success_headers);
-        }
-        if let Some(response) = responses.get_mut("202") {
-            merge_headers(response, &provisioning_headers);
         }
         if let Some(response) = responses.get_mut("502") {
             merge_headers(response, &terminal_error_headers);
@@ -1089,15 +1092,25 @@ fn inject_inference_response_headers(paths: &mut serde_json::Map<String, Value>)
         if let Some(response) = responses.get_mut("200") {
             merge_headers(response, &queue_success_headers);
         }
-        if let Some(response) = responses.get_mut("202") {
-            merge_headers(response, &provisioning_headers);
-        }
         if let Some(response) = responses.get_mut("502") {
             merge_headers(response, &terminal_error_headers);
         }
         if let Some(response) = responses.get_mut("503") {
             merge_headers(response, &retryable_error_headers);
         }
+    }
+
+    for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+        let Some(response) = paths
+            .get_mut(path)
+            .and_then(|path_item| path_item.get_mut("post"))
+            .and_then(|post| post.get_mut("responses"))
+            .and_then(|responses| responses.as_object_mut())
+            .and_then(|responses| responses.get_mut("503"))
+        else {
+            continue;
+        };
+        merge_headers(response, &retryable_error_headers);
     }
 }
 
@@ -2336,18 +2349,6 @@ pub struct InferenceErrorDetail {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ProvisioningResponse {
-    pub status: String,
-    #[serde(default)]
-    pub gpu: String,
-    #[serde(default)]
-    pub bundle: String,
-    pub estimated_wait_s: u64,
-    #[serde(default)]
-    pub message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2443,6 +2444,16 @@ mod tests {
         let spec: serde_json::Value = serde_json::from_str(&OPENAPI_JSON).unwrap();
         let create_pool = &spec["components"]["schemas"]["CreatePoolRequest"];
         assert_eq!(create_pool["required"], json!(["name"]));
+        assert_eq!(create_pool["properties"]["name"]["minLength"], json!(1));
+        assert_eq!(create_pool["properties"]["name"]["maxLength"], json!(128));
+        assert_eq!(
+            create_pool["properties"]["name"]["pattern"],
+            json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$")
+        );
+        assert!(create_pool["properties"]["name"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("lowercase"));
         assert_eq!(
             create_pool["anyOf"],
             json!([
@@ -2610,20 +2621,42 @@ mod tests {
                 .as_object()
                 .unwrap();
             for status in [
-                "200", "202", "400", "404", "409", "413", "500", "502", "503", "504",
+                "200", "400", "404", "409", "413", "500", "502", "503", "504",
             ] {
                 assert!(responses.contains_key(status), "{path} missing {status}");
             }
+            assert!(
+                !responses.contains_key("202"),
+                "{path} must not document 202 provisioning"
+            );
         }
+
+        let generate = &spec["paths"]["/v1/generate/{model}"]["post"]["responses"]
+            .as_object()
+            .unwrap();
+        for status in ["200", "400", "404", "500", "503", "504"] {
+            assert!(
+                generate.contains_key(status),
+                "/v1/generate/{{model}} missing {status}"
+            );
+        }
+        assert!(
+            !generate.contains_key("202"),
+            "/v1/generate/{{model}} must not document 202 provisioning"
+        );
 
         let emb = &spec["paths"]["/v1/embeddings"]["post"]["responses"]
             .as_object()
             .unwrap();
         for status in [
-            "200", "202", "400", "401", "404", "409", "413", "500", "502", "503", "504",
+            "200", "400", "401", "404", "409", "413", "500", "502", "503", "504",
         ] {
             assert!(emb.contains_key(status), "/v1/embeddings missing {status}");
         }
+        assert!(
+            !emb.contains_key("202"),
+            "/v1/embeddings must not document 202 as a success-like provisioning response"
+        );
     }
 
     #[test]
@@ -2746,11 +2779,34 @@ mod tests {
         assert!(config_resolve.as_object().unwrap().contains_key("403"));
         assert!(config_resolve.as_object().unwrap().contains_key("500"));
 
-        let embeddings_202_headers =
-            &spec["paths"]["/v1/embeddings"]["post"]["responses"]["202"]["headers"];
-        assert!(embeddings_202_headers.get("Retry-After").is_some());
-        assert!(embeddings_202_headers.get("X-SIE-Version").is_some());
-        assert!(embeddings_202_headers.get("X-SIE-Server-Version").is_some());
+        for path in [
+            "/v1/encode/{model}",
+            "/v1/score/{model}",
+            "/v1/extract/{model}",
+            "/v1/generate/{model}",
+            "/v1/embeddings",
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+        ] {
+            let retryable_503_headers = &spec["paths"][path]["post"]["responses"]["503"]["headers"];
+            assert!(
+                retryable_503_headers.get("Retry-After").is_some(),
+                "{path} 503 missing Retry-After"
+            );
+            assert!(
+                retryable_503_headers.get("X-SIE-Error-Code").is_some(),
+                "{path} 503 missing X-SIE-Error-Code"
+            );
+            assert!(
+                retryable_503_headers.get("X-SIE-Version").is_some(),
+                "{path} 503 missing X-SIE-Version"
+            );
+            assert!(
+                retryable_503_headers.get("X-SIE-Server-Version").is_some(),
+                "{path} 503 missing X-SIE-Server-Version"
+            );
+        }
 
         let embeddings_200_headers =
             &spec["paths"]["/v1/embeddings"]["post"]["responses"]["200"]["headers"];

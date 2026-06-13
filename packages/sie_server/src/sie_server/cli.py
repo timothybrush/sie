@@ -22,7 +22,7 @@ import typer
 from sie_sdk.bundle_utils import find_bundle_for_models, match_bundle_models
 
 import sie_server
-from sie_server.app.app_state_config import AppStateConfig
+from sie_server.app.app_state_config import ENV_POOL, AppStateConfig
 from sie_server.core.loader import load_model_configs
 from sie_server.main import run_server
 
@@ -76,7 +76,13 @@ def callback() -> None:
     """Search Inference Engine - GPU inference server for search workloads."""
 
 
-def load_bundle(bundle_name: str, bundles_dir: Path, models_dir: str | None = None) -> list[str]:
+def load_bundle(
+    bundle_name: str,
+    bundles_dir: Path,
+    models_dir: str | None = None,
+    *,
+    pool_name: str | None = None,
+) -> list[str]:
     """Load model names from a bundle file using adapter-based matching.
 
     Args:
@@ -97,7 +103,7 @@ def load_bundle(bundle_name: str, bundles_dir: Path, models_dir: str | None = No
         raise FileNotFoundError(msg)
 
     resolved_models_dir = Path(models_dir) if models_dir else Path(DEFAULT_MODELS_DIR)
-    return match_bundle_models(bundle_path, resolved_models_dir)
+    return match_bundle_models(bundle_path, resolved_models_dir, pool_name=pool_name)
 
 
 @app.command("resolve-deps")
@@ -120,6 +126,7 @@ def resolve_deps(
 
     models_path = Path(models_dir).resolve()
     bundles_dir = _DEFAULT_BUNDLES_DIR
+    pool_name = os.environ.get(ENV_POOL) or None
 
     if bundle and models:
         typer.echo("Error: Cannot specify both --bundle and --models", err=True)
@@ -134,13 +141,13 @@ def resolve_deps(
         resolved_bundle = bundle
     else:
         model_list = [m.strip() for m in models.split(",") if m.strip()]  # type: ignore
-        matched = find_bundle_for_models(model_list, bundles_dir, models_path)
+        matched = find_bundle_for_models(model_list, bundles_dir, models_path, pool_name=pool_name)
         if not matched:
             typer.echo(f"Error: No bundle found covering models: {', '.join(model_list)}", err=True)
             raise typer.Exit(1)
         resolved_bundle = matched
 
-    result = collect_bundle_deps(resolved_bundle, bundles_dir, models_path, exclude_cuda=cpu)
+    result = collect_bundle_deps(resolved_bundle, bundles_dir, models_path, exclude_cuda=cpu, pool_name=pool_name)
 
     if result.conflicts:
         if output_json:
@@ -268,6 +275,7 @@ def serve(
 
     # Resolve device (auto-detect if needed)
     resolved_device = resolve_device(device)
+    pool_name = os.environ.get(ENV_POOL) or None
 
     # Handle bundle/models filter
     model_filter: list[str] | None = None
@@ -281,7 +289,7 @@ def serve(
             typer.echo(f"Error: Bundles directory not found: {bundles_dir}", err=True)
             raise typer.Exit(1)
         try:
-            model_filter = load_bundle(bundle, bundles_dir)
+            model_filter = load_bundle(bundle, bundles_dir, models_dir_resolved, pool_name=pool_name)
             typer.echo(f"Bundle '{bundle}': {len(model_filter)} models")
         except FileNotFoundError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -385,6 +393,7 @@ def serve(
         device=resolved_device,
         model_filter=model_filter,
         preload_models=preload_models,
+        pool_name=pool_name,
     )
 
     uvicorn_log = "debug" if verbose else log_level.strip().lower()

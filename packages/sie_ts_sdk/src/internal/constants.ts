@@ -5,7 +5,6 @@
 export const MSGPACK_CONTENT_TYPE = "application/msgpack";
 export const JSON_CONTENT_TYPE = "application/json";
 
-export const HTTP_ACCEPTED = 202;
 export const HTTP_CLIENT_ERROR_MIN = 400;
 export const HTTP_CLIENT_ERROR_MAX = 499;
 export const HTTP_SERVER_ERROR_MIN = 500;
@@ -27,6 +26,7 @@ export const LORA_LOADING_ERROR_CODE = "LORA_LOADING"; // Error code from server
 export const MODEL_LOADING_MAX_RETRIES = 60; // Max retries (60 * 5s = 5 min)
 export const MODEL_LOADING_DEFAULT_DELAY = 5_000; // 5 seconds default retry delay
 export const MODEL_LOADING_ERROR_CODE = "MODEL_LOADING"; // Error code from server
+export const PROVISIONING_ERROR_CODE = "PROVISIONING"; // Error code from gateway provisioning
 
 // Version negotiation headers
 export const SDK_VERSION_HEADER = "X-SIE-SDK-Version";

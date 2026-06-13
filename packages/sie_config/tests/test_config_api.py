@@ -30,7 +30,7 @@ def _write_bundle(bundles_dir: Path, name: str, adapters: list[str], priority: i
     (bundles_dir / f"{name}.yaml").write_text(yaml.dump(bundle))
 
 
-def _write_model(models_dir: Path, sie_id: str, adapter_path: str) -> None:
+def _write_model(models_dir: Path, sie_id: str, adapter_path: str, *, pool: str | None = None) -> None:
     config = {
         "sie_id": sie_id,
         "profiles": {
@@ -40,6 +40,8 @@ def _write_model(models_dir: Path, sie_id: str, adapter_path: str) -> None:
             }
         },
     }
+    if pool is not None:
+        config["pool"] = pool
     filename = sie_id.replace("/", "__") + ".yaml"
     (models_dir / filename).write_text(yaml.dump(config))
 
@@ -89,6 +91,59 @@ class TestConfigAPIModels:
         data = resp.json()
         assert data["model_id"] == "new/model"
         assert data["created_profiles"] == ["default"]
+
+    def test_add_model_normalizes_pool_in_export(self) -> None:
+        yaml_body = "sie_id: pool/model\npool: Customer-A\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:BertFlashAdapter\n    max_batch_tokens: 8192\n"
+        resp = self.client.post(
+            "/v1/configs/models",
+            content=yaml_body,
+            headers={"Content-Type": "application/x-yaml"},
+        )
+        assert resp.status_code == 201
+
+        export = self.client.get("/v1/configs/export")
+        assert export.status_code == 200
+        models = {m["model_id"]: m for m in export.json()["models"]}
+        assert models["pool/model"]["model_config"]["pool"] == "customer-a"
+        assert "pool: customer-a" in models["pool/model"]["raw_yaml"]
+
+    def test_append_model_profile_preserves_pool_in_export(self) -> None:
+        first = (
+            "sie_id: pool/model\n"
+            "pool: Customer-A\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:BertFlashAdapter\n"
+            "    max_batch_tokens: 1024\n"
+        )
+        assert self.client.post("/v1/configs/models", content=first).status_code == 201
+
+        appended = (
+            "sie_id: pool/model\n"
+            "profiles:\n"
+            "  fast:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:BertFlashAdapter\n"
+            "    max_batch_tokens: 8192\n"
+        )
+        assert self.client.post("/v1/configs/models", content=appended).status_code == 201
+
+        export = self.client.get("/v1/configs/export")
+        assert export.status_code == 200
+        models = {m["model_id"]: m for m in export.json()["models"]}
+        entry = models["pool/model"]
+        assert entry["model_config"]["pool"] == "customer-a"
+        assert set(entry["model_config"]["profiles"]) == {"default", "fast"}
+        assert "pool: customer-a" in entry["raw_yaml"]
+
+    def test_add_model_invalid_pool_returns_422(self) -> None:
+        yaml_body = "sie_id: bad/model\npool: customer.a\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:BertFlashAdapter\n    max_batch_tokens: 8192\n"
+        resp = self.client.post(
+            "/v1/configs/models",
+            content=yaml_body,
+            headers={"Content-Type": "application/x-yaml"},
+        )
+        assert resp.status_code == 422
+        assert "pool" in str(resp.json()["detail"])
 
     def test_add_model_unroutable_adapter(self) -> None:
         yaml_body = "sie_id: bad/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.unknown:UnknownAdapter\n    max_batch_tokens: 8192\n"
@@ -564,6 +619,34 @@ class TestConfigAPIExportNoConfigStore:
         assert profiles["default"]["max_batch_tokens"] == 1024
         assert profiles["fast"]["max_batch_tokens"] == 8192
 
+    def test_export_preserves_pool_on_append_without_store(self) -> None:
+        first = (
+            "sie_id: mem/model\n"
+            "pool: Customer-A\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:B\n"
+            "    max_batch_tokens: 1024\n"
+        )
+        assert self.client.post("/v1/configs/models", content=first).status_code == 201
+
+        appended = (
+            "sie_id: mem/model\n"
+            "profiles:\n"
+            "  fast:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:B\n"
+            "    max_batch_tokens: 8192\n"
+        )
+        assert self.client.post("/v1/configs/models", content=appended).status_code == 201
+
+        resp = self.client.get("/v1/configs/export")
+        assert resp.status_code == 200
+        models = {m["model_id"]: m for m in resp.json()["models"]}
+        entry = models["mem/model"]
+        assert entry["model_config"]["pool"] == "customer-a"
+        assert set(entry["model_config"]["profiles"]) == {"default", "fast"}
+        assert "pool: customer-a" in entry["raw_yaml"]
+
     def test_nats_delta_carries_merged_yaml_without_store(self) -> None:
         """On the NATS publish path, the delta payload must be the full
         merged model YAML (not the incremental request body) so a fresh
@@ -692,6 +775,8 @@ class TestConfigAPIEpoch:
         # the gateway and only compared as a string.
         assert isinstance(body["bundles_hash"], str)
         assert len(body["bundles_hash"]) == 64  # sha256 hex
+        assert isinstance(body["bundle_config_hashes_hash"], str)
+        assert len(body["bundle_config_hashes_hash"]) == 64  # sha256 hex
 
     def test_epoch_bundles_hash_changes_when_bundles_reload(self) -> None:
         # The hash is the gateway's only signal that bundles need re-fetching
@@ -707,6 +792,54 @@ class TestConfigAPIEpoch:
         after = self.client.get("/v1/configs/epoch").json()["bundles_hash"]
         assert before != after
         assert len(after) == 64
+
+    def test_epoch_bundle_config_hashes_hash_changes_when_model_hash_changes(self) -> None:
+        # This is the compact signal the gateway uses to detect stale
+        # expected bundle_config_hash values without polling the full export
+        # snapshot on every interval.
+        before = self.client.get("/v1/configs/epoch").json()["bundle_config_hashes_hash"]
+        yaml_body = (
+            "sie_id: hash/model\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        self.client.post("/v1/configs/models", content=yaml_body)
+        after = self.client.get("/v1/configs/epoch").json()["bundle_config_hashes_hash"]
+        assert before != after
+        assert len(after) == 64
+
+    def test_epoch_bundle_config_hashes_hash_changes_when_only_model_pool_changes(self) -> None:
+        # A top-level pool assignment is routing/readiness state, not part of
+        # the worker-parity bundle_config_hash. The compact /epoch fingerprint
+        # must still move so no-store/same-epoch redeploys trigger export
+        # recovery when only model ownership changes.
+        _write_model(self._models, "pool/hash-model", "sie_server.adapters.bert_flash:A")
+        registry: ModelRegistry = self.app.state.model_registry
+        registry.reload()
+
+        before_epoch = self.client.get("/v1/configs/epoch").json()
+        before_export = self.client.get("/v1/configs/export").json()
+        before_bundle_hash = before_export["bundle_config_hashes"]["default"]
+
+        _write_model(
+            self._models,
+            "pool/hash-model",
+            "sie_server.adapters.bert_flash:A",
+            pool="customer-a",
+        )
+        registry.reload()
+
+        after_epoch = self.client.get("/v1/configs/epoch").json()
+        after_export = self.client.get("/v1/configs/export").json()
+        after_bundle_hash = after_export["bundle_config_hashes"]["default"]
+
+        assert before_epoch["epoch"] == after_epoch["epoch"] == 0
+        assert before_bundle_hash == after_bundle_hash
+        assert before_epoch["bundle_config_hashes_hash"] != after_epoch["bundle_config_hashes_hash"]
+        models = {m["model_id"]: m for m in after_export["models"]}
+        assert models["pool/hash-model"]["model_config"]["pool"] == "customer-a"
 
     def test_epoch_advances_after_write(self) -> None:
         before = self.client.get("/v1/configs/epoch").json()["epoch"]
@@ -1300,7 +1433,11 @@ class TestMissingRegistryReturns503:
         client = TestClient(app)
         resp = client.get("/v1/configs/epoch")
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"epoch": 0, "bundles_hash": ""}
+        assert resp.json() == {
+            "epoch": 0,
+            "bundles_hash": "",
+            "bundle_config_hashes_hash": "",
+        }
 
     def test_export_returns_503_when_registry_none(self) -> None:
         # /export reads from the registry so it must 503, matching the

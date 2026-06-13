@@ -139,13 +139,12 @@ describe("SIEClient.chatCompletions", () => {
     expect(init.headers.Authorization).toBe("Bearer sk-test");
   });
 
-  // H1: a 202 (provisioning) MUST not slip through `response.ok` and be cast
-  // to `ChatCompletion`. With `waitForCapacity: false` (the default-ish
-  // semantics for this method) the SDK must throw `ProvisioningError`.
-  it("throws ProvisioningError on 202 when waitForCapacity is false (H1)", async () => {
+  // H1: provisioning must be a non-2xx typed capacity signal, not a successful
+  // response that can be cast to `ChatCompletion`.
+  it("throws ProvisioningError on 503 PROVISIONING when waitForCapacity is false (H1)", async () => {
     mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "provisioning" }), {
-        status: 202,
+      new Response(JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }), {
+        status: 503,
         headers: { "Content-Type": "application/json", "Retry-After": "7" },
       }),
     );
@@ -160,15 +159,18 @@ describe("SIEClient.chatCompletions", () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
-  it("retries a 202 then returns the parsed completion when waitForCapacity is true (H1)", async () => {
+  it("retries 503 PROVISIONING then returns the parsed completion when waitForCapacity is true (H1)", async () => {
     vi.useFakeTimers();
     try {
       mockFetch
         .mockResolvedValueOnce(
-          new Response(JSON.stringify({ detail: "provisioning" }), {
-            status: 202,
-            headers: { "Content-Type": "application/json" },
-          }),
+          new Response(
+            JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
         )
         .mockResolvedValueOnce(jsonResponse(SAMPLE_COMPLETION));
 
@@ -197,7 +199,7 @@ describe("SIEClient.chatCompletions", () => {
     try {
       mockFetch
         .mockResolvedValueOnce(
-          new Response(JSON.stringify({ code: "MODEL_LOADING", message: "loading" }), {
+          new Response(JSON.stringify({ error: { code: "MODEL_LOADING", message: "loading" } }), {
             status: 503,
             headers: { "Content-Type": "application/json" },
           }),
@@ -223,17 +225,33 @@ describe("SIEClient.chatCompletions", () => {
     }
   });
 
+  it("does not retry a generic 503 when waitForCapacity is true (H1)", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: "service unavailable" }, 503));
+
+    const client = new SIEClient("http://localhost:8080");
+    await expect(
+      client.chatCompletions(
+        { model: "m", messages: [{ role: "user", content: "hi" }] },
+        { waitForCapacity: true },
+      ),
+    ).rejects.toBeInstanceOf(ServerError);
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
   it("throws ProvisioningError when provisioning exceeds provisionTimeoutMs (H1)", async () => {
     vi.useFakeTimers();
     try {
-      // Always answer 202 so the loop keeps looping until the budget is
-      // exhausted.
+      // Always answer 503 PROVISIONING so the loop keeps looping until the
+      // budget is exhausted.
       mockFetch.mockImplementation(() =>
         Promise.resolve(
-          new Response(JSON.stringify({ detail: "provisioning" }), {
-            status: 202,
-            headers: { "Content-Type": "application/json", "Retry-After": "5" },
-          }),
+          new Response(
+            JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json", "Retry-After": "5" },
+            },
+          ),
         ),
       );
 

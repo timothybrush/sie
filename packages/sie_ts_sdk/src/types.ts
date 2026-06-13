@@ -5,6 +5,8 @@
  * for full feature parity.
  */
 
+import type { ImageInput, ImageWireFormat } from "./images.js";
+
 /**
  * Output dtype options for quantized embeddings.
  * Matches Python DType literal.
@@ -56,8 +58,8 @@ export interface Item {
   id?: string;
   /** Text content to encode */
   text?: string;
-  /** Images as byte arrays (JPEG/PNG) for multimodal models */
-  images?: Uint8Array[];
+  /** Images for multimodal models; converted to wire format by the client */
+  images?: (ImageInput | ImageWireFormat)[];
   /** Document for composite-document extractors (PDF, DOCX, HTML, ...) */
   document?: DocumentInput;
   /** Pre-encoded multivector (for use with maxsim utility) */
@@ -445,7 +447,7 @@ export interface SIEClientOptions {
   gpu?: string;
   /** API key for authentication (sent as Bearer token) */
   apiKey?: string;
-  /** Whether to auto-retry on 202 (provisioning) responses */
+  /** Whether to auto-retry on 503 PROVISIONING responses */
   waitForCapacity?: boolean;
   /** Maximum time to wait for provisioning in milliseconds (default: 300000) */
   provisionTimeout?: number;
@@ -778,7 +780,7 @@ export interface ChatCompletionChunk {
 export interface ChatCompletionOptions {
   /**
    * When `true`, retry the SAFE pre-execution capacity signals
-   * (`202 Accepted`, `503 MODEL_LOADING`, generic `503`) until
+   * (`503 PROVISIONING`, `503 MODEL_LOADING`) until
    * `provisionTimeoutMs` elapses. When `false`, the first such signal
    * throws (`ProvisioningError` / `ModelLoadingError` / `ServerError`).
    * Defaults to the client's `waitForCapacity` (false unless the

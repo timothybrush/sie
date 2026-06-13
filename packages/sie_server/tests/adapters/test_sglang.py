@@ -35,6 +35,10 @@ class TestSGLangEmbeddingAdapter:
         assert caps.inputs == ["text"]
         assert caps.outputs == ["dense"]
 
+    def test_load_contract_flags(self) -> None:
+        assert SGLangEmbeddingAdapter.requires_main_thread is False
+        assert SGLangEmbeddingAdapter.manages_own_load_timeout is True
+
     def test_dims_before_load_returns_none(self) -> None:
         """Dims returns None before first encode."""
         adapter = SGLangEmbeddingAdapter("test-model")

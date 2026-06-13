@@ -909,10 +909,10 @@ async def get_bundle(request: Request, bundle_id: str) -> Response:
 
 @router.get("/epoch")
 async def latest_epoch(request: Request) -> dict[str, int | str]:
-    """Return the current config epoch counter and bundle-set fingerprint.
+    """Return the current config epoch counter and control-plane fingerprints.
 
     Lightweight complement to `GET /v1/configs/export`. Called periodically
-    by the Rust gateway's `state::config_poller` to detect drift on TWO
+    by the Rust gateway's `state::config_poller` to detect drift on three
     independent axes:
 
     - ``epoch`` (int, monotonic): bumped on every model-config write. If the
@@ -928,6 +928,12 @@ async def latest_epoch(request: Request) -> dict[str, int | str]:
       hash changes, independent of the model epoch — without it, a sie-config
       redeploy that adds a bundle would not propagate to the gateway until a
       coincidental model write or a manual gateway restart.
+    - ``bundle_config_hashes_hash`` (hex sha256, may be empty): fingerprint
+      over the per-bundle config hashes exported by ``/v1/configs/export``
+      plus model-level pool ownership. This catches filesystem-baseline or
+      no-store config drift where the epoch remains unchanged but workers and
+      sie-config agree on a new ``bundle_config_hash`` or model pool
+      assignment that stale gateways have not installed yet.
 
     Intentionally uses read auth rather than admin auth — the epoch is a
     monotonic integer counter and the hash is a one-way digest; neither
@@ -941,11 +947,16 @@ async def latest_epoch(request: Request) -> dict[str, int | str]:
     # Stay tolerant of a missing registry — `/epoch` is the gateway's
     # liveness signal for sie-config and must keep answering even during a
     # registry init failure (see test_epoch_works_without_registry). Empty
-    # `bundles_hash` is the documented "nothing to sync" sentinel; the
-    # gateway will not trigger a bundle re-fetch in that state.
+    # hashes are documented "nothing to sync" sentinels; the gateway
+    # will not trigger a re-fetch in that state.
     model_registry: ModelRegistry | None = getattr(request.app.state, "model_registry", None)
     bundles_hash = model_registry.compute_bundles_hash() if model_registry is not None else ""
-    return {"epoch": epoch, "bundles_hash": bundles_hash}
+    bundle_config_hashes_hash = model_registry.compute_bundle_config_hashes_hash() if model_registry is not None else ""
+    return {
+        "epoch": epoch,
+        "bundles_hash": bundles_hash,
+        "bundle_config_hashes_hash": bundle_config_hashes_hash,
+    }
 
 
 @router.get("/export")

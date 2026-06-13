@@ -50,7 +50,8 @@ When scaling from zero, expect the following latencies:
 ### Client Handling
 
 When a pool is scaling from zero, the gateway returns:
-- **202 Accepted** with `Retry-After: 120` header
+- **503 Service Unavailable** with `X-SIE-Error-Code: PROVISIONING`
+- **Retry-After: 60** header
 - Client should retry after the indicated delay
 
 The SDK handles this automatically with configurable retries.
@@ -194,19 +195,20 @@ Use one of these patterns deliberately:
 - **Static custom queue namespace**: set a worker group's `queuePool` to a
   named value and declare the same name under
   `queueRouting.staticQueuePools`. These pool objects are synthesized by the
-  gateway at startup and do not expire. Example:
+  gateway at startup and do not expire. Queue pool names are rendered and
+  routed in lowercase. Example:
 
   ```yaml
   queueRouting:
     staticQueuePools:
-      companyA:
+      company-a:
         gpus:
           l4: 0
         gpuCaps: {}
   workers:
     pools:
       l4:
-        queuePool: companyA
+        queuePool: company-a
   ```
 
   `gpuCaps: {}` means uncapped admission for matching workers. Use

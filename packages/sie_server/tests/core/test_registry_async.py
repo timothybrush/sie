@@ -1,8 +1,10 @@
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
+from sie_server.core.memory import MemoryConfig
 from sie_server.core.registry import ModelRegistry
 
 
@@ -365,6 +367,33 @@ class TestProactiveEviction:
             assert check_count >= 2
         finally:
             await registry.stop_memory_monitor()
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_does_not_evict_only_loaded_model(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """Pressure monitor keeps a sole resident model to avoid reload loops."""
+        registry = ModelRegistry(
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        registry.add_config(_make_config(name="model-a", hf_id="org/model-a"))
+        mock_adapter = mock_adapter_factory()
+        mock_load_adapter.return_value = mock_adapter
+
+        await registry.load_async("model-a", "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        await registry.start_memory_monitor()
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            await registry.stop_memory_monitor()
+
+        assert registry.is_loaded("model-a")
+        mock_adapter.unload.assert_not_called()
 
     async def test_memory_monitor_starts_and_stops(self) -> None:
         """Memory monitor can be started and stopped cleanly."""

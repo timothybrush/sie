@@ -273,6 +273,7 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
 
         config = AppStateConfig(preload_models=["model-a", "model-b"])
         config.save_to_env_vars()
@@ -285,11 +286,65 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
 
         config = AppStateConfig(preload_models=None)
         config.save_to_env_vars()
         restored = AppStateConfig.from_env_vars()
         assert restored.preload_models is None
+        assert restored.pool_name is None
+
+    def test_pool_name_env_round_trip(self, monkeypatch) -> None:
+        """SIE_POOL survives save_to_env_vars / from_env_vars cycle."""
+        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
+
+        config = AppStateConfig(pool_name="customer-a")
+        config.save_to_env_vars()
+        restored = AppStateConfig.from_env_vars()
+        assert restored.pool_name == "customer-a"
+
+
+class TestModelRegistryConfig:
+    @pytest.mark.asyncio
+    async def test_model_registry_receives_pool_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        created_kwargs: dict[str, Any] = {}
+
+        class FakeRegistry:
+            async def start_memory_monitor(self) -> None:
+                pass
+
+            async def start_idle_evictor(self) -> None:
+                pass
+
+            async def start_hot_reload(self) -> None:
+                pass
+
+            async def stop_memory_monitor(self) -> None:
+                pass
+
+            async def stop_idle_evictor(self) -> None:
+                pass
+
+            async def stop_hot_reload(self) -> None:
+                pass
+
+            async def unload_all_async(self) -> None:
+                pass
+
+        def fake_model_registry(**kwargs: Any) -> FakeRegistry:
+            created_kwargs.update(kwargs)
+            return FakeRegistry()
+
+        monkeypatch.setattr("sie_server.app.app_factory.ModelRegistry", fake_model_registry)
+
+        async with AppFactory._model_registry(AppStateConfig(pool_name="pool-a")):
+            pass
+
+        assert created_kwargs["pool_name"] == "pool-a"
 
 
 class TestConfigureTorchThreads:

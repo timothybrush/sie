@@ -295,9 +295,7 @@ mod tests {
         let r = Registry::new();
         let _ = SchedulerMetrics::register(&r).unwrap();
         for mf in r.gather() {
-            // `prometheus::proto::MetricFamily::name` is a private
-            // field, but the protobuf accessor `get_name` is public.
-            let name = mf.get_name();
+            let name = mf.name();
             assert!(
                 name.starts_with("sie_worker_scheduler_"),
                 "scheduler metric '{name}' must use the sie_worker_scheduler_ prefix"

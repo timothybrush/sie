@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +101,7 @@ class ModelRegistry:
         self._model_filter = set(model_filter) if model_filter else None
         self._device = device
         self._enable_hot_reload = enable_hot_reload
-        self._pool_name = pool_name
+        self._pool_name = pool_name.strip().lower() if pool_name else None
         self._configs: dict[str, ModelConfig] = {}
         self._model_dirs: dict[str, Path] = {}
         self._loaded: dict[str, LoadedModel] = {}
@@ -236,6 +237,18 @@ class ModelRegistry:
             )
         else:
             self._configs = all_configs
+
+        if self._pool_name is not None:
+            before_count = len(self._configs)
+            self._configs = {name: config for name, config in self._configs.items() if self.accepts_config_pool(config)}
+            filtered_count = before_count - len(self._configs)
+            if filtered_count:
+                logger.info(
+                    "Pool filter applied for SIE_POOL=%s: %d/%d models available",
+                    self._pool_name,
+                    len(self._configs),
+                    before_count,
+                )
 
         # Pool isolation. With the post-filter set in hand,
         # reject mixed generation/non-generation pools loudly. The
@@ -1019,6 +1032,13 @@ class ModelRegistry:
             config: The model configuration.
             model_dir: Optional directory for custom adapter resolution.
         """
+        if not self.accepts_config_pool(config):
+            if config.sie_id in self._configs:
+                del self._configs[config.sie_id]
+                self._loader.update_configs(self._configs)
+                self._failed.pop(config.sie_id, None)
+                self._config_version += 1
+            return
         # Pool isolation. Validate before mutating
         # ``self._configs`` so a rejected add does not leave the
         # registry in a half-mutated state. ``None`` pool skips the
@@ -1046,6 +1066,69 @@ class ModelRegistry:
         # request retries with the new config.
         self._failed.pop(config.sie_id, None)
         self._config_version += 1
+
+    async def replace_configs_async(
+        self,
+        configs: Iterable[ModelConfig],
+        model_dir: Path | None = None,
+    ) -> set[str]:
+        """Replace the registry config set from an authoritative snapshot.
+
+        Used by worker-sidecar export reconciliation. Removed or changed
+        loaded models are unloaded under the registry load lock before the
+        config map is swapped, so a worker cannot keep serving a model that
+        disappeared from the authoritative bundle export.
+        """
+        new_configs: dict[str, ModelConfig] = {}
+        for config in configs:
+            if not self.accepts_config_pool(config):
+                continue
+            if config.sie_id in new_configs:
+                msg = f"duplicate model config in authoritative snapshot: {config.sie_id}"
+                raise ValueError(msg)
+            new_configs[config.sie_id] = config
+
+        if self._pool_name is not None:
+            accepted: dict[str, ModelConfig] = {}
+            for name, config in new_configs.items():
+                validate_pool_isolation(
+                    candidate_name=name,
+                    candidate_config=config,
+                    existing_configs=accepted,
+                    pool_name=self._pool_name,
+                )
+                accepted[name] = config
+        for name, config in new_configs.items():
+            validate_no_legacy_scalar_lora_id(name=name, config=config)
+
+        lock = self._get_load_lock()
+        async with lock:
+            removed = set(self._configs) - set(new_configs)
+            changed = {name for name, config in new_configs.items() if self._configs.get(name) != config}
+            invalidated = removed | changed
+
+            for name in sorted(invalidated):
+                if name in self._loaded:
+                    await self._do_unload(name)
+
+            self._configs = dict(new_configs)
+            self._loader.update_configs(self._configs)
+            if self._model_filter is not None:
+                self._model_filter = set(new_configs)
+            self._model_dirs = {name: path for name, path in self._model_dirs.items() if name in new_configs}
+            if model_dir is not None:
+                for name in new_configs:
+                    self._model_dirs[name] = model_dir
+            for name in invalidated:
+                self._failed.pop(name, None)
+            self._config_version += 1
+            return invalidated
+
+    def accepts_config_pool(self, config: ModelConfig) -> bool:
+        if self._pool_name is None:
+            return True
+        config_pool = (config.pool or "default").strip().lower()
+        return config_pool == self._pool_name
 
     def get_model_info(self, name: str) -> dict[str, Any]:
         """Get information about a model.

@@ -273,6 +273,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // at 0 and advances on every successful bootstrap or delta.
     let config_epoch = state::config_epoch::ConfigEpoch::new();
     let bundles_hash = state::bundles_hash::BundlesHash::new();
+    let bundle_config_hashes_hash = state::bundle_config_hashes_hash::BundleConfigHashesHash::new();
 
     // Config persistence lives in sie-config now; the gateway is pure
     // consumer. It gets its authoritative snapshot via the background
@@ -497,6 +498,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&model_registry),
         config_epoch.clone(),
         bundles_hash.clone(),
+        bundle_config_hashes_hash.clone(),
     );
     state::config_poller::spawn(
         config.config_service_url.as_deref(),
@@ -504,6 +506,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&model_registry),
         config_epoch.clone(),
         bundles_hash.clone(),
+        bundle_config_hashes_hash.clone(),
         state::config_poller::DEFAULT_POLL_INTERVAL,
     );
 

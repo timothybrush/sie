@@ -319,6 +319,35 @@ class TestAsyncScore:
         assert result["scores"][0]["item_id"] == "doc-1"
         await client.close()
 
+    @pytest.mark.asyncio
+    async def test_score_converts_image_query_and_items_to_wire_format(self) -> None:
+        """Async score converts image query/items before msgpack serialization."""
+        resp = _make_msgpack_response(
+            {
+                "model": "qwen3-vl-reranker",
+                "scores": [{"item_id": "page-1", "score": 0.8, "rank": 0}],
+            }
+        )
+
+        query_image = b"\xff\xd8\xff\xe0query"
+        item_image = b"\xff\xd8\xff\xe0item"
+        query = {"text": "rocket nozzle", "images": [query_image]}
+        item = {"id": "page-1", "images": [item_image]}
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(return_value=resp)  # type: ignore
+        await client.score("qwen3-vl-reranker", query=query, items=[item])
+
+        body = client._post.call_args.kwargs["data"]
+        request_body = msgpack.unpackb(body, raw=False)
+        query_wire = request_body["query"]["images"][0]
+        item_wire = request_body["items"][0]["images"][0]
+        assert query_wire == {"data": query_image, "format": "jpeg"}
+        assert item_wire == {"data": item_image, "format": "jpeg"}
+        assert query["images"][0] == query_image
+        assert item["images"][0] == item_image
+        await client.close()
+
 
 class TestAsyncExtract:
     """Tests for async extract() method."""

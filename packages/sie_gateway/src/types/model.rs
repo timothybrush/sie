@@ -294,6 +294,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub default_bundle: Option<String>,
     #[serde(default)]
+    pub pool: Option<String>,
+    #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
     /// Model YAML ``inputs:`` map (e.g. ``text: true``).
     #[serde(default)]
@@ -322,6 +324,7 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub name: String,
+    pub pool: Option<String>,
     pub bundles: Vec<String>,
     pub adapter_modules: HashSet<String>,
     pub profile_names: HashSet<String>,
@@ -583,9 +586,11 @@ profiles:
   default:
     adapter_path: "module:Adapter"
     max_batch_tokens: 4096
+pool: customer-a
 "#;
         let config: ModelConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.name, "BAAI/bge-m3");
+        assert_eq!(config.pool, Some("customer-a".into()));
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(
             config.profiles["default"].adapter_path,
@@ -609,6 +614,7 @@ profiles: {}
             name: "test/model".into(),
             adapter_module: Some("mod".into()),
             default_bundle: None,
+            pool: Some("customer-a".into()),
             profiles: HashMap::new(),
             inputs: None,
             max_sequence_length: None,
@@ -618,6 +624,7 @@ profiles: {}
         let back: ModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "test/model");
         assert_eq!(back.adapter_module, Some("mod".into()));
+        assert_eq!(back.pool, Some("customer-a".into()));
     }
 
     #[test]
@@ -914,6 +921,7 @@ tasks:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),
             profile_names: HashSet::new(),
@@ -1030,6 +1038,7 @@ profiles:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "acme/multi-profile-lora".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),
             profile_names: ["default".to_string(), "a100".to_string()]
@@ -1083,6 +1092,7 @@ profiles:
         let info_extras = ModelInfoExtras::from_yaml_raw(&raw);
         let entry = ModelEntry {
             name: "acme/multi-profile-lora".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: HashSet::new(),
             profile_names: ["default".to_string(), "a100".to_string()]

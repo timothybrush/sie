@@ -627,6 +627,38 @@ class TestScore:
             assert request_body["instruction"] == "Rank by relevance to the query"
             client.close()
 
+    def test_score_converts_image_query_and_items_to_wire_format(self) -> None:
+        """score() converts image query/items before msgpack serialization."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = msgpack.packb(
+            {
+                "model": "qwen3-vl-reranker",
+                "scores": [{"item_id": "page-1", "score": 0.8, "rank": 0}],
+            },
+            use_bin_type=True,
+        )
+
+        query_image = b"\xff\xd8\xff\xe0query"
+        item_image = b"\xff\xd8\xff\xe0item"
+        query = {"text": "rocket nozzle", "images": [query_image]}
+        item = {"id": "page-1", "images": [item_image]}
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            client.score("qwen3-vl-reranker", query=query, items=[item])
+
+            call_args = mock_client.return_value.post.call_args
+            request_body = msgpack.unpackb(call_args.kwargs["content"], raw=False)
+            query_wire = request_body["query"]["images"][0]
+            item_wire = request_body["items"][0]["images"][0]
+            assert query_wire == {"data": query_image, "format": "jpeg"}
+            assert item_wire == {"data": item_image, "format": "jpeg"}
+            assert query["images"][0] == query_image
+            assert item["images"][0] == item_image
+            client.close()
+
     def test_score_with_query_id(self) -> None:
         """score() preserves query_id in result."""
         mock_response = MagicMock()

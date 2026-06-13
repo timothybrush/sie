@@ -17,6 +17,8 @@ from typing import Any, Protocol
 import msgpack
 import numpy as np
 
+from sie_sdk.images import convert_item_images
+
 _logger = logging.getLogger(__name__)
 
 
@@ -59,7 +61,6 @@ MSGPACK_CONTENT_TYPE = "application/msgpack"
 JSON_CONTENT_TYPE = "application/json"
 
 # HTTP status code thresholds
-HTTP_ACCEPTED = 202
 HTTP_CLIENT_ERROR = 400
 HTTP_SERVER_ERROR = 500
 HTTP_SERVICE_UNAVAILABLE = 503
@@ -81,6 +82,8 @@ LORA_LOADING_ERROR_CODE = "LORA_LOADING"  # Error code from server
 MODEL_LOADING_MAX_RETRIES = 60  # Max retries (60 * 5s = 5 min, matches provision timeout)
 MODEL_LOADING_DEFAULT_DELAY_S = 5.0  # Default retry delay (model loads take longer than LoRA)
 MODEL_LOADING_ERROR_CODE = "MODEL_LOADING"  # Error code from server
+PROVISIONING_ERROR_CODE = "PROVISIONING"  # Gateway scale-from-zero / worker provisioning
+SIE_ERROR_CODE_HEADER = "X-SIE-Error-Code"
 
 # Terminal load failure (non-retryable). Server returns this with HTTP 502
 # and *no* Retry-After header so the SDK can short-circuit immediately
@@ -116,6 +119,16 @@ RETRY_JITTER_FRACTION = 0.25
 # Module-level RNG, seedable in tests for determinism. Not used for
 # anything security-sensitive — only to de-correlate retry timing.
 _retry_rng = random.Random()  # noqa: S311 — non-cryptographic jitter only
+
+
+def convert_score_images_for_wire(query: Any, items: Sequence[Any]) -> tuple[Any, list[Any]]:
+    """Convert image-bearing score query/items to the SDK image wire shape."""
+    query_for_wire = convert_item_images({**query}) if "images" in query else query
+    items_for_wire = [
+        convert_item_images({**item}) if "images" in item else item  # ty: ignore[invalid-argument-type]
+        for item in items
+    ]
+    return query_for_wire, items_for_wire
 
 
 def apply_jitter(delay: float, *, rng: random.Random | None = None) -> float:
@@ -322,6 +335,11 @@ def get_retry_after(response: _HttpResponse) -> float | None:
     return value
 
 
+def retry_after_or_default(retry_after: float | None, default: float) -> float:
+    """Return a parsed ``Retry-After`` hint, preserving explicit zero."""
+    return retry_after if retry_after is not None else default
+
+
 def compute_oom_backoff(
     retry_after: float | None,
     attempt: int,
@@ -387,6 +405,19 @@ def compute_oom_backoff(
     return apply_jitter(capped, rng=rng)
 
 
+def _header_value(headers: Any, name: str) -> Any:
+    value = headers.get(name)
+    if value is None:
+        value = headers.get(name.lower())
+    return value
+
+
+def normalize_error_code(code: str | None) -> str | None:
+    if code == "provisioning":
+        return PROVISIONING_ERROR_CODE
+    return code
+
+
 def get_error_code(response: _HttpResponse) -> str | None:
     """Extract error code from response body.
 
@@ -396,11 +427,15 @@ def get_error_code(response: _HttpResponse) -> str | None:
     Returns:
         Error code string, or None if not found.
     """
+    header_code = _header_value(response.headers, SIE_ERROR_CODE_HEADER)
+    if isinstance(header_code, str) and header_code:
+        return header_code
+
     detail = get_error_detail(response)
     if detail is None:
         return None
     code = detail.get("code")
-    return code if isinstance(code, str) else None
+    return normalize_error_code(code) if isinstance(code, str) else None
 
 
 def get_error_detail(response: _HttpResponse) -> dict[str, Any] | None:
@@ -547,13 +582,44 @@ def handle_error(response: _HttpResponse) -> None:
         # Fall back to raw text
         message = response.text or message
 
+    header_code = _header_value(response.headers, SIE_ERROR_CODE_HEADER)
+    if isinstance(header_code, str) and header_code:
+        code = header_code
+    else:
+        code = normalize_error_code(code)
+
     # Fallback dispatch — ``model`` is only attached by the helper-style
     # short-circuit (``raise_if_input_too_long``) on the extract path.
+    if response.status_code == HTTP_SERVICE_UNAVAILABLE and code == PROVISIONING_ERROR_CODE:
+        raise ProvisioningError(message, retry_after=get_retry_after(response))
     if response.status_code == HTTP_CLIENT_ERROR and code == INPUT_TOO_LONG_ERROR_CODE:
         raise InputTooLongError(message)
     if response.status_code >= HTTP_SERVER_ERROR:
         raise ServerError(message, code=code, status_code=response.status_code)
     raise RequestError(message, code=code, status_code=response.status_code)
+
+
+def provisioning_retry_delay(
+    response: _HttpResponse,
+    *,
+    gpu: str | None,
+    wait_for_capacity: bool,
+    start_time: float,
+    timeout: float,
+) -> float:
+    """Return a retry delay for ``503 PROVISIONING`` or raise ``ProvisioningError``."""
+    retry_after = get_retry_after(response)
+    if not wait_for_capacity:
+        msg = f"No capacity available for GPU '{gpu}'. Server is provisioning."
+        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+    elapsed = time.monotonic() - start_time
+    if elapsed >= timeout:
+        msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{gpu}'"
+        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+    remaining = timeout - elapsed
+    if retry_after is not None:
+        return min(retry_after, remaining)
+    return apply_jitter(min(DEFAULT_RETRY_DELAY_S, remaining))
 
 
 def next_stream_retry_delay(
@@ -576,24 +642,14 @@ def next_stream_retry_delay(
     body must already be available so :func:`get_error_code` can inspect it.
 
     Returns ``(delay_seconds, new_oom_retries)`` to sleep-then-retry, or
-    raises a terminal error. Only pre-execution signals are retried
-    (202 provisioning, 503 MODEL_LOADING / RESOURCE_EXHAUSTED, generic 503
-    under ``wait_for_capacity``); a 504 and any other error are terminal —
+    raises a terminal error. Only explicit pre-execution signals are retried
+    (503 PROVISIONING / MODEL_LOADING / RESOURCE_EXHAUSTED); a 504 and any
+    other error are terminal —
     streaming generation is non-idempotent, so a post-publish retry could
     double-bill.
     """
     elapsed = time.monotonic() - start_time
     status = response.status_code
-
-    if status == HTTP_ACCEPTED:
-        retry_after = get_retry_after(response)
-        if not wait_for_capacity:
-            msg = f"No capacity available for GPU '{gpu}'. Server is provisioning."
-            raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
-        if elapsed >= timeout:
-            msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{gpu}'"
-            raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
-        return min(retry_after or DEFAULT_RETRY_DELAY_S, timeout - elapsed), oom_retries
 
     # Non-retryable load failure / oversized input short-circuits (these
     # read the buffered body and raise their own typed errors).
@@ -602,11 +658,21 @@ def next_stream_retry_delay(
 
     if status == HTTP_SERVICE_UNAVAILABLE:
         code = get_error_code(response)
+        if code == PROVISIONING_ERROR_CODE:
+            delay = provisioning_retry_delay(
+                response,
+                gpu=gpu,
+                wait_for_capacity=wait_for_capacity,
+                start_time=start_time,
+                timeout=timeout,
+            )
+            return delay, oom_retries
         if code == MODEL_LOADING_ERROR_CODE:
             if elapsed >= timeout:
                 msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
                 raise ModelLoadingError(msg, model=model)
-            delay = get_retry_after(response) or MODEL_LOADING_DEFAULT_DELAY_S
+            retry_after = get_retry_after(response)
+            delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
             return min(delay, timeout - elapsed), oom_retries
         if code == RESOURCE_EXHAUSTED_ERROR_CODE:
             if not wait_for_capacity or oom_retries >= max_oom_retries or elapsed >= timeout:
@@ -614,9 +680,6 @@ def next_stream_retry_delay(
                 raise ResourceExhaustedError(msg, model=model, retries=oom_retries)
             delay = compute_oom_backoff(get_retry_after(response), oom_retries)
             return min(delay, timeout - elapsed), oom_retries + 1
-        if wait_for_capacity and elapsed < timeout:
-            delay = get_retry_after(response) or DEFAULT_RETRY_DELAY_S
-            return min(delay, timeout - elapsed), oom_retries
 
     if status == HTTP_GATEWAY_TIMEOUT:
         msg = (

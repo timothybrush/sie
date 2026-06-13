@@ -31,7 +31,7 @@ class TestEngineConfig:
         assert config.coalesce_ms == 15.0
         assert config.coalesce_ratio == 0.5
         assert config.max_concurrent_requests == 512
-        assert config.memory_pressure_threshold_percent == 85
+        assert config.memory_pressure_threshold_percent == 95
         assert config.max_loras_per_model == 10
         assert config.preprocessor_workers == 4
         assert config.attention_backend == "auto"
@@ -164,6 +164,7 @@ def _make_config(
     max_sequence_length: int | None = None,
     compute_precision: str | None = None,
     profiles: dict[str, ProfileConfig] | None = None,
+    pool: str | None = None,
 ) -> ModelConfig:
     encode = None
     if any(dim is not None for dim in (dense_dim, sparse_dim, multivector_dim)):
@@ -190,6 +191,7 @@ def _make_config(
         hf_id=hf_id,
         weights_path=weights_path,
         tasks=tasks,
+        pool=pool,
         max_sequence_length=max_sequence_length,
         profiles=profiles,
     )
@@ -330,6 +332,16 @@ class TestModelConfig:
                 profiles={"default": ProfileConfig(adapter_path="mod:Cls", max_batch_tokens=8192)},
                 unknown_field="value",  # type: ignore
             )
+
+    def test_pool_field_normalized(self) -> None:
+        """ModelConfig accepts pool assignment and canonicalizes casing."""
+        config = _make_config(pool="Customer-A")
+        assert config.pool == "customer-a"
+
+    def test_pool_field_rejects_invalid_subject_token(self) -> None:
+        """Model pool names must be safe for routing labels and subjects."""
+        with pytest.raises(ValidationError, match="pool must use only"):
+            _make_config(pool="customer.a")
 
     def test_inputs_default(self) -> None:
         """Default inputs is text-only."""

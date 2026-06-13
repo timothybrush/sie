@@ -37,8 +37,9 @@ def _scan_model_adapters(models_dir: Path) -> dict[str, tuple[set[str], str | No
             if module_path:
                 modules.add(module_path)
         if modules:
-            pool = model_data.get("pool")
-            result[model_name] = (modules, pool if isinstance(pool, str) else None)
+            raw_pool = model_data.get("pool")
+            pool = raw_pool.strip().lower() if isinstance(raw_pool, str) else None
+            result[model_name] = (modules, pool or None)
 
     return result
 
@@ -66,8 +67,9 @@ def match_bundle_models(bundle_path: Path, models_dir: Path, *, pool_name: str |
 
     model_adapters = _scan_model_adapters(models_dir)
     matches: list[str] = []
+    normalized_pool_name = pool_name.strip().lower() if pool_name is not None else None
     for name, (modules, pool) in model_adapters.items():
-        if pool_name is not None and (pool or "default") != pool_name:
+        if normalized_pool_name is not None and (pool or "default") != normalized_pool_name:
             continue
         if modules & adapter_modules:
             matches.append(name)
@@ -108,9 +110,10 @@ def find_bundle_for_models(
     # Collect adapter modules needed by the requested models
     model_adapters = _scan_model_adapters(models_dir)
     needed_adapters: set[str] = set()
+    normalized_pool_name = pool_name.strip().lower() if pool_name is not None else None
     for name in model_names:
         modules, pool = model_adapters.get(name, (set(), None))
-        if pool_name is not None and (pool or "default") != pool_name:
+        if normalized_pool_name is not None and (pool or "default") != normalized_pool_name:
             continue
         needed_adapters |= modules
 

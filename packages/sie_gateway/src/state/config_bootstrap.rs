@@ -13,21 +13,18 @@
 //!    validation with `Adapter(s) not in any known bundle`. Pulling them
 //!    over HTTP makes `sie-config` the single source of truth.
 //! 2. `GET /v1/configs/export` (admin-auth) — fetches every persisted model
-//!    config and replays each into the registry so the gateway's served view
-//!    matches `sie-config`'s view.
+//!    config and replaces the registry's model set so the gateway's served
+//!    view matches `sie-config`'s view, including removals.
 //!
 //! Live updates after bootstrap arrive via NATS deltas
 //! (`sie.config.models.*`), which the `NatsManager` feeds into
 //! `ModelRegistry::add_model_config` (append-only: a profile that already
 //! exists with a different `CanonicalProfile` is rejected, so single-epoch
 //! duplicate publishes are caught). The bootstrap and epoch-poller
-//! catch-up paths here use the parallel `add_model_config_authoritative`
-//! entry point instead, which overrides any conflicting profile and logs
-//! a `warn!`. This is required so that a control-plane schema change
-//! between the gateway's cold-start fetch (against an old `sie-config`
-//! revision) and the next poll tick (after `sie-config` has rolled to a
-//! new revision) doesn't lock the registry into a stale, unrecoverable
-//! state.
+//! catch-up paths here use `replace_model_configs_authoritative` instead,
+//! which treats the export as the whole current model surface. This is
+//! required so same-epoch filesystem-baseline drift cannot leave stale
+//! models in the gateway after the new control-plane hash is stored.
 //!
 //! Failure handling:
 //!
@@ -40,9 +37,10 @@
 //!   `sie-config` are missing. `GET /readyz` is process readiness only: once
 //!   the gateway listener is serving it returns **200** + plain text `ok`, even
 //!   with zero workers, so the first inference request can reach the gateway and
-//!   trigger scale-from-zero via `202 + Retry-After`. Bootstrap catch-up is
-//!   visible separately via `GET /v1/configs/models/{id}/status` (`config_epoch`
-//!   on that payload), the `sie_gateway_config_epoch` /
+//!   trigger scale-from-zero via a surface-specific provisioning response.
+//!   Bootstrap catch-up is visible separately via
+//!   `GET /v1/configs/models/{id}/status` (`config_epoch` on that payload), the
+//!   `sie_gateway_config_epoch` /
 //!   `sie_gateway_config_bootstrap_degraded` metrics, and gateway logs — not
 //!   via `/readyz` flipping on export completion.
 //! - `state::config_poller` runs in parallel, periodically reconciling
@@ -73,6 +71,7 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'%');
 
+use crate::state::bundle_config_hashes_hash::BundleConfigHashesHash;
 use crate::state::bundles_hash::BundlesHash;
 use crate::state::config_epoch::ConfigEpoch;
 use crate::state::model_registry::ModelRegistry;
@@ -93,7 +92,7 @@ struct ExportSnapshot {
     models: Vec<ExportedModel>,
 }
 
-/// `GET /v1/configs/epoch` carries TWO independent drift signals:
+/// `GET /v1/configs/epoch` carries independent drift signals:
 ///
 /// - `epoch` — monotonic counter of model-config writes. Drives the
 ///   gateway's model-snapshot re-fetch path (existing behavior).
@@ -103,6 +102,10 @@ struct ExportSnapshot {
 ///   doesn't observe them. Without this signal a `sie-config` redeploy that
 ///   adds a bundle would not propagate to the gateway until either the
 ///   gateway pod restarts or a coincidental model write bumps the epoch.
+/// - `bundle_config_hashes_hash` — sha256 fingerprint over the per-bundle
+///   config hashes exported by `sie-config`. This catches filesystem-baseline
+///   or no-store config drift where the model epoch stays unchanged but the
+///   hashes workers advertise no longer match the stale gateway view.
 ///
 /// Empty string is the documented "nothing to sync" sentinel and is what
 /// `sie-config` returns when its registry is unavailable (degraded state).
@@ -112,6 +115,8 @@ struct EpochResponse {
     epoch: u64,
     #[serde(default)]
     bundles_hash: String,
+    #[serde(default)]
+    bundle_config_hashes_hash: String,
 }
 
 /// What `fetch_epoch` returns to the caller. Public so the poller can pass
@@ -121,6 +126,7 @@ struct EpochResponse {
 pub struct EpochSnapshot {
     pub epoch: u64,
     pub bundles_hash: String,
+    pub bundle_config_hashes_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,9 +193,8 @@ pub enum BootstrapError {
         body: String,
     },
     /// The snapshot was fetched but one or more model entries failed to
-    /// parse or apply. The local registry may be partially updated but
-    /// `ConfigEpoch` was **not** advanced, so the poller will retry on the
-    /// next tick.
+    /// parse or apply. `ConfigEpoch` was **not** advanced, so the poller will
+    /// retry on the next tick.
     #[error("partial apply: {applied}/{total} models applied, {failed} failed (epoch {epoch} not advanced)")]
     PartialApply {
         epoch: u64,
@@ -208,9 +213,8 @@ pub struct BootstrapClient {
 /// Outcome of a single `BootstrapClient::bootstrap` call.
 ///
 /// `epoch` is whatever `sie-config` reported in the snapshot envelope.
-/// `applied` counts configs the registry accepted: new entries, profiles
-/// the authoritative path overrode, and no-op replays where everything
-/// already matched all count. The shared meaning is "this export entry is
+/// `applied` counts configs the registry accepted into the authoritative
+/// replacement snapshot. The shared meaning is "this export entry is
 /// reconciled against the current registry state", which is what the
 /// epoch-advance gate needs.
 /// `failed` counts configs that could not be parsed or whose apply
@@ -236,6 +240,10 @@ pub struct BootstrapOutcome {
     /// value and trigger a re-fetch on the next tick, which is the
     /// intended fail-safe.
     pub bundles_hash: String,
+    /// sha256 fingerprint of the per-bundle config-hash map as observed on
+    /// `GET /v1/configs/epoch` before this bootstrap. See `bundles_hash` for
+    /// why storing the pre-fetch value is the conservative ordering.
+    pub bundle_config_hashes_hash: String,
     pub applied: usize,
     pub failed: usize,
     pub total: usize,
@@ -261,7 +269,7 @@ impl BootstrapClient {
         })
     }
 
-    /// Fetch the current epoch + bundles-hash from `GET /v1/configs/epoch`.
+    /// Fetch the current epoch + drift fingerprints from `GET /v1/configs/epoch`.
     /// Used by `state::config_poller` for bounded-staleness detection
     /// without pulling a full snapshot every tick.
     pub async fn fetch_epoch(&self) -> Result<EpochSnapshot, BootstrapError> {
@@ -284,6 +292,7 @@ impl BootstrapClient {
         Ok(EpochSnapshot {
             epoch: payload.epoch,
             bundles_hash: payload.bundles_hash,
+            bundle_config_hashes_hash: payload.bundle_config_hashes_hash,
         })
     }
 
@@ -417,37 +426,11 @@ impl BootstrapClient {
             "received config export from sie-config"
         );
 
-        let mut applied = 0usize;
         let mut failed = 0usize;
+        let mut configs = Vec::new();
         for model in snapshot.models {
             match parse_exported_model(&model) {
-                // Bootstrap uses the AUTHORITATIVE apply path: when an
-                // existing profile config diverges from the export, the
-                // registry overrides the stored config (with a warn log)
-                // instead of returning an append-only conflict. The append-
-                // only invariant is still enforced on the NATS pub/sub
-                // delta path in `nats::manager::NatsManager`, so within a
-                // single epoch duplicate publishes are still caught. See
-                // `ModelRegistry::add_model_config_authoritative`.
-                Ok(Some(config)) => match registry.add_model_config_authoritative(config) {
-                    Ok(_) => {
-                        // Count any Ok as applied: created, overridden, or
-                        // pure no-op replay all mean "registry accepted the
-                        // entry against the current bundle/adapter set". A
-                        // no-op replay still confirms the entry is current,
-                        // which is what `applied == total` is meant to
-                        // signal to the epoch-advance gate.
-                        applied += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            model = %model.model_id,
-                            error = %e,
-                            "failed to apply exported model config"
-                        );
-                        failed += 1;
-                    }
-                },
+                Ok(Some(config)) => configs.push(config),
                 Ok(None) => {
                     tracing::debug!(
                         model = %model.model_id,
@@ -465,13 +448,24 @@ impl BootstrapClient {
             }
         }
 
+        let mut applied = 0usize;
         if failed == 0 {
-            registry.install_bundle_config_hashes(snapshot.bundle_config_hashes);
+            match registry.replace_model_configs_authoritative(configs) {
+                Ok(count) => {
+                    applied = count;
+                    registry.install_bundle_config_hashes(snapshot.bundle_config_hashes);
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to install authoritative config export");
+                    failed += 1;
+                }
+            }
         }
 
         Ok(BootstrapOutcome {
             epoch: snapshot.epoch,
             bundles_hash: pre_bootstrap.bundles_hash,
+            bundle_config_hashes_hash: pre_bootstrap.bundle_config_hashes_hash,
             applied,
             failed,
             total,
@@ -516,6 +510,7 @@ pub async fn bootstrap_once(
     registry: &ModelRegistry,
     config_epoch: &ConfigEpoch,
     bundles_hash: &BundlesHash,
+    bundle_config_hashes_hash: &BundleConfigHashesHash,
 ) -> Result<BootstrapOutcome, BootstrapError> {
     let outcome = client.bootstrap(registry).await?;
     if !outcome.is_complete() {
@@ -539,12 +534,15 @@ pub async fn bootstrap_once(
     // bundle install or model apply failed we must keep the stored hash
     // stale so the poller re-enters the re-fetch branch on the next tick.
     let bundles_hash_changed = bundles_hash.store(outcome.bundles_hash.clone());
+    let bundle_config_hashes_hash_changed =
+        bundle_config_hashes_hash.store(outcome.bundle_config_hashes_hash.clone());
     info!(
         epoch = outcome.epoch,
         applied = outcome.applied,
         total = outcome.total,
         epoch_advanced = advanced,
         bundles_hash_changed,
+        bundle_config_hashes_hash_changed,
         "bootstrap from sie-config complete",
     );
     Ok(outcome)
@@ -588,6 +586,7 @@ pub fn spawn_bootstrap_retry(
     registry: Arc<ModelRegistry>,
     config_epoch: ConfigEpoch,
     bundles_hash: BundlesHash,
+    bundle_config_hashes_hash: BundleConfigHashesHash,
 ) -> tokio::task::JoinHandle<()> {
     let base_url = base_url.map(str::to_string);
     let admin_token = admin_token.map(str::to_string);
@@ -616,7 +615,15 @@ pub fn spawn_bootstrap_retry(
         let started = std::time::Instant::now();
         let mut degraded = false;
         loop {
-            match bootstrap_once(&client, registry.as_ref(), &config_epoch, &bundles_hash).await {
+            match bootstrap_once(
+                &client,
+                registry.as_ref(),
+                &config_epoch,
+                &bundles_hash,
+                &bundle_config_hashes_hash,
+            )
+            .await
+            {
                 Ok(_) => {
                     if degraded {
                         info!(
@@ -694,6 +701,30 @@ mod tests {
         (registry, temp)
     }
 
+    fn model_config(name: &str) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            adapter_module: None,
+            default_bundle: None,
+            pool: None,
+            profiles: HashMap::from([(
+                "default".to_string(),
+                crate::types::model::ProfileConfig {
+                    adapter_path: Some(
+                        "sie_server.adapters.sentence_transformer:Adapter".to_string(),
+                    ),
+                    max_batch_tokens: None,
+                    compute_precision: None,
+                    adapter_options: None,
+                    extends: None,
+                },
+            )]),
+            inputs: None,
+            max_sequence_length: None,
+            tasks: None,
+        }
+    }
+
     /// Mount minimal `/v1/configs/bundles*` endpoints on `server` returning a
     /// single `default` bundle that covers
     /// `sie_server.adapters.sentence_transformer`. Tests that exercise the
@@ -734,6 +765,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "epoch": epoch,
                 "bundles_hash": bundles_hash,
+                "bundle_config_hashes_hash": "bundle_config_hashes_hash",
             })))
             .mount(server)
             .await;
@@ -786,6 +818,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_replaces_authoritative_model_set_and_drops_stale_models() {
+        let server = MockServer::start().await;
+        let (registry, _tmp) = make_registry();
+        mount_default_bundles(&server).await;
+        mount_default_epoch(&server, 0, "deadbeef").await;
+
+        registry
+            .add_model_config(model_config("stale/model"))
+            .expect("seed stale gateway-local model");
+        assert!(registry.get_model_info("stale/model").is_some());
+
+        let body = serde_json::json!({
+            "snapshot_version": 1,
+            "epoch": 43,
+            "generated_at": "2026-04-17T00:00:00Z",
+            "bundle_config_hashes": {"default": "control-plane-hash"},
+            "models": [
+                {
+                    "model_id": "kept/model",
+                    "raw_yaml": "sie_id: kept/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.sentence_transformer:Adapter\n",
+                    "affected_bundles": ["default"],
+                }
+            ],
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/export"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), None).unwrap();
+        let epoch = ConfigEpoch::new();
+        let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
+        bootstrap_once(
+            &client,
+            registry.as_ref(),
+            &epoch,
+            &bundles_hash,
+            &bundle_config_hashes_hash,
+        )
+        .await
+        .unwrap();
+
+        assert!(registry.get_model_info("kept/model").is_some());
+        assert!(
+            registry.get_model_info("stale/model").is_none(),
+            "authoritative export replacement must remove models omitted from sie-config"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_soft_fails_on_5xx() {
         let server = MockServer::start().await;
         let (registry, _tmp) = make_registry();
@@ -811,8 +896,14 @@ mod tests {
         // No URL configured → task exits immediately, never touching the
         // registry. We `await` the join handle to confirm it terminated.
         let (registry, _tmp) = make_registry();
-        let handle =
-            spawn_bootstrap_retry(None, None, registry, ConfigEpoch::new(), BundlesHash::new());
+        let handle = spawn_bootstrap_retry(
+            None,
+            None,
+            registry,
+            ConfigEpoch::new(),
+            BundlesHash::new(),
+            BundleConfigHashesHash::new(),
+        );
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("retry task should exit immediately when url is None")
@@ -840,14 +931,22 @@ mod tests {
 
         let epoch = ConfigEpoch::new();
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         let client = BootstrapClient::new(server.uri(), None).unwrap();
-        bootstrap_once(&client, registry.as_ref(), &epoch, &bundles_hash)
-            .await
-            .unwrap();
+        bootstrap_once(
+            &client,
+            registry.as_ref(),
+            &epoch,
+            &bundles_hash,
+            &bundle_config_hashes_hash,
+        )
+        .await
+        .unwrap();
         assert_eq!(epoch.get(), 77);
         // BootstrapOutcome carries the pre-bootstrap bundles_hash; confirm
         // the bridge into BundlesHash actually stored it.
         assert_eq!(bundles_hash.get(), "deadbeef");
+        assert_eq!(bundle_config_hashes_hash.get(), "bundle_config_hashes_hash");
 
         // Re-run against a stale snapshot: epoch must not move backward.
         let stale_body = serde_json::json!({
@@ -865,9 +964,15 @@ mod tests {
             .mount(&stale_server)
             .await;
         let stale_client = BootstrapClient::new(stale_server.uri(), None).unwrap();
-        bootstrap_once(&stale_client, registry.as_ref(), &epoch, &bundles_hash)
-            .await
-            .unwrap();
+        bootstrap_once(
+            &stale_client,
+            registry.as_ref(),
+            &epoch,
+            &bundles_hash,
+            &bundle_config_hashes_hash,
+        )
+        .await
+        .unwrap();
         assert_eq!(epoch.get(), 77);
     }
 
@@ -879,6 +984,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "epoch": 42,
                 "bundles_hash": "cafebabe",
+                "bundle_config_hashes_hash": "facefeed",
             })))
             .mount(&server)
             .await;
@@ -887,6 +993,7 @@ mod tests {
         let snapshot = client.fetch_epoch().await.unwrap();
         assert_eq!(snapshot.epoch, 42);
         assert_eq!(snapshot.bundles_hash, "cafebabe");
+        assert_eq!(snapshot.bundle_config_hashes_hash, "facefeed");
     }
 
     #[tokio::test]
@@ -906,6 +1013,7 @@ mod tests {
         let snapshot = client.fetch_epoch().await.unwrap();
         assert_eq!(snapshot.epoch, 7);
         assert_eq!(snapshot.bundles_hash, "");
+        assert_eq!(snapshot.bundle_config_hashes_hash, "");
     }
 
     #[tokio::test]
@@ -1002,6 +1110,7 @@ mod tests {
                     "raw_yaml": null,
                     "model_config": {
                         "sie_id": "json/model",
+                        "pool": "customer-a",
                         "profiles": {
                             "default": {
                                 "adapter_path": "sie_server.adapters.sentence_transformer:Adapter",
@@ -1029,6 +1138,28 @@ mod tests {
             registry.get_model_profile_names("json/model"),
             vec!["default".to_string()],
         );
+    }
+
+    #[test]
+    fn parse_exported_model_preserves_pool_from_json_fallback() {
+        let model = ExportedModel {
+            model_id: "json/model".to_string(),
+            raw_yaml: None,
+            model_config: Some(serde_json::json!({
+                "sie_id": "json/model",
+                "pool": "customer-a",
+                "profiles": {
+                    "default": {
+                        "adapter_path": "sie_server.adapters.sentence_transformer:Adapter",
+                    }
+                }
+            })),
+        };
+
+        let config = parse_exported_model(&model).unwrap().unwrap();
+        assert_eq!(config.pool, Some("customer-a".to_string()));
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("pool: customer-a"));
     }
 
     #[tokio::test]
@@ -1069,7 +1200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_continues_past_malformed_entry() {
+    async fn bootstrap_refuses_partial_model_install_on_malformed_entry() {
         let server = MockServer::start().await;
         let (registry, _tmp) = make_registry();
         mount_default_bundles(&server).await;
@@ -1101,14 +1232,14 @@ mod tests {
 
         let client = BootstrapClient::new(server.uri(), None).unwrap();
         let outcome = client.bootstrap(registry.as_ref()).await.unwrap();
-        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.applied, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.total, 2);
         assert!(!outcome.is_complete());
         assert!(registry.get_model_profile_names("broken/model").is_empty());
-        assert_eq!(
-            registry.get_model_profile_names("good/model"),
-            vec!["default".to_string()],
+        assert!(
+            registry.get_model_profile_names("good/model").is_empty(),
+            "authoritative export replacement must not partially install the valid rows when one row is malformed"
         );
     }
 
@@ -1144,10 +1275,17 @@ mod tests {
 
         let epoch = ConfigEpoch::new();
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         let client = BootstrapClient::new(server.uri(), None).unwrap();
-        let err = bootstrap_once(&client, registry.as_ref(), &epoch, &bundles_hash)
-            .await
-            .unwrap_err();
+        let err = bootstrap_once(
+            &client,
+            registry.as_ref(),
+            &epoch,
+            &bundles_hash,
+            &bundle_config_hashes_hash,
+        )
+        .await
+        .unwrap_err();
         match err {
             BootstrapError::PartialApply {
                 epoch: snap_epoch,
@@ -1169,6 +1307,7 @@ mod tests {
         // next tick. Storing the fresh hash here would let the poller
         // believe the registry is caught up despite the failure.
         assert_eq!(bundles_hash.get(), "");
+        assert_eq!(bundle_config_hashes_hash.get(), "");
     }
 
     /// Two-phase fetch: list endpoint enumerates IDs, per-bundle endpoint

@@ -19,7 +19,12 @@ from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.types import WorkerResult
 from sie_server.ipc_server import IpcServer, IpcServerError
-from sie_server.ipc_types import IPC_VERSION, ApplyModelConfigRequest
+from sie_server.ipc_types import (
+    IPC_VERSION,
+    ApplyModelConfigRequest,
+    ReplaceModelConfigEntry,
+    ReplaceModelConfigsRequest,
+)
 from sie_server.queue_executor import QueueExecutor
 
 _LEN_STRUCT = struct.Struct("!I")
@@ -79,6 +84,7 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg.is_loaded.return_value = True
     reg.is_loading.return_value = False
     reg.get_config.return_value = MagicMock()
+    reg.get_configs_snapshot.return_value = {}
     return QueueExecutor(reg), reg
 
 
@@ -339,6 +345,164 @@ profiles:
                 await client.close()
         finally:
             await srv.stop(drain_timeout_s=1.0)
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_requires_models_field(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(registry)
+
+        model_config = """
+sie_id: kept/model
+hf_id: sentence-transformers/all-MiniLM-L6-v2
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    max_batch_tokens: 4096
+"""
+        await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=7,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_config,
+                    )
+                ],
+            )
+        )
+        assert registry.has_model("kept/model")
+
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="worker-test", stale_after_ms=10_000)
+        await srv.start()
+        try:
+            client = await _Client.connect(sock)
+            try:
+                resp = await client.rpc(
+                    "ReplaceModelConfigs",
+                    {
+                        "bundle_id": "default",
+                        "epoch": 8,
+                        "bundle_config_hash": "",
+                    },
+                )
+                assert resp["ok"] is False
+                assert "Object missing required field `models`" in (resp["error"] or "")
+                assert registry.has_model("kept/model")
+            finally:
+                await client.close()
+        finally:
+            await srv.stop(drain_timeout_s=1.0)
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_drops_removed_registry_config(self) -> None:
+        registry = ModelRegistry(models_dir=None, model_filter=["existing/model"])
+        executor = QueueExecutor(registry)
+
+        def model_yaml(model_id: str) -> str:
+            return f"""
+sie_id: {model_id}
+hf_id: sentence-transformers/all-MiniLM-L6-v2
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    max_batch_tokens: 4096
+"""
+
+        await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=7,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="stale/model",
+                        model_config=model_yaml("stale/model"),
+                    ),
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model"),
+                    ),
+                ],
+            )
+        )
+        assert registry.has_model("stale/model")
+        assert registry.has_model("kept/model")
+        registry._loaded["stale/model"] = MagicMock()
+        registry._do_unload = AsyncMock()
+
+        resp = await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=8,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model"),
+                    )
+                ],
+            )
+        )
+
+        assert resp.applied is True
+        assert resp.applied_models == ["kept/model"]
+        registry._do_unload.assert_awaited_once_with("stale/model")
+        assert not registry.has_model("stale/model")
+        assert registry.has_model("kept/model")
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_reports_pool_filtered_models(self) -> None:
+        registry = ModelRegistry(models_dir=None, pool_name="customer-a")
+        executor = QueueExecutor(registry)
+
+        def model_yaml(model_id: str, *, pool: str | None = None) -> str:
+            pool_line = f"pool: {pool}\n" if pool is not None else ""
+            return f"""
+sie_id: {model_id}
+hf_id: sentence-transformers/all-MiniLM-L6-v2
+{pool_line}tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    max_batch_tokens: 4096
+"""
+
+        resp = await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=8,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="default/model",
+                        model_config=model_yaml("default/model"),
+                    ),
+                    ReplaceModelConfigEntry(
+                        model_id="tenant/model",
+                        model_config=model_yaml("tenant/model", pool="customer-a"),
+                    ),
+                ],
+            )
+        )
+
+        assert resp.applied is True
+        assert resp.applied_models == ["tenant/model"]
+        assert not registry.has_model("default/model")
+        assert registry.has_model("tenant/model")
 
 
 # -----------------------------------------------------------------------------

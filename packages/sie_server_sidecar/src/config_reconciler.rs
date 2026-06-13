@@ -4,8 +4,9 @@
 //! `sie.config.models.<bundle>`, but it does not replay messages that were
 //! published while a worker was disconnected. This module closes that gap by
 //! polling `GET /v1/configs/epoch` and fetching `GET /v1/configs/export` when
-//! the control plane is ahead. A slower full-export pass also covers
-//! no-config-store deployments where `sie-config` keeps epoch at `0`.
+//! the control plane is ahead or when its compact per-bundle config fingerprint
+//! changes. A slower full-export pass also covers legacy/no-config-store
+//! deployments where `sie-config` keeps epoch at `0`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,10 +20,12 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::config_subscriber::{
-    apply_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
+    replace_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
 };
 use crate::ipc_client::{IpcClient, IpcError};
-use crate::ipc_types::{ApplyModelConfigRequest, ApplyModelConfigResponse};
+use crate::ipc_types::{
+    ReplaceModelConfigEntry, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
+};
 use crate::metrics::MetricsRegistry;
 use crate::shutdown::Shutdown;
 
@@ -40,9 +43,11 @@ pub struct ReconcilerConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct EpochResponse {
+struct EpochSnapshot {
     #[serde(default)]
     epoch: u64,
+    #[serde(default)]
+    bundle_config_hashes_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +138,7 @@ impl ReconcileClient {
         })
     }
 
-    async fn fetch_epoch(&self) -> Result<u64, ReconcileError> {
+    async fn fetch_epoch(&self) -> Result<EpochSnapshot, ReconcileError> {
         let url = format!("{}/v1/configs/epoch", self.base_url.trim_end_matches('/'));
         let mut req = self.http.get(&url);
         if let Some(token) = &self.admin_token {
@@ -149,8 +154,7 @@ impl ReconcileClient {
                 body,
             });
         }
-        let payload: EpochResponse = resp.json().await?;
-        Ok(payload.epoch)
+        Ok(resp.json().await?)
     }
 
     async fn fetch_export(&self) -> Result<ExportSnapshot, ReconcileError> {
@@ -178,6 +182,29 @@ fn record_reconcile(metrics: &MetricsRegistry, result: &str) {
         .config_deltas_total
         .with_label_values(&["export", result])
         .inc();
+}
+
+fn drift_reason(
+    local_epoch: u64,
+    remote: &EpochSnapshot,
+    local_bundle_config_hashes_hash: &str,
+    full_export_due: bool,
+) -> Option<&'static str> {
+    if remote.epoch > local_epoch {
+        return Some("epoch_ahead");
+    }
+    if remote.epoch < local_epoch {
+        return Some("epoch_rewind");
+    }
+    if !remote.bundle_config_hashes_hash.is_empty()
+        && remote.bundle_config_hashes_hash != local_bundle_config_hashes_hash
+    {
+        return Some("bundle_config_hashes_hash");
+    }
+    if remote.epoch == 0 && full_export_due {
+        return Some("periodic_export");
+    }
+    None
 }
 
 /// Spawn the optional export reconciler.
@@ -225,6 +252,16 @@ pub fn spawn(
             shutdown: Arc::clone(&shutdown),
         };
         let mut last_successful_export: Option<Instant> = None;
+        let mut last_bundle_config_hashes_hash = match client.fetch_epoch().await {
+            Ok(snapshot) => snapshot.bundle_config_hashes_hash,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "worker-config: initial epoch fingerprint poll failed; startup export will proceed"
+                );
+                String::new()
+            }
+        };
         match reconcile_export(&runtime, false, "startup").await {
             Ok(outcome) if outcome.shutdown => return,
             Ok(outcome) if outcome.failed == 0 => {
@@ -267,40 +304,40 @@ pub fn spawn(
                 _ = shutdown.wait() => return,
                 _ = ticker.tick() => {
                     let local_epoch = state.epoch();
-                    let remote_epoch = match client.fetch_epoch().await {
-                        Ok(epoch) => epoch,
+                    let remote = match client.fetch_epoch().await {
+                        Ok(snapshot) => snapshot,
                         Err(e) => {
                             warn!(error = %e, "worker-config: epoch poll failed");
                             record_reconcile(&metrics, "epoch_error");
                             continue;
                         }
                     };
+                    let remote_epoch = remote.epoch;
+                    let remote_bundle_config_hashes_hash =
+                        remote.bundle_config_hashes_hash.clone();
 
                     let full_export_due = config.full_export_interval.is_some_and(|interval| {
                         last_successful_export
                             .map(|last| last.elapsed() >= interval)
                             .unwrap_or(true)
                     });
-                    let needs_export =
-                        remote_epoch != local_epoch || (remote_epoch == 0 && full_export_due);
 
-                    if !needs_export {
+                    let Some(reason) = drift_reason(
+                        local_epoch,
+                        &remote,
+                        &last_bundle_config_hashes_hash,
+                        full_export_due,
+                    ) else {
                         debug!(
                             local_epoch,
                             remote_epoch,
+                            bundle_config_hashes_hash = %remote_bundle_config_hashes_hash,
                             "worker-config: epoch poll in sync"
                         );
                         continue;
-                    }
+                    };
 
                     let force_epoch = remote_epoch < local_epoch;
-                    let reason = if remote_epoch > local_epoch {
-                        "epoch_ahead"
-                    } else if remote_epoch < local_epoch {
-                        "epoch_rewind"
-                    } else {
-                        "periodic_export"
-                    };
                     if force_epoch {
                         warn!(
                             local_epoch,
@@ -312,6 +349,7 @@ pub fn spawn(
                             local_epoch,
                             remote_epoch,
                             reason,
+                            bundle_config_hashes_hash = %remote_bundle_config_hashes_hash,
                             "worker-config: drift detected; fetching export"
                         );
                     }
@@ -322,6 +360,10 @@ pub fn spawn(
                         Ok(outcome) if outcome.shutdown => return,
                         Ok(outcome) if outcome.failed == 0 => {
                             last_successful_export = Some(Instant::now());
+                            if !remote_bundle_config_hashes_hash.is_empty() {
+                                last_bundle_config_hashes_hash =
+                                    remote_bundle_config_hashes_hash.clone();
+                            }
                             if outcome.applied > 0 {
                                 if let Some(notify) = generation_reconcile.as_ref() {
                                     notify.notify_one();
@@ -372,10 +414,10 @@ async fn reconcile_export(
         &runtime.metrics,
         force_epoch,
         reason,
-        move |req, model_id, epoch| {
+        move |req, epoch| {
             let ipc = Arc::clone(&ipc);
             let shutdown = Arc::clone(&shutdown);
-            async move { apply_via_ipc_with_retry(ipc, shutdown, req, &model_id, epoch).await }
+            async move { replace_via_ipc_with_retry(ipc, shutdown, req, epoch).await }
         },
     )
     .await)
@@ -391,8 +433,8 @@ async fn reconcile_export_snapshot<F, Fut>(
     mut apply: F,
 ) -> ExportOutcome
 where
-    F: FnMut(ApplyModelConfigRequest, String, u64) -> Fut,
-    Fut: Future<Output = Result<Option<ApplyModelConfigResponse>, IpcError>>,
+    F: FnMut(ReplaceModelConfigsRequest, u64) -> Fut,
+    Fut: Future<Output = Result<Option<ReplaceModelConfigsResponse>, IpcError>>,
 {
     let _apply_guard = state.lock_apply().await;
 
@@ -411,12 +453,8 @@ where
     let mut applied = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
-    let control_plane_hash = snapshot
-        .bundle_config_hashes
-        .get(bundle)
-        .filter(|hash| !hash.is_empty())
-        .cloned();
-    let mut last_bundle_hash: Option<String> = None;
+    let mut exported_models = Vec::new();
+    let control_plane_hash = snapshot.bundle_config_hashes.get(bundle).cloned();
     let mut first_hash_mismatch: Option<String> = None;
 
     for model in snapshot.models {
@@ -453,16 +491,20 @@ where
             continue;
         }
 
-        let req = ApplyModelConfigRequest {
-            bundle_id: bundle.to_string(),
+        exported_models.push(ReplaceModelConfigEntry {
             model_id: model.model_id.clone(),
-            epoch: snapshot.epoch,
-            bundle_config_hash: String::new(),
-            profiles_added: vec![],
             model_config,
-        };
+        });
+    }
 
-        let resp = match apply(req, model.model_id.clone(), snapshot.epoch).await {
+    let state_updated = if failed == 0 {
+        let req = ReplaceModelConfigsRequest {
+            bundle_id: bundle.to_string(),
+            epoch: snapshot.epoch,
+            bundle_config_hash: control_plane_hash.clone().unwrap_or_default(),
+            models: exported_models,
+        };
+        let resp = match apply(req, snapshot.epoch).await {
             Ok(Some(resp)) => resp,
             Ok(None) => {
                 record_reconcile(metrics, "shutdown");
@@ -477,41 +519,46 @@ where
             }
             Err(e) => {
                 warn!(
-                    model = %model.model_id,
                     epoch = snapshot.epoch,
                     error = %e,
-                    "worker-config: exported model apply failed"
+                    "worker-config: exported model replace failed"
                 );
-                failed += 1;
-                continue;
+                record_reconcile(metrics, "partial");
+                return ExportOutcome {
+                    epoch: snapshot.epoch,
+                    applied,
+                    failed: failed + 1,
+                    skipped,
+                    shutdown: false,
+                    state_updated: false,
+                };
             }
         };
 
         if !resp.applied {
             warn!(
-                model = %model.model_id,
                 epoch = snapshot.epoch,
-                "worker-config: exported model apply returned applied=false"
+                "worker-config: exported model replace returned applied=false"
             );
-            failed += 1;
-            continue;
+            record_reconcile(metrics, "partial");
+            return ExportOutcome {
+                epoch: snapshot.epoch,
+                applied,
+                failed: failed + 1,
+                skipped,
+                shutdown: false,
+                state_updated: false,
+            };
         }
 
         if let Some(hash) = &control_plane_hash {
-            if !resp.bundle_config_hash.is_empty()
-                && resp.bundle_config_hash != *hash
-                && first_hash_mismatch.is_none()
-            {
+            if !resp.bundle_config_hash.is_empty() && resp.bundle_config_hash != *hash {
                 first_hash_mismatch = Some(resp.bundle_config_hash.clone());
             }
-            last_bundle_hash = Some(hash.clone());
-        } else if !resp.bundle_config_hash.is_empty() {
-            last_bundle_hash = Some(resp.bundle_config_hash);
         }
-        applied += 1;
-    }
+        let applied_bundle_hash = resp.bundle_config_hash.clone();
+        applied = resp.applied_models.len();
 
-    let state_updated = if failed == 0 {
         if let (Some(control_hash), Some(applied_hash)) = (
             control_plane_hash.as_deref(),
             first_hash_mismatch.as_deref(),
@@ -520,11 +567,11 @@ where
                 epoch = snapshot.epoch,
                 advertised_hash = %control_hash,
                 applied_hash = %applied_hash,
-                "worker-config: Python registry hash differs from control-plane export hash; advertising control-plane hash"
+                "worker-config: Python registry hash differs from control-plane export hash; advertising Python-applied hash"
             );
         }
         let state_updated =
-            state.mark_export_reconciled(snapshot.epoch, last_bundle_hash, force_epoch);
+            state.mark_export_reconciled(snapshot.epoch, Some(applied_bundle_hash), force_epoch);
         if state_updated {
             metrics.config_epoch.set(snapshot.epoch as i64);
         }
@@ -585,6 +632,29 @@ mod tests {
     }
 
     #[test]
+    fn drift_reason_detects_same_epoch_bundle_config_hashes_hash_change() {
+        let remote = EpochSnapshot {
+            epoch: 9,
+            bundle_config_hashes_hash: "new-fingerprint".into(),
+        };
+
+        assert_eq!(
+            drift_reason(9, &remote, "old-fingerprint", false),
+            Some("bundle_config_hashes_hash")
+        );
+        assert_eq!(drift_reason(9, &remote, "new-fingerprint", true), None);
+
+        let legacy_remote = EpochSnapshot {
+            epoch: 9,
+            bundle_config_hashes_hash: String::new(),
+        };
+        assert_eq!(
+            drift_reason(9, &legacy_remote, "old-fingerprint", false),
+            None
+        );
+    }
+
+    #[test]
     fn exported_model_targets_exact_bundle_only() {
         let model = ExportedModel {
             model_id: "m".into(),
@@ -639,14 +709,15 @@ mod tests {
         let outcome =
             reconcile_export_snapshot(snapshot, "default", &state, &metrics, false, "test", {
                 let applied = Arc::clone(&applied);
-                move |req, _model_id, _epoch| {
+                move |req, _epoch| {
                     let applied = Arc::clone(&applied);
                     async move {
                         applied.lock().await.push(req);
-                        Ok(Some(ApplyModelConfigResponse {
+                        Ok(Some(ReplaceModelConfigsResponse {
                             applied: true,
                             bundle_config_hash: "hash-7".into(),
                             config_version: 7,
+                            applied_models: vec!["target-model".into()],
                         }))
                     }
                 }
@@ -665,9 +736,10 @@ mod tests {
 
         let applied = applied.lock().await;
         assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0].model_id, "target-model");
         assert_eq!(applied[0].bundle_id, "default");
         assert_eq!(applied[0].epoch, 7);
+        assert_eq!(applied[0].models.len(), 1);
+        assert_eq!(applied[0].models[0].model_id, "target-model");
     }
 
     #[tokio::test]
@@ -690,21 +762,26 @@ mod tests {
             &metrics,
             false,
             "test",
-            |req, _model_id, _epoch| async move {
-                if req.model_id == "bad-model" {
+            |req, _epoch| async move {
+                if req.models.iter().any(|model| model.model_id == "bad-model") {
                     Err(IpcError::Server("apply failed".into()))
                 } else {
-                    Ok(Some(ApplyModelConfigResponse {
+                    Ok(Some(ReplaceModelConfigsResponse {
                         applied: true,
                         bundle_config_hash: "hash-8".into(),
                         config_version: 8,
+                        applied_models: req
+                            .models
+                            .into_iter()
+                            .map(|model| model.model_id)
+                            .collect(),
                     }))
                 }
             },
         )
         .await;
 
-        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.applied, 0);
         assert_eq!(outcome.failed, 1);
         assert!(!outcome.state_updated);
         assert_eq!(state.epoch(), 0);
@@ -729,11 +806,12 @@ mod tests {
             &metrics,
             true,
             "test",
-            |_req, _model_id, _epoch| async move {
-                Ok(Some(ApplyModelConfigResponse {
+            |_req, _epoch| async move {
+                Ok(Some(ReplaceModelConfigsResponse {
                     applied: true,
                     bundle_config_hash: "hash-3".into(),
                     config_version: 3,
+                    applied_models: vec!["target-model".into()],
                 }))
             },
         )
@@ -750,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_reconcile_prefers_control_plane_bundle_hash() {
+    async fn export_reconcile_prefers_python_applied_bundle_hash() {
         let snapshot = ExportSnapshot {
             epoch: 11,
             bundle_config_hashes: HashMap::from([(
@@ -769,11 +847,12 @@ mod tests {
             &metrics,
             false,
             "test",
-            |_req, _model_id, _epoch| async move {
-                Ok(Some(ApplyModelConfigResponse {
+            |_req, _epoch| async move {
+                Ok(Some(ReplaceModelConfigsResponse {
                     applied: true,
                     bundle_config_hash: "python-hash".into(),
                     config_version: 11,
+                    applied_models: vec!["target-model".into()],
                 }))
             },
         )
@@ -784,7 +863,47 @@ mod tests {
         assert_eq!(state.epoch(), 11);
         assert_eq!(
             state.bundle_config_hash().read().unwrap().as_str(),
-            "control-hash"
+            "python-hash"
         );
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_replaces_with_empty_bundle_snapshot() {
+        let snapshot = ExportSnapshot {
+            epoch: 12,
+            bundle_config_hashes: HashMap::from([("default".to_string(), String::new())]),
+            models: vec![exported_model("other-model", &["vision"])],
+        };
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+        let replace_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let outcome =
+            reconcile_export_snapshot(snapshot, "default", &state, &metrics, false, "test", {
+                let replace_calls = Arc::clone(&replace_calls);
+                move |req, _epoch| {
+                    let replace_calls = Arc::clone(&replace_calls);
+                    async move {
+                        replace_calls.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: String::new(),
+                            config_version: 12,
+                            applied_models: vec![],
+                        }))
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.state_updated);
+        assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "");
+
+        let replace_calls = replace_calls.lock().await;
+        assert_eq!(replace_calls.len(), 1);
+        assert!(replace_calls[0].models.is_empty());
     }
 }

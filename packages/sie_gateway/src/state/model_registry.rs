@@ -66,12 +66,16 @@ impl std::error::Error for ResolveError {}
 /// skipped, and which bundles need to be re-broadcast to workers.
 pub type AddModelConfigOutcome = (Vec<String>, Vec<String>, Vec<String>);
 
+const DEFAULT_MODEL_POOL: &str = "default";
+const MAX_POOL_NAME_LEN: usize = 128;
+
 #[derive(Debug, Clone, Default)]
 struct RegistrySnapshot {
     bundles: HashMap<String, BundleInfo>,
     models: HashMap<String, ModelEntry>,
     model_names_lower: HashMap<String, String>,
     bundle_config_hashes: HashMap<String, String>,
+    bundle_pool_config_hashes: HashMap<(String, String), String>,
 }
 
 pub struct ModelRegistry {
@@ -218,14 +222,10 @@ impl ModelRegistry {
         }
 
         // Pre-compute bundle config hashes (expensive: sort + JSON + SHA-256).
-        // Cached here so compute_bundle_config_hash is a simple HashMap lookup.
-        let mut bundle_config_hashes = HashMap::new();
-        for bundle_name in new_bundles.keys() {
-            let hash = Self::hash_bundle_config(bundle_name, &new_bundles, &new_models);
-            if !hash.is_empty() {
-                bundle_config_hashes.insert(bundle_name.clone(), hash);
-            }
-        }
+        // Cached here so route/status lookups are simple HashMap reads.
+        let bundle_config_hashes = Self::rebuild_bundle_config_hashes(&new_bundles, &new_models);
+        let bundle_pool_config_hashes =
+            Self::rebuild_bundle_pool_config_hashes(&new_bundles, &new_models);
 
         info!(
             bundles = new_bundles.len(),
@@ -238,6 +238,7 @@ impl ModelRegistry {
             models: new_models,
             model_names_lower: new_model_names_lower,
             bundle_config_hashes,
+            bundle_pool_config_hashes,
         };
         self.snapshot.store(Arc::new(snap));
     }
@@ -385,6 +386,7 @@ impl ModelRegistry {
             }
             entries.push(ModelEntry {
                 name: format!("{}:{}", base_entry.name, profile_name),
+                pool: base_entry.pool.clone(),
                 bundles: Vec::new(),
                 adapter_modules: variant_adapters,
                 profile_names: variant_profile_names,
@@ -436,6 +438,7 @@ impl ModelRegistry {
     fn model_entry_from_config(config: &ModelConfig) -> Result<ModelEntry, String> {
         let info_extras = crate::types::model::ModelInfoExtras::from_model_config(config);
         let model_name = config.name.clone();
+        let pool = Self::normalize_model_pool(config.pool.as_deref())?;
         let mut adapter_modules: HashSet<String> = HashSet::new();
         let mut profile_names: HashSet<String> = HashSet::new();
         let mut profile_configs: HashMap<String, CanonicalProfile> = HashMap::new();
@@ -457,12 +460,38 @@ impl ModelRegistry {
 
         Ok(ModelEntry {
             name: model_name,
+            pool,
             bundles: Vec::new(),
             adapter_modules,
             profile_names,
             profile_configs,
             info_extras,
         })
+    }
+
+    fn normalize_model_pool(pool: Option<&str>) -> Result<Option<String>, String> {
+        let Some(raw_pool) = pool else {
+            return Ok(None);
+        };
+        let pool = raw_pool.trim().to_lowercase();
+        if pool.is_empty() || pool == DEFAULT_MODEL_POOL {
+            return Ok(None);
+        }
+        if pool.len() > MAX_POOL_NAME_LEN
+            || pool == "_default"
+            || !pool
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(
+                "Field 'pool' must match [A-Za-z0-9_-]{1,128} and must not be _default".to_string(),
+            );
+        }
+        Ok(Some(pool))
+    }
+
+    fn entry_pool_name(entry: &ModelEntry) -> &str {
+        entry.pool.as_deref().unwrap_or(DEFAULT_MODEL_POOL)
     }
 
     fn expand_model_entry_into_profile_variants(
@@ -502,6 +531,7 @@ impl ModelRegistry {
             }
             entries.push(ModelEntry {
                 name: format!("{}:{}", base_entry.name, profile_name),
+                pool: base_entry.pool.clone(),
                 bundles: Vec::new(),
                 adapter_modules: variant_adapters,
                 profile_names: variant_profile_names,
@@ -900,13 +930,9 @@ impl ModelRegistry {
             model_entry.bundles = matching.into_iter().map(|(_, name)| name).collect();
         }
 
-        let mut bundle_config_hashes = HashMap::new();
-        for bundle_name in new_bundles.keys() {
-            let hash = Self::hash_bundle_config(bundle_name, &new_bundles, &snap.models);
-            if !hash.is_empty() {
-                bundle_config_hashes.insert(bundle_name.clone(), hash);
-            }
-        }
+        let bundle_config_hashes = Self::rebuild_bundle_config_hashes(&new_bundles, &snap.models);
+        let bundle_pool_config_hashes =
+            Self::rebuild_bundle_pool_config_hashes(&new_bundles, &snap.models);
 
         info!(
             bundles = new_bundles.len(),
@@ -916,6 +942,7 @@ impl ModelRegistry {
 
         snap.bundles = new_bundles;
         snap.bundle_config_hashes = bundle_config_hashes;
+        snap.bundle_pool_config_hashes = bundle_pool_config_hashes;
         self.snapshot.store(Arc::new(snap));
     }
 
@@ -949,6 +976,13 @@ impl ModelRegistry {
         snap.models.get(&canonical).cloned()
     }
 
+    pub fn get_model_pool_name(&self, model: &str) -> Option<String> {
+        let snap = self.snapshot.load();
+        let canonical = Self::canonical_model_name(&snap, model)?;
+        let entry = snap.models.get(&canonical)?;
+        Some(Self::entry_pool_name(entry).to_string())
+    }
+
     pub fn get_model_profile_names(&self, model: &str) -> Vec<String> {
         let mut profiles: Vec<String> = self
             .get_model_info(model)
@@ -960,10 +994,25 @@ impl ModelRegistry {
 
     /// Look up pre-computed bundle config hash (O(1) HashMap get).
     /// Hash is computed during reload() and add_model_config(), not per-request.
+    #[allow(dead_code)]
     pub fn compute_bundle_config_hash(&self, bundle_id: &str) -> String {
         let snap = self.snapshot.load();
         snap.bundle_config_hashes
             .get(bundle_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn compute_bundle_config_hash_for_pool(&self, bundle_id: &str, pool_name: &str) -> String {
+        let snap = self.snapshot.load();
+        let pool_name = pool_name.trim().to_lowercase();
+        let pool_name = if pool_name.is_empty() {
+            DEFAULT_MODEL_POOL.to_string()
+        } else {
+            pool_name
+        };
+        snap.bundle_pool_config_hashes
+            .get(&(bundle_id.to_string(), pool_name))
             .cloned()
             .unwrap_or_default()
     }
@@ -995,10 +1044,83 @@ impl ModelRegistry {
         bundles: &HashMap<String, BundleInfo>,
         models: &HashMap<String, ModelEntry>,
     ) -> String {
+        Self::hash_bundle_config_scoped(bundle_id, bundles, models, None)
+    }
+
+    fn hash_bundle_config_for_pool(
+        bundle_id: &str,
+        bundles: &HashMap<String, BundleInfo>,
+        models: &HashMap<String, ModelEntry>,
+        pool_name: &str,
+    ) -> String {
+        Self::hash_bundle_config_scoped(bundle_id, bundles, models, Some(pool_name))
+    }
+
+    fn rebuild_bundle_config_hashes(
+        bundles: &HashMap<String, BundleInfo>,
+        models: &HashMap<String, ModelEntry>,
+    ) -> HashMap<String, String> {
+        let mut hashes = HashMap::new();
+        for bundle_name in bundles.keys() {
+            let hash = Self::hash_bundle_config(bundle_name, bundles, models);
+            if !hash.is_empty() {
+                hashes.insert(bundle_name.clone(), hash);
+            }
+        }
+        hashes
+    }
+
+    fn rebuild_bundle_pool_config_hashes(
+        bundles: &HashMap<String, BundleInfo>,
+        models: &HashMap<String, ModelEntry>,
+    ) -> HashMap<(String, String), String> {
+        let mut pools_by_bundle: HashMap<String, HashSet<String>> = HashMap::new();
+        for (model_name, entry) in models {
+            if Self::is_synthetic_profile_variant(model_name, models) {
+                continue;
+            }
+            let pool = Self::entry_pool_name(entry).to_string();
+            for bundle in &entry.bundles {
+                pools_by_bundle
+                    .entry(bundle.clone())
+                    .or_default()
+                    .insert(pool.clone());
+            }
+        }
+
+        let mut hashes = HashMap::new();
+        for (bundle_name, pools) in pools_by_bundle {
+            if !bundles.contains_key(&bundle_name) {
+                continue;
+            }
+            for pool in pools {
+                let hash = Self::hash_bundle_config_for_pool(&bundle_name, bundles, models, &pool);
+                if !hash.is_empty() {
+                    hashes.insert((bundle_name.clone(), pool), hash);
+                }
+            }
+        }
+        hashes
+    }
+
+    fn hash_bundle_config_scoped(
+        bundle_id: &str,
+        bundles: &HashMap<String, BundleInfo>,
+        models: &HashMap<String, ModelEntry>,
+        pool_name: Option<&str>,
+    ) -> String {
         let bundle = match bundles.get(bundle_id) {
             Some(b) => b,
             None => return String::new(),
         };
+        let normalized_pool = pool_name.map(|p| {
+            let p = p.trim().to_lowercase();
+            if p.is_empty() {
+                DEFAULT_MODEL_POOL.to_string()
+            } else {
+                p
+            }
+        });
 
         let bundle_adapter_set: HashSet<&str> =
             bundle.adapters.iter().map(|s| s.as_str()).collect();
@@ -1014,6 +1136,12 @@ impl ModelRegistry {
             }
 
             let model_entry = &models[model_name];
+            if normalized_pool
+                .as_deref()
+                .is_some_and(|pool| Self::entry_pool_name(model_entry) != pool)
+            {
+                continue;
+            }
             if !model_entry.bundles.contains(&bundle_id.to_string()) {
                 continue;
             }
@@ -1098,35 +1226,114 @@ impl ModelRegistry {
         self.add_model_config_inner(config, false)
     }
 
-    /// Like `add_model_config`, but treats the caller as the authoritative
-    /// view of the current epoch: when a profile already exists with a
-    /// different `CanonicalProfile`, the stored config is **overwritten**
-    /// with a `warn!` log instead of returning an append-only conflict
-    /// error.
+    /// Test-only entry point for the per-model authoritative merge branch.
     ///
-    /// This is the path the cold-start bootstrap (`state::config_bootstrap`)
-    /// and the epoch poller's catch-up re-export use. The append-only
-    /// invariant on the NATS pub/sub delta path
-    /// (`nats::manager::NatsManager::apply_notification`) is still enforced
-    /// via the plain `add_model_config`, so single-epoch duplicate publishes
-    /// are still caught.
-    ///
-    /// Why: `sie-config` is the source of truth for the current epoch. If
-    /// the gateway pod started against an old `sie-config` revision and
-    /// cached a stale profile config (e.g. v0.3.2 had nemotron-8b on
-    /// `sglang`), and `sie-config` then rolled to a new revision that
-    /// changed that same profile (e.g. v0.3.3 swapped it for
-    /// `pytorch_embedding`), the next bootstrap re-fetch hits the
-    /// append-only check and the entire export refuses to apply (failed=1
-    /// blocks epoch advance), the poller retries forever, and routing wedges
-    /// for every model. The authoritative path heals that on the next poll
-    /// tick by accepting the new config as the latest word from the control
-    /// plane.
+    /// Production full-snapshot replay uses `replace_model_configs_authoritative`
+    /// so removals are applied atomically. This helper keeps the older conflict
+    /// override branch covered without exposing it as a runtime API.
+    #[cfg(test)]
     pub fn add_model_config_authoritative(
         &self,
         config: ModelConfig,
     ) -> Result<AddModelConfigOutcome, String> {
         self.add_model_config_inner(config, true)
+    }
+
+    /// Replace the model surface with the exact exported control-plane set.
+    ///
+    /// This is the production full-snapshot replay path: it drops models and
+    /// profile variants that disappeared from `sie-config` instead of overlaying
+    /// exported rows onto the existing snapshot. Use this only for
+    /// `/v1/configs/export`, never for live NATS deltas.
+    pub fn replace_model_configs_authoritative(
+        &self,
+        configs: Vec<ModelConfig>,
+    ) -> Result<usize, String> {
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("ModelRegistry write_lock poisoned");
+        let old_snap = self.snapshot.load();
+        let mut new_models: HashMap<String, ModelEntry> = HashMap::new();
+        let mut new_model_names_lower: HashMap<String, String> = HashMap::new();
+        let applied = configs.len();
+
+        for config in configs {
+            let sie_id = &config.name;
+            if sie_id.is_empty() {
+                return Err("Missing required field: name/sie_id".to_string());
+            }
+            if sie_id.chars().any(|c| c.is_control()) {
+                return Err(format!(
+                    "Invalid model id: contains control character (sie_id={:?})",
+                    sie_id
+                ));
+            }
+            if config.profiles.is_empty() {
+                return Err("Missing required field: profiles".to_string());
+            }
+
+            let mut adapter_modules: HashSet<String> = HashSet::new();
+            for (profile_name, profile) in &config.profiles {
+                if let Some(adapter_path) =
+                    Self::effective_adapter_path_from_profiles(&config.profiles, profile_name)
+                {
+                    if let Some(module) = Self::adapter_module_from_path(adapter_path) {
+                        adapter_modules.insert(module);
+                    }
+                } else if profile.extends.is_none() {
+                    return Err(format!("Profile '{}' missing adapter_path", profile_name));
+                }
+            }
+
+            let all_bundle_adapters: HashSet<String> = old_snap
+                .bundles
+                .values()
+                .flat_map(|b| b.adapters.iter().cloned())
+                .collect();
+            let unroutable: Vec<&String> = adapter_modules
+                .iter()
+                .filter(|a| !all_bundle_adapters.contains(a.as_str()))
+                .collect();
+            if !unroutable.is_empty() {
+                return Err(format!(
+                    "Adapter(s) not in any known bundle: {}",
+                    unroutable
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+
+            for mut entry in Self::expand_model_config_into_profile_variants(&config)? {
+                Self::assign_bundles(&mut entry, &old_snap.bundles);
+                new_model_names_lower.insert(entry.name.to_lowercase(), entry.name.clone());
+                new_models.insert(entry.name.clone(), entry);
+            }
+        }
+
+        let bundle_config_hashes =
+            Self::rebuild_bundle_config_hashes(&old_snap.bundles, &new_models);
+        let bundle_pool_config_hashes =
+            Self::rebuild_bundle_pool_config_hashes(&old_snap.bundles, &new_models);
+
+        info!(
+            old_models = old_snap.models.len(),
+            models = new_models.len(),
+            bundles = old_snap.bundles.len(),
+            "replaced model configs from authoritative export"
+        );
+
+        self.snapshot.store(Arc::new(RegistrySnapshot {
+            bundles: old_snap.bundles.clone(),
+            models: new_models,
+            model_names_lower: new_model_names_lower,
+            bundle_config_hashes,
+            bundle_pool_config_hashes,
+        }));
+
+        Ok(applied)
     }
 
     fn add_model_config_inner(
@@ -1206,12 +1413,19 @@ impl ModelRegistry {
         let mut created_profiles: Vec<String> = Vec::new();
         let mut skipped_profiles: Vec<String> = Vec::new();
         let mut overridden_profiles: Vec<String> = Vec::new();
+        let incoming_pool = Self::normalize_model_pool(config.pool.as_deref())?;
 
         if let Some(existing) = snap.models.get_mut(sie_id) {
+            if config.pool.is_some() && existing.pool != incoming_pool {
+                return Err(format!(
+                    "Pool on model '{}' already exists with different value (append-only)",
+                    sie_id
+                ));
+            }
             // Append-only by default: add new profiles, skip identical,
-            // reject conflicts. When `authoritative` is true (bootstrap /
-            // epoch-poll catch-up), a conflicting profile is OVERWRITTEN
-            // with a warn so the control plane's latest word wins.
+            // reject conflicts. The test-only authoritative branch preserves
+            // the per-model overwrite behavior that predates full-snapshot
+            // replacement.
             //
             // Resolution map: a delta update can carry a profile that
             // ``extends`` a profile only present in ``existing.profile_configs``
@@ -1243,8 +1457,7 @@ impl ModelRegistry {
                                 new_max_batch_tokens = ?incoming.max_batch_tokens,
                                 old_compute_precision = ?stored.compute_precision,
                                 new_compute_precision = ?incoming.compute_precision,
-                                "overriding existing profile config from authoritative source (sie-config); \
-                                 likely a control-plane schema change between bootstrap and catch-up",
+                                "overriding existing profile config from authoritative source (sie-config)",
                             );
                             overridden_profiles.push(profile_name.clone());
                             continue;
@@ -1292,6 +1505,7 @@ impl ModelRegistry {
                 sie_id.clone(),
                 ModelEntry {
                     name: sie_id.clone(),
+                    pool: incoming_pool,
                     bundles: Vec::new(),
                     adapter_modules: new_adapter_modules,
                     profile_names,
@@ -1350,6 +1564,8 @@ impl ModelRegistry {
                 snap.bundle_config_hashes.insert(bundle_name.clone(), hash);
             }
         }
+        snap.bundle_pool_config_hashes =
+            Self::rebuild_bundle_pool_config_hashes(&snap.bundles, &snap.models);
 
         info!(
             model = %sie_id,
@@ -1486,6 +1702,7 @@ mod tests {
                 name: "org/x".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: None,
@@ -1542,6 +1759,7 @@ mod tests {
                 name: "org/x".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: None,
@@ -1724,6 +1942,7 @@ profiles:
                 name: "org/broken".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: None,
@@ -1780,6 +1999,7 @@ profiles:
                         name: name.clone(),
                         adapter_module: None,
                         default_bundle: None,
+                        pool: None,
                         profiles,
                         inputs: None,
                         max_sequence_length: None,
@@ -2030,6 +2250,7 @@ adapters:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2094,6 +2315,7 @@ adapters:
                 name: "test/model".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: Some(512),
@@ -2142,6 +2364,7 @@ encode:
                 name: "test/model".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: Some(1024),
@@ -2197,6 +2420,7 @@ adapters:
                 name: "test/model".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: Some(512),
@@ -2240,6 +2464,7 @@ encode:
                 name: "test/model".to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: None,
@@ -2262,6 +2487,7 @@ encode:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2327,12 +2553,10 @@ adapters:
         );
     }
 
-    /// The authoritative path is what `state::config_bootstrap` uses on
-    /// cold-start and on epoch-poller catch-up. It treats the export as
-    /// the source of truth and overrides any divergent stored profile
-    /// config (with a warn log) instead of failing the entire bootstrap.
-    /// Reproduces the `nemotron-8b` adapter swap that wedged sie-test
-    /// until a manual gateway restart.
+    /// The test-only authoritative merge path preserves the old per-model
+    /// conflict override behavior. Production export replay now uses
+    /// `replace_model_configs_authoritative`, but this still guards the shared
+    /// merge code for divergent stored profiles.
     #[test]
     fn test_add_model_config_authoritative_overrides_conflicting_profile() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
@@ -2418,6 +2642,7 @@ adapters:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2442,8 +2667,8 @@ adapters:
             .expect("delta apply must resolve extends against existing.profile_configs");
         assert_eq!(created, vec!["a100-40gb".to_string()]);
 
-        // Same delta under the authoritative path must also succeed (the
-        // override path uses the same merged resolution map).
+        // Same delta under the test-only authoritative path must also succeed
+        // because the override path uses the same merged resolution map.
         registry
             .add_model_config_authoritative(delta)
             .expect("authoritative replay of the same delta must also resolve cleanly");
@@ -2477,6 +2702,7 @@ adapters:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2533,6 +2759,7 @@ adapters:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2681,6 +2908,67 @@ profiles:
     }
 
     #[test]
+    fn test_compute_bundle_config_hash_for_pool_filters_model_pool() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.sentence_transformer
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            models_dir.join("default.yaml"),
+            r#"
+name: default/model
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+    max_batch_tokens: 4096
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            models_dir.join("tenant.yaml"),
+            r#"
+name: tenant/model
+pool: customer-a
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerAdapter"
+    max_batch_tokens: 4096
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let global_hash = registry.compute_bundle_config_hash("default");
+        let default_hash = registry.compute_bundle_config_hash_for_pool("default", "default");
+        let tenant_hash = registry.compute_bundle_config_hash_for_pool("default", "customer-a");
+
+        assert_eq!(
+            registry.get_model_pool_name("tenant/model").as_deref(),
+            Some("customer-a")
+        );
+        assert!(!global_hash.is_empty());
+        assert!(!default_hash.is_empty());
+        assert!(!tenant_hash.is_empty());
+        assert_ne!(global_hash, default_hash);
+        assert_ne!(global_hash, tenant_hash);
+        assert_ne!(default_hash, tenant_hash);
+        assert_eq!(
+            registry.compute_bundle_config_hash_for_pool("default", "missing"),
+            ""
+        );
+    }
+
+    #[test]
     fn test_compute_bundle_config_hash_ignores_profile_variant_aliases() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
 
@@ -2800,6 +3088,7 @@ adapters:
                     name: format!("race/model-{i}"),
                     adapter_module: None,
                     default_bundle: None,
+                    pool: None,
                     profiles: {
                         let mut m = HashMap::new();
                         m.insert(

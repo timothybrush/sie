@@ -8,6 +8,7 @@ config-load and at :meth:`ModelRegistry.add_config` time.
 from __future__ import annotations
 
 import pytest
+import yaml
 from sie_server.config.model import (
     EmbeddingDim,
     EncodeTask,
@@ -55,6 +56,16 @@ def _encode_config(sie_id: str = "BAAI/bge-m3") -> ModelConfig:
             "default": ProfileConfig(adapter_path="mod:Encoder", max_batch_tokens=8192),
         },
     )
+
+
+def _with_pool(config: ModelConfig, pool: str) -> ModelConfig:
+    config.pool = pool
+    return config
+
+
+def _write_config(models_dir, config: ModelConfig) -> None:
+    path = models_dir / f"{config.sie_id.replace('/', '__')}.yaml"
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json", exclude_none=True), sort_keys=False))
 
 
 class TestIsGenerationModel:
@@ -135,15 +146,15 @@ class TestValidatePoolIsolation:
 class TestRegistryHook:
     def test_add_config_gen_then_encode_rejects(self, tmp_path: object) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_gen_config())
+        registry.add_config(_with_pool(_gen_config(), "p1"))
         with pytest.raises(PoolIsolationError):
-            registry.add_config(_encode_config())
+            registry.add_config(_with_pool(_encode_config(), "p1"))
 
     def test_add_config_encode_then_gen_rejects(self) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_encode_config())
+        registry.add_config(_with_pool(_encode_config(), "p1"))
         with pytest.raises(PoolIsolationError):
-            registry.add_config(_gen_config())
+            registry.add_config(_with_pool(_gen_config(), "p1"))
 
     def test_add_config_no_pool_skips_validator(self) -> None:
         """When pool_name is None (tests/no-cluster), validator is skipped."""
@@ -153,14 +164,47 @@ class TestRegistryHook:
 
     def test_add_config_same_task_class_ok(self) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_gen_config("qwen-a"))
-        registry.add_config(_gen_config("qwen-b"))  # should not raise
+        registry.add_config(_with_pool(_gen_config("qwen-a"), "p1"))
+        registry.add_config(_with_pool(_gen_config("qwen-b"), "p1"))  # should not raise
+
+    def test_add_config_skips_different_model_pool(self) -> None:
+        registry = ModelRegistry(pool_name="customer-a")
+        default_config = _encode_config("default/model")
+        tenant_config = _encode_config("tenant/model")
+        tenant_config.pool = "customer-a"
+
+        registry.add_config(default_config)
+        registry.add_config(tenant_config)
+
+        assert "default/model" not in registry.model_names
+        assert "tenant/model" in registry.model_names
+
+    def test_load_configs_from_dir_filters_different_model_pool(self, tmp_path) -> None:
+        default_config = _encode_config("default/model")
+        tenant_config = _with_pool(_encode_config("tenant/model"), "Customer-A")
+        _write_config(tmp_path, default_config)
+        _write_config(tmp_path, tenant_config)
+
+        registry = ModelRegistry(models_dir=tmp_path, pool_name="customer-a")
+
+        assert registry.model_names == ["tenant/model"]
+
+    @pytest.mark.asyncio
+    async def test_replace_configs_filters_different_model_pool(self) -> None:
+        registry = ModelRegistry(pool_name="customer-a")
+        default_config = _encode_config("default/model")
+        tenant_config = _encode_config("tenant/model")
+        tenant_config.pool = "customer-a"
+
+        await registry.replace_configs_async([default_config, tenant_config])
+
+        assert registry.model_names == ["tenant/model"]
 
     def test_failed_add_does_not_mutate_state(self) -> None:
         registry = ModelRegistry(pool_name="p1")
-        registry.add_config(_gen_config())
+        registry.add_config(_with_pool(_gen_config(), "p1"))
         try:
-            registry.add_config(_encode_config())
+            registry.add_config(_with_pool(_encode_config(), "p1"))
         except PoolIsolationError:
             pass
         # bge-m3 should not have been added

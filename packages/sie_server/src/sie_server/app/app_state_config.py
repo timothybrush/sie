@@ -9,6 +9,7 @@ ENV_DEVICE = "SIE_DEVICE"
 ENV_MODELS_DIR = "SIE_MODELS_DIR"
 ENV_MODEL_FILTER = "SIE_MODEL_FILTER"
 ENV_PRELOAD_MODELS = "SIE_PRELOAD_MODELS"
+ENV_POOL = "SIE_POOL"
 
 
 @dataclass
@@ -31,6 +32,9 @@ class AppStateConfig:
     preload_models: list[str] | None = None
     """Optional list of model names to eagerly load at startup. If None, all models are lazy-loaded."""
 
+    pool_name: str | None = None
+    """Optional worker pool identity used by ModelRegistry pool-isolation checks."""
+
     def save_to_env_vars(self) -> None:
         """Serialize configuration to environment variables for uvicorn reload mode."""
         if self.models_dir:
@@ -50,6 +54,11 @@ class AppStateConfig:
         elif ENV_PRELOAD_MODELS in os.environ:
             del os.environ[ENV_PRELOAD_MODELS]
 
+        if self.pool_name:
+            os.environ[ENV_POOL] = self.pool_name
+        elif ENV_POOL in os.environ:
+            del os.environ[ENV_POOL]
+
     @classmethod
     def from_env_vars(cls) -> AppStateConfig:
         """Deserialize configuration from environment variables."""
@@ -59,10 +68,12 @@ class AppStateConfig:
         model_filter = [m.strip() for m in model_filter_str.split(",") if m.strip()] if model_filter_str else None
         preload_str = os.environ.get(ENV_PRELOAD_MODELS)
         preload_models = [m.strip() for m in preload_str.split(",") if m.strip()] if preload_str else None
+        pool_name = os.environ.get(ENV_POOL) or None
 
         return cls(
             models_dir=models_dir,
             device=device,
             model_filter=model_filter,
             preload_models=preload_models,
+            pool_name=pool_name,
         )

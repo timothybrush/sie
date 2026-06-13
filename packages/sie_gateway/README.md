@@ -156,7 +156,7 @@ Common headers:
 Common behaviors:
 
 - `404` for unknown models once the in-memory registry has bootstrapped from `sie-config` (fast-fail; avoids queueing requests for typo'd model ids)
-- `202` + `Retry-After` on scale-from-zero, whether or not `X-SIE-MACHINE-PROFILE` was set (records pending demand for KEDA)
+- `503` + `Retry-After` + `X-SIE-Error-Code: PROVISIONING` on scale-from-zero, whether or not `X-SIE-MACHINE-PROFILE` was set (records pending demand for KEDA)
 - `503` + `Retry-After` for no-consumer or backpressure publish failures
 - `503` + `X-SIE-Error-Code: MODEL_LOADING` + `Retry-After: 5` for queue result timeouts (typically a worker cold-loading the target model). SDK clients with `wait_for_capacity=True` retry under the existing `provision_timeout_s` budget.
 - `503` + `X-SIE-Error-Code: RESOURCE_EXHAUSTED` + `Retry-After: 5` when every item in a batch fails with the same retryable code (`RESOURCE_EXHAUSTED` from worker-side OOM recovery exhaustion, `MODEL_LOADING` from a worker still warming up). The SDK auto-retries with bounded exponential backoff. Mixed batches keep returning `500 all_items_failed` with per-item `code` fields in the response body so callers can see which items hit which failure mode.

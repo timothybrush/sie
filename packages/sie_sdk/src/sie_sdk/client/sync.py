@@ -20,7 +20,7 @@ GPU Selection and Auto-Retry:
     ...     "bge-m3",
     ...     {"text": "Hello"},
     ...     gpu="l4",
-    ...     wait_for_capacity=True,  # Auto-retry on 202/503/504 and transient transport errors
+    ...     wait_for_capacity=True,  # Auto-retry explicit capacity 503s and transient transport errors
     ...     provision_timeout_s=900,  # Wait up to 15 min
     ... )
 
@@ -72,8 +72,6 @@ from sie_sdk.types import (
 from ._shared import (
     DEFAULT_LEASE_RENEWAL_INTERVAL_S,
     DEFAULT_PROVISION_TIMEOUT_S,
-    DEFAULT_RETRY_DELAY_S,
-    HTTP_ACCEPTED,
     HTTP_CLIENT_ERROR,
     HTTP_GATEWAY_TIMEOUT,
     JSON_CONTENT_TYPE,
@@ -83,6 +81,7 @@ from ._shared import (
     MODEL_LOADING_DEFAULT_DELAY_S,
     MODEL_LOADING_ERROR_CODE,
     MSGPACK_CONTENT_TYPE,
+    PROVISIONING_ERROR_CODE,
     RESOURCE_EXHAUSTED_ERROR_CODE,
     RESOURCE_EXHAUSTED_MAX_RETRIES,
     SDK_VERSION_HEADER,
@@ -92,6 +91,7 @@ from ._shared import (
     check_version_skew,
     compute_oom_backoff,
     compute_retry_delay,
+    convert_score_images_for_wire,
     get_error_code,
     get_retry_after,
     get_sdk_version,
@@ -102,8 +102,10 @@ from ._shared import (
     parse_extract_results,
     parse_gpu_param,
     parse_score_result,
+    provisioning_retry_delay,
     raise_if_input_too_long,
     raise_if_model_load_failed,
+    retry_after_or_default,
     sse_chunk_error,
     sse_headers,
 )
@@ -590,6 +592,7 @@ class SIEClient:
 
         Args:
             name: Pool name (used in gpu="pool_name/machine_profile" routing).
+                The gateway stores and routes pool names in lowercase.
             gpus: Optional machine profile requirements for pool readiness, e.g.,
                 {"l4": 2, "l4-spot": 1}.
                 Keys are machine profile names from cluster config.
@@ -940,8 +943,7 @@ class SIEClient:
                 with matching GPU. Required when using the gateway with multiple GPU pools.
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
-                ``202`` (scale-from-zero provisioning); generic ``503`` (no
-                healthy workers for the (bundle, machine_profile) tuple);
+                ``503 PROVISIONING`` (scale-from-zero provisioning);
                 ``504`` (defense-in-depth for older gateways that haven't yet
                 mapped upstream timeouts to ``503 MODEL_LOADING``); local
                 ``httpx`` read/connect/pool timeouts; and transient
@@ -981,7 +983,7 @@ class SIEClient:
             ServerError: If the server encounters an error (5xx response).
             SIEConnectionError: If unable to connect to the server.
             ProvisioningError: If ``wait_for_capacity=False`` and the gateway
-                returns ``202`` (scale-from-zero provisioning), or if ``202``
+                returns ``503 PROVISIONING`` (scale-from-zero provisioning), or if provisioning
                 retries exceed ``provision_timeout_s``.
             ModelLoadingError: If ``503`` ``MODEL_LOADING`` retries exceed
                 ``provision_timeout_s`` during worker-side cold-loading of the
@@ -1091,7 +1093,7 @@ class SIEClient:
         # backoff via ``compute_oom_backoff``.
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -1139,33 +1141,6 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Check if we've exceeded the timeout
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Wait and retry
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                time.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures BEFORE engaging the
             # MODEL_LOADING retry budget. The server emits 502
             # MODEL_LOAD_FAILED for permanent classes (gated repos,
@@ -1176,6 +1151,22 @@ class SIEClient:
             # Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    time.sleep(actual_delay)
+                    continue
+
                 if error_code == LORA_LOADING_ERROR_CODE:
                     lora_retries += 1
 
@@ -1187,7 +1178,7 @@ class SIEClient:
 
                     # Wait and retry
                     retry_after = get_retry_after(response)
-                    delay = retry_after or LORA_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, LORA_LOADING_DEFAULT_DELAY_S)
                     logger.debug(
                         "LoRA loading, retrying in %.1fs (attempt %d/%d)",
                         delay,
@@ -1206,7 +1197,7 @@ class SIEClient:
 
                     # Wait and retry, respecting remaining time
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1229,27 +1220,6 @@ class SIEClient:
                     )
                     continue
 
-                # Generic 503 (no healthy workers) - retry if wait_for_capacity
-                # This handles scale-from-zero when pools are PENDING and have no workers yet
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        # Timeout exceeded, let handle_error raise the exception
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        time.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. A cold-start request that triggers a
@@ -1261,7 +1231,7 @@ class SIEClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1642,8 +1612,7 @@ class SIEClient:
                 with matching GPU.
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
-                ``202`` (scale-from-zero provisioning); generic ``503`` (no
-                healthy workers for the (bundle, machine_profile) tuple);
+                ``503 PROVISIONING`` (scale-from-zero provisioning);
                 ``504`` (defense-in-depth for older gateways that haven't yet
                 mapped upstream timeouts to ``503 MODEL_LOADING``); local
                 ``httpx`` read/connect/pool timeouts; and transient
@@ -1682,7 +1651,7 @@ class SIEClient:
             ServerError: If the server encounters an error (5xx response).
             SIEConnectionError: If unable to connect to the server.
             ProvisioningError: If ``wait_for_capacity=False`` and the gateway
-                returns ``202`` (scale-from-zero provisioning), or if ``202``
+                returns ``503 PROVISIONING`` (scale-from-zero provisioning), or if provisioning
                 retries exceed ``provision_timeout_s``.
             ModelLoadingError: If ``503`` ``MODEL_LOADING`` retries exceed
                 ``provision_timeout_s`` during worker-side cold-loading of the
@@ -1704,11 +1673,12 @@ class SIEClient:
         # Resolve defaults and pool
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
         resolved_options = self._resolve_options(options)
+        query_for_wire, items_for_wire = convert_score_images_for_wire(query, items)
 
         # Build request body
         request_body: dict[str, Any] = {
-            "query": query,
-            "items": items,
+            "query": query_for_wire,
+            "items": items_for_wire,
         }
         if instruction is not None:
             request_body["instruction"] = instruction
@@ -1733,7 +1703,7 @@ class SIEClient:
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -1781,39 +1751,28 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Check if we've exceeded the timeout
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Wait and retry
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                time.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
 
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    time.sleep(actual_delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     # Check if we've exceeded the provision timeout
                     elapsed = time.monotonic() - start_time
@@ -1823,7 +1782,7 @@ class SIEClient:
 
                     # Wait and retry, respecting remaining time
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1846,27 +1805,6 @@ class SIEClient:
                     )
                     continue
 
-                # Generic 503 (no healthy workers) - retry if wait_for_capacity
-                # This handles scale-from-zero when pools are PENDING and have no workers yet
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        # Timeout exceeded, let handle_error raise the exception
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        time.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. A cold-start request that triggers a
@@ -1878,7 +1816,7 @@ class SIEClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1940,7 +1878,7 @@ class SIEClient:
             top_p: Nucleus sampling cutoff.
             stop: Optional list of stop strings.
             gpu: Target GPU type / pool spec; see ``encode``.
-            wait_for_capacity: Auto-retry 202 / 503 MODEL_LOADING responses
+            wait_for_capacity: Auto-retry 503 PROVISIONING / MODEL_LOADING responses
                 under ``provision_timeout_s``. See ``encode``. Unlike the
                 idempotent encode/score/extract paths, a ``504`` gateway
                 timeout is NOT retried here: generation is non-idempotent
@@ -2028,31 +1966,28 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                actual_delay = min(delay, timeout - elapsed)
-                time.sleep(actual_delay)
-                continue
-
             raise_if_model_load_failed(response, model=model)
 
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    time.sleep(actual_delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
                         msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
                         raise ModelLoadingError(msg, model=model)
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     actual_delay = min(delay, timeout - elapsed)
                     time.sleep(actual_delay)
                     continue
@@ -2066,14 +2001,6 @@ class SIEClient:
                         model=model,
                     )
                     continue
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed < timeout:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        actual_delay = min(delay, timeout - elapsed)
-                        time.sleep(actual_delay)
-                        continue
 
             # Do NOT retry 504 here. Unlike the idempotent encode/score/extract
             # paths (which keep the 504 retry block), generation is NOT
@@ -2083,7 +2010,7 @@ class SIEClient:
             # issue a SECOND billable generation with a different completion, so
             # surface it as a terminal ServerError instead (same reasoning as
             # the mid-flight transport-error block above). The pre-execution
-            # 503 MODEL_LOADING / 202 provisioning retries above remain because
+            # 503 MODEL_LOADING / PROVISIONING retries above remain because
             # those fire *before* any generation can have started.
             if response.status_code == HTTP_GATEWAY_TIMEOUT:
                 msg = (
@@ -2144,7 +2071,7 @@ class SIEClient:
         Mirrors the subset of OpenAI's ``chat.completions.create`` the gateway
         honours. For token streaming use :meth:`stream_chat_completions`.
         Generation is non-idempotent, so — like :meth:`generate` — only
-        pre-execution 202 / 503 responses are retried; a 504 (post-publish)
+        pre-execution 503 PROVISIONING / MODEL_LOADING responses are retried; a 504 (post-publish)
         surfaces as :class:`ServerError`.
 
         Typed kwargs cover the full gateway-supported field set (see
@@ -2391,7 +2318,7 @@ class SIEClient:
         """Open an SSE stream (with pre-stream provisioning retry) and yield chunks.
 
         Shared by :meth:`stream_chat_completions` and :meth:`stream_generate`.
-        Only the *pre-stream* response is retried (202 / 503); once bytes start
+        Only the *pre-stream* response is retried (503 PROVISIONING / MODEL_LOADING); once bytes start
         flowing a failure is terminal (non-idempotent). Yielding inside the
         ``with`` keeps the stream open while the caller consumes it; an early
         ``break`` tears the context down and the worker sees the disconnect.
@@ -2516,8 +2443,7 @@ class SIEClient:
                 with matching GPU.
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
-                ``202`` (scale-from-zero provisioning); generic ``503`` (no
-                healthy workers for the (bundle, machine_profile) tuple);
+                ``503 PROVISIONING`` (scale-from-zero provisioning);
                 ``504`` (defense-in-depth for older gateways that haven't yet
                 mapped upstream timeouts to ``503 MODEL_LOADING``); local
                 ``httpx`` read/connect/pool timeouts; and transient
@@ -2556,7 +2482,7 @@ class SIEClient:
             ServerError: If the server encounters an error (5xx response).
             SIEConnectionError: If unable to connect to the server.
             ProvisioningError: If ``wait_for_capacity=False`` and the gateway
-                returns ``202`` (scale-from-zero provisioning), or if ``202``
+                returns ``503 PROVISIONING`` (scale-from-zero provisioning), or if provisioning
                 retries exceed ``provision_timeout_s``.
             ModelLoadingError: If ``503`` ``MODEL_LOADING`` retries exceed
                 ``provision_timeout_s`` during worker-side cold-loading of the
@@ -2639,7 +2565,7 @@ class SIEClient:
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -2687,33 +2613,6 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Check if we've exceeded the timeout
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Wait and retry
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                time.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
 
@@ -2723,6 +2622,22 @@ class SIEClient:
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    time.sleep(actual_delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     # Check if we've exceeded the provision timeout
                     elapsed = time.monotonic() - start_time
@@ -2732,7 +2647,7 @@ class SIEClient:
 
                     # Wait and retry, respecting remaining time
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -2755,27 +2670,6 @@ class SIEClient:
                     )
                     continue
 
-                # Generic 503 (no healthy workers) - retry if wait_for_capacity
-                # This handles scale-from-zero when pools are PENDING and have no workers yet
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        # Timeout exceeded, let handle_error raise the exception
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        time.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. A cold-start request that triggers a
@@ -2787,7 +2681,7 @@ class SIEClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(

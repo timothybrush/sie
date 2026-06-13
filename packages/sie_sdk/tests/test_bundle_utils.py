@@ -24,8 +24,9 @@ def test_match_bundle_models_filters_by_pool(tmp_path: Path) -> None:
     models_dir.mkdir()
 
     _write_model(models_dir, "org/generation")
-    _write_model(models_dir, "org/embedding", pool="sglang-embedding")
+    _write_model(models_dir, "org/embedding", pool="SGLang-Embedding")
 
     assert set(match_bundle_models(bundle_path, models_dir)) == {"org/generation", "org/embedding"}
     assert match_bundle_models(bundle_path, models_dir, pool_name="default") == ["org/generation"]
     assert match_bundle_models(bundle_path, models_dir, pool_name="sglang-embedding") == ["org/embedding"]
+    assert match_bundle_models(bundle_path, models_dir, pool_name="SGLANG-EMBEDDING") == ["org/embedding"]

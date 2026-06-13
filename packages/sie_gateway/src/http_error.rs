@@ -2,11 +2,12 @@
 //! SDK-stable responses (``502 MODEL_LOAD_FAILED``, ``503`` retryable ``{"error":{...}}``)
 //! intentionally stay on their existing shapes.
 //!
-//! The OpenAI-compatible surface introduces a parallel OpenAI-shaped error envelope (see
-//! :mod:`openai_code` / :func:`json_openai_error`) used by
-//! ``/v1/generate/{model}`` and ``/v1/chat/completions``. The remaining
-//! inference endpoints (encode/score/extract/embeddings) still use
-//! ``json_detail`` to preserve existing SDK error-handling contracts.
+//! The OpenAI-compatible surfaces introduce a parallel OpenAI-shaped error envelope
+//! (see :mod:`openai_code` / :func:`json_openai_error`). Generation-compatible
+//! endpoints build that envelope directly. ``/v1/embeddings`` calls the SIE-native
+//! encode path internally and translates non-200 responses back into the OpenAI
+//! envelope. Native encode/score/extract endpoints keep ``json_detail`` to preserve
+//! existing SDK error-handling contracts.
 
 use serde_json::{json, Map, Value};
 
@@ -95,6 +96,8 @@ pub mod openai_code {
     /// the NAK-then-pool-republish-fails path; future rate limiters
     /// (per-token-bucket, per-tenant-quota) would land here too.
     pub const RATE_LIMIT_EXCEEDED: &str = "rate_limit_exceeded";
+    /// OpenAI-compatible scale-from-zero / worker provisioning signal.
+    pub const PROVISIONING: &str = "provisioning";
 }
 
 /// OpenAI-shaped error body:
@@ -141,7 +144,10 @@ pub fn openai_error_from_detail_code(code: &str) -> (&'static str, &'static str)
             (openai_type::INVALID_REQUEST, openai_code::INVALID_REQUEST)
         }
         // 503 — pool/queue saturated or unavailable.
-        "QUEUE_UNAVAILABLE" => (openai_type::SERVER_ERROR, openai_code::TRANSPORT_FAILURE),
+        "QUEUE_UNAVAILABLE" | "POOL_CAPACITY_UNAVAILABLE" => {
+            (openai_type::SERVER_ERROR, openai_code::TRANSPORT_FAILURE)
+        }
+        "PROVISIONING" => (openai_type::SERVER_ERROR, openai_code::PROVISIONING),
         // 504 — overall deadline blown.
         "GATEWAY_TIMEOUT" => (openai_type::SERVER_ERROR, openai_code::OVERALL_TIMEOUT),
         // 429 — forward-compatible with Tier 0 rate limiting.
@@ -214,6 +220,12 @@ mod tests {
                 "model_not_found",
             ),
             (code::QUEUE_UNAVAILABLE, "server_error", "transport_failure"),
+            (
+                code::POOL_CAPACITY_UNAVAILABLE,
+                "server_error",
+                "transport_failure",
+            ),
+            (code::PROVISIONING, "server_error", "provisioning"),
             (code::GATEWAY_TIMEOUT, "server_error", "overall_timeout"),
             ("RATE_LIMIT", "rate_limit_error", "rate_limit_exceeded"),
             (code::INTERNAL_ERROR, "server_error", "transport_failure"),

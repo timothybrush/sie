@@ -23,6 +23,7 @@ from sie_server.ipc_types import (
     METHOD_PROCESS_EXTRACT_BATCH,
     METHOD_PROCESS_GENERATE,
     METHOD_PROCESS_SCORE_BATCH,
+    METHOD_REPLACE_MODEL_CONFIGS,
     METHOD_RUN_BATCH,
     METHOD_SIGNAL_GENERATE_CANCEL,
     METHOD_WORKER_CAPABILITIES,
@@ -39,6 +40,8 @@ from sie_server.ipc_types import (
     ProcessExtractBatchRequest,
     ProcessGenerateRequest,
     ProcessScoreBatchRequest,
+    ReplaceModelConfigsRequest,
+    ReplaceModelConfigsResponse,
     ResponseEnvelope,
     RunBatchRequest,
     SignalGenerateCancelRequest,
@@ -430,6 +433,8 @@ class IpcServer:
                 resp_body = await self._handle_run_batch(msgspec.convert(body, RunBatchRequest))
             elif method == METHOD_APPLY_MODEL_CONFIG:
                 resp_body = self._handle_apply_model_config(msgspec.convert(body, ApplyModelConfigRequest))
+            elif method == METHOD_REPLACE_MODEL_CONFIGS:
+                resp_body = await self._handle_replace_model_configs(msgspec.convert(body, ReplaceModelConfigsRequest))
             elif method == METHOD_SIGNAL_GENERATE_CANCEL:
                 resp_body = await self._handle_signal_generate_cancel(
                     msgspec.convert(body, SignalGenerateCancelRequest)
@@ -521,6 +526,12 @@ class IpcServer:
 
     def _handle_apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
         return self._executor.apply_model_config(req)
+
+    async def _handle_replace_model_configs(
+        self,
+        req: ReplaceModelConfigsRequest,
+    ) -> ReplaceModelConfigsResponse:
+        return await self._executor.replace_model_configs(req)
 
     def _handle_worker_capabilities(self, _req: WorkerCapabilitiesRequest) -> WorkerCapabilitiesResponse:
         generation_models: list[str] = []

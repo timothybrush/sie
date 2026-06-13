@@ -15,6 +15,7 @@ OutputType = Literal["dense", "sparse", "multivector", "score", "json", "tokens"
 PoolingStrategy = Literal["cls", "mean", "last_token", "splade", "none"]
 
 _MODALITY_NAMES = ("text", "image", "audio", "video", "document")
+_MAX_POOL_NAME_LEN = 128
 
 
 class InputModalities(BaseModel):
@@ -428,10 +429,32 @@ class ModelConfig(BaseModel):
     hf_revision: str | None = None
     weights_path: Path | None = None
     package_backed: bool = False
+    pool: str | None = None
     inputs: InputModalities = InputModalities()
     tasks: Tasks
     max_sequence_length: int | None = None
     profiles: dict[str, ProfileConfig]
+
+    @model_validator(mode="after")
+    def validate_pool_name(self) -> "ModelConfig":
+        if self.pool is None:
+            return self
+
+        pool = self.pool.strip().lower()
+        if not pool:
+            self.pool = None
+            return self
+
+        if (
+            len(pool) > _MAX_POOL_NAME_LEN
+            or pool == "_default"
+            or not all(c.isascii() and (c.isalnum() or c in "_-") for c in pool)
+        ):
+            msg = "pool must use only [A-Za-z0-9_-], be at most 128 chars, and not be '_default'"
+            raise ValueError(msg)
+
+        self.pool = pool
+        return self
 
     @model_validator(mode="after")
     def validate_weight_source(self) -> "ModelConfig":

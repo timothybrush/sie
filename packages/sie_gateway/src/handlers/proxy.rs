@@ -22,7 +22,7 @@ use crate::queue::publisher;
 
 use crate::server::AppState;
 use crate::state::model_registry::ResolveError;
-use crate::state::pool_manager::{PoolManager, DEFAULT_POOL_NAME};
+use crate::state::pool_manager::{normalize_pool_name, PoolManager, DEFAULT_POOL_NAME};
 use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
 use crate::types::AuditEntry;
 
@@ -55,7 +55,10 @@ pub(crate) fn system_fingerprint(model: &str) -> String {
     input.push_str(GATEWAY_VERSION);
     format!("fp_{:016x}", xxhash_rust::xxh3::xxh3_64(input.as_bytes()))
 }
-const DEFAULT_RETRY_AFTER: &str = "120";
+/// Provisioning is a retryable pre-execution capacity miss, not an accepted
+/// asynchronous job. Keep the Retry-After hint within the range common OpenAI
+/// SDKs honor directly.
+pub(crate) const PROVISIONING_RETRY_AFTER: &str = "60";
 const BACKPRESSURE_RETRY_AFTER: &str = "5";
 const MODEL_LOADING_RETRY_AFTER: &str = "5";
 const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
@@ -72,7 +75,6 @@ const RESOURCE_EXHAUSTED_RETRY_AFTER: &str = "5";
 /// see ``sie_sdk.client._shared.LORA_LOADING_*``.
 const LORA_LOADING_ERROR_CODE: &str = "LORA_LOADING";
 const LORA_LOADING_RETRY_AFTER: &str = "5";
-const ESTIMATED_WAIT_S: u64 = 180;
 /// Terminal model load failure (non-retryable). Matches ``sie_server`` HTTP 502
 /// contract so ``sie_sdk`` can short-circuit before the ``MODEL_LOADING`` retry
 /// budget (see ``raise_if_model_load_failed``).
@@ -193,9 +195,15 @@ enum PoolResolution {
     /// A healthy worker is registered and this is the pool to publish to.
     Route(QueueRoute),
     /// No healthy worker matches the requested `(pool, machine_profile,
-    /// bundle)` lane — the caller should emit `202 provisioning` and record
-    /// pending demand so KEDA scales up.
+    /// bundle)` lane — the caller should emit the surface-specific
+    /// provisioning response and record pending demand so KEDA scales up.
     Provisioning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisioningSurface {
+    Native,
+    OpenAiCompat,
 }
 
 /// Result of `resolve_effective_pool` — bundles the routing decision
@@ -250,6 +258,28 @@ fn is_valid_pool_name(pool: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
+fn apply_model_pool_default(
+    requested_pool: &mut String,
+    model_pool: Option<&str>,
+) -> Result<(), String> {
+    let Some(model_pool) = model_pool else {
+        if requested_pool.is_empty() {
+            *requested_pool = DEFAULT_POOL_NAME.to_string();
+        }
+        return Ok(());
+    };
+    if requested_pool.is_empty() {
+        *requested_pool = model_pool.to_string();
+        return Ok(());
+    }
+    if requested_pool == model_pool {
+        return Ok(());
+    }
+    Err(format!(
+        "Model is assigned to pool '{model_pool}', but request targeted pool '{requested_pool}'"
+    ))
+}
+
 /// Pure decision logic for the scale-from-zero branch of `proxy_request`.
 /// Kept as a free function so it can be unit-tested without standing up
 /// an `AppState` / `WorkPublisher`.
@@ -268,7 +298,7 @@ fn is_valid_pool_name(pool: &str) -> bool {
 ///   provisioning for that cold lane; the gateway must not silently route to
 ///   another machine profile.
 /// - If nothing resolves, return `Provisioning` so the caller can emit
-///   `202 + Retry-After` — regardless of whether the caller sent
+///   provisioning response — regardless of whether the caller sent
 ///   `X-SIE-MACHINE-PROFILE`. Before the fix this branch only fired when
 ///   `gpu` was non-empty, which turned a normal cold start into a queue
 ///   timeout for default-routing clients.
@@ -284,9 +314,9 @@ async fn resolve_effective_pool(
         // Caller pinned a pool. With the new subject shape, a pool-only
         // pin is not enough to publish cold unless we can infer a single
         // machine-profile token from the pool spec. A pool+GPU pin names the
-        // exact cold lane KEDA is expected to scale, but we still return 202
-        // until a healthy worker is present so the gateway does not publish to
-        // a stream with no active consumer.
+        // exact cold lane KEDA is expected to scale, but we still return a
+        // retryable provisioning error until a healthy worker is present so
+        // the gateway does not publish to a stream with no active consumer.
         if gpu.is_empty() {
             let route = registry
                 .resolve_queue_route_in_pool(bundle, "", pool_name, bundle_config_hash)
@@ -357,17 +387,8 @@ async fn infer_single_pool_profile(
     manager.single_machine_profile_for_pool(pool_name).await
 }
 
-fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
-    let gpu_label = if gpu.is_empty() { "any" } else { gpu };
-    info!(
-        gpu = %gpu_label,
-        bundle = %bundle,
-        "no queue worker available, returning 202",
-    );
-    metrics::PROVISIONING_RESPONSES
-        .with_label_values(&[gpu_label])
-        .inc();
-    let message = if gpu.is_empty() {
+fn provisioning_message(gpu: &str, bundle: &str) -> String {
+    if gpu.is_empty() {
         format!(
             "No worker available for bundle '{}'. Provisioning in progress.",
             bundle
@@ -377,21 +398,13 @@ fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
             "No worker available for GPU type '{}'. Provisioning in progress.",
             gpu
         )
-    };
-    let mut resp = (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "provisioning",
-            "gpu": gpu,
-            "bundle": bundle,
-            "estimated_wait_s": ESTIMATED_WAIT_S,
-            "message": message,
-        })),
-    )
-        .into_response();
+    }
+}
+
+fn add_provisioning_headers(resp: &mut Response, retry_after: &'static str) {
     resp.headers_mut().insert(
         HeaderName::from_static("retry-after"),
-        HeaderValue::from_static(DEFAULT_RETRY_AFTER),
+        HeaderValue::from_static(retry_after),
     );
     resp.headers_mut().insert(
         HeaderName::from_static("x-sie-version"),
@@ -401,7 +414,79 @@ fn build_provisioning_response(gpu: &str, bundle: &str) -> Response {
         HeaderName::from_static("x-sie-server-version"),
         HeaderValue::from_static(GATEWAY_VERSION),
     );
-    resp
+}
+
+fn record_provisioning_response(gpu: &str, bundle: &str, status: StatusCode) {
+    let gpu_label = if gpu.is_empty() { "any" } else { gpu };
+    info!(
+        gpu = %gpu_label,
+        bundle = %bundle,
+        http_status = status.as_u16(),
+        "no queue worker available, returning provisioning response",
+    );
+    metrics::PROVISIONING_RESPONSES
+        .with_label_values(&[gpu_label])
+        .inc();
+}
+
+fn build_provisioning_response_for_surface(
+    gpu: &str,
+    bundle: &str,
+    surface: ProvisioningSurface,
+) -> Response {
+    let message = provisioning_message(gpu, bundle);
+    match surface {
+        ProvisioningSurface::Native => {
+            record_provisioning_response(gpu, bundle, StatusCode::SERVICE_UNAVAILABLE);
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": {
+                        "code": err_code::PROVISIONING,
+                        "message": message,
+                    }
+                })),
+            )
+                .into_response();
+            add_provisioning_headers(&mut resp, PROVISIONING_RETRY_AFTER);
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-sie-error-code"),
+                HeaderValue::from_static(err_code::PROVISIONING),
+            );
+            resp
+        }
+        ProvisioningSurface::OpenAiCompat => {
+            record_provisioning_response(gpu, bundle, StatusCode::SERVICE_UNAVAILABLE);
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json_openai_error(
+                    message,
+                    oai_type::SERVER_ERROR,
+                    None,
+                    oai_code::PROVISIONING,
+                )),
+            )
+                .into_response();
+            add_provisioning_headers(&mut resp, PROVISIONING_RETRY_AFTER);
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-sie-error-code"),
+                HeaderValue::from_static(err_code::PROVISIONING),
+            );
+            resp
+        }
+    }
+}
+
+fn build_openai_provisioning_response(gpu: &str, bundle: &str) -> Response {
+    build_provisioning_response_for_surface(gpu, bundle, ProvisioningSurface::OpenAiCompat)
+}
+
+fn provisioning_surface_for_endpoint(endpoint: &str) -> ProvisioningSurface {
+    if endpoint_uses_openai_envelope(endpoint) {
+        ProvisioningSurface::OpenAiCompat
+    } else {
+        ProvisioningSurface::Native
+    }
 }
 
 async fn capped_lane_admission_response(
@@ -409,6 +494,7 @@ async fn capped_lane_admission_response(
     pool: &str,
     machine_profile: &str,
     bundle: &str,
+    provisioning_surface: ProvisioningSurface,
 ) -> Option<Response> {
     let admission = state
         .pool_manager
@@ -417,30 +503,58 @@ async fn capped_lane_admission_response(
 
     if admission.cap == 0 {
         metrics::record_rejected_request_for_pool(pool, machine_profile, bundle, "pool_cap_zero");
+        let message = format!(
+            "Pool '{}' admits zero workers for GPU type '{}' and bundle '{}'.",
+            pool, machine_profile, bundle
+        );
         let mut m = Map::new();
         m.insert("pool".to_string(), json!(pool));
         m.insert("gpu".to_string(), json!(machine_profile));
         m.insert("bundle".to_string(), json!(bundle));
         m.insert("cap".to_string(), json!(admission.cap));
-        return Some(
-            (
+        let mut resp = match provisioning_surface {
+            ProvisioningSurface::Native => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json_detail_merge(
                     err_code::POOL_CAPACITY_UNAVAILABLE,
-                    format!(
-                        "Pool '{}' admits zero workers for GPU type '{}' and bundle '{}'.",
-                        pool, machine_profile, bundle
-                    ),
+                    message,
                     m,
                 )),
             )
                 .into_response(),
+            ProvisioningSurface::OpenAiCompat => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json_openai_error(
+                    message,
+                    oai_type::SERVER_ERROR,
+                    None,
+                    oai_code::TRANSPORT_FAILURE,
+                )),
+            )
+                .into_response(),
+        };
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-sie-error-code"),
+            HeaderValue::from_static(err_code::POOL_CAPACITY_UNAVAILABLE),
         );
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-sie-version"),
+            HeaderValue::from_static(GATEWAY_VERSION),
+        );
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-sie-server-version"),
+            HeaderValue::from_static(GATEWAY_VERSION),
+        );
+        return Some(resp);
     }
 
     if admission.assigned_count == 0 {
         state.demand_tracker.record(pool, machine_profile, bundle);
-        return Some(build_provisioning_response(machine_profile, bundle));
+        return Some(build_provisioning_response_for_surface(
+            machine_profile,
+            bundle,
+            provisioning_surface,
+        ));
     }
 
     None
@@ -461,7 +575,6 @@ async fn capped_lane_admission_response(
     request_body = crate::openapi::EncodeRequest,
     responses(
         (status = 200, description = "Encode response", body = crate::openapi::EncodeResponse),
-        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
         (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
         (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
         (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
@@ -469,7 +582,7 @@ async fn capped_lane_admission_response(
         (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
         (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
         (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
-        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 503, description = "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
         (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
     )
 )]
@@ -492,7 +605,6 @@ pub async fn proxy_encode(state: State<Arc<AppState>>, req: Request) -> impl Int
     request_body = crate::openapi::ScoreRequest,
     responses(
         (status = 200, description = "Score response", body = crate::openapi::ScoreResponse),
-        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
         (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
         (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
         (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
@@ -500,7 +612,7 @@ pub async fn proxy_encode(state: State<Arc<AppState>>, req: Request) -> impl Int
         (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
         (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
         (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
-        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 503, description = "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
         (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
     )
 )]
@@ -523,7 +635,6 @@ pub async fn proxy_score(state: State<Arc<AppState>>, req: Request) -> impl Into
     request_body = crate::openapi::ExtractRequest,
     responses(
         (status = 200, description = "Extract response", body = crate::openapi::ExtractResponse),
-        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
         (status = 400, description = "Invalid request", body = crate::openapi::StandardApiError),
         (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
         (status = 404, description = "Model not found", body = crate::openapi::StandardApiError),
@@ -531,7 +642,7 @@ pub async fn proxy_score(state: State<Arc<AppState>>, req: Request) -> impl Into
         (status = 413, description = "Request body too large", body = crate::openapi::StandardApiError),
         (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::InferenceInternalServerErrorResponse),
         (status = 502, description = "Terminal model load failure (MODEL_LOAD_FAILED)", body = crate::openapi::GatewayModelLoadFailedResponse),
-        (status = 503, description = "Queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
+        (status = 503, description = "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::InferenceServiceUnavailableResponse),
         (status = 504, description = "Result channel closed", body = crate::openapi::StandardApiError)
     )
 )]
@@ -555,11 +666,10 @@ pub async fn proxy_extract(state: State<Arc<AppState>>, req: Request) -> impl In
     ),
     responses(
         (status = 200, description = "Generated text response", body = crate::openapi::GenerateResponse),
-        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
         (status = 400, description = "Invalid request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
-        (status = 503, description = "Queue unavailable or model loading", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 504, description = "Generation timeout", body = crate::openapi::OpenAIErrorEnvelope),
     )
 )]
@@ -624,6 +734,7 @@ async fn proxy_request(
 ) -> Response {
     // SDK version skew detection
     check_sdk_version(req.headers());
+    let provisioning_surface = provisioning_surface_for_endpoint(endpoint);
 
     // Keep the pre-generation queue hot path untouched for encode /
     // score / extract. Native `/v1/generate/{model}` is the only route
@@ -842,6 +953,22 @@ async fn proxy_request(
             "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
         );
     }
+    if !pool_name.is_empty() {
+        pool_name = normalize_pool_name(&pool_name);
+    }
+    let model_pool = state.model_registry.get_model_pool_name(&model_name);
+    if let Err(message) = apply_model_pool_default(&mut pool_name, model_pool.as_deref()) {
+        metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
+        return endpoint_error_response(
+            endpoint,
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            Some("pool"),
+            message,
+        );
+    }
 
     // Resolve bare GPU to spot variant
     if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
@@ -935,7 +1062,9 @@ async fn proxy_request(
         );
     };
 
-    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(&bundle);
+    let bundle_config_hash = state
+        .model_registry
+        .compute_bundle_config_hash_for_pool(&bundle, &pool_name);
 
     // Resolve the effective pool in one shot. `resolve_effective_pool`
     // folds the demand-tracking probe ("was there an exact
@@ -967,16 +1096,6 @@ async fn proxy_request(
     let effective_route = match lookup.resolution {
         PoolResolution::Route(route) => route,
         PoolResolution::Provisioning => {
-            let gpu_label = if gpu.is_empty() { "any" } else { gpu.as_str() };
-            info!(
-                gpu = %gpu_label,
-                bundle = %bundle,
-                engine = %engine,
-                "no queue worker available, returning 202",
-            );
-            metrics::PROVISIONING_RESPONSES
-                .with_label_values(&[gpu_label])
-                .inc();
             // If route resolution named a concrete cold lane, demand was
             // recorded above with that machine-profile label. Otherwise keep
             // the legacy empty/unknown-profile series for observability even
@@ -984,15 +1103,20 @@ async fn proxy_request(
             if pending_demand_profile.is_none() {
                 state.demand_tracker.record(demand_pool, &gpu, &bundle);
             }
-            return build_provisioning_response(&gpu, &bundle);
+            return build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
         }
     };
     let effective_pool = &effective_route.pool_name;
     let effective_machine_profile = &effective_route.machine_profile;
 
-    if let Some(resp) =
-        capped_lane_admission_response(&state, effective_pool, effective_machine_profile, &bundle)
-            .await
+    if let Some(resp) = capped_lane_admission_response(
+        &state,
+        effective_pool,
+        effective_machine_profile,
+        &bundle,
+        provisioning_surface,
+    )
+    .await
     {
         return resp;
     }
@@ -1083,7 +1207,7 @@ fn should_trace_proxy_request(endpoint: &str) -> bool {
 ///
 /// `pool` is always pre-resolved by the caller via
 /// [`resolve_effective_pool`] and is guaranteed non-empty: the
-/// `PoolResolution::Provisioning` branch returns `202` before we get
+/// `PoolResolution::Provisioning` branch returns provisioning before we get
 /// here, and every `PoolResolution::Route(_)` path produces a non-empty
 /// string (either the caller-pinned `X-SIE-Pool`, or a `pool_name`
 /// harvested from the registry snapshot — route resolution filters out
@@ -1338,6 +1462,15 @@ async fn queue_mode_proxy(
                     .into_response();
             }
 
+            if lower.contains("no consumers") {
+                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
+                return build_provisioning_response_for_surface(
+                    gpu,
+                    bundle,
+                    provisioning_surface_for_endpoint(endpoint),
+                );
+            }
+
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json_detail(
@@ -1347,13 +1480,7 @@ async fn queue_mode_proxy(
             )
                 .into_response();
 
-            if lower.contains("no consumers") {
-                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
-                response.headers_mut().insert(
-                    HeaderName::from_static("retry-after"),
-                    HeaderValue::from_static(DEFAULT_RETRY_AFTER),
-                );
-            } else if lower.contains("backpressure") {
+            if lower.contains("backpressure") {
                 metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
                 response.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
@@ -1504,7 +1631,7 @@ async fn queue_mode_proxy(
     // `REQUEST_COUNT` and `REQUEST_LATENCY` are now emitted by
     // `middleware::metrics::MetricsLayer` for *every* response on the
     // inference routes, including early returns (404, 413, 503, 504,
-    // 202 provisioning, ...). Do not re-emit them here or the success
+    // provisioning, ...). Do not re-emit them here or the success
     // path would be double-counted. The worker-registry per-request
     // bookkeeping stays — it is independent of Prometheus.
     state.registry.record_request("queue").await;
@@ -1888,7 +2015,7 @@ pub(crate) async fn run_streaming_generate(
             let lower = e.to_lowercase();
             let retry_after = if lower.contains("no consumers") {
                 metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
-                Some(DEFAULT_RETRY_AFTER)
+                Some(PROVISIONING_RETRY_AFTER)
             } else if lower.contains("backpressure") {
                 metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
                 Some(BACKPRESSURE_RETRY_AFTER)
@@ -2224,13 +2351,19 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
             message,
             retry_after,
         } => {
+            let is_no_consumers = message.to_lowercase().contains("no consumers");
+            let openai_code = if is_no_consumers {
+                oai_code::PROVISIONING
+            } else {
+                oai_code::TRANSPORT_FAILURE
+            };
             let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json_openai_error(
                     format!("Queue publish failed: {message}"),
                     oai_type::SERVER_ERROR,
                     None,
-                    oai_code::TRANSPORT_FAILURE,
+                    openai_code,
                 )),
             )
                 .into_response();
@@ -2238,6 +2371,12 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                 resp.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
                     HeaderValue::from_static(ra),
+                );
+            }
+            if is_no_consumers {
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-sie-error-code"),
+                    HeaderValue::from_static(err_code::PROVISIONING),
                 );
             }
             resp.headers_mut().insert(
@@ -2345,13 +2484,19 @@ pub(crate) fn build_streaming_publish_failed_for_sse(
     message: &str,
     retry_after: Option<&'static str>,
 ) -> Response {
+    let is_no_consumers = message.to_lowercase().contains("no consumers");
+    let openai_code = if is_no_consumers {
+        oai_code::PROVISIONING
+    } else {
+        oai_code::TRANSPORT_FAILURE
+    };
     let mut resp = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json_openai_error(
             format!("Queue publish failed: {message}"),
             oai_type::SERVER_ERROR,
             None,
-            oai_code::TRANSPORT_FAILURE,
+            openai_code,
         )),
     )
         .into_response();
@@ -2359,6 +2504,12 @@ pub(crate) fn build_streaming_publish_failed_for_sse(
         resp.headers_mut().insert(
             HeaderName::from_static("retry-after"),
             HeaderValue::from_static(ra),
+        );
+    }
+    if is_no_consumers {
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-sie-error-code"),
+            HeaderValue::from_static(err_code::PROVISIONING),
         );
     }
     resp.headers_mut().insert(
@@ -4398,14 +4549,15 @@ struct ResolvedRoute {
 }
 
 /// Resolve GPU/pool routing from headers, validate them, pick the effective
-/// pool (or surface a 202 provisioning response), and bind the work publisher.
-/// Shared by the chat + completions handlers; the OpenAI-shaped error/202
-/// responses are identical across both.
+/// pool (or surface an OpenAI-shaped 503 provisioning response), and bind the
+/// work publisher. Shared by the chat + completions handlers; the OpenAI-shaped
+/// errors are identical across both.
 #[allow(clippy::result_large_err)]
 async fn resolve_generation_route(
     state: &AppState,
     hdr: &HeaderMap,
     bundle: &str,
+    model_name: &str,
 ) -> Result<ResolvedRoute, Response> {
     let mut gpu = hdr
         .get("x-sie-machine-profile")
@@ -4430,6 +4582,23 @@ async fn resolve_generation_route(
             StatusCode::BAD_REQUEST,
             Json(json_openai_error(
                 "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)".to_string(),
+                oai_type::INVALID_REQUEST,
+                Some("X-SIE-Pool"),
+                oai_code::INVALID_REQUEST,
+            )),
+        )
+            .into_response());
+    }
+    if !pool_name.is_empty() {
+        pool_name = normalize_pool_name(&pool_name);
+    }
+    let model_pool = state.model_registry.get_model_pool_name(model_name);
+    if let Err(message) = apply_model_pool_default(&mut pool_name, model_pool.as_deref()) {
+        metrics::record_rejected_request_for_pool(&pool_name, &gpu, bundle, "pool_mismatch");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json_openai_error(
+                message,
                 oai_type::INVALID_REQUEST,
                 Some("X-SIE-Pool"),
                 oai_code::INVALID_REQUEST,
@@ -4492,7 +4661,9 @@ async fn resolve_generation_route(
             .into_response());
     };
 
-    let bundle_config_hash = state.model_registry.compute_bundle_config_hash(bundle);
+    let bundle_config_hash = state
+        .model_registry
+        .compute_bundle_config_hash_for_pool(bundle, &pool_name);
     let engine = state
         .model_registry
         .get_bundle_info(bundle)
@@ -4522,15 +4693,20 @@ async fn resolve_generation_route(
             if pending_demand_profile.is_none() {
                 state.demand_tracker.record(demand_pool, &gpu, bundle);
             }
-            return Err(build_provisioning_response(&gpu, bundle));
+            return Err(build_openai_provisioning_response(&gpu, bundle));
         }
     };
     let effective_pool = effective_route.pool_name;
     let effective_machine_profile = effective_route.machine_profile;
 
-    if let Some(resp) =
-        capped_lane_admission_response(state, &effective_pool, &effective_machine_profile, bundle)
-            .await
+    if let Some(resp) = capped_lane_admission_response(
+        state,
+        &effective_pool,
+        &effective_machine_profile,
+        bundle,
+        ProvisioningSurface::OpenAiCompat,
+    )
+    .await
     {
         return Err(resp);
     }
@@ -4575,7 +4751,7 @@ async fn resolve_generation_route(
         (status = 400, description = "Invalid or unsupported request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
-        (status = 503, description = "Queue unavailable", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
     )
 )]
 pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -4882,7 +5058,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         work_publisher: work_publisher_arc,
         token_id,
         content_length,
-    } = match resolve_generation_route(&state, &hdr, &bundle).await {
+    } = match resolve_generation_route(&state, &hdr, &bundle, &model_name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -5416,7 +5592,7 @@ fn build_text_completion_body(
         (status = 400, description = "Invalid or unsupported request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
-        (status = 503, description = "Queue unavailable", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
     )
 )]
 /// `/v1/completions` — legacy OpenAI Completions. Reuses the shared model/route
@@ -5492,7 +5668,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         work_publisher: work_publisher_arc,
         token_id,
         content_length,
-    } = match resolve_generation_route(&state, &hdr, &bundle).await {
+    } = match resolve_generation_route(&state, &hdr, &bundle, &model_name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -5997,7 +6173,7 @@ fn build_responses_body(
         (status = 400, description = "Invalid or unsupported request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "Worker emitted malformed response", body = crate::openapi::OpenAIErrorEnvelope),
-        (status = 503, description = "Queue unavailable", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 503, description = "Provisioning in progress, queue unavailable, or model loading", body = crate::openapi::OpenAIErrorEnvelope),
     )
 )]
 /// `/v1/responses` — OpenAI Responses API (MVP). String `input` → raw-prompt
@@ -6071,7 +6247,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         work_publisher: work_publisher_arc,
         token_id,
         content_length,
-    } = match resolve_generation_route(&state, &hdr, &bundle).await {
+    } = match resolve_generation_route(&state, &hdr, &bundle, &model_name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -6777,9 +6953,10 @@ fn is_openai_embeddings_forwarded_header(name: &str) -> bool {
 /// envelope. The inner path emits ``{detail:{code,message}}`` (and, for the
 /// 502/503 SDK-stable shapes, ``{error:{…}}``); a client that wraps
 /// ``client.embeddings.create(...)`` in ``except openai.APIError`` cannot
-/// parse those, so we map the inner ``detail.code`` (or, absent it, the HTTP
-/// status) through [`crate::http_error::openai_error_from_detail_code`] and
-/// rebuild the body. The upstream status, allowlisted ``x-…`` headers, and
+/// parse those, so we map the inner ``detail.code`` / ``error.code`` (or,
+/// absent both, the HTTP status) through
+/// [`crate::http_error::openai_error_from_detail_code`] and rebuild the body.
+/// The upstream status, allowlisted ``x-…`` headers, and
 /// ``Retry-After`` (so 429/503 auto-retry still works) are preserved. The
 /// inner ``message`` is already gateway-sanitized (field names + validation
 /// text, never request content or raw upstream internals); unparseable
@@ -6792,10 +6969,12 @@ async fn translate_inner_encode_error(resp: Response) -> Response {
         Ok(b) => serde_json::from_slice(&b).unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
-    // SIE-native `detail.code` is the precise discriminator; fall back to the
-    // HTTP status when the body is the `{error:{…}}` shape or unparseable.
+    // SIE-native `detail.code` / SDK-stable `error.code` is the precise
+    // discriminator; fall back to the HTTP status only when the body is
+    // unparseable or lacks a structured code.
     let sie_code = parsed
         .get("detail")
+        .or_else(|| parsed.get("error"))
         .and_then(|d| d.get("code"))
         .and_then(|c| c.as_str())
         .map(str::to_string)
@@ -6815,13 +6994,16 @@ async fn translate_inner_encode_error(resp: Response) -> Response {
             out.headers_mut().insert(k.clone(), v.clone());
         }
     }
+    if let Ok(value) = HeaderValue::from_str(&sie_code) {
+        out.headers_mut()
+            .insert(HeaderName::from_static("x-sie-error-code"), value);
+    }
     out
 }
 
 /// Map an HTTP status to the SIE-native ``code`` used as a fallback when an
-/// inner error body carries no ``detail.code`` (e.g. the 502/503 SDK-stable
-/// ``{error:{…}}`` shapes). Mirrors the status→code pairing in
-/// [`crate::http_error::openai_error_from_detail_code`].
+/// inner error body carries no ``detail.code`` / ``error.code``. Mirrors the
+/// status-to-code pairing in [`crate::http_error::openai_error_from_detail_code`].
 fn sie_code_from_status(status: StatusCode) -> String {
     match status {
         StatusCode::BAD_REQUEST => err_code::INVALID_REQUEST,
@@ -7081,8 +7263,10 @@ fn check_sdk_version(headers: &HeaderMap) {
 /// (which in particular blew every `bin` field up into a
 /// `Vec<serde_json::Value::Number>` — ~16 MiB of allocations per
 /// 1 MiB of binary input). JSON bodies are converted to `rmpv` once
-/// via [`json_to_rmpv`]; JSON has no binary or ext types so that
-/// conversion is cheap and lossless.
+/// via [`json_item_to_rmpv`]. Known native media byte fields are
+/// base64-decoded into msgpack `bin` to mirror the worker's typed JSON
+/// decode; the rest of the JSON item shape is converted cheaply and
+/// losslessly.
 /// Failure modes for :func:`parse_queue_request`. ``Generic`` keeps
 /// the walking-skeleton's string-based wire-error behaviour (caller wraps in a
 /// generic 400). ``PreBuilt`` carries an already-shaped OpenAI error
@@ -7137,10 +7321,7 @@ fn parse_queue_request_json(
         ));
     }
 
-    let params = match work_params_from_json(&parsed, endpoint) {
-        Ok(p) => p,
-        Err(resp) => return Err(QueueParseError::PreBuilt(resp)),
-    };
+    let params = work_params_from_json(&parsed, endpoint)?;
 
     // Generate requests have no ``items`` array — the prompt and sampling
     // params travel under ``WorkParams.generate`` instead.
@@ -7177,7 +7358,10 @@ fn parse_queue_request_json(
         vec![parsed]
     };
 
-    let items = items_json.into_iter().map(json_to_rmpv).collect();
+    let items = items_json
+        .into_iter()
+        .map(json_item_to_rmpv)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((items, params))
 }
 
@@ -7383,7 +7567,7 @@ fn rmpv_to_json_owned(value: &rmpv::Value) -> serde_json::Value {
 fn work_params_from_json(
     parsed: &serde_json::Value,
     endpoint: &str,
-) -> Result<publisher::WorkParams, Response> {
+) -> Result<publisher::WorkParams, QueueParseError> {
     if endpoint == "score" {
         return Ok(publisher::WorkParams {
             output_types: None,
@@ -7399,7 +7583,8 @@ fn work_params_from_json(
                 parsed
                     .get("query")
                     .cloned()
-                    .map(json_to_rmpv)
+                    .map(json_item_to_rmpv)
+                    .transpose()?
                     .unwrap_or_else(|| rmpv::Value::Map(Vec::new())),
             ),
             generate: None,
@@ -7410,7 +7595,7 @@ fn work_params_from_json(
 
     if endpoint == "generate" {
         return Ok(publisher::WorkParams {
-            generate: generate_params_from_json(parsed)?,
+            generate: generate_params_from_json(parsed).map_err(QueueParseError::PreBuilt)?,
             ..Default::default()
         });
     }
@@ -8422,11 +8607,84 @@ fn generate_params_from_rmpv(
     }))
 }
 
-/// One-shot conversion from `serde_json::Value` to `rmpv::Value`.
+/// Convert a native JSON item to `rmpv::Value`, preserving the media bytes
+/// contract before the item is published to workers as msgpack.
+fn json_item_to_rmpv(value: serde_json::Value) -> Result<rmpv::Value, String> {
+    let mut value = json_to_rmpv(value);
+    decode_native_media_fields(&mut value)?;
+    Ok(value)
+}
+
+fn decode_native_media_fields(item: &mut rmpv::Value) -> Result<(), String> {
+    let rmpv::Value::Map(entries) = item else {
+        return Ok(());
+    };
+
+    for (key, value) in entries {
+        let Some(key) = rmpv_key_str(key) else {
+            continue;
+        };
+        match key {
+            "images" | "documents" => decode_native_media_array(value, key)?,
+            "audio" | "video" | "document" => decode_native_media_object(value, key)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn decode_native_media_array(value: &mut rmpv::Value, field: &str) -> Result<(), String> {
+    let rmpv::Value::Array(items) = value else {
+        return Ok(());
+    };
+
+    for (index, item) in items.iter_mut().enumerate() {
+        decode_native_media_object_data(item, &format!("{field}[{index}].data"))?;
+    }
+    Ok(())
+}
+
+fn decode_native_media_object(value: &mut rmpv::Value, field: &str) -> Result<(), String> {
+    decode_native_media_object_data(value, &format!("{field}.data"))
+}
+
+fn decode_native_media_object_data(value: &mut rmpv::Value, path: &str) -> Result<(), String> {
+    let rmpv::Value::Map(entries) = value else {
+        return Ok(());
+    };
+
+    let Some((_, data_value)) = entries
+        .iter_mut()
+        .find(|(key, _)| rmpv_key_str(key) == Some("data"))
+    else {
+        return Ok(());
+    };
+
+    let rmpv::Value::String(data) = data_value else {
+        return Ok(());
+    };
+    let data = data
+        .as_str()
+        .ok_or_else(|| format!("{path} must be UTF-8 base64"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| format!("invalid base64 in {path}: {e}"))?;
+    *data_value = rmpv::Value::Binary(bytes);
+    Ok(())
+}
+
+fn rmpv_key_str(value: &rmpv::Value) -> Option<&str> {
+    match value {
+        rmpv::Value::String(s) => s.as_str(),
+        _ => None,
+    }
+}
+
+/// One-shot generic conversion from `serde_json::Value` to `rmpv::Value`.
 /// Used for the JSON request-body path: workers all speak msgpack, so
 /// we normalize to `rmpv` once at ingress and avoid having two item
 /// representations flowing through the rest of the publisher.
-/// JSON has no binary or ext types, so this is lossless and cheap
+/// JSON has no binary or ext types, so this generic conversion is lossless and cheap
 /// (no per-byte blow-up like `rmpv_to_json` suffered in the opposite
 /// direction).
 fn json_to_rmpv(value: serde_json::Value) -> rmpv::Value {
@@ -8978,7 +9236,6 @@ fn openai_embedding_items_to_data(
     ),
     responses(
         (status = 200, description = "OpenAI-compatible embeddings response", body = crate::openapi::OpenAIEmbeddingsListResponse),
-        (status = 202, description = "Worker provisioning in progress", body = crate::openapi::ProvisioningResponse),
         (status = 400, description = "Invalid request", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 401, description = "Missing or invalid bearer token", body = crate::openapi::StandardApiError),
         (status = 404, description = "Model not found", body = crate::openapi::OpenAIErrorEnvelope),
@@ -8986,7 +9243,7 @@ fn openai_embedding_items_to_data(
         (status = 413, description = "Request body too large", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 500, description = "All batch items failed or gateway internal error", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 502, description = "MODEL_LOAD_FAILED", body = crate::openapi::OpenAIErrorEnvelope),
-        (status = 503, description = "Model loading, capacity, queue unavailable, or GPU not configured", body = crate::openapi::OpenAIErrorEnvelope),
+        (status = 503, description = "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted", body = crate::openapi::OpenAIErrorEnvelope),
         (status = 504, description = "Result channel closed", body = crate::openapi::OpenAIErrorEnvelope)
     )
 )]
@@ -9155,9 +9412,7 @@ pub async fn proxy_openai_embeddings(State(state): State<Arc<AppState>>, req: Re
         // Genuine errors (4xx/5xx) from the SIE-native encode path arrive as
         // `{detail:{code,message}}` (or the 502/503 `{error:{...}}` shapes);
         // translate them into the OpenAI envelope so the embeddings surface
-        // stays parseable by `openai`-client error handling. Non-error
-        // statuses (notably 202 provisioning) are *not* errors — pass them
-        // through verbatim so provisioning semantics are preserved.
+        // stays parseable by `openai`-client error handling.
         if inner_status.is_client_error() || inner_status.is_server_error() {
             return translate_inner_encode_error(resp).await;
         }
@@ -9588,13 +9843,53 @@ mod tests {
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
 
-        let resp = capped_lane_admission_response(&state, "tenant", "l4", "default")
-            .await
-            .expect("zero-cap lane should fail fast");
+        let resp = capped_lane_admission_response(
+            &state,
+            "tenant",
+            "l4",
+            "default",
+            ProvisioningSurface::Native,
+        )
+        .await
+        .expect("zero-cap lane should fail fast");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["detail"]["code"], err_code::POOL_CAPACITY_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_capped_lane_admission_zero_cap_openai_uses_openai_envelope() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("l4".to_string(), 0);
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+            .await
+            .unwrap();
+        let state = admission_test_state(Arc::clone(&pm));
+
+        let resp = capped_lane_admission_response(
+            &state,
+            "tenant",
+            "l4",
+            "default",
+            ProvisioningSurface::OpenAiCompat,
+        )
+        .await
+        .expect("zero-cap lane should fail fast");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::POOL_CAPACITY_UNAVAILABLE
+        );
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("detail").is_none());
+        assert_eq!(value["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(value["error"]["code"], oai_code::TRANSPORT_FAILURE);
     }
 
     #[tokio::test]
@@ -9609,10 +9904,29 @@ mod tests {
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
 
-        let resp = capped_lane_admission_response(&state, "tenant", "l4", "default")
-            .await
-            .expect("capped lane with no admitted workers should provision");
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let resp = capped_lane_admission_response(
+            &state,
+            "tenant",
+            "l4",
+            "default",
+            ProvisioningSurface::Native,
+        )
+        .await
+        .expect("capped lane with no admitted workers should provision");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], err_code::PROVISIONING);
+        assert!(value.get("status").is_none());
+
         let pending_demand = metrics::PENDING_DEMAND
             .with_label_values(&["tenant", "l4", "default"])
             .get();
@@ -9622,6 +9936,74 @@ mod tests {
             .with_label_values(&["tenant", "l4", "default"])
             .get();
         assert!((cleared_demand - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_capped_lane_admission_zero_assigned_openai_returns_retryable_503() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("l4".to_string(), 1);
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+            .await
+            .unwrap();
+        let state = admission_test_state(Arc::clone(&pm));
+
+        let resp = capped_lane_admission_response(
+            &state,
+            "tenant",
+            "l4",
+            "default",
+            ProvisioningSurface::OpenAiCompat,
+        )
+        .await
+        .expect("OpenAI-compatible capped lane should provision");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("detail").is_none());
+        assert_eq!(value["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(value["error"]["code"], oai_code::PROVISIONING);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Provisioning in progress"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_provisioning_response_empty_gpu_is_retryable_503() {
+        let resp = build_openai_provisioning_response("", "default");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+        assert!(resp.headers().get("x-sie-version").is_some());
+        assert!(resp.headers().get("x-sie-server-version").is_some());
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("detail").is_none());
+        assert!(value.get("status").is_none());
+        assert_eq!(value["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(value["error"]["code"], oai_code::PROVISIONING);
+        let message = value["error"]["message"].as_str().unwrap_or("");
+        assert!(message.contains("bundle 'default'"));
+        assert!(message.contains("Provisioning in progress"));
     }
 
     // ── is_valid_pool_name (pool subject-injection guard) ──────────
@@ -9655,6 +10037,28 @@ mod tests {
         // Over-length is rejected too.
         assert!(!is_valid_pool_name(&"a".repeat(129)));
         assert!(is_valid_pool_name(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn test_apply_model_pool_default() {
+        let mut omitted = String::new();
+        apply_model_pool_default(&mut omitted, Some("customer-a")).unwrap();
+        assert_eq!(omitted, "customer-a");
+
+        let mut matching = "customer-a".to_string();
+        apply_model_pool_default(&mut matching, Some("customer-a")).unwrap();
+        assert_eq!(matching, "customer-a");
+
+        let mut mismatched = "default".to_string();
+        assert!(apply_model_pool_default(&mut mismatched, Some("customer-a")).is_err());
+
+        let mut unknown_omitted = String::new();
+        apply_model_pool_default(&mut unknown_omitted, None).unwrap();
+        assert_eq!(unknown_omitted, "default");
+
+        let mut unknown_explicit = "customer-a".to_string();
+        apply_model_pool_default(&mut unknown_explicit, None).unwrap();
+        assert_eq!(unknown_explicit, "customer-a");
     }
 
     #[test]
@@ -9857,16 +10261,35 @@ mod tests {
         assert_eq!(v["error"]["param"], "grammar");
     }
 
-    #[tokio::test]
-    async fn test_generate_params_from_json_rejects_grammar_dollar_ref() {
+    #[test]
+    fn test_generate_params_from_json_dereferences_grammar_dollar_ref() {
         let body = serde_json::json!({
             "prompt": "Hi",
             "max_new_tokens": 16,
-            "grammar": {"json_schema": {"$ref": "#/$defs/X"}},
+            "grammar": {
+                "json_schema": {
+                    "$defs": {
+                        "X": {"type": "object", "properties": {"x": {"type": "string"}}}
+                    },
+                    "properties": {"item": {"$ref": "#/$defs/X"}}
+                }
+            },
         });
-        let v = _expect_generate_err(&body).await;
-        assert_eq!(v["error"]["code"], "unsupported_field");
-        assert!(v["error"]["param"].as_str().unwrap_or("").ends_with("$ref"));
+        let params = _expect_generate_ok(&body);
+        match params.grammar {
+            Some(publisher::GrammarSpec::JsonSchema { value, .. }) => {
+                assert_eq!(
+                    value["properties"]["item"]["properties"]["x"]["type"],
+                    "string"
+                );
+                let encoded = serde_json::to_string(&value).unwrap();
+                assert!(
+                    !encoded.contains("\"$ref\""),
+                    "schema should be dereferenced: {encoded}"
+                );
+            }
+            other => panic!("expected JsonSchema grammar, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10609,6 +11032,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_translate_inner_encode_pool_capacity_error_to_openai_envelope() {
+        let resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_detail(
+                err_code::POOL_CAPACITY_UNAVAILABLE,
+                "pool admits zero workers",
+            )),
+        )
+            .into_response();
+        let out = translate_inner_encode_error(resp).await;
+        assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            out.headers().get("retry-after").is_none(),
+            "hard cap-zero is not retryable provisioning"
+        );
+        assert_eq!(
+            out.headers().get("x-sie-error-code").unwrap(),
+            err_code::POOL_CAPACITY_UNAVAILABLE
+        );
+
+        let body_bytes = axum::body::to_bytes(out.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
+        assert!(body.get("detail").is_none(), "no leaked detail shape");
+        assert_eq!(body["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(body["error"]["code"], oai_code::TRANSPORT_FAILURE);
+        assert_eq!(body["error"]["message"], "pool admits zero workers");
+    }
+
+    #[tokio::test]
+    async fn test_translate_inner_encode_provisioning_error_to_openai_503() {
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {
+                    "code": err_code::PROVISIONING,
+                    "message": "No worker available for GPU type 'l4'. Provisioning in progress.",
+                },
+            })),
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            "retry-after",
+            HeaderValue::from_static(PROVISIONING_RETRY_AFTER),
+        );
+
+        let out = translate_inner_encode_error(resp).await;
+        assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            out.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            out.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+
+        let body_bytes = axum::body::to_bytes(out.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
+        assert!(body.get("detail").is_none(), "no leaked detail shape");
+        assert_eq!(body["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(body["error"]["code"], oai_code::PROVISIONING);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("l4"));
+    }
+
+    #[tokio::test]
     async fn test_translate_inner_encode_error_falls_back_to_status_for_error_shape() {
         // 502/503 SDK-stable bodies are `{error:{…}}` with no `detail.code`;
         // the HTTP status drives classification and the message is preserved.
@@ -11201,6 +11696,87 @@ mod tests {
         assert_eq!(params.instruction, Some("search".to_string()));
         assert!(params.is_query);
         assert_eq!(params.options.unwrap()["truncate"], true);
+    }
+
+    fn rmpv_map_get<'a>(value: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+        let rmpv::Value::Map(entries) = value else {
+            return None;
+        };
+        entries.iter().find_map(|(entry_key, entry_value)| {
+            if matches!(entry_key, rmpv::Value::String(s) if s.as_str() == Some(key)) {
+                Some(entry_value)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn assert_media_data(value: &rmpv::Value, field: &str, expected: &[u8]) {
+        let media = rmpv_map_get(value, field).unwrap_or_else(|| panic!("{field} missing"));
+        let data = rmpv_map_get(media, "data").unwrap_or_else(|| panic!("{field}.data missing"));
+        assert_eq!(data, &rmpv::Value::Binary(expected.to_vec()));
+    }
+
+    #[test]
+    fn test_parse_queue_request_json_decodes_native_media_data_to_binary() {
+        let body = serde_json::to_vec(&json!({
+            "items": [{
+                "id": "t",
+                "images": [{"data": "aGVsbG8=", "format": "png"}],
+                "audio": {"data": "YXVkaW8=", "format": "wav"},
+                "video": {"data": "dmlkZW8=", "format": "mp4"},
+                "document": {"data": "ZG9j", "format": "pdf"},
+                "metadata": {"data": "bm90LW1lZGlh"}
+            }],
+            "params": {"output_types": ["multivector"]}
+        }))
+        .unwrap();
+
+        let (items, params) = parse_queue_request(&body, false, "encode").unwrap();
+        assert_eq!(params.output_types, Some(vec!["multivector".to_string()]));
+        let item = items.first().expect("one item");
+
+        let images = rmpv_map_get(item, "images").expect("images missing");
+        let rmpv::Value::Array(images) = images else {
+            panic!("images must stay an array");
+        };
+        let image = images.first().expect("one image");
+        let data = rmpv_map_get(image, "data").expect("images[0].data missing");
+        assert_eq!(data, &rmpv::Value::Binary(b"hello".to_vec()));
+        assert!(matches!(
+            rmpv_map_get(image, "format"),
+            Some(rmpv::Value::String(s)) if s.as_str() == Some("png")
+        ));
+
+        assert_media_data(item, "audio", b"audio");
+        assert_media_data(item, "video", b"video");
+        assert_media_data(item, "document", b"doc");
+        assert!(matches!(
+            rmpv_map_get(
+                rmpv_map_get(item, "metadata").expect("metadata missing"),
+                "data"
+            ),
+            Some(rmpv::Value::String(s)) if s.as_str() == Some("bm90LW1lZGlh")
+        ));
+    }
+
+    #[test]
+    fn test_parse_queue_request_json_rejects_invalid_native_media_base64() {
+        let body = serde_json::to_vec(&json!({
+            "items": [{"images": [{"data": "!!!", "format": "png"}]}]
+        }))
+        .unwrap();
+
+        let err = parse_queue_request(&body, false, "encode").unwrap_err();
+        match err {
+            QueueParseError::Generic(message) => {
+                assert!(
+                    message.contains("invalid base64 in images[0].data"),
+                    "unexpected error: {message}"
+                );
+            }
+            QueueParseError::PreBuilt(_) => panic!("expected generic parse error"),
+        }
     }
 
     #[test]
@@ -11820,12 +12396,12 @@ mod tests {
 
     // ── resolve_effective_pool (scale-from-zero decision) ──────────
     //
-    // These tests guard the contract that `proxy_request` emits
-    // `202 provisioning` whenever no healthy worker is registered for
+    // These tests guard the contract that route resolution returns
+    // `Provisioning` whenever no healthy worker is registered for
     // `(bundle, gpu)` — regardless of whether the caller sent an
     // `X-SIE-MACHINE-PROFILE` header. An earlier regression gated the
-    // 202 branch on `!gpu.is_empty()`, so default-routing cold starts
-    // fell through to a `"default"` pool publish and hung.
+    // provisioning branch on `!gpu.is_empty()`, so default-routing cold
+    // starts fell through to a `"default"` pool publish and hung.
 
     use crate::types::worker::{GpuStatus, ModelStatus, WorkerStatusMessage};
     use std::time::Duration as StdDuration;
@@ -11869,8 +12445,8 @@ mod tests {
         // No workers at all. Caller sends no `X-SIE-MACHINE-PROFILE`.
         // Before the fix this returned `Pool("default")` and the gateway
         // published to a nonexistent consumer. After the fix we emit
-        // `Provisioning` so the caller returns `202 + Retry-After` and
-        // records pending demand for KEDA.
+        // `Provisioning` so the caller returns its surface-specific
+        // provisioning response and records pending demand for KEDA.
         let reg = pool_registry();
         let out = resolve_effective_pool(&reg, None, "default", "", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
@@ -11925,7 +12501,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_effective_pool_returns_pool_when_worker_matches_no_gpu() {
         // Common default-routing flow: no GPU header, one worker on the
-        // requested bundle → route to its pool directly (no 202).
+        // requested bundle → route to its pool directly (no provisioning error).
         let reg = pool_registry();
         reg.update_worker(
             "http://w1:8080",
@@ -12005,8 +12581,8 @@ mod tests {
     async fn test_resolve_effective_pool_provisions_explicit_pool_when_only_other_pool_exists() {
         // Explicit pool + GPU names a cold lane. A default or unrelated
         // isolation worker cannot consume the pinned pool's stream, so the
-        // gateway must return 202 instead of publishing to a lane with no
-        // active consumer.
+        // gateway must return a retryable provisioning error instead of
+        // publishing to a lane with no active consumer.
         let reg = pool_registry();
         reg.update_worker("http://w1:8080", worker_msg("default", "l4-spot", "pool-a"))
             .await;
@@ -12640,21 +13216,71 @@ mod tests {
         assert_eq!(v["error"]["param"], "response_format.type");
     }
 
-    /// The shared safety walker applies to the chat translator too:
-    /// a ``$ref`` inside ``json_schema.schema`` rejects with the
-    /// param path naming the keyword.
-    #[tokio::test]
-    async fn test_chat_params_from_json_response_format_rejects_dollar_ref() {
+    /// The shared safety walker applies to the chat translator too, after
+    /// internal ``$ref`` entries inside ``json_schema.schema`` are inlined.
+    #[test]
+    fn test_chat_params_from_json_response_format_dereferences_dollar_ref() {
         let mut body = _chat_body_min("m");
         body["response_format"] = serde_json::json!({
             "type": "json_schema",
             "json_schema": {
-                "schema": {"$ref": "#/$defs/Foo"},
+                "schema": {
+                    "$defs": {
+                        "Step": {
+                            "type": "object",
+                            "properties": {
+                                "explanation": {"type": "string"},
+                                "output": {"type": "string"}
+                            },
+                            "required": ["explanation", "output"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Step"}
+                        },
+                        "single": {
+                            "$ref": "#/$defs/Step",
+                            "description": "one step"
+                        },
+                        "final_answer": {"type": "string"}
+                    },
+                    "required": ["steps", "single", "final_answer"],
+                    "additionalProperties": false
+                },
             }
         });
-        let v = _expect_chat_err(body).await;
-        assert_eq!(v["error"]["code"], "unsupported_field");
-        assert!(v["error"]["param"].as_str().unwrap_or("").ends_with("$ref"));
+        let p = _expect_chat_ok(body);
+        match p.grammar {
+            Some(publisher::GrammarSpec::JsonSchema { value, .. }) => {
+                assert_eq!(
+                    value["properties"]["steps"]["items"]["properties"]["explanation"]["type"],
+                    "string"
+                );
+                assert_eq!(
+                    value["properties"]["steps"]["items"]["additionalProperties"],
+                    false
+                );
+                let single_all_of = value["properties"]["single"]["allOf"]
+                    .as_array()
+                    .expect("Pydantic ref sibling should be preserved as allOf");
+                assert_eq!(
+                    single_all_of[0]["properties"]["explanation"]["type"],
+                    "string"
+                );
+                assert_eq!(single_all_of[1]["description"], "one step");
+                assert_eq!(value["additionalProperties"], false);
+                let encoded = serde_json::to_string(&value).unwrap();
+                assert!(
+                    !encoded.contains("\"$ref\"") && !encoded.contains("\"$defs\""),
+                    "schema should be dereferenced: {encoded}"
+                );
+            }
+            other => panic!("expected JsonSchema grammar, got {other:?}"),
+        }
     }
 
     #[test]
@@ -14416,6 +15042,55 @@ mod tests {
 
     // ── Fix 5: 429 rate_limit_error for KV-saturated + pool-full path
 
+    #[tokio::test]
+    async fn test_build_streaming_error_response_no_consumers_is_provisioning() {
+        let err = StreamingDriverErr::PublishFailed {
+            message: "nats: no consumers available".to_string(),
+            retry_after: Some(PROVISIONING_RETRY_AFTER),
+        };
+        let resp = build_streaming_error_response(&err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(v["error"]["code"], oai_code::PROVISIONING);
+    }
+
+    #[tokio::test]
+    async fn test_build_streaming_publish_failed_for_sse_no_consumers_is_provisioning() {
+        let resp = build_streaming_publish_failed_for_sse(
+            "no consumers available for work stream",
+            Some(PROVISIONING_RETRY_AFTER),
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], oai_type::SERVER_ERROR);
+        assert_eq!(v["error"]["code"], oai_code::PROVISIONING);
+    }
+
     /// ``rate_limit_exceeded`` worker code maps to 429 with the OpenAI
     /// ``rate_limit_error`` envelope ``type`` and the
     /// ``rate_limit_exceeded`` ``code`` discriminator. The
@@ -14598,6 +15273,7 @@ mod tests {
         };
         ModelEntry {
             name: "acme/multi".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: std::collections::HashSet::new(),
             profile_names: ["default".to_string(), "a100".to_string()]
@@ -14676,6 +15352,7 @@ mod tests {
         use crate::types::model::{ModelEntry, ModelInfoExtras};
         let entry = ModelEntry {
             name: "acme/bare".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: std::collections::HashSet::new(),
             profile_names: std::collections::HashSet::new(),

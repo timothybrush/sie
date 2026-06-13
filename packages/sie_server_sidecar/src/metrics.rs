@@ -724,7 +724,7 @@ mod tests {
         m.pull_model_loads_total.with_label_values(&["m1"]).inc();
 
         let families = m.registry.gather();
-        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
         for expected in [
             "sie_worker_messages_received_total",
             "sie_pull_loop_items_fetched",
@@ -825,7 +825,7 @@ mod tests {
         let families = m.registry.gather();
         let fam = families
             .iter()
-            .find(|f| f.get_name() == "sie_worker_backend_phase_seconds")
+            .find(|f| f.name() == "sie_worker_backend_phase_seconds")
             .expect("backend_phase_seconds not registered in shared registry");
 
         // Expect exactly four time-series (one per distinct label
@@ -846,7 +846,7 @@ mod tests {
             let labels: std::collections::HashMap<&str, &str> = metric
                 .get_label()
                 .iter()
-                .map(|lp| (lp.get_name(), lp.get_value()))
+                .map(|lp| (lp.name(), lp.value()))
                 .collect();
             assert!(labels.contains_key("operation"));
             assert!(labels.contains_key("model"));

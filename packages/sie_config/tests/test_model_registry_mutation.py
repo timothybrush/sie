@@ -56,6 +56,113 @@ class TestAddModelConfig:
         assert skipped == []
         assert "default" in bundles
 
+    def test_add_model_config_normalizes_pool(self) -> None:
+        registry, _ = _setup_registry(self._root / "pool")
+        config = {
+            "sie_id": "new/model",
+            "pool": " Customer-A ",
+            "profiles": {
+                "default": {
+                    "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                    "max_batch_tokens": 8192,
+                },
+            },
+        }
+        registry.add_model_config(config)
+        assert config["pool"] == "customer-a"
+
+    def test_add_model_config_rejects_invalid_pool(self) -> None:
+        registry, _ = _setup_registry(self._root / "bad_pool")
+        config = {
+            "sie_id": "bad/model",
+            "pool": "customer.a",
+            "profiles": {
+                "default": {
+                    "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                    "max_batch_tokens": 8192,
+                },
+            },
+        }
+        with pytest.raises(ValueError, match="pool"):
+            registry.add_model_config(config)
+
+    def test_add_model_config_rejects_pool_move_on_profile_append(self) -> None:
+        registry, _ = _setup_registry(
+            self._root / "pool_move",
+            models={"existing/model": "sie_server.adapters.bert_flash:B"},
+        )
+        config = {
+            "sie_id": "existing/model",
+            "pool": "customer-a",
+            "profiles": {
+                "custom": {
+                    "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                    "max_batch_tokens": 8192,
+                },
+            },
+        }
+        with pytest.raises(ValueError, match="Pool on model"):
+            registry.add_model_config(config)
+
+    def test_add_model_config_omitted_pool_append_preserves_existing_pool(self) -> None:
+        registry, _ = _setup_registry(self._root / "pool_append_omitted")
+        registry.add_model_config(
+            {
+                "sie_id": "tenant/model",
+                "pool": "customer-a",
+                "profiles": {
+                    "default": {
+                        "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                        "max_batch_tokens": 1024,
+                    },
+                },
+            }
+        )
+        registry.add_model_config(
+            {
+                "sie_id": "tenant/model",
+                "profiles": {
+                    "fast": {
+                        "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                        "max_batch_tokens": 8192,
+                    },
+                },
+            }
+        )
+
+        full = registry.get_full_config("tenant/model")
+        assert full is not None
+        assert full["pool"] == "customer-a"
+        assert set(full["profiles"]) == {"default", "fast"}
+
+    def test_add_model_config_rejects_explicit_default_pool_move_on_profile_append(self) -> None:
+        registry, _ = _setup_registry(self._root / "pool_append_default")
+        registry.add_model_config(
+            {
+                "sie_id": "tenant/model",
+                "pool": "customer-a",
+                "profiles": {
+                    "default": {
+                        "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                        "max_batch_tokens": 1024,
+                    },
+                },
+            }
+        )
+        config = {
+            "sie_id": "tenant/model",
+            "pool": "default",
+            "profiles": {
+                "fast": {
+                    "adapter_path": "sie_server.adapters.bert_flash:BertAdapter",
+                    "max_batch_tokens": 8192,
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="Pool on model"):
+            registry.add_model_config(config)
+
     def test_model_becomes_routable(self) -> None:
         registry, _ = _setup_registry(self._root / "routable")
         registry.add_model_config(

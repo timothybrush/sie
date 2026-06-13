@@ -162,8 +162,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
         unload_fields=("_process", "_server_url"),
     )
 
-    # SGLang uses signal handlers that require main thread execution.
-    requires_main_thread: bool = True
+    # The SGLang child process owns signal handling; parent load must not block
+    # the uvicorn event loop while polling child readiness.
+    requires_main_thread: bool = False
+    manages_own_load_timeout: bool = True
 
     def __init__(
         self,

@@ -141,7 +141,7 @@ pub async fn delete_pool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if name == DEFAULT_POOL_NAME {
+    if name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
         return (
             StatusCode::FORBIDDEN,
             Json(json_detail(

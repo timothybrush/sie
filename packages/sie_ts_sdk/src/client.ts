@@ -37,12 +37,13 @@ import {
   SIEConnectionError,
   SIEStreamError,
 } from "./errors.js";
+import { toImageWireFormat } from "./images.js";
+import type { ImageInput, ImageWireFormat } from "./images.js";
 import {
   DEFAULT_LEASE_RENEWAL_INTERVAL,
   DEFAULT_PROVISION_TIMEOUT,
   DEFAULT_RETRY_DELAY,
   DEFAULT_TIMEOUT,
-  HTTP_ACCEPTED,
   HTTP_CLIENT_ERROR_MIN,
   JSON_CONTENT_TYPE,
   LORA_LOADING_DEFAULT_DELAY,
@@ -51,6 +52,7 @@ import {
   MODEL_LOADING_DEFAULT_DELAY,
   MODEL_LOADING_ERROR_CODE,
   MSGPACK_CONTENT_TYPE,
+  PROVISIONING_ERROR_CODE,
   SDK_VERSION_HEADER,
   SERVER_VERSION_HEADER,
 } from "./internal/constants.js";
@@ -67,6 +69,7 @@ import {
   throwIfModelLoadFailed,
 } from "./internal/parsing.js";
 import { withProvisioningRetry } from "./internal/provisioning.js";
+import { applyRetryJitter } from "./internal/retry.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
 import { parseSseStream } from "./sse.js";
 import type {
@@ -114,6 +117,31 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<boolean> {
 }
 
 const _LEASE_RENEWAL_MAX_RETRIES = 5;
+
+type ItemWithWireImages = Omit<Item, "images"> & { images?: ImageWireFormat[] };
+type ItemForWire = Item | ItemWithWireImages;
+
+function isImageWireFormat(image: ImageInput | ImageWireFormat): image is ImageWireFormat {
+  return typeof image === "object" && image !== null && "data" in image;
+}
+
+async function imageForWire(image: ImageInput | ImageWireFormat): Promise<ImageWireFormat> {
+  if (isImageWireFormat(image)) {
+    return image;
+  }
+  return toImageWireFormat(image);
+}
+
+async function itemImagesForWire(item: Item): Promise<ItemForWire> {
+  if (!item.images || item.images.length === 0) {
+    return item;
+  }
+  return { ...item, images: await Promise.all(item.images.map(imageForWire)) };
+}
+
+async function itemsImagesForWire(items: Item[]): Promise<ItemForWire[]> {
+  return Promise.all(items.map(itemImagesForWire));
+}
 
 /**
  * Pluck a mid-stream `error` block out of a `ChatCompletionChunk` and
@@ -246,11 +274,12 @@ export class SIEClient {
   ): Promise<EncodeResult | EncodeResult[]> {
     const isSingleItem = !Array.isArray(items);
     const itemsArray = isSingleItem ? [items] : items;
+    const itemsForWire = await itemsImagesForWire(itemsArray);
 
     // Build request body - model is in URL path, not body
     // Wire format uses snake_case
     const body: Record<string, unknown> = {
-      items: itemsArray,
+      items: itemsForWire,
     };
 
     // Add params if any are specified
@@ -583,7 +612,7 @@ export class SIEClient {
         // connect-time refusal. Retrying a mid-flight drop would
         // double-bill, so surface as `SIEConnectionError` and let the
         // retry loop propagate it. The SAFE pre-execution capacity
-        // signals (202 / 503 MODEL_LOADING) are HTTP statuses, not
+        // signals (503 PROVISIONING / MODEL_LOADING) are HTTP statuses, not
         // exceptions, so the retry loop still handles them.
         throw new SIEConnectionError(`Connection failed: ${err.message}`, "connect");
       }
@@ -641,13 +670,11 @@ export class SIEClient {
     const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;
     const provisionTimeoutMs = options.provisionTimeoutMs ?? this.provisionTimeout;
 
-    // H1: pre-execution capacity signals (202 / 503 MODEL_LOADING /
-    // generic 503) MUST be handled by the shared provisioning loop —
-    // otherwise a 202 slipped through as `response.ok === true` and the
-    // SDK returned the provisioning envelope cast as `ChatCompletion`
-    // (no `choices`, no `id`). The loop also surfaces `ProvisioningError`
-    // when the caller opted out (`waitForCapacity: false`) or the
-    // provision budget is exhausted, matching `generate()`.
+    // H1: pre-execution capacity signals (503 PROVISIONING /
+    // MODEL_LOADING) MUST be handled by the shared provisioning loop.
+    // The loop also surfaces `ProvisioningError` when the caller opted out
+    // (`waitForCapacity: false`) or the provision budget is exhausted,
+    // matching `generate()`.
     const response = await withProvisioningRetry(() => this.performJsonPost(url, body, headers), {
       model: req.model,
       gpu: undefined,
@@ -795,11 +822,11 @@ export class SIEClient {
    * if the consumer-supplied `extractError` returns an `SIEStreamError`, the
    * generator throws it instead of yielding the chunk.
    *
-   * Retry policy mirrors {@link generate}: only the SAFE pre-execution
-   * capacity signals — `202` (provisioning) and `503 MODEL_LOADING` — are
-   * retried, and only while `waitForCapacity` is set and the provision
-   * budget remains. Once the body opens we never retry (the call is
-   * non-idempotent; a mid-stream failure must not re-issue generation).
+   * Retry policy mirrors {@link generate}: only explicit SAFE
+   * pre-execution capacity signals — `503 PROVISIONING` and
+   * `503 MODEL_LOADING` — are retried while the provision budget remains.
+   * Once the body opens we never retry (the call is non-idempotent; a
+   * mid-stream failure must not re-issue generation).
    *
    * @internal
    */
@@ -834,8 +861,8 @@ export class SIEClient {
       const startTime = Date.now();
       let response: Response | undefined;
 
-      // Pre-stream provisioning retry loop. We re-fetch on the SAFE
-      // pre-execution capacity signals only (202 / 503 MODEL_LOADING),
+      // Pre-stream provisioning retry loop. We re-fetch on explicit SAFE
+      // pre-execution capacity signals only (503 PROVISIONING / MODEL_LOADING),
       // parallel to `generate()`. The loop terminates by `break`-ing on a
       // 200 (the only status that opens a body) or by throwing.
       while (true) {
@@ -871,52 +898,46 @@ export class SIEClient {
           clearTimeout(preStreamTimeoutId);
         }
 
-        // BUG 13a: `Response.ok` is true for 202, so the old `!response.ok`
-        // gate let a 202 slip through to `response.body` (null) and throw a
-        // misleading "no body" RequestError. Handle 202 explicitly as the
-        // provisioning path (retry under `waitForCapacity`, else throw
-        // ProvisioningError honoring Retry-After).
-        if (attemptResponse.status === HTTP_ACCEPTED) {
-          if (!waitForCapacity) {
-            throw new ProvisioningError(
-              "No capacity available. Server is provisioning.",
-              gpu,
-              getRetryAfter(attemptResponse),
-            );
-          }
-          const elapsed = Date.now() - startTime;
-          if (elapsed >= this.provisionTimeout) {
-            throw new ProvisioningError(
-              `Provisioning timeout after ${elapsed}ms`,
-              gpu,
-              getRetryAfter(attemptResponse),
-            );
-          }
-          const delay = getRetryAfter(attemptResponse) ?? DEFAULT_RETRY_DELAY;
-          // Abortable: a long Retry-After sleep must yield promptly if the
-          // caller aborts (`controller.signal` fires on caller-abort), not
-          // wait out the full delay before the next loop's abort check.
-          if (
-            await abortableSleep(
-              Math.min(delay, this.provisionTimeout - elapsed),
-              controller.signal,
-            )
-          ) {
-            throw new SIEConnectionError("Stream aborted while provisioning", "other");
-          }
-          continue;
-        }
-
         // 502 MODEL_LOAD_FAILED is terminal — surface immediately.
         await throwIfModelLoadFailed(attemptResponse, model);
 
-        // BUG 13b: retry 503 MODEL_LOADING (a SAFE pre-execution signal)
-        // when the caller opted into waiting for capacity, parallel to
-        // `generate()`. Without `waitForCapacity` we fall through to
-        // `handleError` and reject immediately (no retry).
+        // Retry explicit SAFE pre-execution signals before the stream opens.
+        // Without `waitForCapacity`, provisioning falls through to
+        // `handleError` and rejects immediately.
         if (attemptResponse.status === 503) {
           const errorCode = await getErrorCode(attemptResponse.clone());
-          if (errorCode === MODEL_LOADING_ERROR_CODE && waitForCapacity) {
+          if (errorCode === PROVISIONING_ERROR_CODE) {
+            if (!waitForCapacity) {
+              throw new ProvisioningError(
+                "No capacity available. Server is provisioning.",
+                gpu,
+                getRetryAfter(attemptResponse),
+              );
+            }
+            const elapsed = Date.now() - startTime;
+            if (elapsed >= this.provisionTimeout) {
+              throw new ProvisioningError(
+                `Provisioning timeout after ${elapsed}ms`,
+                gpu,
+                getRetryAfter(attemptResponse),
+              );
+            }
+            const retryAfter = getRetryAfter(attemptResponse);
+            const delay = retryAfter ?? applyRetryJitter(DEFAULT_RETRY_DELAY);
+            // Abortable: a long Retry-After sleep must yield promptly if the
+            // caller aborts (`controller.signal` fires on caller-abort), not
+            // wait out the full delay before the next loop's abort check.
+            if (
+              await abortableSleep(
+                Math.min(delay, this.provisionTimeout - elapsed),
+                controller.signal,
+              )
+            ) {
+              throw new SIEConnectionError("Stream aborted while provisioning", "other");
+            }
+            continue;
+          }
+          if (errorCode === MODEL_LOADING_ERROR_CODE) {
             const elapsed = Date.now() - startTime;
             if (elapsed >= this.provisionTimeout) {
               throw new ModelLoadingError(`Model loading timeout for '${model}'`, model);
@@ -932,31 +953,9 @@ export class SIEClient {
             }
             continue;
           }
-          // Generic 503 (scale-from-zero: no / non-MODEL_LOADING error code).
-          // Retry under `waitForCapacity`, mirroring non-streaming
-          // `generate()`. This is still a SAFE pre-execution signal — the
-          // body has not started, so no partial generation is at risk — so
-          // the non-idempotency reasoning (never retry a mid-stream failure)
-          // is preserved.
-          if (waitForCapacity) {
-            const elapsed = Date.now() - startTime;
-            if (elapsed < this.provisionTimeout) {
-              const delay = getRetryAfter(attemptResponse) ?? DEFAULT_RETRY_DELAY;
-              if (
-                await abortableSleep(
-                  Math.min(delay, this.provisionTimeout - elapsed),
-                  controller.signal,
-                )
-              ) {
-                throw new SIEConnectionError("Stream aborted while provisioning", "other");
-              }
-              continue;
-            }
-          }
         }
 
-        // Any remaining non-200 is an error: don't rely on `!response.ok`
-        // (which would also be false for the already-handled 202).
+        // Any remaining non-200 is an error.
         if (attemptResponse.status !== 200) {
           await handleError(attemptResponse);
         }
@@ -1016,10 +1015,13 @@ export class SIEClient {
     items: Item[],
     options: ScoreOptions = {},
   ): Promise<ScoreResult> {
+    const queryForWire = await itemImagesForWire(query);
+    const itemsForWire = await itemsImagesForWire(items);
+
     // Build request body
     const body: Record<string, unknown> = {
-      query,
-      items,
+      query: queryForWire,
+      items: itemsForWire,
     };
 
     const waitForCapacity = options.waitForCapacity ?? this.defaultWaitForCapacity;
@@ -1086,10 +1088,11 @@ export class SIEClient {
   ): Promise<ExtractResult | ExtractResult[]> {
     const isSingleItem = !Array.isArray(items);
     const itemsArray = isSingleItem ? [items] : items;
+    const itemsForWire = await itemsImagesForWire(itemsArray);
 
     // Build request body
     const body: Record<string, unknown> = {
-      items: itemsArray,
+      items: itemsForWire,
     };
 
     // Add params
@@ -1574,9 +1577,9 @@ export class SIEClient {
   /**
    * Make a msgpack HTTP request with retry logic.
    *
-   * Retried (only when `waitForCapacity: true`, capped by `provisionTimeout`):
-   *  - 202 Accepted (provisioning)
-   *  - 503 `MODEL_LOADING` / `LORA_LOADING` / no error code (scale-from-zero)
+   * Retried (capped by `provisionTimeout`):
+   *  - 503 `PROVISIONING` when `waitForCapacity: true`
+   *  - 503 `MODEL_LOADING` / `LORA_LOADING`
    *  - `SIEConnectionError` with `kind === "connect"` (issue #95)
    *
    * `kind === "timeout"` is NOT retried — would extend the user-visible
@@ -1614,36 +1617,6 @@ export class SIEClient {
         throw err;
       }
 
-      // Handle 202 (provisioning) - capacity not available
-      if (response.status === HTTP_ACCEPTED) {
-        const retryAfter = getRetryAfter(response);
-
-        if (!waitForCapacity) {
-          throw new ProvisioningError(
-            `No capacity available for GPU '${gpu}'. Server is provisioning.`,
-            gpu,
-            retryAfter,
-          );
-        }
-
-        // Check if we've exceeded the timeout
-        const elapsed = Date.now() - startTime;
-        if (elapsed >= this.provisionTimeout) {
-          throw new ProvisioningError(
-            `Provisioning timeout after ${elapsed}ms waiting for GPU '${gpu}'`,
-            gpu,
-            retryAfter,
-          );
-        }
-
-        // Wait and retry
-        const delay = retryAfter ?? DEFAULT_RETRY_DELAY;
-        const remaining = this.provisionTimeout - elapsed;
-        const actualDelay = Math.min(delay, remaining);
-        await sleep(actualDelay);
-        continue;
-      }
-
       // Short-circuit terminal load failures (sie-test#85). The server
       // emits 502 MODEL_LOAD_FAILED for permanent classes (gated repos,
       // missing dependencies, unrecognised architectures); we must
@@ -1654,10 +1627,37 @@ export class SIEClient {
       // Short-circuit token-budget overruns (#849).
       await throwIfInputTooLong(response, model);
 
-      // Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
+      // Handle explicit retryable 503 signals.
       if (response.status === 503) {
         const clonedResponse = response.clone();
         const errorCode = await getErrorCode(clonedResponse);
+
+        if (errorCode === PROVISIONING_ERROR_CODE) {
+          const retryAfter = getRetryAfter(response);
+
+          if (!waitForCapacity) {
+            throw new ProvisioningError(
+              `No capacity available for GPU '${gpu}'. Server is provisioning.`,
+              gpu,
+              retryAfter,
+            );
+          }
+
+          const elapsed = Date.now() - startTime;
+          if (elapsed >= this.provisionTimeout) {
+            throw new ProvisioningError(
+              `Provisioning timeout after ${elapsed}ms waiting for GPU '${gpu}'`,
+              gpu,
+              retryAfter,
+            );
+          }
+
+          const delay = retryAfter ?? applyRetryJitter(DEFAULT_RETRY_DELAY);
+          const remaining = this.provisionTimeout - elapsed;
+          const actualDelay = Math.min(delay, remaining);
+          await sleep(actualDelay);
+          continue;
+        }
 
         if (errorCode === LORA_LOADING_ERROR_CODE) {
           loraRetries += 1;
@@ -1694,20 +1694,6 @@ export class SIEClient {
           const actualDelay = Math.min(delay, remaining);
           await sleep(actualDelay);
           continue;
-        }
-
-        // Generic 503 fall-through (router/gateway scale-from-zero).
-        // New code-specific 503 branches MUST go ABOVE this block.
-        if (waitForCapacity) {
-          const elapsed = Date.now() - startTime;
-          if (elapsed < this.provisionTimeout) {
-            const retryAfter = getRetryAfter(response);
-            const delay = retryAfter ?? DEFAULT_RETRY_DELAY;
-            const remaining = this.provisionTimeout - elapsed;
-            const actualDelay = Math.min(delay, remaining);
-            await sleep(actualDelay);
-            continue;
-          }
         }
       }
 

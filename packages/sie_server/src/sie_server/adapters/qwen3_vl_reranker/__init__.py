@@ -26,6 +26,10 @@ _ERR_NO_INPUT = "Qwen3VLRerankerAdapter requires text or images input"
 
 # Chat template markers used by the reranker to structure (query, document) pairs.
 _DEFAULT_INSTRUCTION = "Retrieve relevant documents for the query."
+_SYSTEM_PROMPT = (
+    "Judge whether the Document meets the requirements based on the Query and the Instruct provided. "
+    'Note that the answer can only be "yes" or "no".'
+)
 
 
 def _build_reranker_conversation(
@@ -38,35 +42,32 @@ def _build_reranker_conversation(
 ) -> list[dict[str, Any]]:
     """Build chat conversation for reranking a (query, document) pair.
 
-    The reranker model expects:
-      system: <instruction>
-      user: <query content>
-      assistant: <document content>
-
-    Both query and document can contain text, image, or both.
+    The Qwen3-VL-Reranker reference format puts instruction, query, and
+    document content in one user message. The model chat template emits vision
+    placeholder tokens for images in user content, but not assistant content.
     """
-    # Build query content
-    query_content: list[dict[str, Any]] = []
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": "<Instruct>: " + instruction},
+        {"type": "text", "text": "<Query>:"},
+    ]
     if query_image is not None:
-        query_content.append({"type": "image", "image": query_image})
+        content.append({"type": "image", "image": query_image})
     if query_text:
-        query_content.append({"type": "text", "text": query_text})
-    if not query_content:
-        query_content.append({"type": "text", "text": ""})
+        content.append({"type": "text", "text": query_text})
+    if not query_text and query_image is None:
+        content.append({"type": "text", "text": "NULL"})
 
-    # Build document content
-    doc_content: list[dict[str, Any]] = []
+    content.append({"type": "text", "text": "\n<Document>:"})
     if doc_image is not None:
-        doc_content.append({"type": "image", "image": doc_image})
+        content.append({"type": "image", "image": doc_image})
     if doc_text:
-        doc_content.append({"type": "text", "text": doc_text})
-    if not doc_content:
-        doc_content.append({"type": "text", "text": ""})
+        content.append({"type": "text", "text": doc_text})
+    if not doc_text and doc_image is None:
+        content.append({"type": "text", "text": "NULL"})
 
     return [
-        {"role": "system", "content": [{"type": "text", "text": instruction}]},
-        {"role": "user", "content": query_content},
-        {"role": "assistant", "content": doc_content},
+        {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
+        {"role": "user", "content": content},
     ]
 
 

@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  getErrorCode,
   handleError,
   parseCapacityInfo,
   parseGenerateResult,
@@ -200,7 +201,7 @@ describe("GPU parameter parsing", () => {
 });
 
 describe("Real-world retry scenarios", () => {
-  it("should provide reasonable delays for 202 provisioning retries", () => {
+  it("should provide reasonable delays for provisioning retries", () => {
     // User scenario: GPU is provisioning, need to retry with backoff
     // Typical provisioning takes 30-60 seconds, we should have reasonable delays
 
@@ -249,17 +250,16 @@ describe("handleError (gateway / FastAPI bodies)", () => {
     });
   });
 
-  it("reads top-level message for 202 provisioning (no detail object)", async () => {
+  it("reads 503 PROVISIONING error envelope", async () => {
     const res = new Response(
       JSON.stringify({
-        status: "provisioning",
-        gpu: "l4",
-        bundle: "default",
-        estimated_wait_s: 30,
-        message: "No worker available for GPU type 'l4'. Provisioning in progress.",
+        error: {
+          code: "PROVISIONING",
+          message: "No worker available for GPU type 'l4'. Provisioning in progress.",
+        },
       }),
       {
-        status: 202,
+        status: 503,
         headers: { "Content-Type": "application/json", "Retry-After": "5" },
       },
     );
@@ -271,15 +271,44 @@ describe("handleError (gateway / FastAPI bodies)", () => {
     });
   });
 
-  it("parses HTTP-date Retry-After for 202 provisioning", async () => {
+  it("prefers X-SIE-Error-Code for OpenAI provisioning envelopes", async () => {
+    const res = new Response(
+      JSON.stringify({
+        error: {
+          code: "provisioning",
+          message: "Provisioning in progress.",
+        },
+      }),
+      {
+        status: 503,
+        headers: {
+          "Content-Type": "application/json",
+          "Retry-After": "5",
+          "X-SIE-Error-Code": "PROVISIONING",
+        },
+      },
+    );
+
+    expect(await getErrorCode(res.clone())).toBe("PROVISIONING");
+    await expect(handleError(res, "l4")).rejects.toMatchObject({
+      name: "ProvisioningError",
+      message: "Provisioning in progress.",
+      gpu: "l4",
+      retryAfter: 5000,
+    });
+  });
+
+  it("parses HTTP-date Retry-After for 503 PROVISIONING", async () => {
     const retryAt = new Date(Date.now() + 60_000).toUTCString();
     const res = new Response(
       JSON.stringify({
-        status: "provisioning",
-        message: "Provisioning in progress.",
+        error: {
+          code: "PROVISIONING",
+          message: "Provisioning in progress.",
+        },
       }),
       {
-        status: 202,
+        status: 503,
         headers: { "Content-Type": "application/json", "Retry-After": retryAt },
       },
     );

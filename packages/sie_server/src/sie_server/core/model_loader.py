@@ -365,7 +365,6 @@ class ModelLoader:
             LoadedModel containing the loaded state.
         """
         if adapter.requires_main_thread:
-            # SGLang and similar adapters need main thread for signal handlers
             logger.info(
                 "Loading '%s' in main thread (adapter.requires_main_thread=True)",
                 name,
@@ -398,23 +397,27 @@ class ModelLoader:
         cannot register stale preprocessors or set ``sie_model_loaded=1``
         for a model the registry has marked failed.
 
-        ``requires_main_thread`` adapters (e.g. SGLang) are routed through
-        :meth:`_load_main_thread` instead, which intentionally does NOT
-        apply this timeout — those adapters have their own bounded
-        subprocess startup timeout and double-bounding causes spurious
-        mid-startup failures.
+        Adapters that set ``manages_own_load_timeout`` are also run in this
+        executor, but without the generic ``wait_for`` wrapper. That keeps the
+        event loop responsive while preserving adapter-owned cleanup semantics
+        for subprocess-backed loaders whose startup timeout can terminate the
+        child process cleanly.
         """
 
         def _deserialize_and_warmup() -> None:
             logger.info("Loading model '%s' onto %s", name, device)
             _run_load_with_markers(name, device, adapter)
 
-        await self._run_with_timeout(
-            stage="load",
-            name=name,
-            func=_deserialize_and_warmup,
-            args=(),
-        )
+        if getattr(adapter, "manages_own_load_timeout", False) is True:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._load_executor, _deserialize_and_warmup)
+        else:
+            await self._run_with_timeout(
+                stage="load",
+                name=name,
+                func=_deserialize_and_warmup,
+                args=(),
+            )
         # Registry-state side effects (preprocessor/postprocessor
         # registration, metrics, worker creation, LoRA preloading) run
         # OUTSIDE the executor so an orphan thread from a wait_for
@@ -501,11 +504,11 @@ class ModelLoader:
     ) -> LoadedModel:
         """Load adapter in main thread (for adapters with signal handlers).
 
-        This blocks the event loop but is required for adapters like SGLang
-        that use Python signal handlers which only work in the main thread.
+        This blocks the event loop and is reserved for adapters that truly need
+        parent-process main-thread execution.
 
-        Adapter-internal startup timeouts (e.g. SGLang's subprocess health
-        poll) are rewrapped into :class:`ModelLoadTimeoutError` so the
+        Adapter-internal startup timeouts are rewrapped into
+        :class:`ModelLoadTimeoutError` so the
         registry's failure classifier buckets them as
         ``LoadErrorClass.TIMEOUT`` (30 s cooldown) rather than
         ``UNKNOWN`` (permanent) — consistent with the executor path.
@@ -524,22 +527,7 @@ class ModelLoader:
         try:
             _run_load_with_markers(name, device, adapter)
         except RuntimeError as exc:
-            # SGLang raises ``RuntimeError("SGLang server failed to start
-            # within timeout")`` from ``_wait_for_server``. Pattern-match
-            # on the message; narrow enough to not bucket genuine runtime
-            # failures as timeouts. Other adapters that grow their own
-            # startup timeouts should follow the same convention.
-            msg = str(exc).lower()
-            if "failed to start within timeout" in msg or "startup timeout" in msg:
-                elapsed = time.monotonic() - started
-                increment_model_load_timeout(name, "load")
-                logger.error(
-                    "Main-thread adapter startup timeout: model=%s elapsed_s=%.1f msg=%s",
-                    name,
-                    elapsed,
-                    exc,
-                )
-                raise ModelLoadTimeoutError(model=name, stage="load", elapsed_s=elapsed, timeout_s=elapsed) from exc
+            _raise_if_adapter_startup_timeout(name, started, exc)
             raise
         return self._finish_load(name, device, adapter, config)
 
@@ -728,11 +716,39 @@ def _run_load_with_markers(name: str, device: str, adapter: ModelAdapter) -> Non
     consistently across adapters (the resulting ``warmup_s`` is just ~0).
     """
     logger.info("Model deserialize start: '%s' on %s", name, device)
-    adapter.load(device)
+    started = time.monotonic()
+    try:
+        adapter.load(device)
+    except RuntimeError as exc:
+        _raise_if_adapter_startup_timeout(name, started, exc)
+        raise
     logger.info("Model deserialize end: '%s' on %s", name, device)
     logger.info("Model warmup start: '%s' on %s", name, device)
     adapter.warmup()
     logger.info("Model warmup end: '%s' on %s", name, device)
+
+
+def _raise_if_adapter_startup_timeout(name: str, started: float, exc: RuntimeError) -> None:
+    """Reclassify adapter-owned startup timeout errors.
+
+    SGLang raises ``RuntimeError("SGLang server failed to start within timeout")``
+    from its subprocess health poll. Pattern-match on the message; narrow enough
+    to not bucket genuine runtime failures as timeouts. Other adapters that grow
+    their own startup timeouts should follow the same convention.
+    """
+    msg = str(exc).lower()
+    if "failed to start within timeout" not in msg and "startup timeout" not in msg:
+        return
+
+    elapsed = time.monotonic() - started
+    increment_model_load_timeout(name, "load")
+    logger.error(
+        "Adapter startup timeout: model=%s elapsed_s=%.1f msg=%s",
+        name,
+        elapsed,
+        exc,
+    )
+    raise ModelLoadTimeoutError(model=name, stage="load", elapsed_s=elapsed, timeout_s=elapsed) from exc
 
 
 def _merge_adaptive_params(

@@ -117,6 +117,7 @@ def collect_bundle_deps(
     models_dir: Path,
     *,
     exclude_cuda: bool = False,
+    pool_name: str | None = None,
 ) -> BundleDepResult:
     """Collect all dependencies for a bundle from its deps section.
 
@@ -177,7 +178,7 @@ def collect_bundle_deps(
             requirements.append(pkg)
 
     # Discover model names that match this bundle's adapters (for the result)
-    model_names = match_bundle_models(bundle_path, models_dir)
+    model_names = match_bundle_models(bundle_path, models_dir, pool_name=pool_name)
 
     return BundleDepResult(
         requirements=requirements,

@@ -49,12 +49,13 @@ use crate::ipc_types::{
     ApplyModelConfigRequest, ApplyModelConfigResponse, BatchOutcome, DrainRequest, DrainResponse,
     EnsureModelReadyRequest, EnsureModelReadyResponse, GenerateEvent, PingRequest, PingResponse,
     ProcessEncodeBatchRequest, ProcessExtractBatchRequest, ProcessGenerateRequest,
-    ProcessScoreBatchRequest, RequestEnvelope, ResponseEnvelope, RunBatchRequest,
-    SignalGenerateCancelRequest, SignalGenerateCancelResponse, WorkerCapabilitiesRequest,
-    WorkerCapabilitiesResponse, IPC_VERSION, METHOD_APPLY_MODEL_CONFIG, METHOD_DRAIN,
-    METHOD_ENSURE_MODEL_READY, METHOD_PING, METHOD_PROCESS_ENCODE_BATCH,
-    METHOD_PROCESS_EXTRACT_BATCH, METHOD_PROCESS_GENERATE, METHOD_PROCESS_SCORE_BATCH,
-    METHOD_RUN_BATCH, METHOD_SIGNAL_GENERATE_CANCEL, METHOD_WORKER_CAPABILITIES,
+    ProcessScoreBatchRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
+    RequestEnvelope, ResponseEnvelope, RunBatchRequest, SignalGenerateCancelRequest,
+    SignalGenerateCancelResponse, WorkerCapabilitiesRequest, WorkerCapabilitiesResponse,
+    IPC_VERSION, METHOD_APPLY_MODEL_CONFIG, METHOD_DRAIN, METHOD_ENSURE_MODEL_READY, METHOD_PING,
+    METHOD_PROCESS_ENCODE_BATCH, METHOD_PROCESS_EXTRACT_BATCH, METHOD_PROCESS_GENERATE,
+    METHOD_PROCESS_SCORE_BATCH, METHOD_REPLACE_MODEL_CONFIGS, METHOD_RUN_BATCH,
+    METHOD_SIGNAL_GENERATE_CANCEL, METHOD_WORKER_CAPABILITIES,
 };
 use crate::log_util::ErrChain;
 use crate::metrics::MetricsRegistry;
@@ -965,6 +966,13 @@ impl IpcClient {
         req: ApplyModelConfigRequest,
     ) -> Result<ApplyModelConfigResponse, IpcError> {
         self.call(METHOD_APPLY_MODEL_CONFIG, req).await
+    }
+
+    pub async fn replace_model_configs(
+        &self,
+        req: ReplaceModelConfigsRequest,
+    ) -> Result<ReplaceModelConfigsResponse, IpcError> {
+        self.call(METHOD_REPLACE_MODEL_CONFIGS, req).await
     }
 
     pub async fn drain(&self, deadline_ms: u64) -> Result<DrainResponse, IpcError> {

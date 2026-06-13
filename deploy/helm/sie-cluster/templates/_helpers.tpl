@@ -473,14 +473,14 @@ Returns a comma-joined, sorted list of distinct machine profiles.
 */}}
 {{- define "sie-cluster.bundle.machineProfiles" -}}
 {{- $root := .root -}}
-{{- $queuePool := .queuePool -}}
+{{- $queuePool := .queuePool | lower -}}
 {{- $bundle := .bundle -}}
-{{- $defaultQueuePool := default "default" $root.Values.workers.common.queuePool -}}
+{{- $defaultQueuePool := default "default" $root.Values.workers.common.queuePool | lower -}}
 {{- $profiles := dict -}}
 {{- range $poolName, $pool := $root.Values.workers.pools -}}
 {{- if $pool.enabled -}}
 {{- $mp := default $poolName $pool.machineProfile -}}
-{{- $qp := default $defaultQueuePool $pool.queuePool -}}
+{{- $qp := default $defaultQueuePool $pool.queuePool | lower -}}
 {{- if eq $qp $queuePool -}}
 {{- range $bundleName, $bundleCfg := $pool.bundles -}}
 {{- if and (eq $bundleName $bundle) (dig "enabled" true $bundleCfg) -}}

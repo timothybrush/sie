@@ -67,6 +67,7 @@ class ProfileConflictError(ValueError):
 # load error rather than tolerating them.
 KNOWN_ENGINES: frozenset[str] = frozenset({"pytorch"})
 DEFAULT_ENGINE: str = "pytorch"
+_MAX_POOL_NAME_LEN = 128
 
 # Adapter-module prefix expected for each engine. The gateway's matcher
 # is engine-agnostic (it intersects ``bundle.adapters`` with the model's
@@ -78,6 +79,35 @@ DEFAULT_ENGINE: str = "pytorch"
 _ENGINE_ADAPTER_PREFIXES: dict[str, tuple[str, ...]] = {
     "pytorch": ("sie_server.adapters.",),
 }
+
+
+def _normalize_pool_name(config: dict) -> None:
+    """Validate and canonicalize an optional model-level pool name."""
+    if "pool" not in config:
+        return
+
+    raw_pool = config.get("pool")
+    if raw_pool is None:
+        config.pop("pool", None)
+        return
+    if not isinstance(raw_pool, str):
+        msg = "Field 'pool' must be a string"
+        raise ValueError(msg)
+
+    pool = raw_pool.strip().lower()
+    if not pool:
+        config.pop("pool", None)
+        return
+
+    if (
+        len(pool) > _MAX_POOL_NAME_LEN
+        or pool == "_default"
+        or not all(c.isascii() and (c.isalnum() or c in "_-") for c in pool)
+    ):
+        msg = "Field 'pool' must match [A-Za-z0-9_-]{1,128} and must not be _default"
+        raise ValueError(msg)
+
+    config["pool"] = pool
 
 
 @dataclass
@@ -505,6 +535,37 @@ class ModelRegistry:
         payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def compute_bundle_config_hashes_hash(self) -> str:
+        """Stable SHA-256 over per-bundle config hashes and pool ownership.
+
+        The gateway polls this via ``GET /v1/configs/epoch`` to detect
+        control-plane config drift even when the model epoch is unchanged (for
+        example, no-store deployments where a sie-config image redeploy
+        rebuilds the filesystem baseline at epoch 0). ``bundle_config_hash``
+        intentionally stays worker-parity scoped to runtime profile fields, so
+        this compact fingerprint also includes model-level pool ownership: a
+        pure top-level ``pool:`` move changes routing/readiness even when the
+        worker-applied config hash for each bundle is otherwise unchanged.
+        """
+        by_bundle = {}
+        with self._lock:
+            bundle_ids = sorted(self._bundles)
+            if not bundle_ids:
+                return ""
+            for bundle_id in bundle_ids:
+                model_pools = {}
+                for model_name, model_info in sorted(self._models.items()):
+                    if bundle_id not in model_info.bundles:
+                        continue
+                    pool = self._model_full_configs.get(model_name, {}).get("pool") or "default"
+                    model_pools[model_name] = str(pool).strip().lower() or "default"
+                by_bundle[bundle_id] = {
+                    "bundle_config_hash": self.compute_bundle_config_hash(bundle_id),
+                    "model_pools": model_pools,
+                }
+        payload = json.dumps(by_bundle, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def get_bundle_info(self, bundle: str) -> BundleInfo | None:
         """Get bundle info.
 
@@ -577,6 +638,10 @@ class ModelRegistry:
             msg = "Missing required field: sie_id"
             raise ValueError(msg)
 
+        _normalize_pool_name(config)
+        incoming_has_pool = "pool" in config
+        incoming_pool = config.get("pool") or "default"
+
         profiles = config.get("profiles", {})
         if not profiles:
             msg = "Missing required field: profiles"
@@ -613,6 +678,10 @@ class ModelRegistry:
         skipped_profiles: list[str] = []
 
         if existing:
+            existing_pool = self._model_full_configs.get(sie_id, {}).get("pool") or "default"
+            if incoming_has_pool and incoming_pool != existing_pool:
+                msg = f"Pool on model '{sie_id}' already exists with different value. Config API is append-only."
+                raise ValueError(msg)
             existing_full_profiles = self._model_full_configs.get(sie_id, {}).get("profiles", {})
             conflicting_profiles: list[str] = []
             for profile_name, profile in profiles.items():

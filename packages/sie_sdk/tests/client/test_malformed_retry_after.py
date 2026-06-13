@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_sdk import SIEAsyncClient, SIEClient
-from sie_sdk.client._shared import get_retry_after
+from sie_sdk.client._shared import get_retry_after, provisioning_retry_delay
 from sie_sdk.client.errors import ModelLoadingError, ProvisioningError
 
 
@@ -105,20 +105,35 @@ class TestGetRetryAfterHttpDate:
         assert get_retry_after(_resp_with_retry_after("not-a-date")) is None
 
 
+class TestProvisioningRetryDelay:
+    def test_retry_after_zero_means_immediate_retry(self) -> None:
+        response = _resp_with_retry_after("0")
+        assert (
+            provisioning_retry_delay(
+                response,
+                gpu="l4",
+                wait_for_capacity=True,
+                start_time=time.monotonic(),
+                timeout=10.0,
+            )
+            == 0.0
+        )
+
+
 class TestSyncGenerateMalformedRetryAfter:
-    """(b) sync ``generate()`` against a perpetual ``202 Retry-After: nan``
+    """(b) sync ``generate()`` against a perpetual ``503 PROVISIONING Retry-After: nan``
     must NOT raise ``ValueError`` (no ``time.sleep(nan)`` crash) and must
     terminate within the provision budget with a bounded number of HTTP calls.
     """
 
-    def test_perpetual_202_nan_does_not_crash_and_is_bounded(self) -> None:
+    def test_perpetual_503_provisioning_nan_does_not_crash_and_is_bounded(self) -> None:
         from sie_sdk.client.errors import ProvisioningError
 
-        def _resp_202_nan() -> MagicMock:
+        def _resp_503_provisioning_nan() -> MagicMock:
             response = MagicMock()
-            response.status_code = 202
+            response.status_code = 503
             response.headers = {"Retry-After": "nan", "content-type": "application/json"}
-            response.json.return_value = {"detail": {"message": "provisioning"}}
+            response.json.return_value = {"error": {"code": "PROVISIONING", "message": "provisioning"}}
             response.content = json.dumps(response.json.return_value).encode("utf-8")
             return response
 
@@ -136,7 +151,7 @@ class TestSyncGenerateMalformedRetryAfter:
             patch("sie_sdk.client.sync.httpx.Client") as mock_client,
             patch("sie_sdk.client.sync.time.sleep", side_effect=_fake_sleep),
         ):
-            mock_client.return_value.post.return_value = _resp_202_nan()
+            mock_client.return_value.post.return_value = _resp_503_provisioning_nan()
             client = SIEClient("http://localhost:8080")
             # Must terminate (ProvisioningError) within the budget — NOT ValueError.
             with pytest.raises(ProvisioningError):

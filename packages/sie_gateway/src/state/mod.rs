@@ -1,3 +1,4 @@
+pub mod bundle_config_hashes_hash;
 pub mod bundles_hash;
 pub mod config_bootstrap;
 pub mod config_epoch;

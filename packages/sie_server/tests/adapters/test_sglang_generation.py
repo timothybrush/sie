@@ -46,6 +46,11 @@ def test_capabilities_declare_tokens(adapter) -> None:
     assert caps.outputs == ["tokens"]
 
 
+def test_load_contract_flags() -> None:
+    assert SGLangGenerationAdapter.requires_main_thread is False
+    assert SGLangGenerationAdapter.manages_own_load_timeout is True
+
+
 def test_unloaded_generate_raises(adapter) -> None:
     # ``generate`` is now an async generator function; the loaded-check
     # fires when we first try to drive the iterator, not at call time.

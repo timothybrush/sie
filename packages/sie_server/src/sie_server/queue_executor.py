@@ -31,6 +31,8 @@ from sie_server.ipc_types import (
     ProcessScoreBatchRequest,
     RawOutput,
     ReadinessState,
+    ReplaceModelConfigsRequest,
+    ReplaceModelConfigsResponse,
     ScoreBatchItem,
     ScoreOutputRaw,
     SparseOutput,
@@ -527,6 +529,43 @@ class QueueExecutor:
             return ""
         return compute_bundle_config_hash_cached(self._registry, bundle_id)
 
+    async def replace_model_configs(self, req: ReplaceModelConfigsRequest) -> ReplaceModelConfigsResponse:
+        """Replace the bundle-scoped registry view from a full export snapshot."""
+        if not req.bundle_id:
+            msg = "bundle_id is required"
+            raise ValueError(msg)
+
+        configs: list[ModelConfig] = []
+        for entry in req.models:
+            if not entry.model_config.strip():
+                msg = "model_config is required"
+                raise ValueError(msg)
+
+            raw = yaml.safe_load(entry.model_config)
+            if not isinstance(raw, dict):
+                msg = "model_config must decode to a YAML mapping"
+                raise ValueError(msg)
+
+            model_config = ModelConfig(**raw)
+            if entry.model_id and model_config.sie_id != entry.model_id:
+                msg = f"model_id mismatch: export={entry.model_id!r} config={model_config.sie_id!r}"
+                raise ValueError(msg)
+            configs.append(model_config)
+
+        invalidated = await self._registry.replace_configs_async(configs)
+        for model_id in invalidated:
+            self.invalidate_model_descriptor(model_id)
+        for config in configs:
+            self.invalidate_model_descriptor(config.sie_id)
+        bundle_hash = compute_bundle_config_hash_cached(self._registry, req.bundle_id)
+        applied_models = sorted(self._registry.get_configs_snapshot(req.bundle_id))
+        return ReplaceModelConfigsResponse(
+            applied=True,
+            bundle_config_hash=bundle_hash,
+            config_version=int(getattr(self._registry, "_config_version", 0)),
+            applied_models=applied_models,
+        )
+
     # -- Readiness ---------------------------------------------------------
 
     async def ensure_model_ready(self, model_id: str) -> ReadinessState:
@@ -538,6 +577,9 @@ class QueueExecutor:
         - ``loading_in_progress``: NAK with longer delay (already loading)
         - ``retry_later``: NAK with base delay (unknown error path)
         """
+        if not self._registry.has_model(model_id):
+            return "retry_later"
+
         if self._registry.is_loaded(model_id):
             return "ready"
 

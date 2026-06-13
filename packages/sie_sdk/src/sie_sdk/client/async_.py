@@ -65,8 +65,6 @@ from sie_sdk.types import (
 from ._shared import (
     DEFAULT_LEASE_RENEWAL_INTERVAL_S,
     DEFAULT_PROVISION_TIMEOUT_S,
-    DEFAULT_RETRY_DELAY_S,
-    HTTP_ACCEPTED,
     HTTP_CLIENT_ERROR,
     HTTP_GATEWAY_TIMEOUT,
     JSON_CONTENT_TYPE,
@@ -76,6 +74,7 @@ from ._shared import (
     MODEL_LOADING_DEFAULT_DELAY_S,
     MODEL_LOADING_ERROR_CODE,
     MSGPACK_CONTENT_TYPE,
+    PROVISIONING_ERROR_CODE,
     RESOURCE_EXHAUSTED_ERROR_CODE,
     RESOURCE_EXHAUSTED_MAX_RETRIES,
     SDK_VERSION_HEADER,
@@ -85,6 +84,7 @@ from ._shared import (
     check_version_skew,
     compute_oom_backoff,
     compute_retry_delay,
+    convert_score_images_for_wire,
     get_error_code,
     get_retry_after,
     get_sdk_version,
@@ -95,8 +95,10 @@ from ._shared import (
     parse_extract_results,
     parse_gpu_param,
     parse_score_result,
+    provisioning_retry_delay,
     raise_if_input_too_long,
     raise_if_model_load_failed,
+    retry_after_or_default,
     sse_chunk_error,
     sse_headers,
 )
@@ -711,6 +713,7 @@ class SIEAsyncClient:
 
         Args:
             name: Pool name (used in gpu="pool_name/machine_profile" routing).
+                The gateway stores and routes pool names in lowercase.
             gpus: Optional machine profile requirements for pool readiness, e.g.,
                 {"l4": 2, "l4-spot": 1}.
             gpu_caps: Optional maximum assigned workers per machine profile, e.g.,
@@ -1136,7 +1139,7 @@ class SIEAsyncClient:
         # Retry counter for server-side OOM (RESOURCE_EXHAUSTED).
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -1190,39 +1193,28 @@ class SIEAsyncClient:
                 msg = f"Failed to connect to {self._base_url}: {e}"
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Check if we've exceeded the timeout
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                # Wait and retry
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                await asyncio.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
 
             # Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    await asyncio.sleep(actual_delay)
+                    continue
+
                 if error_code == LORA_LOADING_ERROR_CODE:
                     lora_retries += 1
 
@@ -1234,7 +1226,7 @@ class SIEAsyncClient:
 
                     # Wait and retry
                     retry_after = get_retry_after(response)
-                    delay = retry_after or LORA_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, LORA_LOADING_DEFAULT_DELAY_S)
                     logger.debug(
                         "LoRA loading, retrying in %.1fs (attempt %d/%d)",
                         delay,
@@ -1253,7 +1245,7 @@ class SIEAsyncClient:
 
                     # Wait and retry, respecting remaining time
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1276,27 +1268,6 @@ class SIEAsyncClient:
                     )
                     continue
 
-                # Generic 503 (no healthy workers) - retry if wait_for_capacity
-                # This handles scale-from-zero when pools are PENDING and have no workers yet
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        # Timeout exceeded, let handle_error raise the exception
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        await asyncio.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. A cold-start request that triggers a
@@ -1308,7 +1279,7 @@ class SIEAsyncClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1571,11 +1542,12 @@ class SIEAsyncClient:
         # Resolve defaults and pool
         pool_name, resolved_gpu = await self._resolve_pool_and_gpu(gpu)
         resolved_options = self._resolve_options(options)
+        query_for_wire, items_for_wire = convert_score_images_for_wire(query, items)
 
         # Build request body
         request_body: dict[str, Any] = {
-            "query": query,
-            "items": items,
+            "query": query_for_wire,
+            "items": items_for_wire,
         }
         if instruction is not None:
             request_body["instruction"] = instruction
@@ -1600,7 +1572,7 @@ class SIEAsyncClient:
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -1654,37 +1626,28 @@ class SIEAsyncClient:
                 msg = f"Failed to connect to {self._base_url}: {e}"
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                await asyncio.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
 
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    await asyncio.sleep(actual_delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
@@ -1692,7 +1655,7 @@ class SIEAsyncClient:
                         raise ModelLoadingError(msg, model=model)
 
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1715,24 +1678,6 @@ class SIEAsyncClient:
                     )
                     continue
 
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        await asyncio.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. See encode() above for rationale.
@@ -1740,7 +1685,7 @@ class SIEAsyncClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -1863,30 +1808,28 @@ class SIEAsyncClient:
                 msg = f"Request failed: {e}"
                 raise SIEConnectionError(msg) from e
 
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                await asyncio.sleep(min(delay, timeout - elapsed))
-                continue
-
             raise_if_model_load_failed(response, model=model)
 
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
                         msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
                         raise ModelLoadingError(msg, model=model)
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     await asyncio.sleep(min(delay, timeout - elapsed))
                     continue
                 if error_code == RESOURCE_EXHAUSTED_ERROR_CODE:
@@ -1899,13 +1842,6 @@ class SIEAsyncClient:
                         model=model,
                     )
                     continue
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed < timeout:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        await asyncio.sleep(min(delay, timeout - elapsed))
-                        continue
 
             # Do NOT retry 504 here. Unlike the idempotent encode/score/extract
             # paths (which keep the 504 retry block), generation is NOT
@@ -1915,7 +1851,7 @@ class SIEAsyncClient:
             # issue a SECOND billable generation with a different completion, so
             # surface it as a terminal ServerError instead (same reasoning as
             # the mid-flight transport-error block above). The pre-execution
-            # 503 MODEL_LOADING / 202 provisioning retries above remain because
+            # 503 MODEL_LOADING / PROVISIONING retries above remain because
             # those fire *before* any generation can have started.
             if response.status_code == HTTP_GATEWAY_TIMEOUT:
                 msg = (
@@ -1974,7 +1910,7 @@ class SIEAsyncClient:
 
         Async counterpart of :meth:`SIEClient.chat_completions`. For token
         streaming use :meth:`stream_chat_completions`. Generation is
-        non-idempotent, so only pre-execution 202 / 503 responses are retried;
+        non-idempotent, so only pre-execution 503 PROVISIONING / MODEL_LOADING responses are retried;
         a 504 surfaces as :class:`ServerError`.
 
         Typed kwargs cover the full gateway-supported field set (see
@@ -2224,7 +2160,7 @@ class SIEAsyncClient:
         """Open an aiohttp SSE stream (with pre-stream provisioning retry) and yield chunks.
 
         Shared by :meth:`stream_chat_completions` and :meth:`stream_generate`.
-        Only the *pre-stream* response is retried (202 / 503); once bytes flow
+        Only the *pre-stream* response is retried (503 PROVISIONING / MODEL_LOADING); once bytes flow
         a failure is terminal (non-idempotent). The ``async with`` keeps the
         connection open while the caller consumes the generator.
         """
@@ -2393,7 +2329,7 @@ class SIEAsyncClient:
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
 
-        # Retry loop for 202 (provisioning) responses
+        # Retry loop for retryable provisioning/capacity responses.
         while True:
             # Compute per-request timeout: cap to remaining provision time
             # This ensures a single hanging request can't exceed the overall timeout
@@ -2447,31 +2383,6 @@ class SIEAsyncClient:
                 msg = f"Failed to connect to {self._base_url}: {e}"
                 raise SIEConnectionError(msg) from e
 
-            # Handle 202 (provisioning) - capacity not available
-            if response.status_code == HTTP_ACCEPTED:
-                retry_after = get_retry_after(response)
-
-                if not wait_for_capacity:
-                    msg = f"No capacity available for GPU '{resolved_gpu}'. Server is provisioning."
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{resolved_gpu}'"
-                    raise ProvisioningError(msg, gpu=resolved_gpu, retry_after=retry_after)
-
-                delay = retry_after or DEFAULT_RETRY_DELAY_S
-                remaining = timeout - elapsed
-                actual_delay = min(delay, remaining)
-                logger.debug(
-                    "Waiting %.1fs for capacity (elapsed: %.1fs, timeout: %.1fs)",
-                    actual_delay,
-                    elapsed,
-                    timeout,
-                )
-                await asyncio.sleep(actual_delay)
-                continue
-
             # Short-circuit terminal load failures (sie-test#85).
             raise_if_model_load_failed(response, model=model)
 
@@ -2481,6 +2392,22 @@ class SIEAsyncClient:
             # Handle 503 with MODEL_LOADING - auto-retry
             if response.status_code == 503:
                 error_code = get_error_code(response)
+                if error_code == PROVISIONING_ERROR_CODE:
+                    actual_delay = provisioning_retry_delay(
+                        response,
+                        gpu=resolved_gpu,
+                        wait_for_capacity=wait_for_capacity,
+                        start_time=start_time,
+                        timeout=timeout,
+                    )
+                    logger.debug(
+                        "Provisioning in progress, retrying in %.1fs (timeout: %.1fs)",
+                        actual_delay,
+                        timeout,
+                    )
+                    await asyncio.sleep(actual_delay)
+                    continue
+
                 if error_code == MODEL_LOADING_ERROR_CODE:
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
@@ -2488,7 +2415,7 @@ class SIEAsyncClient:
                         raise ModelLoadingError(msg, model=model)
 
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(
@@ -2511,24 +2438,6 @@ class SIEAsyncClient:
                     )
                     continue
 
-                if wait_for_capacity:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= timeout:
-                        pass
-                    else:
-                        retry_after = get_retry_after(response)
-                        delay = retry_after or DEFAULT_RETRY_DELAY_S
-                        remaining = timeout - elapsed
-                        actual_delay = min(delay, remaining)
-                        logger.debug(
-                            "No healthy workers, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs)",
-                            actual_delay,
-                            elapsed,
-                            timeout,
-                        )
-                        await asyncio.sleep(actual_delay)
-                        continue
-
             # Handle 504 (gateway timeout) — defense-in-depth for older
             # gateways that don't yet map an upstream timeout to
             # 503 + MODEL_LOADING. See encode() above for rationale.
@@ -2536,7 +2445,7 @@ class SIEAsyncClient:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
                     retry_after = get_retry_after(response)
-                    delay = retry_after or MODEL_LOADING_DEFAULT_DELAY_S
+                    delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
                     remaining = timeout - elapsed
                     actual_delay = min(delay, remaining)
                     logger.info(

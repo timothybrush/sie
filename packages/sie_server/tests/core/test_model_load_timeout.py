@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
+from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.hf_env import set_hf_default_timeouts
 from sie_server.core.load_errors import (
     LoadErrorClass,
@@ -45,6 +47,20 @@ def _make_loader(timeout_s: float | None = None) -> ModelLoader:
         postprocessor_registry=PostprocessorRegistry(cpu_pool),
         all_configs={},
         model_load_timeout_s=timeout_s,
+    )
+
+
+def _make_embedding_config(name: str = "t") -> ModelConfig:
+    return ModelConfig(
+        sie_id=name,
+        hf_id=f"org/{name}",
+        tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=8))),
+        profiles={
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+                max_batch_tokens=8,
+            )
+        },
     )
 
 
@@ -312,6 +328,74 @@ class TestRegistryIntegration:
         assert after == before, (
             "orphan thread mutated MODEL_LOADED gauge — _finish_load must not run from the executor thread"
         )
+
+    async def test_adapter_owned_timeout_load_runs_in_executor_without_generic_wait_for(self) -> None:
+        """Subprocess-backed adapters own child cleanup and startup timeout.
+
+        They still need to load away from the event loop, but wrapping them in
+        the generic ``wait_for`` can orphan a still-loading subprocess. This
+        test proves the adapter-owned path runs in the model-load executor and
+        is not cut off by ``SIE_MODEL_LOAD_TIMEOUT_S``.
+        """
+        from unittest.mock import MagicMock
+
+        loader = _make_loader(timeout_s=0.01)
+        loop = asyncio.get_running_loop()
+        loop_thread_id = threading.get_ident()
+        load_started = asyncio.Event()
+        release_load = threading.Event()
+        load_thread_id: int | None = None
+
+        def _slow_load(device: str) -> None:
+            nonlocal load_thread_id
+            load_thread_id = threading.get_ident()
+            loop.call_soon_threadsafe(load_started.set)
+            if not release_load.wait(timeout=1.0):
+                raise AssertionError("test bug: load was not released")
+
+        adapter = MagicMock()
+        adapter.load.side_effect = _slow_load
+        adapter.warmup.return_value = None
+        adapter.requires_main_thread = False
+        adapter.manages_own_load_timeout = True
+        adapter.get_preprocessor.return_value = None
+        adapter.get_postprocessors.return_value = None
+        adapter.memory_footprint.return_value = 0
+        adapter.supports_lora.return_value = False
+
+        started = time.monotonic()
+        load_task = asyncio.create_task(
+            loader.load_and_register_async("managed", "cpu", adapter, _make_embedding_config("managed"))
+        )
+        try:
+            await asyncio.wait_for(load_started.wait(), timeout=0.5)
+
+            assert load_started.is_set()
+            assert time.monotonic() - started < 0.25
+            assert not load_task.done()
+        finally:
+            release_load.set()
+
+        loaded = await asyncio.wait_for(load_task, timeout=1.0)
+
+        assert loaded.adapter is adapter
+        assert load_thread_id is not None
+        assert load_thread_id != loop_thread_id
+
+    async def test_adapter_owned_startup_timeout_classifies_from_executor(self) -> None:
+        from unittest.mock import MagicMock
+
+        loader = _make_loader(timeout_s=0.01)
+        adapter = MagicMock()
+        adapter.load.side_effect = RuntimeError("SGLang server failed to start within timeout")
+        adapter.warmup.return_value = None
+        adapter.requires_main_thread = False
+        adapter.manages_own_load_timeout = True
+
+        with pytest.raises(ModelLoadTimeoutError) as exc_info:
+            await loader.load_and_register_async("sg", "cuda:0", adapter, _make_embedding_config("sg"))
+
+        assert exc_info.value.stage == "load"
 
     async def test_sglang_startup_timeout_classifies_as_timeout(self) -> None:
         """Regression: ``_load_main_thread`` rewraps SGLang's

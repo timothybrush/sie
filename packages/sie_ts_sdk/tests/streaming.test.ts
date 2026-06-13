@@ -532,13 +532,12 @@ describe("SIEClient.streamGenerate", () => {
     expect(cancelled()).toBe(true);
   });
 
-  // BUG 13a (MEDIUM): a 202 on the streaming path with waitForCapacity:false
-  // must reject with ProvisioningError, NOT a generic "no body" RequestError
-  // (Response.ok is true for 202 so it previously slipped through to the body).
-  it("rejects a 202 with ProvisioningError on the streaming path (BUG 13a)", async () => {
+  // BUG 13a (MEDIUM): provisioning on the streaming path with
+  // waitForCapacity:false must reject with ProvisioningError.
+  it("rejects 503 PROVISIONING with ProvisioningError on the streaming path (BUG 13a)", async () => {
     mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "provisioning" }), {
-        status: 202,
+      new Response(JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }), {
+        status: 503,
         headers: { "Content-Type": "application/json", "Retry-After": "7" },
       }),
     );
@@ -559,15 +558,14 @@ describe("SIEClient.streamGenerate", () => {
     }
   });
 
-  // BUG 13b (MEDIUM): the streaming path must honor waitForCapacity by
-  // retrying the SAFE pre-execution capacity signals (503 MODEL_LOADING / 202)
-  // before opening the stream — parallel to generate().
+  // BUG 13b (MEDIUM): the streaming path must retry SAFE pre-execution
+  // model-loading signals before opening the stream — parallel to generate().
   it("retries 503 MODEL_LOADING then streams the 200 when waitForCapacity:true (BUG 13b)", async () => {
     vi.useFakeTimers();
     try {
       mockFetch
         .mockResolvedValueOnce(
-          new Response(JSON.stringify({ code: "MODEL_LOADING", message: "loading" }), {
+          new Response(JSON.stringify({ error: { code: "MODEL_LOADING", message: "loading" } }), {
             status: 503,
             headers: { "Content-Type": "application/json" },
           }),
@@ -603,41 +601,19 @@ describe("SIEClient.streamGenerate", () => {
     }
   });
 
-  it("does NOT retry 503 MODEL_LOADING when waitForCapacity:false (BUG 13b)", async () => {
-    mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: { code: "MODEL_LOADING", message: "loading" } }), {
-        status: 503,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    const client = new SIEClient("http://localhost:8080");
-    const gen = client.streamGenerate(
-      "m",
-      "hi",
-      { maxNewTokens: 8, waitForCapacity: false },
-      undefined,
-    );
-    await expect(gen.next()).rejects.toBeTruthy();
-    expect(mockFetch.mock.calls.length).toBe(1);
-  });
-
-  // A generic 503 (scale-from-zero: no / non-MODEL_LOADING error code) must
-  // be retried under waitForCapacity on the streaming path, matching the
-  // non-streaming generate() behavior.
-  it("retries a generic 503 then streams the 200 when waitForCapacity:true", async () => {
+  it("retries 503 MODEL_LOADING even when waitForCapacity:false (BUG 13b)", async () => {
     vi.useFakeTimers();
     try {
       mockFetch
         .mockResolvedValueOnce(
-          new Response(JSON.stringify({ detail: "no capacity" }), {
+          new Response(JSON.stringify({ error: { code: "MODEL_LOADING", message: "loading" } }), {
             status: 503,
             headers: { "Content-Type": "application/json" },
           }),
         )
         .mockResolvedValueOnce(
           sseResponse([
-            generateChunk(0, "Hello"),
+            generateChunk(0, "Loaded"),
             generateChunk(1, "", { done: true, finish_reason: "stop" }),
           ]),
         );
@@ -648,27 +624,49 @@ describe("SIEClient.streamGenerate", () => {
       });
       const chunks: GenerateChunk[] = [];
       const consume = (async () => {
-        for await (const chunk of client.streamGenerate("m", "hi", {
-          maxNewTokens: 8,
-          waitForCapacity: true,
-        })) {
+        for await (const chunk of client.streamGenerate(
+          "m",
+          "hi",
+          { maxNewTokens: 8, waitForCapacity: false },
+          undefined,
+        )) {
           chunks.push(chunk);
         }
       })();
-      // DEFAULT_RETRY_DELAY between attempts for a generic 503.
       await vi.advanceTimersByTimeAsync(5_000);
       await consume;
 
       expect(mockFetch.mock.calls.length).toBe(2);
-      expect(chunks.map((c) => c.text_delta).join("")).toBe("Hello");
+      expect(chunks.map((c) => c.text_delta).join("")).toBe("Loaded");
     } finally {
       vi.useRealTimers();
     }
   });
 
+  // A generic 503 is not a provisioning contract. It must stay terminal even
+  // when the caller opts into capacity waiting.
+  it("does NOT retry a generic 503 when waitForCapacity:true", async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "service unavailable" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new SIEClient("http://localhost:8080");
+    const gen = client.streamGenerate(
+      "m",
+      "hi",
+      { maxNewTokens: 8, waitForCapacity: true },
+      undefined,
+    );
+    await expect(gen.next()).rejects.toBeTruthy();
+    expect(mockFetch.mock.calls.length).toBe(1);
+  });
+
   it("does NOT retry a generic 503 when waitForCapacity:false", async () => {
     mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "no capacity" }), {
+      new Response(JSON.stringify({ detail: "service unavailable" }), {
         status: 503,
         headers: { "Content-Type": "application/json" },
       }),
@@ -692,13 +690,16 @@ describe("SIEClient.streamGenerate", () => {
   it("aborts promptly during a provisioning Retry-After sleep", { timeout: 3_000 }, async () => {
     vi.useFakeTimers();
     try {
-      // Always answer 202 so the loop stays in the provisioning sleep.
+      // Always answer 503 PROVISIONING so the loop stays in the provisioning sleep.
       mockFetch.mockImplementation(() =>
         Promise.resolve(
-          new Response(JSON.stringify({ detail: "provisioning" }), {
-            status: 202,
-            headers: { "Content-Type": "application/json", "Retry-After": "300" },
-          }),
+          new Response(
+            JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json", "Retry-After": "300" },
+            },
+          ),
         ),
       );
 

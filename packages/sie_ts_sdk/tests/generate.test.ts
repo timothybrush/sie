@@ -200,7 +200,7 @@ describe("SIEClient.generate", () => {
  * `fetch` `TypeError` — which can be raised for a connection dropped
  * AFTER the request body was sent (mid-flight) — must NOT be retried.
  * Retrying would issue a SECOND billable generation. The safe
- * pre-execution capacity signals (202 provisioning, 503 MODEL_LOADING)
+ * pre-execution capacity signals (503 PROVISIONING, 503 MODEL_LOADING)
  * are detected from the HTTP status and ARE still retried.
  */
 describe("SIEClient.generate retry semantics (B1c)", () => {
@@ -242,22 +242,29 @@ describe("SIEClient.generate retry semantics (B1c)", () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
-  it("still retries the safe 202 provisioning status path under waitForCapacity", async () => {
+  it("still retries the safe 503 PROVISIONING status path under waitForCapacity", async () => {
     vi.useFakeTimers();
     const client = new SIEClient("http://localhost:8080", {
       timeout: 30_000,
       provisionTimeout: 60_000,
     });
 
-    mockFetch.mockResolvedValueOnce(new Response(null, { status: 202 })).mockResolvedValueOnce(
-      jsonResponse({
-        model: "m",
-        text: "ok",
-        finish_reason: "stop",
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        attempt_id: "a",
-      }),
-    );
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          model: "m",
+          text: "ok",
+          finish_reason: "stop",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          attempt_id: "a",
+        }),
+      );
 
     const promise = client.generate("m", "hi", { maxNewTokens: 8, waitForCapacity: true });
     // DEFAULT_RETRY_DELAY = 5_000ms.
@@ -276,7 +283,7 @@ describe("SIEClient.generate retry semantics (B1c)", () => {
     });
 
     const modelLoading = new Response(
-      JSON.stringify({ code: "MODEL_LOADING", message: "loading" }),
+      JSON.stringify({ error: { code: "MODEL_LOADING", message: "loading" } }),
       {
         status: 503,
         headers: { "Content-Type": "application/json" },

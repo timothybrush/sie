@@ -938,6 +938,10 @@
             "type": "integer"
           },
           "name": {
+            "description": "Pool name used in gpu=\"pool/machine_profile\" routing. Names are stored and routed in lowercase. Only ASCII letters, digits, '_' and '-' are allowed; '_default' is reserved.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$",
             "type": "string"
           },
           "ttl_seconds": {
@@ -2399,32 +2403,6 @@
         },
         "type": "object"
       },
-      "ProvisioningResponse": {
-        "properties": {
-          "bundle": {
-            "type": "string"
-          },
-          "estimated_wait_s": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "gpu": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "estimated_wait_s"
-        ],
-        "type": "object"
-      },
       "Relation": {
         "properties": {
           "head": {
@@ -2908,7 +2886,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.4"
+    "version": "0.6.5"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3092,7 +3070,7 @@
     },
     "/readyz": {
       "get": {
-        "description": "Process readiness only. Always returns 200 once the gateway is serving requests; never returns 503. Worker readiness is reported by GET /health and by inference responses (202 + Retry-After from a workerless gateway). This contract supports KEDA scale-from-zero.",
+        "description": "Process readiness only. Always returns 200 once the gateway is serving requests; never returns 503. Worker readiness is reported by GET /health and by inference responses with retryable provisioning signals from a workerless gateway. This contract supports KEDA scale-from-zero.",
         "operationId": "readyz",
         "responses": {
           "200": {
@@ -3230,7 +3208,33 @@
                 }
               }
             },
-            "description": "Queue unavailable"
+            "description": "Provisioning in progress, queue unavailable, or model loading",
+            "headers": {
+              "Retry-After": {
+                "description": "Suggested retry delay in seconds, when retryable",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Error-Code": {
+                "description": "SDK-stable gateway or worker error code",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Server-Version": {
+                "description": "Gateway-compatible server version advertised by this gateway",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Version": {
+                "description": "Gateway package version that handled the request",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -3311,7 +3315,33 @@
                 }
               }
             },
-            "description": "Queue unavailable"
+            "description": "Provisioning in progress, queue unavailable, or model loading",
+            "headers": {
+              "Retry-After": {
+                "description": "Suggested retry delay in seconds, when retryable",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Error-Code": {
+                "description": "SDK-stable gateway or worker error code",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Server-Version": {
+                "description": "Gateway-compatible server version advertised by this gateway",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Version": {
+                "description": "Gateway package version that handled the request",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "`/v1/completions` — legacy OpenAI Completions (single-candidate, raw-prompt).",
@@ -3813,36 +3843,6 @@
               }
             }
           },
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProvisioningResponse"
-                }
-              }
-            },
-            "description": "Worker provisioning in progress",
-            "headers": {
-              "Retry-After": {
-                "description": "Suggested retry delay in seconds",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Server-Version": {
-                "description": "Gateway-compatible server version advertised by this gateway",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Version": {
-                "description": "Gateway package version that handled the request",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
           "400": {
             "content": {
               "application/json": {
@@ -3954,7 +3954,7 @@
                 }
               }
             },
-            "description": "Model loading, capacity, queue unavailable, or GPU not configured",
+            "description": "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted",
             "headers": {
               "Retry-After": {
                 "description": "Suggested retry delay in seconds, when retryable",
@@ -4180,36 +4180,6 @@
               }
             }
           },
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProvisioningResponse"
-                }
-              }
-            },
-            "description": "Worker provisioning in progress",
-            "headers": {
-              "Retry-After": {
-                "description": "Suggested retry delay in seconds",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Server-Version": {
-                "description": "Gateway-compatible server version advertised by this gateway",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Version": {
-                "description": "Gateway package version that handled the request",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
           "400": {
             "content": {
               "application/json": {
@@ -4321,7 +4291,7 @@
                 }
               }
             },
-            "description": "Queue unavailable, GPU not configured, model loading, or capacity exhausted",
+            "description": "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted",
             "headers": {
               "Retry-After": {
                 "description": "Suggested retry delay in seconds, when retryable",
@@ -4548,36 +4518,6 @@
               }
             }
           },
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProvisioningResponse"
-                }
-              }
-            },
-            "description": "Worker provisioning in progress",
-            "headers": {
-              "Retry-After": {
-                "description": "Suggested retry delay in seconds",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Server-Version": {
-                "description": "Gateway-compatible server version advertised by this gateway",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Version": {
-                "description": "Gateway package version that handled the request",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
           "400": {
             "content": {
               "application/json": {
@@ -4689,7 +4629,7 @@
                 }
               }
             },
-            "description": "Queue unavailable, GPU not configured, model loading, or capacity exhausted",
+            "description": "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted",
             "headers": {
               "Retry-After": {
                 "description": "Suggested retry delay in seconds, when retryable",
@@ -4804,17 +4744,75 @@
                 }
               }
             },
-            "description": "Generated text response"
-          },
-          "202": {
-            "content": {
-              "application/json": {
+            "description": "Generated text response",
+            "headers": {
+              "X-Inference-Time": {
+                "description": "Worker-reported inference time in milliseconds",
                 "schema": {
-                  "$ref": "#/components/schemas/ProvisioningResponse"
+                  "type": "string"
+                }
+              },
+              "X-Payload-Fetch-Time": {
+                "description": "Worker-reported offloaded payload fetch time in milliseconds, when available",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Postprocessing-Time": {
+                "description": "Worker-reported postprocessing time in milliseconds, when available",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Queue-Publish-Time": {
+                "description": "Milliseconds spent publishing work to the queue",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Queue-Time": {
+                "description": "Worker-reported queue time in milliseconds",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Queue-Wait-Time": {
+                "description": "Milliseconds spent waiting for worker results",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Request-Id": {
+                "description": "Gateway request id for queue-backed inference",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Server-Version": {
+                "description": "Gateway-compatible server version advertised by this gateway",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Version": {
+                "description": "Gateway package version that handled the request",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Worker": {
+                "description": "Logical queue worker tag that produced the response",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Tokenization-Time": {
+                "description": "Worker-reported tokenization time in milliseconds, when available",
+                "schema": {
+                  "type": "string"
                 }
               }
-            },
-            "description": "Worker provisioning in progress"
+            }
           },
           "400": {
             "content": {
@@ -4871,7 +4869,33 @@
                 }
               }
             },
-            "description": "Queue unavailable or model loading"
+            "description": "Provisioning in progress, queue unavailable, or model loading",
+            "headers": {
+              "Retry-After": {
+                "description": "Suggested retry delay in seconds, when retryable",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Error-Code": {
+                "description": "SDK-stable gateway or worker error code",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Server-Version": {
+                "description": "Gateway-compatible server version advertised by this gateway",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Version": {
+                "description": "Gateway package version that handled the request",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "504": {
             "content": {
@@ -5416,7 +5440,33 @@
                 }
               }
             },
-            "description": "Queue unavailable"
+            "description": "Provisioning in progress, queue unavailable, or model loading",
+            "headers": {
+              "Retry-After": {
+                "description": "Suggested retry delay in seconds, when retryable",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Error-Code": {
+                "description": "SDK-stable gateway or worker error code",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Server-Version": {
+                "description": "Gateway-compatible server version advertised by this gateway",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-SIE-Version": {
+                "description": "Gateway package version that handled the request",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "summary": "`/v1/responses` — OpenAI Responses API (MVP, stateless single-turn).",
@@ -5607,36 +5657,6 @@
               }
             }
           },
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProvisioningResponse"
-                }
-              }
-            },
-            "description": "Worker provisioning in progress",
-            "headers": {
-              "Retry-After": {
-                "description": "Suggested retry delay in seconds",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Server-Version": {
-                "description": "Gateway-compatible server version advertised by this gateway",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-SIE-Version": {
-                "description": "Gateway package version that handled the request",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
           "400": {
             "content": {
               "application/json": {
@@ -5748,7 +5768,7 @@
                 }
               }
             },
-            "description": "Queue unavailable, GPU not configured, model loading, or capacity exhausted",
+            "description": "Provisioning in progress, queue unavailable, GPU not configured, model loading, or capacity exhausted",
             "headers": {
               "Retry-After": {
                 "description": "Suggested retry delay in seconds, when retryable",

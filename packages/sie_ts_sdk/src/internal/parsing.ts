@@ -25,15 +25,22 @@ import type {
   WorkerInfo,
 } from "../types.js";
 import {
-  HTTP_ACCEPTED,
   HTTP_CLIENT_ERROR_MAX,
   HTTP_CLIENT_ERROR_MIN,
   HTTP_SERVER_ERROR_MAX,
   HTTP_SERVER_ERROR_MIN,
   MSGPACK_CONTENT_TYPE,
+  PROVISIONING_ERROR_CODE,
 } from "./constants.js";
 
 import { getRetryAfter as getRetryAfterFromHeader } from "./retry.js";
+
+const SIE_ERROR_CODE_HEADER = "X-SIE-Error-Code";
+
+function normalizeErrorCode(code: string | undefined): string | undefined {
+  if (code === "provisioning") return PROVISIONING_ERROR_CODE;
+  return code;
+}
 
 /**
  * Parse GPU parameter from "pool/gpu" format
@@ -94,10 +101,13 @@ export async function getErrorDetail(
  * Extract error code from response body (handles both JSON and msgpack)
  */
 export async function getErrorCode(response: Response): Promise<string | undefined> {
+  const headerCode = response.headers.get(SIE_ERROR_CODE_HEADER);
+  if (headerCode) return headerCode;
+
   const detail = await getErrorDetail(response);
   if (!detail) return undefined;
   const code = detail.code;
-  return typeof code === "string" ? code : undefined;
+  return typeof code === "string" ? normalizeErrorCode(code) : undefined;
 }
 
 /**
@@ -173,7 +183,7 @@ export async function handleError(response: Response, gpu?: string): Promise<nev
 
   // Prefer nested ``error`` / ``detail`` objects (gateway + FastAPI dict detail),
   // same as Python ``handle_error``. Legacy: string ``detail``, or top-level
-  // ``message`` (e.g. gateway 202 provisioning body).
+  // ``message``.
   const detail = await getErrorDetail(response.clone());
 
   let code: string | undefined;
@@ -202,8 +212,9 @@ export async function handleError(response: Response, gpu?: string): Promise<nev
       message = response.statusText;
     }
   }
+  code = response.headers.get(SIE_ERROR_CODE_HEADER) ?? normalizeErrorCode(code);
 
-  if (status === HTTP_ACCEPTED) {
+  if (status === 503 && code === PROVISIONING_ERROR_CODE) {
     const retryAfter = getRetryAfter(response);
     throw new ProvisioningError(message, gpu, retryAfter);
   }

@@ -111,17 +111,6 @@ pub struct MachineProfile {
     pub spot: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProvisioningResponse {
-    pub status: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub gpu: String,
-    pub estimated_wait_s: i32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub message: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub event: String,

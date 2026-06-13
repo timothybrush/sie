@@ -25,6 +25,7 @@ def _make_registry(*, loaded: bool = True, loading: bool = False) -> MagicMock:
     reg = MagicMock()
     reg.model_names = ["test/model"]
     reg.device = "cpu"
+    reg.has_model.return_value = True
     reg.is_loaded.return_value = loaded
     reg.is_loading.return_value = loading
     reg.get_config.return_value = MagicMock()
@@ -90,6 +91,14 @@ class TestEnsureModelReady:
         reg = _make_registry(loaded=True)
         ex = QueueExecutor(reg)
         assert await ex.ensure_model_ready("test/model") == "ready"
+        reg.start_load_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_loaded_but_no_config_returns_retry_later(self) -> None:
+        reg = _make_registry(loaded=True)
+        reg.has_model.return_value = False
+        ex = QueueExecutor(reg)
+        assert await ex.ensure_model_ready("test/model") == "retry_later"
         reg.start_load_async.assert_not_called()
 
     @pytest.mark.asyncio

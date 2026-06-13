@@ -158,6 +158,7 @@ class AppFactory:
             memory_config=memory_config,
             device=config.device,
             engine_config=engine_config,
+            pool_name=config.pool_name,
         )
         try:
             # Start background services (memory monitor, idle evictor, hot reload).

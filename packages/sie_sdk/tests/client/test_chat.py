@@ -6,7 +6,7 @@ Mocks the httpx layer; exercises:
 - ``stream_chat_completions`` SSE chunk yielding + ``stream:true`` body.
 - ``stream_generate`` SSE chunk yielding + HF-id path normalization.
 - A mid-stream error chunk raises ``ServerError``.
-- A 202 pre-stream response is retried, then the stream is consumed.
+- A 503 PROVISIONING pre-stream response is retried, then the stream is consumed.
 """
 
 from __future__ import annotations
@@ -171,11 +171,15 @@ def test_stream_raises_server_error_on_error_chunk() -> None:
         client.close()
 
 
-def test_stream_chat_retries_202_then_streams() -> None:
-    s202 = _FakeStream(status_code=202, headers={"Retry-After": "0.01"}, json_body={"detail": {"message": "prov"}})
+def test_stream_chat_retries_503_provisioning_then_streams() -> None:
+    s503 = _FakeStream(
+        status_code=503,
+        headers={"Retry-After": "0.01", "content-type": "application/json"},
+        json_body={"error": {"code": "PROVISIONING", "message": "prov"}},
+    )
     s200 = _FakeStream(lines=_sse(_chat_chunk("ok", finish="stop")))
     with patch("sie_sdk.client.sync.httpx.Client") as mc:
-        mc.return_value.stream.side_effect = [s202, s200]
+        mc.return_value.stream.side_effect = [s503, s200]
         client = SIEClient("http://localhost:8080")
         out = list(client.stream_chat_completions("m", [{"role": "user", "content": "hi"}], provision_timeout_s=5.0))
         assert [c["choices"][0]["delta"].get("content") for c in out] == ["ok"]

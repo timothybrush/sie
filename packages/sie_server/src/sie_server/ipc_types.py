@@ -45,6 +45,7 @@ METHOD_SIGNAL_GENERATE_CANCEL = "SignalGenerateCancel"
 # Direct ``sie-server`` HTTP execution does not use this IPC boundary.
 METHOD_RUN_BATCH = "RunBatch"
 METHOD_APPLY_MODEL_CONFIG = "ApplyModelConfig"
+METHOD_REPLACE_MODEL_CONFIGS = "ReplaceModelConfigs"
 METHOD_DRAIN = "Drain"
 
 
@@ -160,6 +161,25 @@ class ApplyModelConfigResponse(msgspec.Struct):
     applied: bool
     bundle_config_hash: str
     config_version: int = 0
+
+
+class ReplaceModelConfigEntry(msgspec.Struct):
+    model_id: str
+    model_config: str
+
+
+class ReplaceModelConfigsRequest(msgspec.Struct):
+    bundle_id: str
+    epoch: int
+    bundle_config_hash: str
+    models: list[ReplaceModelConfigEntry]
+
+
+class ReplaceModelConfigsResponse(msgspec.Struct):
+    applied: bool
+    bundle_config_hash: str
+    config_version: int = 0
+    applied_models: list[str] = msgspec.field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------

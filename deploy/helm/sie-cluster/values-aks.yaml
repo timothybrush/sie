@@ -137,9 +137,18 @@ workers:
         limits:
           cpu: "4"
           memory: "16Gi"
+      # AKS GPU pool taint (set on every GPU node). Required regardless of spot.
+      # AKS spot pool taint (set only when machineProfiles.<name>.spot=true);
+      # without this, the worker pod stays Pending on spot nodes even after
+      # cluster-autoscaler scales the pool up, because every kubelet on a spot
+      # VMSS adds `kubernetes.azure.com/scalesetpriority=spot:NoSchedule`.
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
+          effect: NoSchedule
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
           effect: NoSchedule
       bundles:
         default:

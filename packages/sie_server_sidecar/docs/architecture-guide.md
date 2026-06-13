@@ -283,11 +283,13 @@ the model descriptor cache, and returns the bundle hash it computes locally.
 
 When `SIE_CONFIG_SERVICE_URL` is set, the sidecar also runs an export
 reconciler. It performs a startup `GET /v1/configs/export`, then polls
-`GET /v1/configs/epoch`. If the control-plane epoch is ahead, or if the slow
-full-export reconcile is due for an epoch-0/no-config-store deployment, it replays
-only export entries whose `affected_bundles` include this worker's bundle. The
-advertised hash advances only after every relevant export entry applies
-successfully, so a partial replay does not produce a false worker ACK.
+`GET /v1/configs/epoch`. If the control-plane epoch is ahead, if the
+control-plane `bundle_config_hashes_hash` changes, or if the slow full-export
+reconcile is due for an epoch-0/no-config-store deployment, it sends the full
+bundle-relevant export set to Python over IPC `ReplaceModelConfigs`. Python
+validates every entry, unloads removed or changed loaded models, and replaces
+the bundle-scoped registry view. The advertised hash advances only after that
+replacement succeeds, so a partial export does not produce a false worker ACK.
 
 The NATS health publisher reads that hash dynamically, so the gateway's
 `/v1/configs/models/{id}/status` endpoint observes worker convergence without
@@ -311,7 +313,7 @@ task, then creates the worker-specific generation stream.
 - **Durable config drift.** The sidecar cleans up overlapping consumers, but a
   pure durable config change may still need operator cleanup if JetStream
   rejects an update.
-- **Config replay scope.** Worker-side export reconciliation replays model
+- **Config replay scope.** Worker-side export reconciliation replaces model
   configs, not bundle definitions or adapter code. Bundle changes still require
   a matching `sie-config`/worker image rollout; the running sidecar can only
   apply configs for adapters already present in the co-located Python image.

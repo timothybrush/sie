@@ -563,7 +563,8 @@ class PoolSpec(TypedDict, total=False):
     renews the lease.
 
     Attributes:
-        name: Pool name (required). Used in GPU param as "pool_name/machine_profile".
+        name: Pool name (required). Used in GPU param as "pool_name/machine_profile";
+            the gateway stores and routes pool names in lowercase.
         gpus: Optional GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.

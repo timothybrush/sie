@@ -8,7 +8,7 @@
 //!
 //! This poller closes that gap by periodically calling
 //! `GET /v1/configs/epoch` on `sie-config` and comparing the response to
-//! the gateway's last-known control-plane state on TWO axes:
+//! the gateway's last-known control-plane state on three axes:
 //!
 //! 1. **Model epoch** (`ConfigEpoch`, monotonic counter bumped on every
 //!    model-config write). A remote-ahead value triggers a full
@@ -20,8 +20,13 @@
 //!    a full bootstrap so the gateway picks up bundle additions or changes
 //!    without requiring a gateway pod restart (and without depending on a
 //!    coincidental model write to bump the epoch).
+//! 3. **Bundle config hashes hash** (`BundleConfigHashesHash`, sha256
+//!    fingerprint of `sie-config`'s per-bundle config-hash map). A mismatch
+//!    triggers the same full bootstrap so a gateway cannot stay wedged with
+//!    stale expected hashes while healthy workers advertise the current
+//!    control-plane hash.
 //!
-//! Both axes funnel into the same `bootstrap_once` call — that function
+//! All axes funnel into the same `bootstrap_once` call — that function
 //! re-fetches bundles and models together, which is the correct blanket
 //! response to any control-plane drift we observe.
 //!
@@ -34,9 +39,9 @@
 //!   arrives over NATS and is lost in flight, we need the poller to catch
 //!   remote=1 vs local=0 and trigger a catch-up. Gating on `local != 0`
 //!   would wedge the gateway silently until the next restart.
-//! - The epoch endpoint is a deliberately tiny payload (one integer +
-//!   one short hex string). It is much cheaper than `/export` and can run
-//!   on a short cadence without stressing `sie-config`.
+//! - The epoch endpoint is a deliberately tiny payload (one integer plus
+//!   short fingerprints). It is much cheaper than `/export` and can run on
+//!   a short cadence without stressing `sie-config`.
 //! - Errors are logged and swallowed. A transient epoch-endpoint failure
 //!   does not reset the local epoch or the stored bundle hash; the next
 //!   tick retries.
@@ -46,16 +51,17 @@
 //!   poller re-runs `bootstrap_once` and, on success, force-resets the
 //!   local counter to the remote value. Without this branch the
 //!   `remote > local` catch-up trigger would be permanently unreachable.
-//! - Empty remote `bundles_hash` means `sie-config` is in a
-//!   registry-degraded state (startup failure or hot reload in flight).
-//!   We skip the hash-mismatch branch in that case rather than thrash
-//!   fetching an empty bundle set.
+//! - Empty remote hashes mean `sie-config` is in a registry-degraded state
+//!   (startup failure or hot reload in flight), or the peer is too old to
+//!   emit that field. We skip that hash-mismatch branch rather than thrash
+//!   fetching an empty control-plane view.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
+use crate::state::bundle_config_hashes_hash::BundleConfigHashesHash;
 use crate::state::bundles_hash::BundlesHash;
 use crate::state::config_bootstrap::{bootstrap_once, BootstrapClient, BootstrapError};
 use crate::state::config_epoch::ConfigEpoch;
@@ -73,6 +79,7 @@ pub fn spawn(
     registry: Arc<ModelRegistry>,
     config_epoch: ConfigEpoch,
     bundles_hash: BundlesHash,
+    bundle_config_hashes_hash: BundleConfigHashesHash,
     interval: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let base = base_url?.to_string();
@@ -100,6 +107,7 @@ pub fn spawn(
             ticker.tick().await;
             let local_epoch_val = config_epoch.get();
             let local_bundles_hash = bundles_hash.get();
+            let local_bundle_config_hashes_hash = bundle_config_hashes_hash.get();
             let snapshot = match client.fetch_epoch().await {
                 Ok(s) => s,
                 Err(BootstrapError::BadStatus { status, .. }) => {
@@ -114,6 +122,7 @@ pub fn spawn(
 
             let remote_epoch = snapshot.epoch;
             let remote_bundles_hash = snapshot.bundles_hash;
+            let remote_bundle_config_hashes_hash = snapshot.bundle_config_hashes_hash;
             // Skip the bundle-hash comparison when sie-config reported the
             // empty "registry unavailable" sentinel. Treating empty as a
             // real change would make us thrash every tick while the control
@@ -121,8 +130,10 @@ pub fn spawn(
             // still runs normally.
             let bundles_hash_drift =
                 !remote_bundles_hash.is_empty() && remote_bundles_hash != local_bundles_hash;
+            let bundle_config_hashes_hash_drift = !remote_bundle_config_hashes_hash.is_empty()
+                && remote_bundle_config_hashes_hash != local_bundle_config_hashes_hash;
 
-            // Branch priority matters when both axes drift in the same
+            // Branch priority matters when multiple axes drift in the same
             // tick (e.g. sie-config restarts with an ephemeral store: the
             // epoch rewinds AND the bundles_hash shifts because the
             // restarted instance recomputed it from the baked baseline).
@@ -163,9 +174,17 @@ pub fn spawn(
                     local_epoch = local_epoch_val,
                     remote_epoch = remote_epoch,
                     bundles_hash_drift,
+                    bundle_config_hashes_hash_drift,
                     "local epoch is ahead of sie-config authority; re-fetching export before force-reset"
                 );
-                match bootstrap_once(&client, registry.as_ref(), &config_epoch, &bundles_hash).await
+                match bootstrap_once(
+                    &client,
+                    registry.as_ref(),
+                    &config_epoch,
+                    &bundles_hash,
+                    &bundle_config_hashes_hash,
+                )
+                .await
                 {
                     Ok(_) => {
                         // `bootstrap_once` advanced via `set_max`, which is
@@ -184,20 +203,32 @@ pub fn spawn(
                         );
                     }
                 }
-            } else if remote_epoch > local_epoch_val || bundles_hash_drift {
+            } else if remote_epoch > local_epoch_val
+                || bundles_hash_drift
+                || bundle_config_hashes_hash_drift
+            {
                 info!(
                     local_epoch = local_epoch_val,
                     remote_epoch = remote_epoch,
                     bundles_hash_drift,
+                    bundle_config_hashes_hash_drift,
                     reason = if remote_epoch > local_epoch_val {
                         "epoch ahead"
-                    } else {
+                    } else if bundles_hash_drift {
                         "bundle hash changed"
+                    } else {
+                        "bundle config hashes changed"
                     },
                     "control-plane drift detected; re-running bootstrap"
                 );
-                if let Err(e) =
-                    bootstrap_once(&client, registry.as_ref(), &config_epoch, &bundles_hash).await
+                if let Err(e) = bootstrap_once(
+                    &client,
+                    registry.as_ref(),
+                    &config_epoch,
+                    &bundles_hash,
+                    &bundle_config_hashes_hash,
+                )
+                .await
                 {
                     warn!(error = %e, "catch-up bootstrap failed; will retry next tick");
                 }
@@ -245,7 +276,7 @@ mod tests {
         (registry, temp)
     }
 
-    async fn mount_bundles(server: &MockServer) {
+    async fn mount_bundle_endpoints(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/v1/configs/bundles"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -265,6 +296,10 @@ mod tests {
             ))
             .mount(server)
             .await;
+    }
+
+    async fn mount_bundles(server: &MockServer) {
+        mount_bundle_endpoints(server).await;
         Mock::given(method("GET"))
             .and(path("/v1/configs/export"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -299,6 +334,7 @@ mod tests {
         let (registry, _tmp) = make_registry();
         let config_epoch = ConfigEpoch::new();
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         // Pretend a prior bootstrap recorded a different hash — the
         // "before the sie-config redeploy" state.
         bundles_hash.store("stale_hash".to_string());
@@ -309,6 +345,7 @@ mod tests {
             Arc::clone(&registry),
             config_epoch.clone(),
             bundles_hash.clone(),
+            bundle_config_hashes_hash.clone(),
             Duration::from_millis(50),
         )
         .expect("poller should spawn");
@@ -330,6 +367,75 @@ mod tests {
         // Epoch path was NOT the trigger — remote == local == 0 — proving
         // the hash-drift branch stands on its own.
         assert_eq!(config_epoch.get(), 0);
+
+        handle.abort();
+    }
+
+    /// Regression for stale gateway expected-hash state: a no-store
+    /// `sie-config` redeploy can rebuild filesystem baseline model configs at
+    /// epoch 0 while keeping the same bundle set. Workers and sie-config then
+    /// agree on a new `bundle_config_hash`, but a gateway that only watches
+    /// epoch + bundle-set hash keeps routing against the old value forever.
+    #[tokio::test]
+    async fn bundle_config_hashes_drift_triggers_bootstrap_without_epoch_or_bundle_drift() {
+        let server = MockServer::start().await;
+        mount_bundle_endpoints(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/epoch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": 0,
+                "bundles_hash": "same_bundle_surface",
+                "bundle_config_hashes_hash": "new_config_hashes_fingerprint",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/export"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "snapshot_version": 1,
+                "epoch": 0,
+                "generated_at": "2026-04-17T00:00:00Z",
+                "bundle_config_hashes": {"default": "new_control_plane_hash"},
+                "models": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let (registry, _tmp) = make_registry();
+        let config_epoch = ConfigEpoch::new();
+        let bundles_hash = BundlesHash::new();
+        bundles_hash.store("same_bundle_surface".to_string());
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
+        bundle_config_hashes_hash.store("stale_config_hashes_fingerprint".to_string());
+
+        let handle = spawn(
+            Some(&server.uri()),
+            None,
+            Arc::clone(&registry),
+            config_epoch.clone(),
+            bundles_hash.clone(),
+            bundle_config_hashes_hash.clone(),
+            Duration::from_millis(50),
+        )
+        .expect("poller should spawn");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if bundle_config_hashes_hash.get() == "new_config_hashes_fingerprint" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("poller should pick up bundle-config-hashes drift within 3s");
+
+        assert_eq!(config_epoch.get(), 0);
+        assert_eq!(bundles_hash.get(), "same_bundle_surface");
+        assert_eq!(
+            registry.compute_bundle_config_hash("default"),
+            "new_control_plane_hash"
+        );
 
         handle.abort();
     }
@@ -366,6 +472,7 @@ mod tests {
         config_epoch.set_max(10);
         assert_eq!(config_epoch.get(), 10);
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         bundles_hash.store("pre_restart_hash".to_string());
 
         let handle = spawn(
@@ -374,6 +481,7 @@ mod tests {
             Arc::clone(&registry),
             config_epoch.clone(),
             bundles_hash.clone(),
+            bundle_config_hashes_hash.clone(),
             Duration::from_millis(50),
         )
         .expect("poller should spawn");
@@ -463,6 +571,7 @@ mod tests {
         let config_epoch = ConfigEpoch::new();
         config_epoch.set_max(10);
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         bundles_hash.store("pre_restart_hash".to_string());
 
         let interval = Duration::from_millis(50);
@@ -472,6 +581,7 @@ mod tests {
             Arc::clone(&registry),
             config_epoch.clone(),
             bundles_hash.clone(),
+            bundle_config_hashes_hash.clone(),
             interval,
         )
         .expect("poller should spawn");
@@ -537,6 +647,7 @@ mod tests {
         let (registry, _tmp) = make_registry();
         let config_epoch = ConfigEpoch::new();
         let bundles_hash = BundlesHash::new();
+        let bundle_config_hashes_hash = BundleConfigHashesHash::new();
         bundles_hash.store("stale_hash".to_string());
 
         let handle = spawn(
@@ -545,6 +656,7 @@ mod tests {
             Arc::clone(&registry),
             config_epoch.clone(),
             bundles_hash.clone(),
+            bundle_config_hashes_hash.clone(),
             Duration::from_millis(50),
         )
         .expect("poller should spawn");

@@ -1,7 +1,10 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::http_error::{code as err_code, json_detail};
+
+const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROVISIONING_RETRY_AFTER: &str = "60";
 
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +24,7 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let is_gpu_provisioning = matches!(self, AppError::GpuProvisioning(_));
         let (status, code, message) = match &self {
             AppError::NoWorkerAvailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -28,7 +32,7 @@ impl IntoResponse for AppError {
                 self.to_string(),
             ),
             AppError::GpuProvisioning(_) => (
-                StatusCode::ACCEPTED,
+                StatusCode::SERVICE_UNAVAILABLE,
                 err_code::PROVISIONING,
                 self.to_string(),
             ),
@@ -45,7 +49,26 @@ impl IntoResponse for AppError {
         };
 
         let body = json_detail(code, message);
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if is_gpu_provisioning {
+            response.headers_mut().insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from_static(PROVISIONING_RETRY_AFTER),
+            );
+            response.headers_mut().insert(
+                HeaderName::from_static("x-sie-error-code"),
+                HeaderValue::from_static(err_code::PROVISIONING),
+            );
+            response.headers_mut().insert(
+                HeaderName::from_static("x-sie-version"),
+                HeaderValue::from_static(GATEWAY_VERSION),
+            );
+            response.headers_mut().insert(
+                HeaderName::from_static("x-sie-server-version"),
+                HeaderValue::from_static(GATEWAY_VERSION),
+            );
+        }
+        response
     }
 }
 
@@ -66,11 +89,26 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_provisioning_is_202() {
+    fn test_gpu_provisioning_is_503() {
         assert_eq!(
             response_status(AppError::GpuProvisioning("l4".into())),
-            StatusCode::ACCEPTED
+            StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn test_gpu_provisioning_has_retry_headers() {
+        let response = AppError::GpuProvisioning("l4".into()).into_response();
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            PROVISIONING_RETRY_AFTER
+        );
+        assert_eq!(
+            response.headers().get("x-sie-error-code").unwrap(),
+            err_code::PROVISIONING
+        );
+        assert!(response.headers().get("x-sie-version").is_some());
+        assert!(response.headers().get("x-sie-server-version").is_some());
     }
 
     #[test]

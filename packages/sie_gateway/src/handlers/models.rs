@@ -163,6 +163,7 @@ fn canonical_worker_models(
 fn worker_only_model_info(name: &str, loaded: bool) -> Value {
     ModelEntry {
         name: name.to_string(),
+        pool: None,
         bundles: Vec::new(),
         adapter_modules: HashSet::new(),
         profile_names: HashSet::new(),
@@ -409,6 +410,7 @@ mod route_tests {
                 name: model_id.to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 tasks: None,
@@ -530,6 +532,7 @@ mod route_tests {
                 name: model_id.to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 tasks: Some(serde_yaml::from_str("generate: {}").unwrap()),

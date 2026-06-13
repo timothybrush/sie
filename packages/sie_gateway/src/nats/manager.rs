@@ -638,6 +638,7 @@ adapters:
             name: "test/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles: {
                 let mut profiles = HashMap::new();
                 profiles.insert(

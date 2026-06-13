@@ -12,7 +12,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SIEClient } from "../src/client.js";
-import { RequestError, SIEConnectionError, ServerError } from "../src/errors.js";
+import { ProvisioningError, RequestError, SIEConnectionError, ServerError } from "../src/errors.js";
 import { packMessage, unpackMessage } from "../src/msgpack.js";
 
 // Mock fetch globally
@@ -545,7 +545,7 @@ describe("SIEClient.close()", () => {
   });
 });
 
-describe("SIEClient retry on connection errors and generic 503s", () => {
+describe("SIEClient retry on connection errors and provisioning 503s", () => {
   beforeEach(() => {
     mockFetch.mockClear();
     // Fake timers also fake Date.now(), which requestWithRetry uses.
@@ -636,7 +636,7 @@ describe("SIEClient retry on connection errors and generic 503s", () => {
     await client.close();
   });
 
-  it("should retry on generic 503 (no error code) when waitForCapacity is true", async () => {
+  it("should retry on 503 PROVISIONING when waitForCapacity is true", async () => {
     const client = new SIEClient("http://localhost:8080", {
       timeout: 30_000,
       provisionTimeout: 60_000,
@@ -644,10 +644,18 @@ describe("SIEClient retry on connection errors and generic 503s", () => {
 
     mockFetch
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ detail: "no healthy workers" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "PROVISIONING",
+              message: "No capacity available. Server is provisioning.",
+            },
+          }),
+          {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
       )
       .mockResolvedValueOnce(
         createMsgpackResponse({
@@ -667,25 +675,51 @@ describe("SIEClient retry on connection errors and generic 503s", () => {
     await client.close();
   });
 
-  it("should not retry on generic 503 when waitForCapacity is false", async () => {
+  it("should throw ProvisioningError on 503 PROVISIONING when waitForCapacity is false", async () => {
     const client = new SIEClient("http://localhost:8080", { timeout: 1000 });
 
     mockFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "no healthy workers" }), {
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "PROVISIONING",
+            message: "No capacity available. Server is provisioning.",
+          },
+        }),
+        {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Retry-After": "7" },
+        },
+      ),
+    );
+
+    await expect(
+      client.encode("bge-m3", { text: "test" }, { waitForCapacity: false }),
+    ).rejects.toThrow(ProvisioningError);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    await client.close();
+  });
+
+  it("should not retry on generic 503 even when waitForCapacity is true", async () => {
+    const client = new SIEClient("http://localhost:8080", { timeout: 1000 });
+
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "service unavailable" }), {
         status: 503,
         headers: { "Content-Type": "application/json" },
       }),
     );
 
     await expect(
-      client.encode("bge-m3", { text: "test" }, { waitForCapacity: false }),
+      client.encode("bge-m3", { text: "test" }, { waitForCapacity: true }),
     ).rejects.toThrow(ServerError);
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
     await client.close();
   });
 
-  it("should honor Retry-After header on generic 503", async () => {
+  it("should honor Retry-After header on 503 PROVISIONING", async () => {
     const client = new SIEClient("http://localhost:8080", {
       timeout: 30_000,
       provisionTimeout: 60_000,
@@ -693,13 +727,21 @@ describe("SIEClient retry on connection errors and generic 503s", () => {
 
     mockFetch
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ detail: "no healthy workers" }), {
-          status: 503,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": "2", // < DEFAULT_RETRY_DELAY (5s)
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "PROVISIONING",
+              message: "No capacity available. Server is provisioning.",
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "2", // < DEFAULT_RETRY_DELAY (5s)
+            },
           },
-        }),
+        ),
       )
       .mockResolvedValueOnce(
         createMsgpackResponse({
@@ -817,6 +859,30 @@ describe("Real-world usage patterns", () => {
 
     await client.close();
   });
+
+  it("should convert images to wire format before encode serialization", async () => {
+    const client = new SIEClient("http://localhost:8080");
+    const imageBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0]);
+
+    mockFetch.mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ dense: { values: new Float32Array([0.1, 0.2]) } }],
+      }),
+    );
+
+    await client.encode("colpali-v1.3", { id: "page-1", images: [imageBytes] });
+
+    const fetchCall = mockFetch.mock.calls[0];
+    const body = fetchCall?.[1]?.body as Uint8Array;
+    const parsed = unpackMessage<{
+      items?: { images?: { data: Uint8Array; format: string }[] }[];
+    }>(body);
+
+    expect(parsed.items?.[0]?.images?.[0]?.data).toEqual(imageBytes);
+    expect(parsed.items?.[0]?.images?.[0]?.format).toBe("jpeg");
+
+    await client.close();
+  });
 });
 
 describe("SIEClient.score() - reranking", () => {
@@ -903,6 +969,34 @@ describe("SIEClient.score() - reranking", () => {
     const fetchCall = mockFetch.mock.calls[0];
     const headers = fetchCall?.[1]?.headers as Record<string, string>;
     expect(headers["X-SIE-MACHINE-PROFILE"]).toBe("a100-80gb");
+  });
+
+  it("should convert image query and items to wire format before score serialization", async () => {
+    const queryImage = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1]);
+    const itemImage = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 2]);
+
+    mockFetch.mockResolvedValueOnce(
+      createMsgpackResponse({
+        model: "qwen3-vl-reranker",
+        scores: [{ item_id: "page-1", score: 0.9, rank: 0 }],
+      }),
+    );
+
+    await client.score("qwen3-vl-reranker", { text: "rocket nozzle", images: [queryImage] }, [
+      { id: "page-1", images: [itemImage] },
+    ]);
+
+    const fetchCall = mockFetch.mock.calls[0];
+    const body = fetchCall?.[1]?.body as Uint8Array;
+    const parsed = unpackMessage<{
+      query?: { images?: { data: Uint8Array; format: string }[] };
+      items?: { images?: { data: Uint8Array; format: string }[] }[];
+    }>(body);
+
+    expect(parsed.query?.images?.[0]?.data).toEqual(queryImage);
+    expect(parsed.query?.images?.[0]?.format).toBe("jpeg");
+    expect(parsed.items?.[0]?.images?.[0]?.data).toEqual(itemImage);
+    expect(parsed.items?.[0]?.images?.[0]?.format).toBe("jpeg");
   });
 });
 
@@ -1012,6 +1106,27 @@ describe("SIEClient.extract() - NER", () => {
     const parsed = unpackMessage<{ params?: { labels?: string[] } }>(body);
 
     expect(parsed.params?.labels).toEqual(["person", "organization", "location"]);
+  });
+
+  it("should convert images to wire format before extract serialization", async () => {
+    const imageBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0]);
+
+    mockFetch.mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ entities: [] }],
+      }),
+    );
+
+    await client.extract("docling", { id: "page-1", images: [imageBytes] }, { labels: [] });
+
+    const fetchCall = mockFetch.mock.calls[0];
+    const body = fetchCall?.[1]?.body as Uint8Array;
+    const parsed = unpackMessage<{
+      items?: { images?: { data: Uint8Array; format: string }[] }[];
+    }>(body);
+
+    expect(parsed.items?.[0]?.images?.[0]?.data).toEqual(imageBytes);
+    expect(parsed.items?.[0]?.images?.[0]?.format).toBe("jpeg");
   });
 
   it("should pass threshold option in params", async () => {

@@ -33,7 +33,7 @@ class ProvisioningError(SIEError):
     """Error when capacity is not available and provisioning timed out.
 
     Raised when:
-    - Server returns 202 (no capacity, provisioning)
+    - Server returns 503 with PROVISIONING code
     - wait_for_capacity=False (caller doesn't want to wait)
     - Or provisioning timeout exceeded
 

@@ -21,7 +21,9 @@ use tracing::{debug, info, warn};
 
 use crate::health_publisher::SharedBundleConfigHash;
 use crate::ipc_client::{IpcClient, IpcError};
-use crate::ipc_types::ApplyModelConfigRequest;
+use crate::ipc_types::{
+    ApplyModelConfigRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
+};
 use crate::metrics::MetricsRegistry;
 use crate::shutdown::Shutdown;
 
@@ -137,9 +139,7 @@ impl ConfigApplyState {
 
     fn mark_applied(&self, epoch: u64, bundle_config_hash: String) {
         if epoch == 0 {
-            if !bundle_config_hash.is_empty() {
-                self.set_bundle_hash(bundle_config_hash);
-            }
+            self.set_bundle_hash(bundle_config_hash);
             return;
         }
 
@@ -150,9 +150,7 @@ impl ConfigApplyState {
                 .compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    if !bundle_config_hash.is_empty() {
-                        self.set_bundle_hash(bundle_config_hash);
-                    }
+                    self.set_bundle_hash(bundle_config_hash);
                     return;
                 }
                 Err(observed) => current = observed,
@@ -176,9 +174,7 @@ impl ConfigApplyState {
             self.set_epoch_max(epoch);
         }
         if let Some(hash) = bundle_config_hash {
-            if !hash.is_empty() {
-                self.set_bundle_hash(hash);
-            }
+            self.set_bundle_hash(hash);
         }
         true
     }
@@ -316,14 +312,6 @@ async fn wait_retry_or_shutdown(shutdown: &Shutdown, delay: Duration) -> bool {
         biased;
         _ = shutdown.wait() => true,
         _ = sleep(delay) => false,
-    }
-}
-
-fn authoritative_bundle_hash(notification_hash: &str, applied_hash: &str) -> String {
-    if notification_hash.is_empty() {
-        applied_hash.to_string()
-    } else {
-        notification_hash.to_string()
     }
 }
 
@@ -465,6 +453,45 @@ pub(crate) async fn apply_via_ipc_with_retry(
                         attempt,
                         error = %e,
                         "worker-config: Python registry apply still waiting"
+                    );
+                }
+                if wait_retry_or_shutdown(&shutdown, retry_delay).await {
+                    return Ok(None);
+                }
+                retry_delay = next_retry_delay(retry_delay);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+pub(crate) async fn replace_via_ipc_with_retry(
+    ipc: Arc<IpcClient>,
+    shutdown: Arc<Shutdown>,
+    req: ReplaceModelConfigsRequest,
+    epoch: u64,
+) -> Result<Option<ReplaceModelConfigsResponse>, IpcError> {
+    let mut retry_delay = RETRY_BASE_DELAY;
+    let mut attempt = 0_u64;
+    loop {
+        match ipc.replace_model_configs(req.clone()).await {
+            Ok(resp) => return Ok(Some(resp)),
+            Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
+                attempt = attempt.saturating_add(1);
+                if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
+                    warn!(
+                        epoch,
+                        attempt,
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        error = %e,
+                        "worker-config: transient Python registry replace failure; retrying"
+                    );
+                } else {
+                    debug!(
+                        epoch,
+                        attempt,
+                        error = %e,
+                        "worker-config: Python registry replace still waiting"
                     );
                 }
                 if wait_retry_or_shutdown(&shutdown, retry_delay).await {
@@ -621,8 +648,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
         return;
     }
 
-    let applied_bundle_hash =
-        authoritative_bundle_hash(&notification.bundle_config_hash, &resp.bundle_config_hash);
+    let applied_bundle_hash = resp.bundle_config_hash.clone();
 
     if !notification.bundle_config_hash.is_empty()
         && !resp.bundle_config_hash.is_empty()
@@ -633,7 +659,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
             epoch = notification.epoch,
             advertised_hash = %notification.bundle_config_hash,
             applied_hash = %resp.bundle_config_hash,
-            "worker-config: Python registry hash differs from control-plane hash; advertising control-plane hash"
+            "worker-config: Python registry hash differs from control-plane hash; advertising Python-applied hash"
         );
         record_delta(metrics, kind, "hash_mismatch");
     } else {
@@ -739,6 +765,22 @@ mod tests {
     }
 
     #[test]
+    fn live_apply_can_clear_bundle_hash() {
+        let state = ConfigApplyState::new("old".into());
+        state.mark_applied(4, String::new());
+        assert_eq!(state.epoch(), 4);
+        assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn export_reconcile_can_clear_bundle_hash() {
+        let state = ConfigApplyState::new("old".into());
+        assert!(state.mark_export_reconciled(4, Some(String::new()), false));
+        assert_eq!(state.epoch(), 4);
+        assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "");
+    }
+
+    #[test]
     fn accepted_hash_history_keeps_inflight_work_processable() {
         let state = ConfigApplyState::new("h0".into());
         assert!(state.accepts_bundle_config_hash(""));
@@ -749,18 +791,6 @@ mod tests {
         assert!(state.accepts_bundle_config_hash("h0"));
         assert!(state.accepts_bundle_config_hash("h1"));
         assert!(!state.accepts_bundle_config_hash("missing"));
-    }
-
-    #[test]
-    fn advertised_notification_hash_wins_after_successful_apply() {
-        assert_eq!(
-            authoritative_bundle_hash("control-plane", "python-local"),
-            "control-plane"
-        );
-        assert_eq!(
-            authoritative_bundle_hash("", "python-local"),
-            "python-local"
-        );
     }
 
     #[test]

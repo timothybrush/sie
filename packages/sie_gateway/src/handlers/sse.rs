@@ -215,7 +215,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
             let lower = e.to_lowercase();
             let retry_after = if lower.contains("no consumers") {
                 metrics::record_rejected_request_for_pool(&pool, &gpu, &bundle, "no_consumers");
-                Some("120")
+                Some(crate::handlers::proxy::PROVISIONING_RETRY_AFTER)
             } else if lower.contains("backpressure") {
                 metrics::record_rejected_request_for_pool(&pool, &gpu, &bundle, "backpressure");
                 Some("5")

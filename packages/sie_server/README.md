@@ -32,7 +32,7 @@ sie-server serve --port 8080 --device cuda:0
 
 | Env var | Default | Effect |
 |--|--|--|
-| `SIE_MEMORY_PRESSURE_THRESHOLD_PERCENT` | `85` | VRAM utilisation that triggers reactive LRU eviction by the pressure monitor. |
+| `SIE_MEMORY_PRESSURE_THRESHOLD_PERCENT` | `95` | VRAM utilisation that triggers reactive LRU eviction by the pressure monitor. |
 | `SIE_OOM_RECOVERY__ENABLED` | `true` | Master switch for reactive OOM recovery in the worker dispatch path (`cache_clear → evict_lru → split_batch`). |
 | `SIE_OOM_RECOVERY__STRATEGY` | `cache_clear,evict_lru,split_batch` | Ordered recovery actions. Earlier actions tried first. |
 | `SIE_OOM_RECOVERY__MAX_SPLIT_DEPTH` | `4` | Cap on recursive batch halving (≤16 sub-batches). |

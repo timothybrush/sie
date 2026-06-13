@@ -61,10 +61,17 @@ class ModelAdapter(ABC):
         mechanism (e.g., engine.shutdown()) that fully releases memory.
 
     Main Thread Requirement:
-        Some adapters (e.g., SGLang) use signal handlers that only work in
+        Some adapters may use parent-process signal handlers that only work in
         the main thread. Set requires_main_thread = True for these adapters.
         The registry will run load() directly in the event loop instead of
         in a thread pool, which blocks but ensures main thread execution.
+
+    Adapter-Owned Load Timeout:
+        Subprocess-backed adapters may own a cleanup-safe startup timeout. Set
+        manages_own_load_timeout = True for those adapters so the registry runs
+        the load + warmup marker path in the model-load executor without
+        wrapping it in the generic Python wait_for timeout, which cannot kill
+        the underlying thread.
 
     Device-Aware Factory Method:
         Adapters can override create_for_device() to return different adapter
@@ -73,8 +80,11 @@ class ModelAdapter(ABC):
         properties (fallback_adapter_path, fallback_kwargs_overrides).
     """
 
-    # Set to True for adapters that need main thread (e.g., SGLang signal handlers)
+    # Set to True only for adapters that need parent-process main-thread execution.
     requires_main_thread: bool = False
+
+    # Set to True for adapters with their own cleanup-safe load/warmup timeout.
+    manages_own_load_timeout: bool = False
 
     @classmethod
     def create_for_device(cls, device: str, **kwargs: Any) -> "ModelAdapter":

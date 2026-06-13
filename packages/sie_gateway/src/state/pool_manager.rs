@@ -76,6 +76,23 @@ impl std::fmt::Display for InvalidMachineProfileError {
 
 impl std::error::Error for InvalidMachineProfileError {}
 
+#[derive(Debug)]
+pub struct InvalidPoolNameError {
+    pub name: String,
+}
+
+impl std::fmt::Display for InvalidPoolNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Invalid pool name '{}': only [A-Za-z0-9_-] are allowed (max 128 chars)",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for InvalidPoolNameError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolAdmissionStatus {
     pub cap: u32,
@@ -120,14 +137,19 @@ impl PoolManager {
         let static_pool_names = self.static_pool_names.read().await.clone();
         let mut pools = self.pools.write().await;
         let mut count = 0;
-        for pool in k8s_pools {
+        for mut pool in k8s_pools {
             if !Self::should_restore_pool_from_k8s(&pool) {
                 continue;
             }
+            if let Err(e) = validate_pool_name(&pool.spec.name) {
+                warn!(pool = %pool.spec.name, error = %e, "skipping invalid pool from K8s restore");
+                continue;
+            }
+            pool.spec.name = normalize_pool_name(&pool.spec.name);
             if static_pool_names.contains(&normalize_pool_name(&pool.spec.name)) {
                 continue;
             }
-            if !pools.contains_key(&pool.spec.name) {
+            if pool_key_for_name(&pools, &pool.spec.name).is_none() {
                 info!(pool = %pool.spec.name, "restored pool from K8s");
                 pools.insert(pool.spec.name.clone(), pool);
                 count += 1;
@@ -137,7 +159,7 @@ impl PoolManager {
     }
 
     fn should_restore_pool_from_k8s(pool: &Pool) -> bool {
-        pool.spec.name != DEFAULT_POOL_NAME
+        !pool.spec.name.eq_ignore_ascii_case(DEFAULT_POOL_NAME)
     }
 
     fn now_secs() -> f64 {
@@ -215,6 +237,7 @@ impl PoolManager {
         let mut normalized_specs = Vec::new();
         let mut desired_names = HashSet::new();
         for spec in specs {
+            validate_pool_name(&spec.name)?;
             let name = normalize_pool_name(&spec.name);
             if name.is_empty() || name == DEFAULT_POOL_NAME {
                 continue;
@@ -391,27 +414,37 @@ impl PoolManager {
         ttl_seconds: Option<u64>,
         minimum_worker_count: u32,
     ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
+        let raw_name = name;
+        validate_pool_name(name)?;
+        let name = normalize_pool_name(name);
+        if name == DEFAULT_POOL_NAME && raw_name != DEFAULT_POOL_NAME {
+            return Err(Box::new(DefaultPoolMutationError));
+        }
         let gpus = Self::normalize_gpus_and_caps(gpus, &gpu_caps);
         self.validate_pool_profiles(&gpus, &gpu_caps)?;
-        let is_static_pool = self.is_static_pool(name).await;
+        let is_static_pool = self.is_static_pool(&name).await;
         if is_static_pool {
             return Err(Box::new(StaticPoolMutationError {
-                name: name.to_string(),
+                name: raw_name.to_string(),
             }));
         }
 
         let now = Self::now_secs();
         let mut pools = self.pools.write().await;
 
-        // Idempotent: return existing pool if found
-        if let Some(existing) = pools.get_mut(name) {
+        // Idempotent: return/update the existing pool, including
+        // case-variant requests for the same logical pool name.
+        if let Some(pool_key) = pool_key_for_name(&pools, &name) {
+            let existing = pools
+                .get_mut(&pool_key)
+                .expect("pool key resolved from the same map");
             let spec_changed = existing.spec.bundle != bundle
                 || existing.spec.gpus != gpus
                 || existing.spec.gpu_caps != gpu_caps
                 || existing.spec.ttl_seconds != ttl_seconds
                 || existing.spec.minimum_worker_count != minimum_worker_count;
 
-            if name == DEFAULT_POOL_NAME && spec_changed {
+            if pool_key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) && spec_changed {
                 return Err(Box::new(DefaultPoolMutationError));
             }
 
@@ -433,16 +466,16 @@ impl PoolManager {
 
             // Persist spec updates and renew the K8s Lease (best-effort,
             // skip default pool).
-            if name != DEFAULT_POOL_NAME {
+            if !pool_key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
                 if let Some(ref backend) = self.k8s_backend {
                     if spec_changed {
                         if let Err(e) = backend.save_pool(&result).await {
-                            warn!(error = %e, pool = name, "failed to persist pool update to K8s");
+                            warn!(error = %e, pool = %pool_key, "failed to persist pool update to K8s");
                         }
                     }
                     let ttl = Self::lease_ttl_seconds(&result);
-                    if let Err(e) = backend.create_or_renew_lease(name, ttl).await {
-                        warn!(error = %e, pool = name, "failed to renew K8s Lease");
+                    if let Err(e) = backend.create_or_renew_lease(&pool_key, ttl).await {
+                        warn!(error = %e, pool = %pool_key, "failed to renew K8s Lease");
                     }
                 }
             }
@@ -455,7 +488,7 @@ impl PoolManager {
 
         let pool = Pool {
             spec: PoolSpec {
-                name: name.to_string(),
+                name: name.clone(),
                 bundle,
                 gpus,
                 gpu_caps,
@@ -470,23 +503,23 @@ impl PoolManager {
             },
         };
 
-        pools.insert(name.to_string(), pool.clone());
+        pools.insert(name.clone(), pool.clone());
         drop(pools); // release write lock before K8s call
-        info!(pool = name, "created pool");
+        info!(pool = %name, "created pool");
         crate::metrics::POOL_EVENTS
             .with_label_values(&["created"])
             .inc();
 
         // Persist dynamic named pools to K8s. The default pool is synthetic
         // per gateway replica and is not a lease-owned runtime pool.
-        if name != DEFAULT_POOL_NAME {
+        if !name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
             if let Some(ref backend) = self.k8s_backend {
                 if let Err(e) = backend.save_pool(&pool).await {
-                    warn!(error = %e, pool = name, "failed to persist pool to K8s");
+                    warn!(error = %e, pool = %name, "failed to persist pool to K8s");
                 }
                 let ttl = Self::lease_ttl_seconds(&pool);
-                if let Err(e) = backend.create_or_renew_lease(name, ttl).await {
-                    warn!(error = %e, pool = name, "failed to create K8s Lease");
+                if let Err(e) = backend.create_or_renew_lease(&name, ttl).await {
+                    warn!(error = %e, pool = %name, "failed to create K8s Lease");
                 }
             }
         }
@@ -612,7 +645,7 @@ impl PoolManager {
     }
 
     pub async fn delete_pool(&self, name: &str) -> Result<bool, PoolDeletionProtectedError> {
-        if name == DEFAULT_POOL_NAME {
+        if name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
             return Err(PoolDeletionProtectedError::Default);
         }
         if self.is_static_pool(name).await {
@@ -660,7 +693,7 @@ impl PoolManager {
         // Renew the K8s Lease (best-effort, skip default and static Helm pools)
         if let Some(key) = found_key.as_ref() {
             if let Some(ref backend) = self.k8s_backend {
-                if key != DEFAULT_POOL_NAME && !is_static_pool {
+                if !key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) && !is_static_pool {
                     if let Err(e) = backend.renew_lease(key).await {
                         warn!(error = %e, pool = %key, "failed to renew K8s Lease");
                     }
@@ -751,7 +784,7 @@ impl PoolManager {
             }
         }
 
-        let state = if pool_key == DEFAULT_POOL_NAME {
+        let state = if pool_key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
             if assigned.is_empty() {
                 PoolState::Pending
             } else {
@@ -773,7 +806,7 @@ impl PoolManager {
         let backend = self.k8s_backend.clone();
         drop(pools);
 
-        if status_changed && pool_key != DEFAULT_POOL_NAME && !is_static_pool {
+        if status_changed && !pool_key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) && !is_static_pool {
             if let Some(ref backend) = backend {
                 if let Err(e) = backend.update_pool_status(&pool_key, &new_status).await {
                     warn!(error = %e, pool = %pool_key, "failed to persist pool assignment status to K8s");
@@ -804,19 +837,29 @@ impl PoolManager {
     /// keep `last_renewed` unchanged, because assignment changes should not
     /// extend the pool lease.
     /// Does NOT write back to K8s (the event already came from K8s).
-    pub async fn apply_remote_pool(&self, pool: Pool) {
-        let name = pool.spec.name.clone();
+    pub async fn apply_remote_pool(&self, mut pool: Pool) {
+        let raw_name = pool.spec.name.clone();
 
         // Skip the default pool -- each gateway manages its own default pool
-        if name == DEFAULT_POOL_NAME {
+        if raw_name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
             return;
         }
+        if let Err(e) = validate_pool_name(&raw_name) {
+            warn!(pool = %raw_name, error = %e, "skipping invalid pool from K8s watch");
+            return;
+        }
+        let name = normalize_pool_name(&raw_name);
+        pool.spec.name = name.clone();
         if self.is_static_pool(&name).await {
             return;
         }
 
         let mut pools = self.pools.write().await;
-        if let Some(existing) = pools.get(&name) {
+        let pool_key = pool_key_for_name(&pools, &name);
+        if let Some(existing_key) = pool_key.as_ref() {
+            let existing = pools
+                .get(existing_key)
+                .expect("pool key resolved from the same map");
             let renewed_delta = pool.status.last_renewed - existing.status.last_renewed;
             if renewed_delta < -TIMESTAMP_TOLERANCE_S {
                 return;
@@ -830,6 +873,10 @@ impl PoolManager {
                     return;
                 }
             }
+
+            if existing_key != &name {
+                pools.remove(existing_key);
+            }
         }
 
         info!(pool = %name, "applied remote pool from K8s watch");
@@ -840,7 +887,7 @@ impl PoolManager {
     /// Does NOT write back to K8s (the event already came from K8s).
     pub async fn remove_remote_pool(&self, name: &str) {
         // Never delete the default pool via watch events
-        if name == DEFAULT_POOL_NAME {
+        if name.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
             return;
         }
         if self.is_static_pool(name).await {
@@ -848,8 +895,9 @@ impl PoolManager {
         }
 
         let mut pools = self.pools.write().await;
-        if pools.remove(name).is_some() {
-            info!(pool = %name, "removed remote pool via K8s watch");
+        if let Some(key) = pool_key_for_name(&pools, name) {
+            pools.remove(&key);
+            info!(pool = %key, "removed remote pool via K8s watch");
         }
     }
 
@@ -861,7 +909,7 @@ impl PoolManager {
         {
             let pools = self.pools.read().await;
             for (name, pool) in pools.iter() {
-                if name == DEFAULT_POOL_NAME
+                if name.eq_ignore_ascii_case(DEFAULT_POOL_NAME)
                     || static_pool_names.contains(&normalize_pool_name(name))
                 {
                     continue;
@@ -883,7 +931,7 @@ impl PoolManager {
             match backend.list_expired_leases().await {
                 Ok(k8s_expired) => {
                     for name in k8s_expired {
-                        if name == DEFAULT_POOL_NAME
+                        if name.eq_ignore_ascii_case(DEFAULT_POOL_NAME)
                             || expired.contains(&name)
                             || static_pool_names.contains(&normalize_pool_name(&name))
                         {
@@ -946,8 +994,24 @@ fn worker_consumes_pool(worker_pool: &str, pool_name: &str) -> bool {
     normalize_pool_name(worker_pool) == normalize_pool_name(pool_name)
 }
 
-fn normalize_pool_name(name: &str) -> String {
+pub(crate) fn normalize_pool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+fn validate_pool_name(name: &str) -> Result<(), InvalidPoolNameError> {
+    if !name.is_empty()
+        && name.len() <= 128
+        && !name.eq_ignore_ascii_case("_default")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        Ok(())
+    } else {
+        Err(InvalidPoolNameError {
+            name: name.to_string(),
+        })
+    }
 }
 
 fn pool_key_for_name(pools: &HashMap<String, Pool>, name: &str) -> Option<String> {
@@ -988,6 +1052,24 @@ mod tests {
             bundle.to_string(),
             pool.to_string(),
         )
+    }
+
+    #[test]
+    fn test_validate_pool_name_matches_route_contract() {
+        for name in ["default", "customer-acme", "bench_1", "A100Pool"] {
+            validate_pool_name(name).unwrap();
+        }
+
+        for name in ["", "foo.bar", "foo*", "foo>", "foo bar", " foo", "_default"] {
+            assert!(validate_pool_name(name).is_err(), "{name:?} should fail");
+        }
+        assert!(validate_pool_name(&"a".repeat(129)).is_err());
+        validate_pool_name(&"a".repeat(128)).unwrap();
+    }
+
+    #[test]
+    fn test_normalize_pool_name_canonicalizes_case() {
+        assert_eq!(normalize_pool_name("Customer-Acme"), "customer-acme");
     }
 
     #[tokio::test]
@@ -1063,12 +1145,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_pool_rejects_invalid_pool_names() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        for name in ["", "bench.l4", "bench*", "bench>", "bench pool", "_default"] {
+            let mut gpus = HashMap::new();
+            gpus.insert("l4-spot".to_string(), 1);
+            let result = pm.create_pool(name, gpus, None, None, 0).await;
+            assert!(result.is_err(), "{name:?} should fail");
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid pool name"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_rejects_default_case_variant() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+        pm.create_default_pool().await;
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        let result = pm.create_pool("Default", gpus, None, None, 0).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default pool"));
+        let pools = pm.list_pools().await;
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].spec.name, DEFAULT_POOL_NAME);
+
+        let idempotent_case_variant = pm
+            .create_pool("Default", HashMap::new(), None, None, 0)
+            .await;
+        assert!(idempotent_case_variant.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_updates_case_variant_dynamic_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("Bench", gpus, None, None, 0).await.unwrap();
+
+        let mut updated_gpus = HashMap::new();
+        updated_gpus.insert("l4-spot".to_string(), 2);
+        let pool = pm
+            .create_pool("bench", updated_gpus, None, Some(60), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.spec.name, "bench");
+        assert_eq!(pool.spec.gpus.get("l4-spot"), Some(&2));
+        assert_eq!(pool.spec.ttl_seconds, Some(60));
+        let pools = pm.list_pools().await;
+        assert_eq!(pools.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_delete_default_pool_fails() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
         pm.create_default_pool().await;
 
         let result = pm.delete_pool(DEFAULT_POOL_NAME).await;
         assert!(result.is_err());
+
+        let case_variant = pm.delete_pool("Default").await;
+        assert!(case_variant.is_err());
     }
 
     #[tokio::test]
@@ -1228,6 +1372,28 @@ mod tests {
             .to_string()
             .contains("static Helm queue pool"));
         assert!(pm.renew_pool("BENCH").await);
+    }
+
+    #[tokio::test]
+    async fn test_static_pool_rejects_invalid_name() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let specs = vec![PoolSpec {
+            name: " bench".to_string(),
+            bundle: None,
+            gpus: HashMap::from([("l4-spot".to_string(), 0)]),
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+        }];
+
+        let result = pm.sync_static_pools(&specs).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid pool name"));
+        assert!(pm.list_pools().await.is_empty());
     }
 
     #[tokio::test]
@@ -1928,6 +2094,10 @@ mod tests {
         };
 
         assert!(!PoolManager::should_restore_pool_from_k8s(&pool));
+
+        let mut case_variant = pool;
+        case_variant.spec.name = "Default".to_string();
+        assert!(!PoolManager::should_restore_pool_from_k8s(&case_variant));
     }
 
     #[tokio::test]
@@ -2043,6 +2213,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_remote_pool_case_variant_updates_existing_logical_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        let local = pm
+            .create_pool("Bench", gpus, None, Some(60), 0)
+            .await
+            .unwrap();
+
+        let mut remote = local.clone();
+        remote.spec.name = "bench".to_string();
+        remote.spec.ttl_seconds = Some(120);
+        remote.status.last_renewed += 1.0;
+
+        pm.apply_remote_pool(remote).await;
+
+        let pools = pm.list_pools().await;
+        assert_eq!(pools.len(), 1);
+        let found = pm.get_pool("Bench").await.unwrap();
+        assert_eq!(found.spec.name, "bench");
+        assert_eq!(found.spec.ttl_seconds, Some(120));
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_pool_skips_invalid_pool_name() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let remote = Pool {
+            spec: PoolSpec {
+                name: "bench.l4".to_string(),
+                bundle: None,
+                gpus: HashMap::from([("l4-spot".to_string(), 1)]),
+                gpu_caps: HashMap::new(),
+                ttl_seconds: Some(60),
+                minimum_worker_count: 0,
+            },
+            status: PoolStatus {
+                state: PoolState::Pending,
+                assigned_workers: Vec::new(),
+                created_at: 1000.0,
+                last_renewed: 1000.0,
+            },
+        };
+
+        pm.apply_remote_pool(remote).await;
+
+        assert!(pm.list_pools().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_remove_remote_pool_skips_default() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
         pm.create_default_pool().await;
@@ -2050,6 +2271,21 @@ mod tests {
         pm.remove_remote_pool(DEFAULT_POOL_NAME).await;
 
         assert!(pm.get_pool(DEFAULT_POOL_NAME).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_remove_remote_pool_case_variant_removes_existing_logical_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("Bench", gpus, None, Some(60), 0)
+            .await
+            .unwrap();
+
+        pm.remove_remote_pool("bench").await;
+
+        assert!(pm.get_pool("Bench").await.is_none());
     }
 
     #[tokio::test]

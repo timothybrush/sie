@@ -98,7 +98,7 @@ pub async fn healthz() -> impl IntoResponse {
     get,
     path = "/readyz",
     tag = "health",
-    description = "Process readiness only. Always returns 200 once the gateway is serving requests; never returns 503. Worker readiness is reported by GET /health and by inference responses (202 + Retry-After from a workerless gateway). This contract supports KEDA scale-from-zero.",
+    description = "Process readiness only. Always returns 200 once the gateway is serving requests; never returns 503. Worker readiness is reported by GET /health and by inference responses with retryable provisioning signals from a workerless gateway. This contract supports KEDA scale-from-zero.",
     responses(
         (status = 200, description = "Gateway process is ready", body = String, content_type = "text/plain; charset=utf-8")
     )

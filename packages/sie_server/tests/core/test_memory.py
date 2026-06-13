@@ -140,7 +140,7 @@ class TestMemoryConfig:
         """Test default configuration values."""
         config = MemoryConfig()
 
-        assert config.pressure_threshold == 0.85
+        assert config.pressure_threshold == 0.95
         assert config.min_free_bytes is None
         assert config.proactive_eviction is True
 
@@ -308,6 +308,25 @@ class TestMemoryManager:
 
         assert manager.check_pressure() is True
 
+    def test_default_threshold_tolerates_sglang_static_pool_overhead(self) -> None:
+        """Default threshold stays above 85% static pools plus normal overhead."""
+        manager = MemoryManager(device="cpu")
+
+        manager._tracker = MagicMock()
+        manager._tracker.get_stats.return_value = MemoryStats(
+            used_bytes=866,
+            total_bytes=1000,
+            device_type="cpu",
+        )
+        assert manager.check_pressure() is False
+
+        manager._tracker.get_stats.return_value = MemoryStats(
+            used_bytes=96,
+            total_bytes=100,
+            device_type="cpu",
+        )
+        assert manager.check_pressure() is True
+
     def test_check_pressure_min_free_bytes(self) -> None:
         """Test pressure check with min_free_bytes threshold."""
         manager = MemoryManager(
@@ -327,8 +346,8 @@ class TestMemoryManager:
 
         # Mock high memory usage
         mock_stats = MemoryStats(
-            used_bytes=9 * (1024**3),
-            total_bytes=10 * (1024**3),
+            used_bytes=96,
+            total_bytes=100,
             device_type="cpu",
         )
         manager._tracker = MagicMock()
@@ -363,8 +382,8 @@ class TestMemoryManager:
 
         # Mock high memory usage
         mock_stats = MemoryStats(
-            used_bytes=9 * (1024**3),
-            total_bytes=10 * (1024**3),
+            used_bytes=96,
+            total_bytes=100,
             device_type="cpu",
         )
         manager._tracker = MagicMock()

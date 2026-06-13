@@ -13,7 +13,7 @@ Top-level summary:
 The gateway's contract with `sie-config` is three shapes. Everything else below elaborates on them.
 
 1. `GET /v1/configs/export` — full snapshot, consumed on cold start and on drift detection.
-2. `GET /v1/configs/epoch` — monotonic integer, polled every 30s to detect drift.
+2. `GET /v1/configs/epoch` — monotonic integer plus compact fingerprints, polled every 30s to detect drift.
 3. `sie.config.models._all` (NATS Core) — live deltas; missed ones are caught by (2).
 
 The gateway's contract with admin tooling for post-write readiness is `GET /v1/configs/models/{id}/status`.
@@ -58,8 +58,8 @@ Rules enforced on the inference path:
 - If the queue transport is unavailable (no usable NATS client at init), the gateway returns `503`. It does not fall back to direct mode.
 - Unknown model ids fast-fail with `404` whenever the in-memory `ModelRegistry` has been populated (either by the filesystem seed or by a successful bootstrap / delta from `sie-config`). In the pre-bootstrap edge case where the registry is still empty — no seed, no export applied yet — the proxy falls back to the caller-supplied bundle (or `"default"`) so an unseeded gateway can still publish work to a cold pool that a caller pinned via `X-SIE-Pool`. Once any model is registered, this fallback is disabled and the 404 contract applies.
 - Automatic pool selection only considers healthy workers whose reported `bundle_config_hash` matches the gateway's expected hash. Explicit `X-SIE-Pool` remains an operator override; deliveries with hashes unknown to the worker-sidecar are NAKed before Python IPC.
-- On scale-from-zero — i.e. no healthy worker registered for the `(bundle, machine_profile)` tuple and the caller did not pin an explicit pool — the gateway returns `202 provisioning` with `Retry-After: 120` and records pending demand for KEDA. This applies whether or not the caller set `X-SIE-MACHINE-PROFILE`; default-routing clients get the same contract as profile-pinned clients.
-- On no-consumer conditions for the JetStream publish the gateway returns `503` with `Retry-After: 120`. On backpressure conditions the gateway returns `503` with `Retry-After: 5`.
+- On scale-from-zero — i.e. no healthy worker registered for the `(bundle, machine_profile)` tuple and the caller did not pin an explicit pool — the gateway records pending demand for KEDA and returns a retryable `503` provisioning response with `Retry-After: 60`, `X-SIE-Error-Code: PROVISIONING`, and gateway version headers. SIE-native surfaces use the SDK retry envelope (`{"error":{"code","message"}}`); OpenAI-compatible surfaces (`/v1/generate`, `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`) use the OpenAI error envelope, because standard OpenAI clients parse 2xx as successful model output. This applies whether or not the caller set `X-SIE-MACHINE-PROFILE`; default-routing clients get the same contract as profile-pinned clients.
+- On no-consumer conditions for the JetStream publish, the gateway treats the miss as the same pre-execution provisioning state and returns the same retryable `503 PROVISIONING` contract (`Retry-After: 60`, `X-SIE-Error-Code: PROVISIONING`, and surface-specific error envelope). On backpressure conditions the gateway returns `503` with `Retry-After: 5`.
 - On queue result timeouts the gateway returns `503` with `X-SIE-Error-Code: MODEL_LOADING` and `Retry-After: 5`. The most common trigger is a worker cold-loading the target model on demand (worker NAKs the JetStream message and redelivers after load); the SDK retries this under the same `provision_timeout_s` budget used for worker-emitted `MODEL_LOADING` responses.
 - When workers report failure on every item of a batch with the **same retryable error code** in `WorkResult.error_code`, the gateway translates that into a `503` with the SDK-expected envelope (`error.code`, `Retry-After`, `X-SIE-Error-Code`) so the SDK auto-retries. Currently recognised codes: `RESOURCE_EXHAUSTED` (worker-side OOM recovery exhausted — `Retry-After: 5`), `MODEL_LOADING`, and `LORA_LOADING`. **Mixed batches** (different codes per item) keep going through the compatibility `500 all_items_failed` path with per-item `code` fields exposed in `details[]`, so callers can see exactly which items hit which failure mode. Workers reporting `RESOURCE_EXHAUSTED` are **not** marked unhealthy — losing an allocation race is not a worker-health signal.
 - When **every** failed item carries **`MODEL_LOAD_FAILED`**, the gateway returns **`502 Bad Gateway`** with the SDK-style **`error`** object (`code`, `message`, `error_class`, `attempts`, `permanent`) — matching the terminal model-load contract consumed by SDK retry logic (no `Retry-After`; the SDK must not burn the `MODEL_LOADING` retry budget). The gateway synthesises conservative `attempts` / `permanent` fields on this queue path when the worker payload does not carry registry-shaped failure metadata.
@@ -67,8 +67,12 @@ Rules enforced on the inference path:
 Encode / extract tuning fields (`output_types`, `instruction`, `options`, `labels`, `output_schema`, `is_query`) are read **only** from the nested JSON **`params`** object (and the msgpack analogue: a top-level **`params`** map). The score path continues to read `query` / `instruction` / `options` at the top level of the request body, matching `sie_server`.
 
 Work-item and result payloads on the wire are **msgpack** (`rmp_serde`). JSON is used only for the HTTP request/response envelope when the client negotiates it (via `Content-Type` / `Accept`); the gateway transcodes msgpack ↔ JSON at the edge so the hot path between gateway and workers is always binary.
+On SIE-native JSON requests, media byte fields such as `items[].images[].data`
+are accepted as base64 strings at the HTTP edge and decoded into msgpack `bin`
+before the gateway publishes the worker item, preserving the worker-side typed
+`bytes` contract behind gateway-fronted clusters.
 
-Gateway-generated **JSON error** bodies (validation, routing, auth, config read, pools) use a FastAPI-like envelope **`{"detail":{"code":"<STABLE_CODE>","message":"…", …}}`**. Extra diagnostic keys (e.g. `compatible_bundles`, `gpu`, `model`) live **inside** `detail` when present. This is intentionally **not** the same shape as SDK retry contracts, which remain **`{"error":{"code","message"}}`** for **503** retryable worker signals and **`502`** **`MODEL_LOAD_FAILED`**. **202 provisioning** and **200** success payloads keep their existing top-level shapes.
+Gateway-generated **JSON error** bodies (validation, routing, auth, config read, pools) use a FastAPI-like envelope **`{"detail":{"code":"<STABLE_CODE>","message":"…", …}}`**. Extra diagnostic keys (e.g. `compatible_bundles`, `gpu`, `model`) live **inside** `detail` when present. This is intentionally **not** the same shape as SDK retry contracts, which remain **`{"error":{"code","message"}}`** for **503** retryable worker signals, SIE-native provisioning, and **`502`** **`MODEL_LOAD_FAILED`**. OpenAI-compatible provisioning uses the OpenAI error envelope. **200** success payloads keep their existing top-level shapes.
 
 ## 3. Configuration Write Path
 
@@ -120,10 +124,10 @@ The gateway does not block startup on `sie-config`. Startup is:
 
 1. Construct `ModelRegistry`. In default Helm deploys, `SIE_BUNDLES_DIR` and `SIE_MODELS_DIR` are unset and the registry's filesystem reload is a no-op (warns once that the dirs are missing, then proceeds with empty bundle and model maps). The optional `gateway.embeddedConfigs` / `gateway.configMap` overlays mount a ConfigMap at `/configs/{bundles,models}` and set those env vars; in that mode the registry loads the seed before bootstrap runs.
 2. Initialize the other runtime subsystems that do not depend on `sie-config`: NATS manager (with config-delta subscription), worker health manager, optional filesystem config watcher, pool manager / K8s backend, and worker discovery.
-3. Spawn two independent background tasks: `state::config_bootstrap::spawn_bootstrap_retry` and `state::config_poller::spawn`. They share the same `ModelRegistry`, `ConfigEpoch` (monotonic model-write counter), and `BundlesHash` (sha256 fingerprint of `sie-config`'s loaded bundle set). The poller skips its first tick (one `DEFAULT_POLL_INTERVAL` grace) so the initial bootstrap attempt can run first, and then reconciles on every subsequent tick regardless of whether the bootstrap task has completed yet.
+3. Spawn two independent background tasks: `state::config_bootstrap::spawn_bootstrap_retry` and `state::config_poller::spawn`. They share the same `ModelRegistry`, `ConfigEpoch` (monotonic model-write counter), `BundlesHash` (sha256 fingerprint of `sie-config`'s loaded bundle set), and `BundleConfigHashesHash` (sha256 fingerprint of the per-bundle config-hash map). The poller skips its first tick (one `DEFAULT_POLL_INTERVAL` grace) so the initial bootstrap attempt can run first, and then reconciles on every subsequent tick regardless of whether the bootstrap task has completed yet.
 4. Bind the HTTP listener. Kubernetes probes use plain-text endpoints implemented in `handlers/health.rs`:
    - **`GET /healthz`** — liveness. Always **`200 OK`** with body **`ok`** and **`Content-Type: text/plain; charset=utf-8`** (same wire shape as `sie_server`'s `/healthz`).
-   - **`GET /readyz`** — readiness for **routing traffic to this gateway process**. Returns **`200 OK`** + **`ok`** once the gateway listener is serving. It is intentionally independent of worker health and `sie-config` reachability: a gateway with zero healthy workers must still receive the first inference request so it can return `202 + Retry-After` and emit `sie_gateway_pending_demand` for scale-from-zero. Worker availability is exposed on **`GET /health`** and by the inference response path itself.
+   - **`GET /readyz`** — readiness for **routing traffic to this gateway process**. Returns **`200 OK`** + **`ok`** once the gateway listener is serving. It is intentionally independent of worker health and `sie-config` reachability: a gateway with zero healthy workers must still receive the first inference request so it can return a retryable provisioning response and emit `sie_gateway_pending_demand` for scale-from-zero. Worker availability is exposed on **`GET /health`** and by the inference response path itself.
 
 The bootstrap/poller tasks are spawned **before** the HTTP listener binds, so requests hitting a freshly-bound replica can observe either filesystem-seed-only state or a partially-applied snapshot depending on timing. That is by design. **`/readyz` does not wait for control-plane sync** (see §11 caveat 3); bootstrap completeness is tracked via **`GET /v1/configs/models/{id}/status`**, **`sie_gateway_config_bootstrap_degraded`**, and **`sie_gateway_config_epoch`** — not by `/readyz` alone.
 
@@ -138,14 +142,14 @@ Startup short-circuits:
 
 `bootstrap_once` runs a three-call sequence, authenticated with `SIE_ADMIN_TOKEN` as a bearer token on `SIE_CONFIG_SERVICE_URL`:
 
-1. `GET /v1/configs/epoch` — reads the bundle-set fingerprint BEFORE we fetch bundles, so the hash we store reflects the state we're about to catch up from (the pre-fetch ordering is load-bearing — see below).
+1. `GET /v1/configs/epoch` — reads the compact control-plane fingerprints BEFORE we fetch bundles, so the hashes we store reflect the state we're about to catch up from (the pre-fetch ordering is load-bearing — see below). The `bundle_config_hashes_hash` fingerprint covers both worker-parity bundle config hashes and model-level pool ownership, because top-level `pool` changes affect routing/readiness even when the worker-applied profile hash is otherwise unchanged.
 2. `GET /v1/configs/bundles` and per-id `GET /v1/configs/bundles/{id}` — the two-phase bundle fetch. The YAML bodies are parsed into `BundleInfo` values and handed to `ModelRegistry::install_bundles`, which atomically replaces the registry's bundle set and recomputes every model's bundle associations.
-3. `GET /v1/configs/export` — replays every exported model config into `ModelRegistry` via `add_model_config`. Malformed or unparseable entries are logged and counted as `failed`; they do not abort the loop. Export rows that carry no config body are skipped and are *not* counted as failed.
+3. `GET /v1/configs/export` — parses every exported model config, then replaces the gateway `ModelRegistry` model set from that authoritative snapshot. Malformed, unparseable, or unroutable entries are logged and counted as `failed`; a failed export does not mutate the model set. Export rows that carry no config body are skipped and are *not* counted as failed.
 
-Returns `BootstrapOutcome { epoch, bundles_hash, applied, failed, total }`.
+Returns `BootstrapOutcome { epoch, bundles_hash, bundle_config_hashes_hash, applied, failed, total }`.
 
-- If **any** model entry failed (`outcome.failed > 0`), `bootstrap_once` returns `BootstrapError::PartialApply` and **advances neither `ConfigEpoch` nor `BundlesHash`**. The poller will detect drift on the next tick and retry.
-- If all entries applied, `bootstrap_once` advances `ConfigEpoch` via `set_max(outcome.epoch)`, stores `outcome.bundles_hash` into `BundlesHash`, and the retry task exits.
+- If **any** model entry failed (`outcome.failed > 0`), `bootstrap_once` returns `BootstrapError::PartialApply` and **advances neither `ConfigEpoch`, `BundlesHash`, nor `BundleConfigHashesHash`**. The poller will detect drift on the next tick and retry.
+- If all entries applied, `bootstrap_once` advances `ConfigEpoch` via `set_max(outcome.epoch)`, stores `outcome.bundles_hash` into `BundlesHash`, stores `outcome.bundle_config_hashes_hash` into `BundleConfigHashesHash`, and the retry task exits.
 
 Why fetch `/epoch` BEFORE `/bundles`: if a bundle is added on `sie-config` between our epoch read and our bundle list read, we install a bundle set *newer* than the hash reflects. The next poll tick sees `remote_hash != stored_hash` and re-fetches — a cheap self-heal. The inverse — storing a hash that's *newer* than the bundles we actually installed — would silently wedge the gateway on a stale registry, which is what the bundle-hash mechanism exists to prevent.
 
@@ -165,19 +169,20 @@ During the bootstrap-retry window (before the first successful fetch):
 
 ### 4.2 Epoch poll
 
-`state::config_poller::spawn` runs independently of bootstrap with `DEFAULT_POLL_INTERVAL = 30s`. It skips its first tick (to let the initial bootstrap attempt run without contention), then on every tick calls `GET /v1/configs/epoch` on `sie-config` (always sending `SIE_ADMIN_TOKEN` as the bearer — the `/epoch` handler is read-auth and accepts either `SIE_AUTH_TOKEN` or `SIE_ADMIN_TOKEN`, but the gateway-as-client only presents the admin token). The `/epoch` response carries **two** drift signals:
+`state::config_poller::spawn` runs independently of bootstrap with `DEFAULT_POLL_INTERVAL = 30s`. It skips its first tick (to let the initial bootstrap attempt run without contention), then on every tick calls `GET /v1/configs/epoch` on `sie-config` (always sending `SIE_ADMIN_TOKEN` as the bearer — the `/epoch` handler is read-auth and accepts either `SIE_AUTH_TOKEN` or `SIE_ADMIN_TOKEN`, but the gateway-as-client only presents the admin token). The `/epoch` response carries three drift signals:
 
 - `epoch` — monotonic counter bumped on every model-config write.
 - `bundles_hash` — sha256 fingerprint over `sie-config`'s loaded bundle set. Bundles are filesystem artifacts inside the `sie-config` image, so their effective "version" is redeploy time, which the model-write counter does not observe.
+- `bundle_config_hashes_hash` — sha256 fingerprint over the per-bundle `bundle_config_hash` map from `sie-config` plus model-level pool ownership. This catches no-store/filesystem-baseline redeploys where the epoch and bundle set stay unchanged but the expected routing hashes or model pool assignment move.
 
-Both signals funnel into the same `bootstrap_once` call — that function re-fetches bundles and models together, which is the correct blanket response to any control-plane drift.
+All signals funnel into the same `bootstrap_once` call — that function re-fetches bundles and models together, which is the correct blanket response to any control-plane drift.
 
 Per-tick decisions:
 
-- If `remote_epoch > local_epoch` **OR** `remote_bundles_hash != stored_bundles_hash` (with the empty-string "registry unavailable" sentinel skipped), the poller calls `bootstrap_once`. On success, `ConfigEpoch` advances and `BundlesHash` is updated.
-- If `remote_epoch < local_epoch`, the local counter has run ahead of authority. Most innocent cause: `sie-config` lost its persisted epoch file and restarted at a lower value. Most worrying cause: a forged/untrusted NATS delta wedged the gateway ahead of authority (this is defense-in-depth alongside the producer allowlist — see §4.3). The poller refetches the full export first and only calls `ConfigEpoch::force_set(remote)` if the export succeeded; a failed recovery export keeps `local > remote`, so the next tick re-enters this branch and retries. Note: `ModelRegistry` is append-only for models (but not for bundles — `install_bundles` replaces), so any profiles admitted during the pre-recovery window remain in the registry after recovery — the export replay overlays authority on top of them rather than clearing them. A follow-up restart is the clean fix. Logged at ERROR.
-- A remote `bundles_hash` of `""` is the documented "sie-config registry unavailable" sentinel (startup failure or hot reload in flight). The poller skips the hash-mismatch branch in that case rather than thrash fetching against a degraded control plane. The epoch branch still runs normally.
-- Transient `/epoch` failures are logged and swallowed. The next tick retries. Neither the local epoch nor the stored bundles hash is reset on poll failure.
+- If `remote_epoch > local_epoch`, `remote_bundles_hash != stored_bundles_hash`, or `remote_bundle_config_hashes_hash != stored_bundle_config_hashes_hash` (with empty-string sentinels skipped), the poller calls `bootstrap_once`. On success, `ConfigEpoch`, `BundlesHash`, and `BundleConfigHashesHash` are updated.
+- If `remote_epoch < local_epoch`, the local counter has run ahead of authority. Most innocent cause: `sie-config` lost its persisted epoch file and restarted at a lower value. Most worrying cause: a forged/untrusted NATS delta wedged the gateway ahead of authority (this is defense-in-depth alongside the producer allowlist — see §4.3). The poller refetches the full export first and only calls `ConfigEpoch::force_set(remote)` if the export succeeded; a failed recovery export keeps `local > remote`, so the next tick re-enters this branch and retries. Successful recovery replaces the gateway model set with the authority's export, including removals. Logged at ERROR.
+- A remote hash of `""` is the documented "sie-config registry unavailable" / legacy-field sentinel. The poller skips that hash-mismatch branch rather than thrash fetching against a degraded control plane. The epoch branch still runs normally.
+- Transient `/epoch` failures are logged and swallowed. The next tick retries. Neither the local epoch nor the stored hashes are reset on poll failure.
 - The poller **always** compares local vs. remote, including when `local_epoch == 0` or `stored_bundles_hash == ""`. This matters for fresh clusters: if `sie-config`'s very first write (→ epoch 1) is lost on the wire, the gateway must catch `remote=1 > local=0` and trigger recovery. Gating on "non-zero local" would wedge a fresh gateway until a restart.
 
 Operational consequence: adding or changing a bundle in `sie-config` propagates to running gateways within one `DEFAULT_POLL_INTERVAL` (≤ 30s worst case). No `kubectl rollout restart deployment/sie-gateway` is required for the gateway to learn the updated bundle set.
@@ -213,12 +218,12 @@ The gateway serves these endpoints directly out of its in-memory `ModelRegistry`
 Concurrency on the gateway's `ModelRegistry`:
 
 - Reads are lock-free. `ArcSwap<RegistrySnapshot>` lets readers clone an `Arc` pointer to the current snapshot without blocking.
-- Writes (`add_model_config`, `reload`) hold `write_lock: Mutex<()>` across the `load → mutate → store` cycle. Without this lock, two concurrent writers could both load the same base snapshot and silently drop one set of changes.
+- Writes (`add_model_config`, authoritative export replacement, `reload`) hold `write_lock: Mutex<()>` across the `load → mutate → store` cycle. Without this lock, two concurrent writers could both load the same base snapshot and silently drop one set of changes.
 - `RegistrySnapshot` caches `bundle_config_hashes: HashMap<String, String>`, so the per-request worker-ack hash lookup (§6) is an `O(1)` map read rather than a SHA-256 over tens of KB of JSON.
 
 ## 6. Worker-Ack Status (`GET /v1/configs/models/{id}/status`)
 
-Admin tooling uses this endpoint after a `sie-config` write to observe whether configured workers are reporting the expected `bundle_config_hash` for each affected bundle. Worker-sidecar containers advance that hash after their bundle-scoped NATS delta is accepted by Python IPC `ApplyModelConfig`, or after the worker export reconciler replays the missed bundle entry from `sie-config`.
+Admin tooling uses this endpoint after a `sie-config` write to observe whether configured workers are reporting the expected `bundle_config_hash` for each affected bundle. Worker-sidecar containers advance that hash after their bundle-scoped NATS delta is accepted by Python IPC `ApplyModelConfig`, or after the worker export reconciler replaces the bundle-scoped Python registry view from `sie-config`.
 
 Response shape:
 
@@ -231,6 +236,7 @@ Response shape:
   "bundles": [
     {
       "bundle_id": "default",
+      "pool": "default",
       "expected_bundle_config_hash": "sha256…",
       "total_eligible_workers": 3,
       "acked_workers": ["worker-1", "worker-2", "worker-3"],
@@ -382,7 +388,7 @@ The gateway has no persistent config store. `SIE_CONFIG_STORE_DIR` and `SIE_CONF
 
 1. **`sie-config` is a single point of failure for the control plane.** While the pod is down, config writes, authoritative config reads, and gateway catch-up fetches all fail. **The inference hot path is unaffected** — it never touches `sie-config`. New gateway pods enter the soft-degraded bootstrap-retry state (§4.1), serve filesystem-seed traffic until `sie-config` is reachable, and return **`200 ok`** from **`GET /readyz`** once the process is serving. The SPOF is rooted in `_IdempotencyState` (in-memory, per-process). Multi-replica requires moving idempotency state to a shared backend (Redis, JetStream KV, a DB row per key). Until then, `replicas: 1` is a deliberate trade of availability for a correct idempotency contract.
 
-2. **Config deltas use NATS Core pub/sub; deltas published during a gateway-NATS disconnect are lost.** Recovery is automatic via the epoch poller (§4.2). The worst-case staleness window is `DEFAULT_POLL_INTERVAL` plus one export round-trip. No pod restart is required. Shortening `DEFAULT_POLL_INTERVAL` trades load on `sie-config` for recovery time.
+2. **Config deltas use NATS Core pub/sub; deltas published during a gateway-NATS disconnect are lost.** Recovery is automatic via the config poller (§4.2). The worst-case staleness window is `DEFAULT_POLL_INTERVAL` plus one export round-trip. No pod restart is required. Shortening `DEFAULT_POLL_INTERVAL` trades load on `sie-config` for recovery time.
 
 3. **Bootstrap is background-retried, not blocking.** A gateway started while `sie-config` is unreachable will serve filesystem-seed traffic immediately. API-added models are missing until the first successful export. `ConfigEpoch` typically stays at `0` during this window — but a NATS delta that arrives before the first export can move it above `0`, so admin tooling should use the `sie_gateway_config_bootstrap_degraded` gauge (set after 10 failed attempts or 5 minutes of sustained failure, cleared on first success) as the authoritative "has this replica ever reconciled with `sie-config`?" signal rather than `config_epoch == 0`. **`GET /readyz` does not encode bootstrap completion or worker health**; it is process readiness (§4).
 
@@ -509,7 +515,7 @@ Emitted from a Tower middleware (`MetricsLayer` in `middleware/metrics.rs`) that
 
 ### 15.2 Routing outcomes — gateway
 
-- `sie_gateway_provisioning_responses_total{machine_profile}` — counter. `202 Accepted` returned when no ready worker exists; paired with `sie_gateway_pending_demand` for KEDA scale-up.
+- `sie_gateway_provisioning_responses_total{machine_profile}` — counter. A provisioning response was returned when no ready worker exists; paired with `sie_gateway_pending_demand` for KEDA scale-up.
 - `sie_gateway_rejected_requests_total{pool,machine_profile,bundle,reason}` — counter. In-handler emission because the `reason` label (`timeout`, `capacity`, `no_workers`, ...) is too granular for the middleware.
 - `sie_gateway_pending_demand{pool,machine_profile,bundle}` — gauge. KEDA trigger. Cleared by `clear_fulfilled_demand` when healthy workers appear on the exact queue lane.
 - `sie_gateway_active_lease_gpus{pool,machine_profile,bundle}` — gauge. KEDA trigger. Recomputed from the current pool list on every `update_pool_metrics`; bundle-pinned pools use the pool spec bundle, while unfiltered pools split by the assigned workers' actual bundles.
@@ -540,7 +546,7 @@ Emitted from a Tower middleware (`MetricsLayer` in `middleware/metrics.rs`) that
 
 - `sie_gateway_config_bootstrap_failures_total` — counter. Background bootstrap retry failures (see §10).
 - `sie_gateway_config_bootstrap_degraded` — gauge, `0` or `1`. Set to `1` once the gateway has been serving the filesystem seed past the degraded threshold; cleared on the first successful bootstrap.
-- `sie_gateway_config_epoch` — gauge. Highest-known control-plane epoch on this gateway. Updated by bootstrap fetch, NATS Core delta handler, and the epoch poller. Pairs with `sie_config_epoch` for drift alerting (§15.9).
+- `sie_gateway_config_epoch` — gauge. Highest-known control-plane epoch on this gateway. Updated by bootstrap fetch, NATS Core delta handler, and the config poller. Pairs with `sie_config_epoch` for drift alerting (§15.9).
 - `sie_gateway_config_deltas_total{kind,result}` — counter. NATS Core config-delta processing outcomes. `kind` is the delta kind (`epoch_bump`, `model_added`); `result` is `applied`, `parse_error`, `apply_error`, or `rejected_untrusted`.
 - `sie_gateway_nats_connected` — gauge, `0` or `1`. Flipped by the NATS client's connect/disconnect event callbacks. Unlabeled: the gateway uses a single `async-nats` client for JetStream (work + results) and NATS Core (config deltas), so a single gauge accurately represents the only connection-state dimension that exists today. If we later split clients per purpose, re-introduce a `stream` label at that point.
 
@@ -567,7 +573,7 @@ The most important alert across both services. Fires when any gateway's view of 
 (sie_config_epoch - on() sie_gateway_config_epoch) > 0
 ```
 
-Sustained non-zero for >1 minute means either NATS Core deltas are not flowing (pub/sub has no replay, so a disconnected gateway silently falls behind) or the epoch poller is stuck. The poller normally closes this gap within its poll interval regardless of NATS health, so a sustained alert here is always an actionable incident.
+Sustained non-zero for >1 minute means either NATS Core deltas are not flowing (pub/sub has no replay, so a disconnected gateway silently falls behind) or the config poller is stuck. The poller normally closes this gap within its poll interval regardless of NATS health, so a sustained alert here is always an actionable incident.
 
 ## 16. Worked Example: end-to-end request
 
@@ -724,8 +730,8 @@ POST /v1/pools
 
 Helm publishes canonical machine profiles in `SIE_GATEWAY_CONFIGURED_GPUS`, request aliases in `SIE_GATEWAY_GPU_ALIASES`, and optional deploy-owned static queue pools in `SIE_GATEWAY_STATIC_QUEUE_POOLS`.
 
-Each pool gets its own JetStream stream (`WORK_POOL_{name}`) with subjects `sie.work.{name}.*.*.*`. Workers are deployed with `SIE_POOL={name}`, `SIE_MACHINE_PROFILE={profile}`, and `SIE_BUNDLE={bundle}`; they consume only from their concrete `sie.work.{name}.{profile}.{bundle}.*` lane. The pool is the tenant/logical-capacity boundary; machine profile and bundle are the runtime lane inside that pool. Helm's baseline default puts enabled worker groups in `SIE_POOL=default`, so SDK calls can pass just the machine profile (`gpu="l4"`) for shared-cluster capacity. Dedicated pool deployments override `queuePool` and require callers to name the pool explicitly, for example `gpu="customer-acme/l4"`. A cold `X-SIE-POOL` request without `X-SIE-MACHINE-PROFILE` can emit lane-specific `pending_demand` only when the registered pool spec contains exactly one machine profile; multi-profile pools require the caller to send the profile because the gateway must not guess which StatefulSet KEDA should scale.
+Each pool gets its own JetStream stream (`WORK_POOL_{name}`) with subjects `sie.work.{name}.*.*.*`. Pool names are validated against `[A-Za-z0-9_-]` and canonicalized to lowercase at the API, gateway request, K8s restore/watch, and Helm render boundaries, so NATS subjects and KEDA labels do not split by case. Workers are deployed with `SIE_POOL={name}`, `SIE_MACHINE_PROFILE={profile}`, and `SIE_BUNDLE={bundle}`; they consume only from their concrete `sie.work.{name}.{profile}.{bundle}.*` lane. The pool is the tenant/logical-capacity boundary; machine profile and bundle are the runtime lane inside that pool. Helm's baseline default puts enabled worker groups in `SIE_POOL=default`, so SDK calls can pass just the machine profile (`gpu="l4"`) for shared-cluster capacity. Dedicated pool deployments override `queuePool` and require callers to name the pool explicitly, for example `gpu="customer-acme/l4"`. A cold `X-SIE-POOL` request without `X-SIE-MACHINE-PROFILE` can emit lane-specific `pending_demand` only when the registered pool spec contains exactly one machine profile; multi-profile pools require the caller to send the profile because the gateway must not guess which StatefulSet KEDA should scale.
 
 Creating a usable custom pool has two supported shapes. For deploy-owned static pools, add the worker group to Helm values with `queuePool`/`SIE_POOL` set to the logical pool name and declare the same name under `queueRouting.staticQueuePools`; the gateway synthesizes a non-expiring pool object at startup for sidecar admission. For dynamic/lease-owned pools, add the worker group to Helm values and then register or renew the pool through `POST /v1/pools`; those pools expire after their TTL unless renewed with `POST /v1/pools/{name}/renew`. Clients target either shape with an explicit `X-SIE-POOL` header, for example `X-SIE-POOL: customer-acme`, or SDK `gpu="customer-acme/l4"`. The `default` pool is protected and cannot be deleted. Missing named pools intentionally fail closed so capped/dynamic pool isolation is not weakened by a silent fallback.
 
-Model configs registered via the control plane (`sie-config`) are not tied to a pool — they describe what the cluster can serve, not who gets to serve it. Pool membership, worker counts, and GPU types are Helm-driven and independent of the config API.
+Model configs registered via the control plane (`sie-config`) may carry a top-level `pool` field. That field is model routing/config assignment: omitted or empty means `default`, and a request that omits `X-SIE-POOL` defaults to the model's assigned pool. It does not create workers, KEDA ScaledObjects, or runtime pool leases. Pool membership, worker counts, machine profiles, bundles, and autoscaling lanes are still Helm-driven; `/v1/pools` and `queueRouting.staticQueuePools` only create or renew runtime admission/capacity state for already-rendered logical pool names.

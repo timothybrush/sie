@@ -190,9 +190,12 @@ async fn compute_model_status(
     // misreport, so `no_bundles` makes the distinction explicit and
     // `all_bundles_acked` stays false.
     let mut all_acked = !model_info.bundles.is_empty();
+    let model_pool = model_info.pool.as_deref().unwrap_or("default");
 
     for bundle_id in &model_info.bundles {
-        let expected = state.model_registry.compute_bundle_config_hash(bundle_id);
+        let expected = state
+            .model_registry
+            .compute_bundle_config_hash_for_pool(bundle_id, model_pool);
 
         let mut total_eligible = 0usize;
         let mut acked_workers: Vec<String> = Vec::new();
@@ -206,6 +209,9 @@ async fn compute_model_status(
             // park it in `pending_workers` indefinitely. The fleet is
             // case-consistent in practice.
             if worker.bundle != *bundle_id {
+                continue;
+            }
+            if !worker.pool_name.eq_ignore_ascii_case(model_pool) {
                 continue;
             }
             if !worker.healthy() {
@@ -226,6 +232,7 @@ async fn compute_model_status(
 
         bundles_out.push(json!({
             "bundle_id": bundle_id,
+            "pool": model_pool,
             "expected_bundle_config_hash": expected,
             "total_eligible_workers": total_eligible,
             "acked_workers": acked_workers,
@@ -723,6 +730,7 @@ mod tests {
                 name: model_id.to_string(),
                 adapter_module: None,
                 default_bundle: None,
+                pool: None,
                 profiles,
                 inputs: None,
                 max_sequence_length: None,
@@ -799,7 +807,7 @@ mod tests {
             memory_used_bytes: Some(0),
             memory_total_bytes: Some(0),
             gpus: Vec::new(),
-            pool_name: String::new(),
+            pool_name: "default".into(),
             saturated: false,
             terminated: false,
         }
@@ -811,7 +819,9 @@ mod tests {
         let models_dir = tempfile::TempDir::new().unwrap();
         let (app, state) = build_test_router_with_state(&bundles_dir, &models_dir).await;
         seed_model(&state, "BAAI/bge-m3");
-        let expected_hash = state.model_registry.compute_bundle_config_hash("default");
+        let expected_hash = state
+            .model_registry
+            .compute_bundle_config_hash_for_pool("default", "default");
         assert!(!expected_hash.is_empty(), "bundle hash should be populated");
 
         state
@@ -917,6 +927,7 @@ mod tests {
             name: "empty/model".to_string(),
             adapter_module: None,
             default_bundle: None,
+            pool: None,
             profiles,
             inputs: None,
             max_sequence_length: None,
@@ -935,6 +946,7 @@ mod tests {
         // compute_model_status directly.
         let entry = crate::types::model::ModelEntry {
             name: "empty/model".to_string(),
+            pool: None,
             bundles: Vec::new(),
             adapter_modules: Default::default(),
             profile_names: Default::default(),

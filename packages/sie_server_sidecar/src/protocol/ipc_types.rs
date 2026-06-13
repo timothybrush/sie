@@ -40,6 +40,7 @@ pub const METHOD_SIGNAL_GENERATE_CANCEL: &str = "SignalGenerateCancel";
 /// that don't wire a scheduler.
 pub const METHOD_RUN_BATCH: &str = "RunBatch";
 pub const METHOD_APPLY_MODEL_CONFIG: &str = "ApplyModelConfig";
+pub const METHOD_REPLACE_MODEL_CONFIGS: &str = "ReplaceModelConfigs";
 pub const METHOD_DRAIN: &str = "Drain";
 
 // -----------------------------------------------------------------------------
@@ -282,6 +283,30 @@ pub struct ApplyModelConfigResponse {
     pub bundle_config_hash: String,
     #[serde(default)]
     pub config_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceModelConfigEntry {
+    pub model_id: String,
+    pub model_config: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceModelConfigsRequest {
+    pub bundle_id: String,
+    pub epoch: u64,
+    pub bundle_config_hash: String,
+    pub models: Vec<ReplaceModelConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceModelConfigsResponse {
+    pub applied: bool,
+    pub bundle_config_hash: String,
+    #[serde(default)]
+    pub config_version: u64,
+    #[serde(default)]
+    pub applied_models: Vec<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -1111,5 +1136,29 @@ mod tests {
         assert_eq!(back.worker_id, "w-1");
         assert_eq!(back.timestamp_ms, 123.0);
         assert_eq!(back.bundle_config_hash, "");
+    }
+
+    #[test]
+    fn replace_model_configs_request_requires_models_field() {
+        let missing_models = rmp_serde::to_vec_named(&serde_json::json!({
+            "bundle_id": "default",
+            "epoch": 7,
+            "bundle_config_hash": "",
+        }))
+        .unwrap();
+        assert!(
+            rmp_serde::from_slice::<ReplaceModelConfigsRequest>(&missing_models).is_err(),
+            "missing models must not decode as an authoritative empty snapshot"
+        );
+
+        let explicit_empty = rmp_serde::to_vec_named(&serde_json::json!({
+            "bundle_id": "default",
+            "epoch": 7,
+            "bundle_config_hash": "",
+            "models": [],
+        }))
+        .unwrap();
+        let decoded: ReplaceModelConfigsRequest = rmp_serde::from_slice(&explicit_empty).unwrap();
+        assert!(decoded.models.is_empty());
     }
 }

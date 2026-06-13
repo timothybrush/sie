@@ -2,7 +2,7 @@
 
 Mocks the aiohttp session; exercises the async mirror of ``test_chat.py``:
 buffered ``chat_completions``, ``stream_chat_completions``, ``stream_generate``,
-mid-stream error -> ``ServerError``, and a 202 pre-stream retry.
+mid-stream error -> ``ServerError``, and a 503 PROVISIONING pre-stream retry.
 """
 
 from __future__ import annotations
@@ -158,11 +158,15 @@ async def test_async_stream_raises_on_error_chunk() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_stream_chat_retries_202_then_streams() -> None:
-    s202 = _FakeRaw(status=202, headers={"Retry-After": "0.01"}, body={"detail": {"message": "prov"}})
+async def test_async_stream_chat_retries_503_provisioning_then_streams() -> None:
+    s503 = _FakeRaw(
+        status=503,
+        headers={"Retry-After": "0.01", "content-type": "application/json"},
+        body={"error": {"code": "PROVISIONING", "message": "prov"}},
+    )
     s200 = _FakeRaw(status=200, line_bytes=_sse_bytes(_chat_chunk("ok", finish="stop")))
     client = SIEAsyncClient("http://localhost:8080")
-    session = _patch_session(client, post_side_effect=[s202, s200])
+    session = _patch_session(client, post_side_effect=[s503, s200])
     out = [
         c
         async for c in client.stream_chat_completions("m", [{"role": "user", "content": "hi"}], provision_timeout_s=5.0)

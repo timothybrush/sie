@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.5
+
+- chore(main): release 0.6.5
+- fix(gateway): preserve ref sibling schema semantics
+- fix(gateway): dereference structured output schema refs
+- refactor(sidecar): inline applied bundle hash
+- fix(config): fingerprint model pool ownership
+- chore(worker): address SGLang load review nits
+- fix(gateway): align provisioning contract docs
+- fix(gateway): address provisioning review feedback
+- fix(server): guard readiness for removed configs
+- test(server): fix ipc registry mock snapshot
+- docs: clarify pool capacity semantics
+- fix: align GPU memory pressure defaults
+- fix(server): honor pool-aware model configs
+- fix(gateway): make provisioning non-2xx universally
+- fix(worker): keep SGLang loads off event loop
+- fix(gateway): return retryable OpenAI provisioning errors
+- test(server): cover qwen3 vl reranker document image ordering
+- fix(sdk): normalize score images for wire transport
+- fix(server): render qwen3 vl reranker document images in user prompt
+- fix(gateway): decode native media JSON bytes
+- fix(deps): bump sidecar prometheus for protobuf advisory
+- fix(config): harden replace snapshot IPC
+- fix(config): replace drifted export snapshots
+- fix(config): detect bundle config hash drift
+- fix(sie-cluster): add spot toleration to AKS worker pool
+
 ## v0.6.4
 
 - chore(main): release 0.6.4

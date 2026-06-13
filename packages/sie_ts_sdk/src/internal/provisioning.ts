@@ -3,10 +3,10 @@
  *
  * Both {@link SIEClient.generate} and {@link SIEClient.chatCompletions}
  * receive identical pre-execution capacity signals from the gateway —
- * `202 Accepted` (provisioning) and `503` with a known error code
- * (`MODEL_LOADING`) or a generic 503 (scale-from-zero). They both need
- * to retry those SAFE pre-execution signals while honouring a caller-
- * supplied `waitForCapacity` flag plus a `provisionTimeout` budget.
+ * `503` with a known error code (`PROVISIONING` or `MODEL_LOADING`).
+ * They both need to retry those SAFE pre-execution signals while
+ * honouring a caller-supplied `waitForCapacity` flag plus a
+ * `provisionTimeout` budget.
  *
  * This helper centralises that loop. Callers supply a `performFetch`
  * callback that issues a fresh `fetch` per attempt (the request must be
@@ -22,11 +22,12 @@
 import { ModelLoadingError, ProvisioningError, RequestError } from "../errors.js";
 import {
   DEFAULT_RETRY_DELAY,
-  HTTP_ACCEPTED,
   MODEL_LOADING_DEFAULT_DELAY,
   MODEL_LOADING_ERROR_CODE,
+  PROVISIONING_ERROR_CODE,
 } from "./constants.js";
 import { getErrorCode, getRetryAfter, handleError, throwIfModelLoadFailed } from "./parsing.js";
+import { applyRetryJitter } from "./retry.js";
 
 /** Options controlling the provisioning retry loop. */
 export interface ProvisioningOptions {
@@ -35,9 +36,9 @@ export interface ProvisioningOptions {
   /** GPU label passed through to `ProvisioningError`. May be `undefined`. */
   gpu: string | undefined;
   /**
-   * When `true`, the loop retries 202 / `503 MODEL_LOADING` / generic 503
-   * until the provision budget is exhausted. When `false`, the first such
-   * signal throws (the call-site opted out of waiting).
+   * When `true`, the loop retries `503 PROVISIONING` / `503 MODEL_LOADING`
+   * until the provision budget is exhausted. When `false`, the first
+   * provisioning signal throws (the call-site opted out of waiting).
    */
   waitForCapacity: boolean;
   /**
@@ -76,32 +77,32 @@ export async function withProvisioningRetry(
   while (true) {
     const response = await performFetch();
 
-    if (response.status === HTTP_ACCEPTED) {
-      if (!opts.waitForCapacity) {
-        throw new ProvisioningError(
-          "No capacity available. Server is provisioning.",
-          opts.gpu,
-          getRetryAfter(response),
-        );
-      }
-      const elapsed = Date.now() - startTime;
-      if (elapsed >= opts.provisionTimeoutMs) {
-        throw new ProvisioningError(
-          `Provisioning timeout after ${elapsed}ms`,
-          opts.gpu,
-          getRetryAfter(response),
-        );
-      }
-      const delay = getRetryAfter(response) ?? DEFAULT_RETRY_DELAY;
-      await sleep(Math.min(delay, opts.provisionTimeoutMs - elapsed));
-      continue;
-    }
-
     // 502 MODEL_LOAD_FAILED is terminal — surface immediately.
     await throwIfModelLoadFailed(response, opts.model);
 
     if (response.status === 503) {
       const errorCode = await getErrorCode(response.clone());
+      if (errorCode === PROVISIONING_ERROR_CODE) {
+        if (!opts.waitForCapacity) {
+          throw new ProvisioningError(
+            "No capacity available. Server is provisioning.",
+            opts.gpu,
+            getRetryAfter(response),
+          );
+        }
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= opts.provisionTimeoutMs) {
+          throw new ProvisioningError(
+            `Provisioning timeout after ${elapsed}ms`,
+            opts.gpu,
+            getRetryAfter(response),
+          );
+        }
+        const retryAfter = getRetryAfter(response);
+        const delay = retryAfter ?? applyRetryJitter(DEFAULT_RETRY_DELAY);
+        await sleep(Math.min(delay, opts.provisionTimeoutMs - elapsed));
+        continue;
+      }
       if (errorCode === MODEL_LOADING_ERROR_CODE) {
         const elapsed = Date.now() - startTime;
         if (elapsed >= opts.provisionTimeoutMs) {
@@ -110,14 +111,6 @@ export async function withProvisioningRetry(
         const delay = getRetryAfter(response) ?? MODEL_LOADING_DEFAULT_DELAY;
         await sleep(Math.min(delay, opts.provisionTimeoutMs - elapsed));
         continue;
-      }
-      if (opts.waitForCapacity) {
-        const elapsed = Date.now() - startTime;
-        if (elapsed < opts.provisionTimeoutMs) {
-          const delay = getRetryAfter(response) ?? DEFAULT_RETRY_DELAY;
-          await sleep(Math.min(delay, opts.provisionTimeoutMs - elapsed));
-          continue;
-        }
       }
     }
 
