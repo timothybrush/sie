@@ -258,7 +258,7 @@ Computation rules:
 
 ## 7. Cross-Service Hash Parity
 
-`bundle_config_hash` is computed independently by `sie-config` and the gateway, and also by workers. For the admin-tooling readiness flow to work, all three must produce byte-identical hashes for the same config.
+`bundle_config_hash` is computed independently by `sie-config`, the gateway, and workers. The `sie-config` export/epoch surface keeps the global per-bundle hash for bootstrap and drift detection. Gateway hot routing/readiness compares workers against the hash for the same materialized scope the worker serves: the default pool scope for unfiltered workers, or the named pool scope for workers filtered by `SIE_POOL`. For the admin-tooling readiness flow to work, gateway and worker hashes must be byte-identical for that same bundle/pool scope.
 
 The hash is a SHA-256 over a JSON-serialized, sort-keys representation of a structured object. The outer shape is an array of models, each with `sie_id` and `profiles: [{name, config: {...4 fields...}}]`, where the inner `config` for each profile is strictly the four routable-profile fields: `adapter_path`, `max_batch_tokens`, `compute_precision`, `adapter_options`. Any field outside that whitelist is excluded from the hash so that non-routable edits (e.g. comments, description-style metadata) cannot unnecessarily invalidate worker acks. Python uses `orjson.dumps(..., OPT_SORT_KEYS)`; Rust mirrors this via `serde_json::to_vec` over `BTreeMap`-backed canonical types.
 

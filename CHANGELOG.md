@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.6
+
+- chore(main): release 0.6.6
+- fix(config): clarify missing profile inheritance
+- fix(config): avoid sticky missing bundle hashes
+- fix(config): fail closed on missing bundle metadata
+- fix(config): align pool-scoped bundle hashes
+
 ## v0.6.5
 
 - chore(main): release 0.6.5

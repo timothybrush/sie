@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import getpass
 import hashlib
 import json
@@ -9,18 +10,22 @@ import os
 import time
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+import yaml
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sie_sdk.types import (
     GPUMetrics,
-    ModelConfig,
     ModelState,
     ModelStatus,
     ServerInfo,
     WorkerStatusMessage,
 )
+from sie_sdk.types import (
+    ModelConfig as SDKModelConfig,
+)
 
+from sie_server.config.model import ModelConfig as ServerModelConfig
 from sie_server.core.batcher import BatchConfig
 from sie_server.core.gpu_health import gpu_is_healthy_async
 from sie_server.core.readiness import is_ready
@@ -44,6 +49,10 @@ router = APIRouter(tags=["websocket"])
 
 # Server start time for uptime calculation
 _server_start_time: float | None = None
+
+
+class BundleMetadataUnavailableError(RuntimeError):
+    """Raised when worker-side bundle metadata cannot be loaded for hashing."""
 
 
 def init_server_start_time() -> None:
@@ -114,7 +123,7 @@ def get_model_status(registry: ModelRegistry) -> list[ModelStatus]:
             "state": state,
             "device": None,
             "memory_bytes": 0,
-            "config": ModelConfig(
+            "config": SDKModelConfig(
                 hf_id=config.hf_id,
                 adapter=adapter_path,
                 inputs=inputs_list,
@@ -159,6 +168,95 @@ def get_model_status(registry: ModelRegistry) -> list[ModelStatus]:
     return models
 
 
+def _resolve_default_dir(name: str) -> Path:
+    pkg_dir = Path(__file__).resolve().parent.parent
+    bundled = pkg_dir / name
+    if bundled.is_dir():
+        return bundled
+    return pkg_dir.parent.parent / name
+
+
+@functools.lru_cache(maxsize=32)
+def _bundle_adapter_modules(bundle_id: str) -> frozenset[str]:
+    bundle_path = _resolve_default_dir("bundles") / f"{bundle_id}.yaml"
+    if not bundle_path.exists():
+        msg = f"Bundle config {bundle_path} not found"
+        raise BundleMetadataUnavailableError(msg)
+    try:
+        data = yaml.safe_load(bundle_path.read_text()) or {}
+    except Exception as exc:
+        msg = f"Failed to parse bundle config {bundle_path}"
+        raise BundleMetadataUnavailableError(msg) from exc
+    adapters = data.get("adapters", [])
+    if not isinstance(adapters, list):
+        msg = f"Invalid adapters list in bundle config {bundle_path}"
+        raise BundleMetadataUnavailableError(msg)
+    return frozenset(str(adapter) for adapter in adapters if adapter)
+
+
+def _is_hash_falsy(value: object) -> bool:
+    if value is None:
+        return True
+    if value is False:
+        return True
+    if isinstance(value, int | float) and value == 0:
+        return True
+    return isinstance(value, str | list | tuple | dict) and len(value) == 0
+
+
+def _canonical_adapter_options_for_hash(adapter_options: dict[str, Any] | None) -> dict[str, Any] | None:
+    if isinstance(adapter_options, dict) and not any(not _is_hash_falsy(value) for value in adapter_options.values()):
+        return None
+    return adapter_options
+
+
+def _profile_adapter_options_for_hash(profile: Any) -> dict[str, Any] | None:
+    if "adapter_options" not in getattr(profile, "model_fields_set", set()):
+        return None
+    adapter_options = profile.adapter_options
+    option_fields = getattr(adapter_options, "model_fields_set", set())
+    raw: dict[str, Any] = {}
+    if "loadtime" in option_fields:
+        raw["loadtime"] = dict(adapter_options.loadtime)
+    if "runtime" in option_fields:
+        raw["runtime"] = dict(adapter_options.runtime)
+    return _canonical_adapter_options_for_hash(raw)
+
+
+def _resolved_profile_for_hash(config: ServerModelConfig, profile_name: str) -> dict[str, Any]:
+    def resolve(name: str, seen: set[str]) -> dict[str, Any]:
+        if name in seen:
+            msg = f"Profile '{name}' has an inheritance cycle"
+            raise ValueError(msg)
+        seen.add(name)
+
+        profile = config.profiles.get(name)
+        if profile is None:
+            msg = f"Profile '{name}' referenced via extends does not exist"
+            raise ValueError(msg)
+        if profile.extends:
+            resolved = resolve(profile.extends, seen)
+        else:
+            resolved = {
+                "adapter_path": None,
+                "max_batch_tokens": None,
+                "compute_precision": None,
+                "adapter_options": None,
+            }
+
+        if profile.adapter_path is not None:
+            resolved["adapter_path"] = profile.adapter_path
+        if profile.max_batch_tokens is not None:
+            resolved["max_batch_tokens"] = profile.max_batch_tokens
+        if profile.compute_precision is not None:
+            resolved["compute_precision"] = profile.compute_precision
+        if "adapter_options" in getattr(profile, "model_fields_set", set()):
+            resolved["adapter_options"] = _profile_adapter_options_for_hash(profile)
+        return resolved
+
+    return resolve(profile_name, set())
+
+
 def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
     """Compute SHA-256 hash of model configs assigned to this worker's bundle.
 
@@ -179,29 +277,24 @@ def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
 
     # Deterministic serialization matching gateway's compute_bundle_config_hash:
     # both sides hash [{"sie_id": name, "profiles": [{name, config}]}]
-    # where config contains routable fields: adapter_path, max_batch_tokens,
-    # compute_precision, adapter_options.
+    # where config contains resolved routable fields: adapter_path,
+    # max_batch_tokens, compute_precision, adapter_options.
     items = []
+    bundle_adapter_set = _bundle_adapter_modules(bundle_id)
     for config in sorted(configs.values(), key=lambda c: c.sie_id):
         profiles_for_hash = []
         for pname in sorted(config.profiles.keys()):
-            profile = config.profiles[pname]
-            # Normalize adapter_options to a plain dict or None.
-            # Pydantic models serialize default AdapterOptions() as
-            # {"loadtime": {}, "runtime": {}} which would mismatch
-            # the gateway's raw dict (None when not set). Treat a
-            # default/empty AdapterOptions the same as None.
-            adapter_opts_raw = None
-            if profile.adapter_options:
-                dumped = profile.adapter_options.model_dump(mode="json")
-                # Treat all-empty-sub-dicts as None (matches gateway's raw None)
-                if any(v for v in dumped.values()):
-                    adapter_opts_raw = dumped
+            profile_dict = _resolved_profile_for_hash(config, pname)
+            adapter_path = profile_dict.get("adapter_path")
+            if adapter_path:
+                module_path = str(adapter_path).split(":", maxsplit=1)[0]
+                if module_path not in bundle_adapter_set:
+                    continue
             profile_dict = {
-                "adapter_path": profile.adapter_path,
-                "max_batch_tokens": profile.max_batch_tokens,
-                "compute_precision": profile.compute_precision,
-                "adapter_options": adapter_opts_raw,
+                "adapter_path": profile_dict.get("adapter_path"),
+                "max_batch_tokens": profile_dict.get("max_batch_tokens"),
+                "compute_precision": profile_dict.get("compute_precision"),
+                "adapter_options": profile_dict.get("adapter_options"),
             }
             profiles_for_hash.append({"name": pname, "config": profile_dict})
         items.append({"sie_id": config.sie_id, "profiles": profiles_for_hash})
@@ -232,7 +325,14 @@ def compute_bundle_config_hash_cached(registry: ModelRegistry, bundle_id: str) -
     cached = registry_cache.get(bundle_id)
     if cached is not None and cached[0] == version:
         return cached[1]
-    result = _compute_bundle_config_hash(registry, bundle_id)
+    try:
+        result = _compute_bundle_config_hash(registry, bundle_id)
+    except BundleMetadataUnavailableError:
+        logger.exception(
+            "Unable to load bundle metadata for %s; returning empty bundle_config_hash to avoid widened hash scope",
+            bundle_id,
+        )
+        return ""
     registry_cache[bundle_id] = (version, result)
     return result
 

@@ -2966,6 +2966,23 @@ profiles:
             registry.compute_bundle_config_hash_for_pool("default", "missing"),
             ""
         );
+
+        registry.install_bundle_config_hashes(HashMap::from([(
+            "default".to_string(),
+            "control-plane-global-hash".to_string(),
+        )]));
+        assert_eq!(
+            registry.compute_bundle_config_hash("default"),
+            "control-plane-global-hash"
+        );
+        assert_eq!(
+            registry.compute_bundle_config_hash_for_pool("default", "default"),
+            default_hash
+        );
+        assert_eq!(
+            registry.compute_bundle_config_hash_for_pool("default", "customer-a"),
+            tenant_hash
+        );
     }
 
     #[test]

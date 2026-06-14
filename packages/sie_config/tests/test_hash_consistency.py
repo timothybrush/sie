@@ -1,8 +1,13 @@
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from sie_config.model_registry import ModelRegistry
+from sie_server.api import ws as worker_ws
+from sie_server.api.ws import compute_bundle_config_hash_cached
+from sie_server.core.registry import ModelRegistry as WorkerModelRegistry
 
 
 def _create_registry_with_model(
@@ -28,8 +33,6 @@ def _create_registry_with_model(
 
 
 def _compute_worker_hash_via_registry(model_configs: list[dict]) -> str:
-    import tempfile
-
     if not model_configs:
         return ""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -98,6 +101,129 @@ class TestHashConsistency:
             ]
         )
         assert router_hash == worker_hash
+
+    def test_inherited_profiles_match_worker_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._root / "extends"
+        bundles_dir = root / "bundles"
+        models_dir = root / "models"
+        bundles_dir.mkdir(parents=True, exist_ok=True)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        bundle_id = "hash-test-bundle"
+        adapter_module = "test.hash_adapter"
+        (bundles_dir / f"{bundle_id}.yaml").write_text(
+            yaml.dump(
+                {
+                    "name": bundle_id,
+                    "priority": 10,
+                    "adapters": [adapter_module],
+                }
+            )
+        )
+        model_config = {
+            "sie_id": "test/model",
+            "hf_id": "test/model",
+            "inputs": {"text": True},
+            "tasks": {"encode": {"dense": {"dim": 3}}},
+            "profiles": {
+                "default": {
+                    "adapter_path": f"{adapter_module}:Adapter",
+                    "max_batch_tokens": 8192,
+                    "compute_precision": "float16",
+                    "adapter_options": {
+                        "loadtime": {},
+                        "runtime": {"normalize": True},
+                    },
+                },
+                "query": {
+                    "extends": "default",
+                    "adapter_options": {
+                        "runtime": {
+                            "normalize": False,
+                            "instruction": "query",
+                        }
+                    },
+                },
+            },
+        }
+        (models_dir / "test-model.yaml").write_text(yaml.dump(model_config))
+
+        config_registry = ModelRegistry(bundles_dir, models_dir)
+        config_hash = config_registry.compute_bundle_config_hash(bundle_id)
+
+        def resolve_worker_default_dir(name: str) -> Path:
+            if name == "bundles":
+                return bundles_dir
+            return root / name
+
+        worker_ws._bundle_adapter_modules.cache_clear()
+        monkeypatch.setattr(worker_ws, "_resolve_default_dir", resolve_worker_default_dir)
+        worker_registry = WorkerModelRegistry(
+            models_dir=models_dir,
+            model_filter=["test/model"],
+            pool_name="default",
+            enable_hot_reload=False,
+        )
+        try:
+            worker_hash = compute_bundle_config_hash_cached(worker_registry, bundle_id)
+        finally:
+            worker_ws._bundle_adapter_modules.cache_clear()
+
+        assert config_hash == worker_hash
+
+    def test_worker_hash_fails_closed_when_bundle_metadata_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._root / "missing_bundle"
+        models_dir = root / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "test-model.yaml").write_text(
+            yaml.dump(
+                {
+                    "sie_id": "test/model",
+                    "hf_id": "test/model",
+                    "inputs": {"text": True},
+                    "tasks": {"encode": {"dense": {"dim": 3}}},
+                    "profiles": {
+                        "default": {
+                            "adapter_path": "test.hash_adapter:Adapter",
+                            "max_batch_tokens": 8192,
+                        }
+                    },
+                }
+            )
+        )
+
+        def resolve_worker_default_dir(name: str) -> Path:
+            return root / name
+
+        worker_ws._bundle_adapter_modules.cache_clear()
+        monkeypatch.setattr(worker_ws, "_resolve_default_dir", resolve_worker_default_dir)
+        worker_registry = WorkerModelRegistry(
+            models_dir=models_dir,
+            model_filter=["test/model"],
+            pool_name="default",
+            enable_hot_reload=False,
+        )
+        try:
+            assert compute_bundle_config_hash_cached(worker_registry, "missing-bundle") == ""
+            bundles_dir = root / "bundles"
+            bundles_dir.mkdir()
+            (bundles_dir / "missing-bundle.yaml").write_text(
+                yaml.dump(
+                    {
+                        "name": "missing-bundle",
+                        "priority": 10,
+                        "adapters": ["test.hash_adapter"],
+                    }
+                )
+            )
+            recovered_hash = compute_bundle_config_hash_cached(worker_registry, "missing-bundle")
+            assert len(recovered_hash) == 64
+        finally:
+            worker_ws._bundle_adapter_modules.cache_clear()
+
+    def test_worker_hash_reports_missing_profile_parent(self) -> None:
+        config = SimpleNamespace(profiles={"default": SimpleNamespace(extends="missing-parent")})
+        with pytest.raises(ValueError, match="Profile 'missing-parent' referenced via extends does not exist"):
+            worker_ws._resolved_profile_for_hash(config, "default")
 
     def test_order_independence(self) -> None:
         aaa_profile = {"adapter_path": "sie_server.adapters.bert_flash:BertAdapter", "max_batch_tokens": 8192}

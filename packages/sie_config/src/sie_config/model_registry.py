@@ -23,6 +23,56 @@ def _canonical_profile_dict(profile: dict) -> dict:
     return {k: profile.get(k) for k in _PROFILE_HASH_FIELDS}
 
 
+def _is_hash_falsy(value: object) -> bool:
+    if value is None:
+        return True
+    if value is False:
+        return True
+    if isinstance(value, int | float) and value == 0:
+        return True
+    return isinstance(value, str | list | tuple | dict) and len(value) == 0
+
+
+def _canonical_adapter_options_for_hash(adapter_options: object) -> object | None:
+    """Mirror gateway canonicalization for adapter_options in bundle hashes."""
+    if isinstance(adapter_options, dict) and not any(not _is_hash_falsy(value) for value in adapter_options.values()):
+        return None
+    return adapter_options
+
+
+def _resolve_profile_for_hash(profiles: dict, profile_name: str) -> dict:
+    """Resolve profile inheritance into the fields covered by bundle hashes."""
+
+    def resolve(name: str, seen: set[str]) -> dict:
+        if name in seen:
+            msg = f"Profile '{name}' has an inheritance cycle"
+            raise ValueError(msg)
+        seen.add(name)
+
+        profile = profiles.get(name)
+        if not isinstance(profile, dict):
+            msg = f"Profile '{name}' not found"
+            raise ValueError(msg)
+
+        parent_name = profile.get("extends")
+        if parent_name:
+            resolved = resolve(str(parent_name), seen)
+        else:
+            resolved = dict.fromkeys(_PROFILE_HASH_FIELDS)
+
+        for field_name in ("adapter_path", "max_batch_tokens", "compute_precision"):
+            value = profile.get(field_name)
+            if value is not None:
+                resolved[field_name] = value
+
+        if "adapter_options" in profile:
+            resolved["adapter_options"] = _canonical_adapter_options_for_hash(profile.get("adapter_options"))
+
+        return resolved
+
+    return resolve(profile_name, set())
+
+
 class ModelNotFoundError(Exception):
     """Model not found in any bundle (HTTP 404)."""
 
@@ -960,28 +1010,20 @@ class ModelRegistry:
                 adapter_modules = self._model_adapter_modules.get(model_name, set())
                 # Only include if model has adapters in this bundle
                 if adapter_modules & bundle_adapter_set:
-                    profile_configs = self._model_profile_configs.get(model_name, {})
+                    full_profiles = self._model_full_configs.get(model_name, {}).get("profiles", {})
                     profiles_for_hash = []
                     # Hash only the fields that affect inference behaviour,
                     # matching the worker-side hash in
                     # ``sie_server.api.ws._compute_bundle_config_hash``.
-                    _hash_fields = ("adapter_path", "max_batch_tokens", "compute_precision", "adapter_options")
                     for pname in sorted(self.get_model_profile_names(model_name)):
                         # Only include profiles whose adapter is routable in this bundle
-                        p_cfg = profile_configs.get(pname, {})
+                        p_cfg = _resolve_profile_for_hash(full_profiles, pname)
                         p_adapter = p_cfg.get("adapter_path", "")
                         if p_adapter:
                             p_module = p_adapter.split(":", maxsplit=1)[0]
                             if p_module not in bundle_adapter_set:
                                 continue
-                        # Normalize: only include hash-relevant fields.
-                        # adapter_options: treat empty/default as None (matches worker).
-                        adapter_opts = p_cfg.get("adapter_options")
-                        if isinstance(adapter_opts, dict) and not any(adapter_opts.values()):
-                            adapter_opts = None
-                        filtered_cfg = {
-                            k: (adapter_opts if k == "adapter_options" else p_cfg.get(k)) for k in _hash_fields
-                        }
+                        filtered_cfg = {k: p_cfg.get(k) for k in _PROFILE_HASH_FIELDS}
                         profiles_for_hash.append({"name": pname, "config": filtered_cfg})
                     items.append(
                         {
