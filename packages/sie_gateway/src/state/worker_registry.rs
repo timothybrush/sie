@@ -12,17 +12,6 @@ use crate::types::{
     ClusterStatus, ModelInfo, WorkerHealth, WorkerInfo, WorkerState, WorkerStatusMessage,
 };
 
-/// Strip a `:profile` routing suffix down to the base model id.
-///
-/// Profile variants live in the model registry as `format!("{base}:{profile}")`
-/// (see `model_registry::expand_*`), but workers advertise only the base
-/// model name in their `loaded_models`. HuggingFace model ids never
-/// contain `:`, so the first `:` unambiguously separates the base id from
-/// the profile. Returns `model` unchanged when there is no suffix.
-fn base_model_id(model: &str) -> &str {
-    model.split_once(':').map_or(model, |(base, _)| base)
-}
-
 /// Rate-limit gate for the duplicate-worker-name warning, in whole
 /// seconds since process start. `ring_snapshot_for` runs on the
 /// per-request hot path, so an unconditional `warn!` on a persistent
@@ -349,14 +338,13 @@ impl WorkerRegistry {
     /// [`resolve_queue_route_matching`]. Used by the proxy to build
     /// per-request HRW snapshots.
     ///
-    /// A `model:profile` request is matched against the **base** model
-    /// id: workers advertise only base model names in `loaded_models`
-    /// (the `:profile` variant is a registry-only routing concept — the
-    /// adapter is selected per-request, not per-loaded-model), so without
-    /// stripping the suffix a `model:profile` request would never find an
-    /// eligible worker and would always fall through to the pool subject
-    /// (mislabelled `unhealthy_skipped`). HF model ids never contain `:`,
-    /// so the suffix split is unambiguous.
+    /// A `model:profile` request is matched as its own model id. The server
+    /// loader expands non-default profiles into concrete `base:profile`
+    /// configs with profile-specific SGLang launch args, so collapsing the
+    /// suffix here would direct-dispatch to a worker that only has the base
+    /// model resident and can silently launch the wrong precision/profile.
+    /// If no worker has the variant loaded yet, the request falls through to
+    /// the pool subject and lazy-loads that concrete variant.
     #[cfg(test)]
     pub fn dispatch_workers_for(
         &self,
@@ -385,7 +373,6 @@ impl WorkerRegistry {
         bundle_config_hash: &str,
         admitted_worker_names: Option<&HashSet<String>>,
     ) -> Vec<WorkerState> {
-        let base_model = base_model_id(model);
         let snap = self.snapshot.load();
         snap.all_healthy
             .iter()
@@ -397,7 +384,7 @@ impl WorkerRegistry {
                     && w.machine_profile.eq_ignore_ascii_case(machine_profile)
                     && w.bundle.eq_ignore_ascii_case(bundle)
                     && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
-                    && w.models.iter().any(|m| m.eq_ignore_ascii_case(base_model))
+                    && w.models.iter().any(|m| m.eq_ignore_ascii_case(model))
             })
             .cloned()
             .collect()
@@ -1215,17 +1202,8 @@ mod tests {
 
     // ── dispatch_workers_for / profile-variant routing ─────────────
 
-    #[test]
-    fn test_base_model_id_strips_profile_suffix() {
-        assert_eq!(base_model_id("BAAI/bge-m3"), "BAAI/bge-m3");
-        assert_eq!(base_model_id("BAAI/bge-m3:fast"), "BAAI/bge-m3");
-        // Only the first `:` separates the profile; HF ids never contain `:`.
-        assert_eq!(base_model_id("org/model:a:b"), "org/model");
-        assert_eq!(base_model_id(""), "");
-    }
-
     #[tokio::test]
-    async fn test_dispatch_workers_for_profile_variant_matches_base_worker() {
+    async fn test_dispatch_workers_for_profile_variant_requires_variant_worker() {
         let reg = registry();
         // A worker advertising only the *base* model name in a named pool.
         let mut msg = make_msg(true);
@@ -1234,19 +1212,39 @@ mod tests {
         msg.loaded_models = vec!["BAAI/bge-m3".into()];
         reg.update_worker("http://w1:8080", msg).await;
 
-        // A `:profile` request must direct-dispatch to the base-model
-        // worker rather than fall through to the pool.
+        // A `:profile` request must not direct-dispatch to the base-model
+        // worker. The profile variant carries its own launch args.
         let direct =
             reg.dispatch_workers_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
-        assert_eq!(direct.len(), 1, "profile variant should match base worker");
-        assert_eq!(direct[0].name, "w1");
+        assert!(
+            direct.is_empty(),
+            "profile variant must wait for/load a worker with that exact variant"
+        );
 
         // The bare base id still works (regression guard).
         let base = reg.dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "default", "");
         assert_eq!(base.len(), 1);
 
-        // The ring snapshot (built from the same filter) is non-empty,
-        // so HRW can pick a worker for the profile variant.
+        // The ring snapshot (built from the same filter) stays empty
+        // until the concrete variant is reported loaded.
+        let ring = reg.ring_snapshot_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
+        assert_eq!(ring.len(), 0);
+
+        let mut msg = make_msg(true);
+        msg.name = "w1".into();
+        msg.pool_name = "default".into();
+        msg.loaded_models = vec!["BAAI/bge-m3:fast".into()];
+        reg.update_worker("http://w1:8080", msg).await;
+
+        let direct =
+            reg.dispatch_workers_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
+        assert_eq!(
+            direct.len(),
+            1,
+            "loaded profile variant should match exactly"
+        );
+        assert_eq!(direct[0].name, "w1");
+
         let ring = reg.ring_snapshot_for("BAAI/bge-m3:fast", "default", "l4-spot", "default", "");
         assert_eq!(ring.len(), 1);
 

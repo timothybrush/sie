@@ -10,6 +10,7 @@ import torch
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
+from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import Entity
@@ -165,6 +166,12 @@ class PaddleOCRVLAdapter(BaseAdapter):
         )
         self._model.to(device)  # ty: ignore[invalid-argument-type]
         self._model.eval()
+
+        # FIX[#1151]: rebind the PaddleOCR-VL vision Conv2d patch-embed to its
+        # matmul equivalent (same weights). Its encoder runs the conv per-patch
+        # (the full-grid branch raises NotImplementedError), so the non-overlapping
+        # Conv2d hits the same pathologically slow per-patch cuDNN path.
+        rebind_vision_patch_embed(self._model, "paddleocr_vl")
 
         self._create_preprocessor()
         logger.info("PaddleOCR-VL model loaded successfully")

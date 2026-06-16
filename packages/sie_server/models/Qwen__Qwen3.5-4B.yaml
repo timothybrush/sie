@@ -17,6 +17,14 @@ tasks:
     # raise this on a per-profile basis.
     context_length: 8192
     max_output_tokens: 4096
+    # Route grammar-constrained requests (response_format / grammar) to the
+    # non-speculative variant. The default/a100/h100 profiles run NEXTN
+    # speculative decoding for free-text throughput, but NEXTN bypasses SGLang's
+    # Outlines grammar FSM (leaks out-of-schema keys, truncates mid-JSON —
+    # verified on L4). The `no-spec` profile (speculative off, same Outlines
+    # backend) enforces the grammar correctly; the gateway rewrites grammar
+    # requests to `Qwen/Qwen3.5-4B:no-spec` so free-text keeps NEXTN.
+    grammar_profile: no-spec
     capabilities:
       # NOTE: scoped to what the production backend (``outlines``, set
       # per-profile under ``adapter_options.loadtime``) actually supports

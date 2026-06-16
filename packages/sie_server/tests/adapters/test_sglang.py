@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from sie_server.adapters.sglang import _server
 from sie_server.adapters.sglang._server import STARTUP_TIMEOUT_S as _STARTUP_TIMEOUT_S
 from sie_server.adapters.sglang._server import parse_device_index
 from sie_server.adapters.sglang.embedding import SGLangEmbeddingAdapter
@@ -38,6 +39,35 @@ class TestSGLangEmbeddingAdapter:
     def test_load_contract_flags(self) -> None:
         assert SGLangEmbeddingAdapter.requires_main_thread is False
         assert SGLangEmbeddingAdapter.manages_own_load_timeout is True
+
+    def test_startup_timeout_prefers_explicit_profile_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _server.STARTUP_TIMEOUT_ENV_VARS:
+            monkeypatch.setenv(name, "120")
+
+        assert _server.resolve_startup_timeout(1800) == 1800
+
+    def test_startup_timeout_accepts_operator_aliases(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _server.STARTUP_TIMEOUT_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("SIE_MODEL_READY_TIMEOUT_S", "1234")
+
+        assert _server.resolve_startup_timeout() == 1234
+
+    def test_startup_timeout_rejects_non_finite_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _server.STARTUP_TIMEOUT_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("SIE_MODEL_READY_TIMEOUT_S", "inf")
+        monkeypatch.setenv("SIE_SERVER_STARTUP_TIMEOUT_S", "1200")
+
+        assert _server.resolve_startup_timeout(float("inf")) == 1200
+
+    def test_startup_timeout_rejects_liveness_budget_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _server.STARTUP_TIMEOUT_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("SIE_WORKER_LIVENESS_BUDGET_S", "900")
+
+        with pytest.raises(ValueError, match="SIE_WORKER_LIVENESS_BUDGET_S"):
+            _server.resolve_startup_timeout(900)
 
     def test_dims_before_load_returns_none(self) -> None:
         """Dims returns None before first encode."""

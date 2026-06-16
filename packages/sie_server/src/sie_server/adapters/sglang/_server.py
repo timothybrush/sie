@@ -13,6 +13,7 @@ lifecycle of a single SGLang HTTP server child process.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import signal
@@ -40,13 +41,81 @@ _RESERVED_PORTS: set[int] = set()
 _RESERVED_PORTS_LOCK = threading.Lock()
 
 # 8B+ models can take 5+ min just to download from HF on a fresh cache,
-# plus SGLang itself then loads the model onto the GPU. Override via
-# SIE_SGLANG_STARTUP_TIMEOUT_S for hosts with slow network or larger models.
-STARTUP_TIMEOUT_S = int(os.environ.get("SIE_SGLANG_STARTUP_TIMEOUT_S", "900"))
+# plus SGLang itself then loads the model onto the GPU. Override via the
+# SGLang-specific env var below, or one of the adapter/server aliases that
+# operators commonly try when tuning cold-start budgets.
+DEFAULT_STARTUP_TIMEOUT_S = 900.0
+STARTUP_TIMEOUT_ENV_VARS = (
+    "SIE_SGLANG_STARTUP_TIMEOUT_S",
+    "SIE_MODEL_READY_TIMEOUT_S",
+    "SIE_ADAPTER_STARTUP_TIMEOUT_S",
+    "SIE_SERVER_STARTUP_TIMEOUT_S",
+)
+LIVENESS_BUDGET_ENV_VAR = "SIE_WORKER_LIVENESS_BUDGET_S"
+STARTUP_TIMEOUT_S = DEFAULT_STARTUP_TIMEOUT_S
 HEALTH_CHECK_INTERVAL_S = 2.0
 BASE_PORT = 30000  # Starting port for SGLang servers
 
 ERR_SERVER_STARTUP = "SGLang server failed to start within timeout"
+
+
+def _resolve_liveness_budget() -> float | None:
+    raw = os.environ.get(LIVENESS_BUDGET_ENV_VAR)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected seconds", LIVENESS_BUDGET_ENV_VAR, raw)
+        return None
+    if math.isfinite(value) and value > 0:
+        return value
+    logger.warning("Ignoring invalid %s=%r; expected finite seconds > 0", LIVENESS_BUDGET_ENV_VAR, raw)
+    return None
+
+
+def _validate_liveness_budget(timeout_s: float) -> float:
+    budget_s = _resolve_liveness_budget()
+    if budget_s is not None and timeout_s >= budget_s:
+        msg = (
+            f"SGLang startup timeout {timeout_s:g}s must be lower than "
+            f"{LIVENESS_BUDGET_ENV_VAR}={budget_s:g}s so kubelet liveness does not kill the worker mid-load"
+        )
+        raise ValueError(msg)
+    return timeout_s
+
+
+def resolve_startup_timeout(timeout_s: float | None = None) -> float:
+    """Resolve the SGLang startup-health timeout.
+
+    Precedence:
+    1. Explicit adapter/profile value (``adapter_options.loadtime.startup_timeout_s``).
+    2. Environment variables in ``STARTUP_TIMEOUT_ENV_VARS`` order.
+    3. ``DEFAULT_STARTUP_TIMEOUT_S``.
+    """
+    if timeout_s is not None:
+        try:
+            value = float(timeout_s)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0:
+            return _validate_liveness_budget(value)
+        logger.warning("Ignoring invalid SGLang startup timeout override: %r (must be finite > 0)", timeout_s)
+
+    for name in STARTUP_TIMEOUT_ENV_VARS:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r; expected seconds", name, raw)
+            continue
+        if math.isfinite(value) and value > 0:
+            return _validate_liveness_budget(value)
+        logger.warning("Ignoring invalid %s=%r; expected finite seconds > 0", name, raw)
+
+    return _validate_liveness_budget(DEFAULT_STARTUP_TIMEOUT_S)
 
 
 def find_free_port(start_port: int = BASE_PORT) -> int:
@@ -145,7 +214,7 @@ def wait_for_server(
     process: subprocess.Popen[bytes],
     *,
     output_file: tempfile._TemporaryFileWrapper | None = None,
-    timeout_s: float = STARTUP_TIMEOUT_S,
+    timeout_s: float | None = None,
 ) -> bool:
     """Poll the SGLang ``/health`` endpoint until the server is ready.
 
@@ -154,6 +223,7 @@ def wait_for_server(
         timeout elapses or the subprocess dies. Subprocess output (when
         ``output_file`` is provided) is logged on failure for diagnostics.
     """
+    timeout_s = resolve_startup_timeout(timeout_s)
     health_url = f"{server_url}/health"
     start_time = time.monotonic()
 

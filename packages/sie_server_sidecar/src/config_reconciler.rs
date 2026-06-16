@@ -5,8 +5,8 @@
 //! published while a worker was disconnected. This module closes that gap by
 //! polling `GET /v1/configs/epoch` and fetching `GET /v1/configs/export` when
 //! the control plane is ahead or when its compact per-bundle config fingerprint
-//! changes. A slower full-export pass also covers legacy/no-config-store
-//! deployments where `sie-config` keeps epoch at `0`.
+//! changes. A slower full-export pass also covers legacy deployments where
+//! `sie-config` cannot provide a compact fingerprint.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -111,6 +111,14 @@ struct ExportOutcome {
     skipped: usize,
     shutdown: bool,
     state_updated: bool,
+    export_signature: Option<blake3::Hash>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportReconcileOptions<'a> {
+    force_epoch: bool,
+    reason: &'a str,
+    previous_export_signature: Option<blake3::Hash>,
 }
 
 struct ReconcileClient {
@@ -207,6 +215,33 @@ fn drift_reason(
     None
 }
 
+fn compute_export_signature(
+    bundle: &str,
+    bundle_config_hash: Option<&str>,
+    models: &[ReplaceModelConfigEntry],
+) -> blake3::Hash {
+    fn update_len_prefixed(hasher: &mut blake3::Hasher, value: &str) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    update_len_prefixed(&mut hasher, bundle);
+    update_len_prefixed(&mut hasher, bundle_config_hash.unwrap_or_default());
+
+    let mut entries: Vec<(&str, &str)> = models
+        .iter()
+        .map(|model| (model.model_id.as_str(), model.model_config.as_str()))
+        .collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    hasher.update(&(entries.len() as u64).to_le_bytes());
+    for (model_id, model_config) in entries {
+        update_len_prefixed(&mut hasher, model_id);
+        update_len_prefixed(&mut hasher, model_config);
+    }
+    hasher.finalize()
+}
+
 /// Spawn the optional export reconciler.
 ///
 /// The task is disabled when `config.base_url` is empty. The caller owns the
@@ -252,6 +287,7 @@ pub fn spawn(
             shutdown: Arc::clone(&shutdown),
         };
         let mut last_successful_export: Option<Instant> = None;
+        let mut last_export_signature: Option<blake3::Hash> = None;
         let mut last_bundle_config_hashes_hash = match client.fetch_epoch().await {
             Ok(snapshot) => snapshot.bundle_config_hashes_hash,
             Err(e) => {
@@ -262,10 +298,13 @@ pub fn spawn(
                 String::new()
             }
         };
-        match reconcile_export(&runtime, false, "startup").await {
+        match reconcile_export(&runtime, false, "startup", None).await {
             Ok(outcome) if outcome.shutdown => return,
             Ok(outcome) if outcome.failed == 0 => {
                 last_successful_export = Some(Instant::now());
+                if let Some(signature) = outcome.export_signature {
+                    last_export_signature = Some(signature);
+                }
                 if outcome.applied > 0 {
                     if let Some(notify) = generation_reconcile.as_ref() {
                         notify.notify_one();
@@ -354,12 +393,15 @@ pub fn spawn(
                         );
                     }
 
-                    match reconcile_export(&runtime, force_epoch, reason)
+                    match reconcile_export(&runtime, force_epoch, reason, last_export_signature)
                     .await
                     {
                         Ok(outcome) if outcome.shutdown => return,
                         Ok(outcome) if outcome.failed == 0 => {
                             last_successful_export = Some(Instant::now());
+                            if let Some(signature) = outcome.export_signature {
+                                last_export_signature = Some(signature);
+                            }
                             if !remote_bundle_config_hashes_hash.is_empty() {
                                 last_bundle_config_hashes_hash =
                                     remote_bundle_config_hashes_hash.clone();
@@ -403,6 +445,7 @@ async fn reconcile_export(
     runtime: &ReconcileRuntime<'_>,
     force_epoch: bool,
     reason: &str,
+    previous_export_signature: Option<blake3::Hash>,
 ) -> Result<ExportOutcome, ReconcileError> {
     let snapshot = runtime.client.fetch_export().await?;
     let ipc = Arc::clone(&runtime.ipc);
@@ -412,8 +455,11 @@ async fn reconcile_export(
         runtime.bundle,
         &runtime.state,
         &runtime.metrics,
-        force_epoch,
-        reason,
+        ExportReconcileOptions {
+            force_epoch,
+            reason,
+            previous_export_signature,
+        },
         move |req, epoch| {
             let ipc = Arc::clone(&ipc);
             let shutdown = Arc::clone(&shutdown);
@@ -428,8 +474,7 @@ async fn reconcile_export_snapshot<F, Fut>(
     bundle: &str,
     state: &ConfigApplyState,
     metrics: &MetricsRegistry,
-    force_epoch: bool,
-    reason: &str,
+    options: ExportReconcileOptions<'_>,
     mut apply: F,
 ) -> ExportOutcome
 where
@@ -438,7 +483,7 @@ where
 {
     let _apply_guard = state.lock_apply().await;
 
-    if !force_epoch && snapshot.epoch < state.epoch() {
+    if !options.force_epoch && snapshot.epoch < state.epoch() {
         record_reconcile(metrics, "stale_export");
         return ExportOutcome {
             epoch: snapshot.epoch,
@@ -447,6 +492,7 @@ where
             skipped: snapshot.models.len(),
             shutdown: false,
             state_updated: false,
+            export_signature: None,
         };
     }
 
@@ -497,6 +543,36 @@ where
         });
     }
 
+    let export_signature = if failed == 0 {
+        Some(compute_export_signature(
+            bundle,
+            control_plane_hash.as_deref(),
+            &exported_models,
+        ))
+    } else {
+        None
+    };
+
+    if options.reason == "periodic_export"
+        && export_signature.is_some()
+        && export_signature == options.previous_export_signature
+    {
+        record_reconcile(metrics, "no_change");
+        debug!(
+            epoch = snapshot.epoch,
+            skipped, "worker-config: periodic export unchanged; skipping replace"
+        );
+        return ExportOutcome {
+            epoch: snapshot.epoch,
+            applied: 0,
+            failed: 0,
+            skipped,
+            shutdown: false,
+            state_updated: false,
+            export_signature,
+        };
+    }
+
     let state_updated = if failed == 0 {
         let req = ReplaceModelConfigsRequest {
             bundle_id: bundle.to_string(),
@@ -515,6 +591,7 @@ where
                     skipped,
                     shutdown: true,
                     state_updated: false,
+                    export_signature,
                 };
             }
             Err(e) => {
@@ -531,6 +608,7 @@ where
                     skipped,
                     shutdown: false,
                     state_updated: false,
+                    export_signature,
                 };
             }
         };
@@ -548,6 +626,7 @@ where
                 skipped,
                 shutdown: false,
                 state_updated: false,
+                export_signature,
             };
         }
 
@@ -570,8 +649,11 @@ where
                 "worker-config: Python registry hash differs from control-plane export hash; advertising Python-applied hash"
             );
         }
-        let state_updated =
-            state.mark_export_reconciled(snapshot.epoch, Some(applied_bundle_hash), force_epoch);
+        let state_updated = state.mark_export_reconciled(
+            snapshot.epoch,
+            Some(applied_bundle_hash),
+            options.force_epoch,
+        );
         if state_updated {
             metrics.config_epoch.set(snapshot.epoch as i64);
         }
@@ -596,7 +678,7 @@ where
         applied,
         failed,
         skipped,
-        reason,
+        reason = options.reason,
         state_updated,
         "worker-config: export reconcile attempt finished"
     );
@@ -608,6 +690,7 @@ where
         skipped,
         shutdown: false,
         state_updated,
+        export_signature,
     }
 }
 
@@ -618,17 +701,33 @@ mod tests {
 
     use tokio::sync::Mutex;
 
-    fn exported_model(model_id: &str, bundles: &[&str]) -> ExportedModel {
+    fn exported_model_with_yaml(model_id: &str, bundles: &[&str], raw_yaml: &str) -> ExportedModel {
         ExportedModel {
             model_id: model_id.into(),
-            raw_yaml: Some(format!("sie_id: {model_id}\nprofiles:\n  default: {{}}\n")),
+            raw_yaml: Some(raw_yaml.to_string()),
             model_config: None,
             affected_bundles: bundles.iter().map(|b| (*b).to_string()).collect(),
         }
     }
 
+    fn exported_model(model_id: &str, bundles: &[&str]) -> ExportedModel {
+        exported_model_with_yaml(
+            model_id,
+            bundles,
+            &format!("sie_id: {model_id}\nprofiles:\n  default: {{}}\n"),
+        )
+    }
+
     fn metrics() -> MetricsRegistry {
         MetricsRegistry::new().expect("metrics registry")
+    }
+
+    fn reconcile_options(reason: &'static str) -> ExportReconcileOptions<'static> {
+        ExportReconcileOptions {
+            force_epoch: false,
+            reason,
+            previous_export_signature: None,
+        }
     }
 
     #[test]
@@ -651,6 +750,29 @@ mod tests {
         assert_eq!(
             drift_reason(9, &legacy_remote, "old-fingerprint", false),
             None
+        );
+    }
+
+    #[test]
+    fn drift_reason_preserves_epoch_zero_periodic_export_with_stable_fingerprint() {
+        let remote = EpochSnapshot {
+            epoch: 0,
+            bundle_config_hashes_hash: "stable-fingerprint".into(),
+        };
+
+        assert_eq!(
+            drift_reason(0, &remote, "stable-fingerprint", true),
+            Some("periodic_export")
+        );
+        assert_eq!(drift_reason(0, &remote, "stable-fingerprint", false), None);
+
+        let legacy_remote = EpochSnapshot {
+            epoch: 0,
+            bundle_config_hashes_hash: String::new(),
+        };
+        assert_eq!(
+            drift_reason(0, &legacy_remote, "stable-fingerprint", true),
+            Some("periodic_export")
         );
     }
 
@@ -706,8 +828,13 @@ mod tests {
         let metrics = metrics();
         let applied = Arc::new(Mutex::new(Vec::new()));
 
-        let outcome =
-            reconcile_export_snapshot(snapshot, "default", &state, &metrics, false, "test", {
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            "default",
+            &state,
+            &metrics,
+            reconcile_options("test"),
+            {
                 let applied = Arc::clone(&applied);
                 move |req, _epoch| {
                     let applied = Arc::clone(&applied);
@@ -721,8 +848,9 @@ mod tests {
                         }))
                     }
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert_eq!(outcome.applied, 1);
         assert_eq!(outcome.failed, 0);
@@ -760,8 +888,7 @@ mod tests {
             "default",
             &state,
             &metrics,
-            false,
-            "test",
+            reconcile_options("test"),
             |req, _epoch| async move {
                 if req.models.iter().any(|model| model.model_id == "bad-model") {
                     Err(IpcError::Server("apply failed".into()))
@@ -804,8 +931,10 @@ mod tests {
             "default",
             &state,
             &metrics,
-            true,
-            "test",
+            ExportReconcileOptions {
+                force_epoch: true,
+                ..reconcile_options("test")
+            },
             |_req, _epoch| async move {
                 Ok(Some(ReplaceModelConfigsResponse {
                     applied: true,
@@ -845,8 +974,7 @@ mod tests {
             "default",
             &state,
             &metrics,
-            false,
-            "test",
+            reconcile_options("test"),
             |_req, _epoch| async move {
                 Ok(Some(ReplaceModelConfigsResponse {
                     applied: true,
@@ -878,8 +1006,13 @@ mod tests {
         let metrics = metrics();
         let replace_calls = Arc::new(Mutex::new(Vec::new()));
 
-        let outcome =
-            reconcile_export_snapshot(snapshot, "default", &state, &metrics, false, "test", {
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            "default",
+            &state,
+            &metrics,
+            reconcile_options("test"),
+            {
                 let replace_calls = Arc::clone(&replace_calls);
                 move |req, _epoch| {
                     let replace_calls = Arc::clone(&replace_calls);
@@ -893,8 +1026,9 @@ mod tests {
                         }))
                     }
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert_eq!(outcome.applied, 0);
         assert_eq!(outcome.failed, 0);
@@ -905,5 +1039,173 @@ mod tests {
         let replace_calls = replace_calls.lock().await;
         assert_eq!(replace_calls.len(), 1);
         assert!(replace_calls[0].models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_skips_unchanged_periodic_snapshot_before_ipc() {
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+        let replace_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let initial = reconcile_export_snapshot(
+            ExportSnapshot {
+                epoch: 0,
+                bundle_config_hashes: HashMap::from([(
+                    "default".to_string(),
+                    "control-hash".to_string(),
+                )]),
+                models: vec![exported_model("target-model", &["default"])],
+            },
+            "default",
+            &state,
+            &metrics,
+            reconcile_options("startup"),
+            {
+                let replace_calls = Arc::clone(&replace_calls);
+                move |req, _epoch| {
+                    let replace_calls = Arc::clone(&replace_calls);
+                    async move {
+                        replace_calls.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: "control-hash".into(),
+                            config_version: 1,
+                            applied_models: vec!["target-model".into()],
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+        let signature = initial.export_signature.expect("initial signature");
+
+        let unchanged = reconcile_export_snapshot(
+            ExportSnapshot {
+                epoch: 0,
+                bundle_config_hashes: HashMap::from([(
+                    "default".to_string(),
+                    "control-hash".to_string(),
+                )]),
+                models: vec![exported_model("target-model", &["default"])],
+            },
+            "default",
+            &state,
+            &metrics,
+            ExportReconcileOptions {
+                previous_export_signature: Some(signature),
+                ..reconcile_options("periodic_export")
+            },
+            {
+                let replace_calls = Arc::clone(&replace_calls);
+                move |req, _epoch| {
+                    let replace_calls = Arc::clone(&replace_calls);
+                    async move {
+                        replace_calls.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: "control-hash".into(),
+                            config_version: 2,
+                            applied_models: vec!["target-model".into()],
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(unchanged.applied, 0);
+        assert_eq!(unchanged.failed, 0);
+        assert!(!unchanged.state_updated);
+        assert_eq!(replace_calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn export_reconcile_applies_epoch_zero_periodic_snapshot_when_body_changes() {
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+        let replace_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let initial = reconcile_export_snapshot(
+            ExportSnapshot {
+                epoch: 0,
+                bundle_config_hashes: HashMap::from([(
+                    "default".to_string(),
+                    "stable-routing-hash".to_string(),
+                )]),
+                models: vec![exported_model_with_yaml(
+                    "target-model",
+                    &["default"],
+                    "sie_id: target-model\nprofiles:\n  default:\n    max_batch_tokens: 4096\n",
+                )],
+            },
+            "default",
+            &state,
+            &metrics,
+            reconcile_options("startup"),
+            {
+                let replace_calls = Arc::clone(&replace_calls);
+                move |req, _epoch| {
+                    let replace_calls = Arc::clone(&replace_calls);
+                    async move {
+                        replace_calls.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: "stable-routing-hash".into(),
+                            config_version: 1,
+                            applied_models: vec!["target-model".into()],
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+        let signature = initial.export_signature.expect("initial signature");
+
+        let changed = reconcile_export_snapshot(
+            ExportSnapshot {
+                epoch: 0,
+                bundle_config_hashes: HashMap::from([(
+                    "default".to_string(),
+                    "stable-routing-hash".to_string(),
+                )]),
+                models: vec![exported_model_with_yaml(
+                    "target-model",
+                    &["default"],
+                    "sie_id: target-model\nprofiles:\n  default:\n    max_batch_tokens: 8192\n",
+                )],
+            },
+            "default",
+            &state,
+            &metrics,
+            ExportReconcileOptions {
+                previous_export_signature: Some(signature),
+                ..reconcile_options("periodic_export")
+            },
+            {
+                let replace_calls = Arc::clone(&replace_calls);
+                move |req, _epoch| {
+                    let replace_calls = Arc::clone(&replace_calls);
+                    async move {
+                        let applied_models = req
+                            .models
+                            .iter()
+                            .map(|model| model.model_id.clone())
+                            .collect();
+                        replace_calls.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: "stable-routing-hash".into(),
+                            config_version: 2,
+                            applied_models,
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(changed.applied, 1);
+        assert_eq!(changed.failed, 0);
+        assert_eq!(replace_calls.lock().await.len(), 2);
     }
 }

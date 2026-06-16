@@ -165,6 +165,89 @@ profiles:
         assert len(configs) == 1
         assert "valid-model" in configs
 
+    def test_profile_max_seq_length_is_promoted_to_variant_context(self, tmp_path: Path) -> None:
+        """Profile variants can expose a larger generation context than the base model."""
+        (tmp_path / "qwen.yaml").write_text("""
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+tasks:
+  generate:
+    context_length: 4096
+    max_output_tokens: 4096
+max_sequence_length: 4096
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+    admission_enabled: true
+    adaptive_batching:
+      target_p50_ms: 250
+      min_wait_ms: 2
+  rtx-pro-6000:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 32768
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+  long-startup:
+    adapter_path: "sie_server.adapters.sglang.generation:SGLangGenerationAdapter"
+    max_batch_tokens: 32768
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+        startup_timeout_s: 900
+        extra_launch_args:
+          - "--example-flag"
+  extended-startup:
+    extends: default
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+        startup_timeout_s: 1200
+""")
+
+        configs = load_model_configs(tmp_path)
+
+        base = configs["Qwen/Qwen3.6-27B"]
+        variant = configs["Qwen/Qwen3.6-27B:rtx-pro-6000"]
+        long_startup_variant = configs["Qwen/Qwen3.6-27B:long-startup"]
+        extended_startup_variant = configs["Qwen/Qwen3.6-27B:extended-startup"]
+        assert base.tasks.generate is not None
+        assert variant.tasks.generate is not None
+        assert long_startup_variant.tasks.generate is not None
+        assert extended_startup_variant.tasks.generate is not None
+        assert base.tasks.generate.context_length == 4096
+        assert base.max_sequence_length == 4096
+        assert variant.tasks.generate.context_length == 32768
+        assert variant.max_sequence_length == 32768
+        assert long_startup_variant.tasks.generate.context_length == 32768
+        assert long_startup_variant.max_sequence_length == 32768
+        assert extended_startup_variant.tasks.generate.context_length == 32768
+        assert extended_startup_variant.max_sequence_length == 32768
+        assert _build_adapter_kwargs(variant, "bfloat16")["max_seq_length"] == 32768
+        long_startup_kwargs = _build_adapter_kwargs(long_startup_variant, "bfloat16")
+        assert long_startup_kwargs["max_seq_length"] == 32768
+        assert long_startup_kwargs["startup_timeout_s"] == 900
+        assert long_startup_kwargs["extra_launch_args"] == ["--example-flag"]
+        extended_startup_kwargs = _build_adapter_kwargs(extended_startup_variant, "bfloat16")
+        assert extended_startup_kwargs["max_seq_length"] == 32768
+        assert extended_startup_kwargs["startup_timeout_s"] == 1200
+        extended_profile = extended_startup_variant.resolve_profile("default")
+        assert extended_profile.kv_budget_tokens == 8192
+        assert extended_profile.admission_enabled is True
+        assert extended_profile.adaptive_batching is not None
+        assert extended_profile.adaptive_batching.target_p50_ms == 250
+        assert extended_profile.adaptive_batching.min_wait_ms == 2
+        assert extended_startup_variant._resolved_cache is not base._resolved_cache
+        assert extended_startup_variant._resolved_cache is not variant._resolved_cache
+        assert extended_startup_variant._resolved_cache is not long_startup_variant._resolved_cache
+        assert extended_startup_variant._resolved_lock is not base._resolved_lock
+        assert extended_startup_variant._resolved_lock is not variant._resolved_lock
+        assert extended_startup_variant._resolved_lock is not long_startup_variant._resolved_lock
+
     def test_missing_models_dir(self, tmp_path: Path) -> None:
         """Raises FileNotFoundError for missing models directory."""
         missing_dir = tmp_path / "nonexistent"

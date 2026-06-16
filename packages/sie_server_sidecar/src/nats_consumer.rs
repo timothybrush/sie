@@ -704,6 +704,8 @@ mod tests {
             bundle: "b".into(),
             ipc_socket_path: PathBuf::from("/tmp/s.sock"),
             ipc_pool_size: 1,
+            ipc_request_timeout_s: 60,
+            model_ready_timeout_s: 900,
             payload_store_url: None,
             gateway_url: None,
             gateway_api_key: None,

@@ -555,8 +555,6 @@ class QueueExecutor:
         invalidated = await self._registry.replace_configs_async(configs)
         for model_id in invalidated:
             self.invalidate_model_descriptor(model_id)
-        for config in configs:
-            self.invalidate_model_descriptor(config.sie_id)
         bundle_hash = compute_bundle_config_hash_cached(self._registry, req.bundle_id)
         applied_models = sorted(self._registry.get_configs_snapshot(req.bundle_id))
         return ReplaceModelConfigsResponse(

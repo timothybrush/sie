@@ -14,16 +14,10 @@ inputs:
 tasks:
   generate:
     # Native context length is 262,144 tokens (YaRN extends to ~1M).
-    # Default to 4096 here — this matches the empirically-calibrated
-    # reference point in the profile comments below
-    # (mem_fraction_static=0.93, weight 51.05 GB + kvcache 11.63 GB).
-    # 8192 was the original optimistic default but SGLang's
-    # init_memory_pool refused to fit it inside the conservative
-    # mem_fraction envelope on H100-80GB even when bumped to 0.97 —
-    # NEXTN speculative-decoding draft KV pushes the total past the
-    # available headroom. Raise both context_length AND
-    # mem_fraction_static together if you need longer contexts;
-    # benchmarking and prod requests today fit comfortably in 4096.
+    # Keep the base model contract at the measured 4K window. The managed
+    # tester rollout exposes the 32K surface only through the
+    # ``:rtx-pro-6000`` variant below, whose profile-level ``max_seq_length``
+    # is promoted into the generated variant config by the loader.
     context_length: 4096
     max_output_tokens: 4096
     capabilities:
@@ -42,12 +36,9 @@ tasks:
       code: true
       # CAVEAT: this flag is precision-agnostic, but FP8 weight quant regresses
       # SQL ~13pts (Spider 0.71 BF16 -> 0.58 FP8, same-subset control; see the
-      # ADR + baseline). Code/tools/MC are FP8-safe. The default rtx-pro-6000
-      # profile is FP8, so route SQL-critical traffic to the BF16+NEXTN variant
-      # (the 96GB card fits it). The `:profile` variant suffix can't route by
-      # precision (it's stripped before worker dispatch), so deploy the BF16
-      # variant under a distinct bundle and point the `sql` job alias at it via
-      # a bundle-qualified target, e.g.
+      # ADR + baseline). Code/tools/MC are FP8-safe. The RTX FP8 profile below is
+      # for code/tools/general. Route SQL-critical traffic to the BF16 profile
+      # or a BF16 bundle-qualified alias, e.g.
       # SIE_GATEWAY_MODEL_ALIASES={"sql":"<bf16-bundle>:/Qwen/Qwen3.6-27B"}
       # (gateway resolve_model_spec_with_aliases; see ADR 0001).
       sql: true
@@ -72,7 +63,7 @@ tasks:
               type: string
           required: [answer]
 max_sequence_length: 4096
-# ── KV-cache math (placeholder, pending Modal calibration) ──
+# ── KV-cache math ──
 #
 # Qwen3.6-27B layer breakdown (per model card / config.json):
 #   * 64 layers in a 16 × (3 × DeltaNet + 1 × GatedAttention) pattern
@@ -80,44 +71,26 @@ max_sequence_length: 4096
 #   * 48 recurrent Gated-DeltaNet layers — managed by SGLang's mamba
 #     scheduler under ``--mamba-scheduler-strategy extra_buffer``
 #
-# BF16 weights ≈ 27e9 × 2 B ≈ 54 GB before activations / KV.
-#   * L4 (22 GB)        → infeasible
-#   * A100-40GB (40 GB) → infeasible BF16; would need FP8 or TP2
-#   * H100-80GB         → primary target (single-GPU, BF16)
-#   * H100×2 (160 GB)   → for context >32k or large concurrencies
-#
-# ``kv_budget_tokens`` is a conservative analytical placeholder pending
-# the first /get_server_info dump from tools/smoke_qwen36_27b.py on
-# Modal. Re-calibrate from the empirical token_capacity before relying
-# on these numbers in production.
+# BF16 weights ≈ 27e9 × 2 B ≈ 54 GB before activations / KV. FP8 weight
+# quantization cuts the VRAM weight footprint to ~27 GB but still requires
+# enough host RAM to read the BF16 checkpoint before quantization.
+#   * L4 (24 GB)         → infeasible
+#   * A100-40GB (40 GB)  → infeasible BF16; FP8/TP2 only
+#   * H100-80GB          → BF16 speculative profiles at the measured 4K window
+#   * RTX PRO 6000 96GB  → FP8 + NEXTN profile with a 32K variant surface
 profiles:
-  # L4 / A100-40GB profiles intentionally omitted — Qwen3.6-27B's BF16
-  # weights (~54 GB) do not fit. Add an FP8 or TP2 profile if those
-  # tiers become required.
+  # L4 / A100-40GB BF16 profiles intentionally omitted — Qwen3.6-27B's BF16
+  # weights (~54 GB) do not fit.
   default:
     max_batch_tokens: 16384
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
-    # Conservative H100-80GB placeholder pending the first
-    # /get_server_info dump from tools/smoke_qwen36_27b.py on Modal.
-    # Empirical reference point (2026-05-27 smoke, mem_fraction_static=0.93,
-    # context_length=4096, no-spec): SGLang reported
-    # ``weight=51.05 GB, kvcache=11.63 GB, token_capacity=190,543``.
-    # Sizing here at ~1/12 of that capacity to leave room for NEXTN
-    # draft KV + grammar/Outlines compile arena once spec is re-enabled.
-    # Re-calibrate after a smoke run on this profile's actual settings.
-    # Halved from 16384 to leave more H100-80GB headroom for the NEXTN
-    # draft activation arena. 8192 KV slots × ~64 KB/token ≈ 0.5 GB —
-    # plenty for the realistic per-request concurrency on this profile.
+    # H100-80GB speculative launch shape carried forward at the measured 4K
+    # base-model context. The managed cluster routes 32K 27B generation to
+    # ``rtx-pro-6000``.
     kv_budget_tokens: 8192
     adapter_options:
       loadtime:
-        # 0.95 paired with ``context_length: 4096`` + the *smaller*
-        # NEXTN draft below (num_steps=2 / num_draft_tokens=2 vs the
-        # 3/4 model-card default). The 0.93+default-draft cell still
-        # OOM'd ``init_memory_pool`` because verification batch grows
-        # with num_steps × num_draft_tokens; halving both shrinks the
-        # activation arena enough to fit.
         mem_fraction_static: 0.95
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
@@ -125,15 +98,9 @@ profiles:
         grammar_backend: outlines
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
-        # MTP/NEXTN per the Qwen3.x model-card recipe (SGLang implements
-        # NEXTN under the EAGLE codepath; ``/server_info`` reports
-        # ``speculative_algorithm: EAGLE``). Smaller-draft variant
-        # (num_steps=2 / num_draft_tokens=2 vs the model-card 3/4) so
-        # the verification batch fits inside H100-80GB at ctx=4096 +
-        # mfs=0.95. The 3/4 default reliably OOM'd
-        # ``init_memory_pool`` even at mfs=0.97 — the trade is a
-        # slightly smaller speculative window for the ability to fit at
-        # all. Re-tune (or re-enable 3/4) once FP8 / TP=2 is wired up.
+        # MTP/NEXTN per the Qwen3.x model-card recipe. Keep the smaller 2/2
+        # H100 draft shape from main; the larger 3/4 draft remains on the
+        # RTX-PRO-6000 FP8 profile.
         speculative:
           enabled: true
           algorithm: nextn
@@ -141,9 +108,9 @@ profiles:
           eagle_topk: 1
           num_draft_tokens: 2
         # ``--mamba-scheduler-strategy extra_buffer`` is the required
-        # pair-flag for NEXTN spec on the hybrid Gated-DeltaNet
-        # architecture. With spec disabled it's also harmless to keep,
-        # so we leave it for when spec is re-enabled.
+        # pair-flag for NEXTN spec on the hybrid Gated-DeltaNet architecture.
+        # Keep it paired with ``--disable-overlap-schedule`` for all NEXTN
+        # launch profiles.
         extra_launch_args:
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
@@ -156,19 +123,19 @@ profiles:
           temperature: 0.7
           top_p: 0.8
           presence_penalty: 1.5
+          min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
   h100:
     max_batch_tokens: 32768
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
-    # Same H100-80GB target as ``default``; this profile widens
-    # ``max_batch_tokens`` for batch-heavy workloads once calibration
-    # confirms KV headroom.
+    # Same H100-80GB target as ``default`` with the model-card 3/4 NEXTN draft
+    # preserved from main. Keep the public H100 context at the measured 4K
+    # base-model window until a separate 32K H100 smoke lands.
     kv_budget_tokens: 32768
     adapter_options:
       loadtime:
-        # Same as ``default`` — see that profile's mfs comment.
         mem_fraction_static: 0.93
         served_model_name: Qwen/Qwen3.6-27B
         disable_cuda_graph: true
@@ -197,6 +164,7 @@ profiles:
           temperature: 0.7
           top_p: 0.8
           presence_penalty: 1.5
+          min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"
   # RTX PRO 6000 (96 GB GDDR7, Blackwell Server Edition, sm_120) profile.
@@ -226,12 +194,17 @@ profiles:
     max_batch_tokens: 32768
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
-    # FP8 weights (~27 GB) + 96 GB total leaves generous KV/draft headroom;
-    # start conservative and raise after the first /get_server_info dump on
-    # the actual RTX-PRO-6000 smoke.
-    kv_budget_tokens: 16384
+    # FP8 weights (~27 GB) + 96 GB total leaves KV/draft headroom for two
+    # 32K-context admissions on the validated RTX-PRO-6000 serving path.
+    kv_budget_tokens: 65536
     adapter_options:
       loadtime:
+        # Profile-scoped launch/context override. ``loadtime`` already
+        # overrides adapter constructor kwargs; loader variant expansion
+        # also promotes this into the generated ``:rtx-pro-6000`` model's
+        # ``tasks.generate.context_length`` / ``max_sequence_length`` so
+        # the 32K contract is attached to the RTX variant, not the base model.
+        max_seq_length: 32768
         # 0.90 is a conservative starting point — FP8 weights free enough
         # memory that the 3/4 NEXTN verification batch should fit with room
         # to spare. Iterate upward (smoke ``--mem-fraction-static``) once the
@@ -321,5 +294,6 @@ profiles:
           temperature: 0.7
           top_p: 0.8
           presence_penalty: 1.5
+          min_new_tokens: 10
         stop_tokens:
           - "<|im_end|>"

@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from sie_sdk.storage import (
 from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.engine import ComputePrecision
-from sie_server.config.model import AdapterOptions, ModelConfig, ProfileConfig
+from sie_server.config.model import AdapterOptions, ModelConfig, ProfileConfig, ResolvedProfile
 from sie_server.core.inference import AttentionBackend
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
         for profile_name, profile in config.profiles.items():
             if profile_name == "default":
                 continue
+            resolved: ResolvedProfile | None = None
             # Resolve extending profiles, use standalone profiles as-is
             if profile.extends is not None:
                 resolved = config.resolve_profile(profile_name)
@@ -119,6 +121,9 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
                         loadtime=dict(resolved.loadtime),
                         runtime=dict(resolved.runtime),
                     ),
+                    adaptive_batching=resolved.adaptive_batching,
+                    kv_budget_tokens=resolved.kv_budget_tokens,
+                    admission_enabled=resolved.admission_enabled,
                 )
             else:
                 variant_default = profile.model_copy(update={"extends": None})
@@ -128,12 +133,30 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
                 logger.warning("Variant '%s' collides with existing config; skipping expansion", variant_id)
                 continue
             variant_profiles = {"default": variant_default}
+            variant_updates: dict[str, Any] = {
+                "sie_id": variant_id,
+                "profiles": variant_profiles,
+            }
+            loadtime = resolved.loadtime if resolved is not None else profile.adapter_options.loadtime
+            profile_max_seq = loadtime.get("max_seq_length")
+            if isinstance(profile_max_seq, int) and profile_max_seq > 0:
+                variant_updates["max_sequence_length"] = profile_max_seq
+                if config.tasks.generate is not None:
+                    variant_updates["tasks"] = config.tasks.model_copy(
+                        update={
+                            "generate": config.tasks.generate.model_copy(
+                                update={"context_length": profile_max_seq},
+                            ),
+                        },
+                    )
             variant_config = config.model_copy(
-                update={
-                    "sie_id": variant_id,
-                    "profiles": variant_profiles,
-                },
+                update=variant_updates,
             )
+            # ``model_copy`` carries PrivateAttr values, including the resolved
+            # profile cache. Variants must not share cached "default" profiles
+            # with the base config or sibling variants.
+            variant_config._resolved_cache = {}
+            variant_config._resolved_lock = threading.Lock()
             variants[variant_id] = variant_config
             logger.info("Expanded profile '%s' as variant: %s", profile_name, variant_id)
 

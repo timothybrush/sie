@@ -744,3 +744,47 @@ class TestKvBudgetTokensValidator:
         assert isinstance(resolved, ResolvedProfile)
         assert resolved.kv_budget_tokens == 8192
         assert resolved.admission_enabled is True
+
+
+class TestGrammarProfile:
+    """``tasks.generate.grammar_profile`` validation (grammar-request routing)."""
+
+    @staticmethod
+    def _config(grammar_profile: str | None, *, with_no_spec: bool = True) -> ModelConfig:
+        profiles = {
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.test:TestAdapter",
+                max_batch_tokens=8192,
+                kv_budget_tokens=1024,
+            ),
+        }
+        if with_no_spec:
+            profiles["no-spec"] = ProfileConfig(
+                adapter_path="sie_server.adapters.test:TestAdapter",
+                max_batch_tokens=8192,
+                kv_budget_tokens=1024,
+            )
+        return ModelConfig(
+            sie_id="gen-model",
+            hf_id="org/gen",
+            tasks=Tasks(
+                generate=GenerateTask(context_length=8192, max_output_tokens=512, grammar_profile=grammar_profile)
+            ),
+            profiles=profiles,
+        )
+
+    def test_valid_grammar_profile(self) -> None:
+        config = self._config("no-spec")
+        assert config.tasks.generate.grammar_profile == "no-spec"  # type: ignore[union-attr]
+
+    def test_none_is_default(self) -> None:
+        config = self._config(None)
+        assert config.tasks.generate.grammar_profile is None  # type: ignore[union-attr]
+
+    def test_unknown_grammar_profile_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="grammar_profile"):
+            self._config("does-not-exist")
+
+    def test_grammar_profile_default_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must not be 'default'"):
+            self._config("default")

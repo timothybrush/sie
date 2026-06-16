@@ -462,6 +462,116 @@ profiles:
         assert registry.has_model("kept/model")
 
     @pytest.mark.asyncio
+    async def test_replace_model_configs_keeps_loaded_model_for_identical_config(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(registry)
+
+        def model_yaml(model_id: str) -> str:
+            return f"""
+sie_id: {model_id}
+hf_id: sentence-transformers/all-MiniLM-L6-v2
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    max_batch_tokens: 4096
+"""
+
+        await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=7,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model"),
+                    )
+                ],
+            )
+        )
+        config_version = registry._config_version
+        registry._loaded["kept/model"] = MagicMock()
+        registry._do_unload = AsyncMock()
+
+        resp = await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=8,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model"),
+                    )
+                ],
+            )
+        )
+
+        assert resp.applied is True
+        assert resp.applied_models == ["kept/model"]
+        registry._do_unload.assert_not_awaited()
+        assert registry._config_version == config_version
+        assert registry.has_model("kept/model")
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_unloads_loaded_model_for_changed_config(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(registry)
+
+        def model_yaml(model_id: str, *, max_batch_tokens: int) -> str:
+            return f"""
+sie_id: {model_id}
+hf_id: sentence-transformers/all-MiniLM-L6-v2
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sentence_transformer:Adapter
+    max_batch_tokens: {max_batch_tokens}
+"""
+
+        await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=7,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model", max_batch_tokens=4096),
+                    )
+                ],
+            )
+        )
+        registry._loaded["kept/model"] = MagicMock()
+        registry._do_unload = AsyncMock()
+
+        resp = await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="default",
+                epoch=8,
+                bundle_config_hash="",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="kept/model",
+                        model_config=model_yaml("kept/model", max_batch_tokens=8192),
+                    )
+                ],
+            )
+        )
+
+        assert resp.applied is True
+        assert resp.applied_models == ["kept/model"]
+        registry._do_unload.assert_awaited_once_with("kept/model")
+        assert registry.get_config("kept/model").profiles["default"].max_batch_tokens == 8192
+
+    @pytest.mark.asyncio
     async def test_replace_model_configs_reports_pool_filtered_models(self) -> None:
         registry = ModelRegistry(models_dir=None, pool_name="customer-a")
         executor = QueueExecutor(registry)

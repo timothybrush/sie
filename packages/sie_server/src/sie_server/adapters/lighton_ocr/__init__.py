@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+import torch.nn.functional as F
 
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
@@ -48,6 +49,7 @@ class LightOnOCRAdapter(ModelAdapter):
         num_beams: int = 1,
         attn_implementation: str = "sdpa",
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        max_batch_images: int = 4,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -59,6 +61,11 @@ class LightOnOCRAdapter(ModelAdapter):
             num_beams: Number of beams for beam search.
             attn_implementation: Attention implementation - "eager", "sdpa", or "flash_attention_2".
             system_prompt: System prompt for the chat template.
+            max_batch_images: Max images per batched ``generate()`` call. Bounds KV-cache /
+                vision-activation memory so a large incoming batch cannot OOM (issue #33,
+                decoder-batching KV-OOM). The
+                default (4) is safe on a 24GB L4 with ``max_new_tokens=4096``; raise it on
+                higher-VRAM GPUs to batch more pages per call.
             **kwargs: Ignored extra arguments from the loader.
         """
         del kwargs  # Unused - accepts normalize, max_seq_length, etc.
@@ -68,6 +75,7 @@ class LightOnOCRAdapter(ModelAdapter):
         self._num_beams = num_beams
         self._attn_implementation = attn_implementation
         self._system_prompt = system_prompt
+        self._max_batch_images = max(1, max_batch_images)
 
         self._model: Any = None
         self._processor: Any = None
@@ -113,6 +121,14 @@ class LightOnOCRAdapter(ModelAdapter):
         self._processor = LightOnOcrProcessor.from_pretrained(
             self._model_name_or_path,
         )
+
+        # Batched generation left-pads input_ids (prompt length varies with image
+        # resolution), so the decoder must pad on the left and have a pad token.
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        if tokenizer is not None:
+            tokenizer.padding_side = "left"
+            if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
 
         self._model = LightOnOcrForConditionalGeneration.from_pretrained(
             self._model_name_or_path,
@@ -275,11 +291,19 @@ class LightOnOCRAdapter(ModelAdapter):
             num_beams: Beam search width.
 
         Returns:
-            ExtractOutput with entities.
+            ExtractOutput with entities in original item order.
+
+        Preprocessed payloads are run through a single batched ``generate()`` per
+        sub-batch instead of one call per image, so GPU concurrency actually scales
+        OCR throughput (issue #601). Images may differ in resolution (Pixtral is
+        variable-resolution), so pixel_values are zero-padded to the per-batch max and
+        input_ids are left-padded — mirroring transformers' own batched Pixtral path.
         """
         from sie_server.core.prepared import LightOnOCRPayload, PreparedItem
 
-        all_entities = []
+        results: list[list[Entity]] = [[] for _ in items]
+        payloads: list[Any] = []
+        payload_indices: list[int] = []
 
         for i, prepared in enumerate(prepared_items):
             if isinstance(prepared, PreparedItem):
@@ -287,40 +311,104 @@ class LightOnOCRAdapter(ModelAdapter):
             else:
                 payload = getattr(prepared, "payload", prepared)
 
-            if not isinstance(payload, LightOnOCRPayload):
-                entities = self._extract_single(
+            if isinstance(payload, LightOnOCRPayload):
+                payloads.append(payload)
+                payload_indices.append(i)
+            else:
+                results[i] = self._extract_single(
                     items[i],
                     instruction=None,
                     max_new_tokens=max_new_tokens,
                     num_beams=num_beams,
                 )
-                all_entities.append(entities)
-                continue
 
-            pixel_values = payload.pixel_values.unsqueeze(0).to(device=self._device, dtype=self._model.dtype)
-            input_ids = payload.input_ids.unsqueeze(0).to(self._device)
-            attention_mask = payload.attention_mask.unsqueeze(0).to(self._device)
-            image_sizes = payload.image_sizes.unsqueeze(0).to(self._device)
-            prompt_len = input_ids.shape[1]
+        # Sub-batch to bound KV-cache / vision-activation memory (issue #33, decoder-batching KV-OOM): a large
+        # incoming batch under high concurrency could otherwise OOM a 24GB L4.
+        for start in range(0, len(payloads), self._max_batch_images):
+            chunk = payloads[start : start + self._max_batch_images]
+            chunk_indices = payload_indices[start : start + self._max_batch_images]
+            texts = self._generate_batch(chunk, max_new_tokens=max_new_tokens, num_beams=num_beams)
+            for text, i in zip(texts, chunk_indices):
+                results[i] = self._convert_output(text)
 
-            with torch.inference_mode():
-                output_ids = self._model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    num_beams=num_beams,
-                )
+        return ExtractOutput(entities=results)
 
-            generated_ids = output_ids[0, prompt_len:]
-            generated_text = self._processor.decode(generated_ids, skip_special_tokens=True)
+    def _generate_batch(
+        self,
+        payloads: list[Any],
+        *,
+        max_new_tokens: int,
+        num_beams: int,
+    ) -> list[str]:
+        """Run one batched ``generate()`` over preprocessed LightOnOCR payloads.
 
-            entities = self._convert_output(generated_text)
-            all_entities.append(entities)
+        Args:
+            payloads: LightOnOCRPayload items (pixel_values [C,H,W], input_ids [L],
+                attention_mask [L], image_sizes [2]) that may have different resolutions.
+            max_new_tokens: Max tokens to generate.
+            num_beams: Beam search width.
 
-        return ExtractOutput(entities=all_entities)
+        Returns:
+            Decoded Markdown text per payload, in input order.
+        """
+        device = self._device
+        dtype = self._model.dtype
+
+        # pixel_values: zero-pad each [C, H_i, W_i] to the per-batch max (bottom/right),
+        # then stack to [N, C, H_max, W_max]. image_sizes carries the TRUE (h, w) per image
+        # so the Pixtral encoder masks the padding out (mirrors HF _pad_for_batching).
+        max_h = max(int(p.pixel_values.shape[1]) for p in payloads)
+        max_w = max(int(p.pixel_values.shape[2]) for p in payloads)
+        padded_pixels = [
+            F.pad(p.pixel_values, (0, max_w - int(p.pixel_values.shape[2]), 0, max_h - int(p.pixel_values.shape[1])))
+            for p in payloads
+        ]
+        pixel_values = torch.stack(padded_pixels).to(device=device, dtype=dtype)
+        image_sizes = torch.stack([p.image_sizes for p in payloads]).to(device)
+
+        # input_ids / attention_mask: LEFT-pad to the longest prompt so every row's real
+        # tokens align at the right edge (required for correct batched greedy decode;
+        # prompt length varies with image resolution).
+        pad_id = self._pad_token_id()
+        max_len = max(int(p.input_ids.shape[0]) for p in payloads)
+        input_ids_rows: list[torch.Tensor] = []
+        attention_rows: list[torch.Tensor] = []
+        for p in payloads:
+            n_pad = max_len - int(p.input_ids.shape[0])
+            ids = p.input_ids
+            mask = p.attention_mask
+            if n_pad:
+                ids = torch.cat([torch.full((n_pad,), pad_id, dtype=ids.dtype), ids])
+                mask = torch.cat([torch.zeros(n_pad, dtype=mask.dtype), mask])
+            input_ids_rows.append(ids)
+            attention_rows.append(mask)
+        input_ids = torch.stack(input_ids_rows).to(device)
+        attention_mask = torch.stack(attention_rows).to(device)
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=num_beams,
+            )
+
+        # Left-padding right-aligns every prompt, so generation starts at column max_len.
+        generated = output_ids[:, max_len:]
+        return self._processor.batch_decode(generated, skip_special_tokens=True)
+
+    def _pad_token_id(self) -> int:
+        """Resolve the pad token id for left-padding (Qwen3 has one; fall back to eos)."""
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        pad_id = getattr(tokenizer, "pad_token_id", None) if tokenizer is not None else None
+        if pad_id is None:
+            pad_id = self._model.config.text_config.eos_token_id
+        if isinstance(pad_id, (list, tuple)):
+            pad_id = pad_id[0]
+        return int(pad_id)
 
     def _extract_single(
         self,

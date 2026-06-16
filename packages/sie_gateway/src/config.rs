@@ -213,12 +213,12 @@ fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
 /// them. Empty alias/target pairs are skipped; aliases are stored lowercased
 /// because resolution lowercases the lookup.
 ///
-/// A target may be a bare model id (`Org/Model`) or a bundle-qualified spec
-/// (`bundle:/Org/Model`). The bundle form lets an operator pin a precision /
-/// profile bundle for a job — e.g. map `sql` to a BF16 bundle that avoids the
-/// FP8 SQL-accuracy regression (ADR 0001), since the `:profile` variant suffix
-/// is stripped before worker dispatch and so cannot itself route by precision.
-/// `resolve_model_spec_with_aliases` (proxy.rs) applies the bundle.
+/// A target may be a bare model id (`Org/Model`), a concrete profile variant
+/// (`Org/Model:profile`), or a bundle-qualified spec (`bundle:/Org/Model`).
+/// The bundle form lets an operator pin a precision / profile bundle for a job
+/// — e.g. map `sql` to a BF16 bundle that avoids the FP8 SQL-accuracy
+/// regression (ADR 0001). `resolve_model_spec_with_aliases` (proxy.rs) applies
+/// the bundle and preserves concrete profile variants.
 fn build_model_aliases(overrides: HashMap<String, String>) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     // Built-in: the code-generation job → the model with a MEASURED

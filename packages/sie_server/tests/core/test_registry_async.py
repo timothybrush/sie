@@ -1,6 +1,6 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
@@ -54,6 +54,26 @@ class TestAsyncLoading:
         config = _make_config(name="test-model", hf_id="org/test")
         registry.add_config(config)
         return registry
+
+    async def test_replace_configs_invalidates_when_model_dir_changes(self, tmp_path: Path) -> None:
+        """Same config with a new model_dir must update adapter resolution state."""
+        registry = ModelRegistry()
+        config = _make_config(name="test-model", hf_id="org/test")
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+
+        await registry.replace_configs_async([config], model_dir=old_dir)
+        registry._loaded["test-model"] = MagicMock()
+        registry._do_unload = AsyncMock()
+
+        invalidated = await registry.replace_configs_async(
+            [_make_config(name="test-model", hf_id="org/test")],
+            model_dir=new_dir,
+        )
+
+        assert invalidated == {"test-model"}
+        assert registry._model_dirs["test-model"] == new_dir
+        registry._do_unload.assert_awaited_once_with("test-model")
 
     async def test_load_async_basic(self, registry_with_model: ModelRegistry) -> None:
         """Test basic async loading."""

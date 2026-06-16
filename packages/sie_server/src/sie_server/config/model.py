@@ -157,6 +157,18 @@ class GenerateTask(BaseModel):
     :class:`ProfileConfig` rather than here, because the
     budget is a per-worker/per-profile shape rather than a per-task
     semantic.
+
+    ``grammar_profile`` optionally names a profile that grammar-constrained
+    requests (OpenAI ``response_format`` / SIE-native ``grammar``) must run on.
+    When set, the gateway rewrites such a request's model id to the
+    ``{sie_id}:{grammar_profile}`` variant so it is served by that profile,
+    while unconstrained requests keep the request's resolved profile. This
+    exists because some throughput optimisations are incompatible with
+    decode-time grammar enforcement — notably NEXTN/MTP speculative decoding
+    bypasses SGLang's Outlines FSM (leaks out-of-schema keys, truncates
+    mid-JSON), so a model whose default profile is speculative points
+    ``grammar_profile`` at a non-speculative profile (e.g. ``no-spec``). ``None``
+    (default) means no rewrite — grammar runs on the request's resolved profile.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -166,6 +178,7 @@ class GenerateTask(BaseModel):
     capabilities: GenerateCapabilities = GenerateCapabilities()
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     prewarm_grammars: list[PrewarmGrammar] = Field(default_factory=list)
+    grammar_profile: str | None = None
 
 
 class Tasks(BaseModel):
@@ -473,6 +486,22 @@ class ModelConfig(BaseModel):
         if "default" not in self.profiles:
             msg = "'default' key must exist in profiles"
             raise ValueError(msg)
+
+        # ``grammar_profile`` must name a real profile (it becomes the
+        # ``{sie_id}:{grammar_profile}`` variant the gateway routes grammar
+        # requests to). Rejecting an unknown name here turns a silent
+        # no-op (the gateway would skip the rewrite) into a load-time error.
+        if self.tasks.generate is not None and self.tasks.generate.grammar_profile is not None:
+            gp = self.tasks.generate.grammar_profile
+            if gp not in self.profiles:
+                msg = (
+                    f"tasks.generate.grammar_profile '{gp}' is not a defined profile. Available: {list(self.profiles)}"
+                )
+                raise ValueError(msg)
+            if gp == "default":
+                msg = "tasks.generate.grammar_profile must not be 'default' (it names a non-default variant profile)"
+                raise ValueError(msg)
+
         for name, profile in self.profiles.items():
             if profile.extends is not None:
                 if profile.extends not in self.profiles:

@@ -194,6 +194,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         speculative: dict[str, Any] | None = None,
         extra_launch_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
+        startup_timeout_s: float | None = None,
         # Multi-LoRA: served-name → HF-id/path map. When non-empty the server
         # launches with ``--enable-lora`` and per-request ``lora_path``
         # selection is available. ``max_loras_per_batch`` caps concurrent
@@ -251,6 +252,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._speculative = speculative
         self._extra_launch_args = list(extra_launch_args or [])
         self._extra_env = dict(extra_env or {})
+        self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
         self._lora_paths = dict(lora_paths or {})
         self._max_loras_per_batch = max_loras_per_batch
 
@@ -411,7 +413,12 @@ class SGLangGenerationAdapter(GenerationAdapter):
             extra_env=extra_env or None,
         )
 
-        if not _server.wait_for_server(self._server_url, self._process, output_file=self._output_file):
+        if not _server.wait_for_server(
+            self._server_url,
+            self._process,
+            output_file=self._output_file,
+            timeout_s=self._startup_timeout_s,
+        ):
             log_path = getattr(self._output_file, "name", None)
             if log_path:
                 logger.error("SGLang failed to reach health. log_path=%s", log_path)

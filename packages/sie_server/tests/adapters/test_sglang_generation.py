@@ -90,6 +90,29 @@ def test_load_drops_is_embedding(
     assert adapter._server_url == "http://localhost:30005"
 
 
+@patch("sie_server.adapters.sglang._server.wait_for_server", return_value=True)
+@patch("sie_server.adapters.sglang._server.subprocess.Popen")
+@patch("sie_server.adapters.sglang._server.find_free_port")
+def test_load_passes_profile_startup_timeout_to_health_wait(
+    mock_find_port: MagicMock,
+    mock_popen: MagicMock,
+    mock_wait_for_server: MagicMock,
+) -> None:
+    mock_find_port.return_value = 30005
+    mock_process = MagicMock()
+    mock_process.poll.return_value = None
+    mock_popen.return_value = mock_process
+    adapter = SGLangGenerationAdapter(
+        model_name_or_path="Qwen/Qwen3.6-27B",
+        served_model_name="Qwen/Qwen3.6-27B",
+        startup_timeout_s=1800,
+    )
+
+    adapter.load("cuda:0")
+
+    assert mock_wait_for_server.call_args.kwargs["timeout_s"] == 1800
+
+
 @patch("sie_server.adapters.sglang._server.subprocess.Popen")
 @patch("sie_server.adapters.sglang._server.requests.get")
 @patch("sie_server.adapters.sglang._server.find_free_port")

@@ -259,7 +259,18 @@ pub struct StreamCollector {
     pub published_at: Instant,
     pub first_chunk_at: Option<Instant>,
     pub last_chunk_at: Option<Instant>,
+    /// DISPATCH model id — the routed target (a ``:no-spec`` grammar
+    /// variant when grammar routing fired, else the requested base).
+    /// Kept for functional dispatch parity with ``PublishTarget.model``
+    /// (NATS subject, republish, fallback token bucket). NEVER used to
+    /// label metrics — use ``display_model`` for that.
     pub model: String,
+    /// DISPLAY model id — the requested base model. Equal to ``model``
+    /// unless grammar routing rewrote the dispatch target. All
+    /// collector/publisher metric labels read this so no series carries
+    /// the ``:no-spec`` variant (#1324). Defaults to ``model`` in
+    /// [`Self::new`]; the publish path overrides it with the requested id.
+    pub display_model: String,
     pub pool: String,
     /// Pulsed by ``apply()`` on every non-stale chunk. The HTTP handler
     /// uses this to reset the inter-chunk timer (§4.4.3). Wrapped in
@@ -368,6 +379,7 @@ impl StreamCollector {
             published_at: Instant::now(),
             first_chunk_at: None,
             last_chunk_at: None,
+            display_model: model.clone(),
             model,
             pool,
             activity: Arc::new(Notify::new()),
@@ -520,7 +532,7 @@ impl StreamCollector {
         if chunk.kind != "chunk" {
             metrics::GENERATION_INVALID_CHUNKS
                 .with_label_values(&[
-                    &metrics::sanitize_model_label(self.model.as_str()),
+                    &metrics::sanitize_model_label(self.display_model.as_str()),
                     &metrics::sanitize_label(self.pool.as_str()),
                     "kind",
                 ])
@@ -531,7 +543,7 @@ impl StreamCollector {
             if !t.is_finite() {
                 metrics::GENERATION_INVALID_CHUNKS
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(self.model.as_str()),
+                        &metrics::sanitize_model_label(self.display_model.as_str()),
                         &metrics::sanitize_label(self.pool.as_str()),
                         "ttft_nan",
                     ])
@@ -543,7 +555,7 @@ impl StreamCollector {
             if !is_known_finish_reason(reason) {
                 metrics::GENERATION_INVALID_CHUNKS
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(self.model.as_str()),
+                        &metrics::sanitize_model_label(self.display_model.as_str()),
                         &metrics::sanitize_label(self.pool.as_str()),
                         "finish_reason",
                     ])
@@ -565,7 +577,7 @@ impl StreamCollector {
                 if self.abandoned_attempt_id.as_deref() == Some(chunk.attempt_id.as_str()) {
                     metrics::GENERATION_STALE_ATTEMPT_CHUNKS
                         .with_label_values(&[
-                            &metrics::sanitize_model_label(self.model.as_str()),
+                            &metrics::sanitize_model_label(self.display_model.as_str()),
                             &metrics::sanitize_label(self.pool.as_str()),
                         ])
                         .inc();
@@ -581,7 +593,7 @@ impl StreamCollector {
             Some(current) if current != &chunk.attempt_id => {
                 metrics::GENERATION_STALE_ATTEMPT_CHUNKS
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(self.model.as_str()),
+                        &metrics::sanitize_model_label(self.display_model.as_str()),
                         &metrics::sanitize_label(self.pool.as_str()),
                     ])
                     .inc();
@@ -613,7 +625,7 @@ impl StreamCollector {
                 if chunk.seq <= last {
                     metrics::GENERATION_STALE_ATTEMPT_CHUNKS
                         .with_label_values(&[
-                            &metrics::sanitize_model_label(self.model.as_str()),
+                            &metrics::sanitize_model_label(self.display_model.as_str()),
                             &metrics::sanitize_label(self.pool.as_str()),
                         ])
                         .inc();
@@ -631,7 +643,7 @@ impl StreamCollector {
                 if chunk.seq > last + 1 {
                     metrics::GENERATION_SEQ_GAP_CHUNKS
                         .with_label_values(&[
-                            &metrics::sanitize_model_label(self.model.as_str()),
+                            &metrics::sanitize_model_label(self.display_model.as_str()),
                             &metrics::sanitize_label(self.pool.as_str()),
                         ])
                         .inc();
@@ -902,6 +914,94 @@ mod tests {
         assert_eq!(
             outcome.candidates[1].finish_reason.as_deref(),
             Some("length")
+        );
+    }
+
+    /// #1324: collector chunk-metric labels must surface the DISPLAY
+    /// (requested base) model, never the ``:no-spec`` dispatch variant a
+    /// grammar request is routed to. Sets ``display_model`` != ``model``
+    /// and checks the invalid-chunk and stale-attempt counters advance on
+    /// the display series while the dispatch series stays flat.
+    #[test]
+    fn test_chunk_metrics_label_with_display_model_not_dispatch_variant() {
+        let dispatch = "acme/grammar-model:no-spec";
+        let display = "acme/grammar-model";
+        let pool = "grammar_label_test_pool";
+
+        // ── invalid-kind chunk → GENERATION_INVALID_CHUNKS[.., "kind"] ──
+        let invalid_display_before = metrics::GENERATION_INVALID_CHUNKS
+            .with_label_values(&[display, pool, "kind"])
+            .get();
+        let invalid_dispatch_before = metrics::GENERATION_INVALID_CHUNKS
+            .with_label_values(&[dispatch, pool, "kind"])
+            .get();
+
+        let (tx, _rx) = oneshot::channel();
+        let mut c = StreamCollector::new(tx, dispatch.to_string(), pool.to_string());
+        c.display_model = display.to_string();
+        let mut bad = _make_chunk("att-A", 0, "x", false);
+        bad.kind = "garbage".to_string();
+        assert_eq!(c.apply(bad), ChunkApplied::Stale);
+
+        assert!(
+            (metrics::GENERATION_INVALID_CHUNKS
+                .with_label_values(&[display, pool, "kind"])
+                .get()
+                - invalid_display_before
+                - 1.0)
+                .abs()
+                < f64::EPSILON,
+            "display series should increment"
+        );
+        assert!(
+            (metrics::GENERATION_INVALID_CHUNKS
+                .with_label_values(&[dispatch, pool, "kind"])
+                .get()
+                - invalid_dispatch_before)
+                .abs()
+                < f64::EPSILON,
+            "dispatch (:no-spec) series must NOT be labelled"
+        );
+
+        // ── stale-attempt chunk → GENERATION_STALE_ATTEMPT_CHUNKS ──
+        let stale_display_before = metrics::GENERATION_STALE_ATTEMPT_CHUNKS
+            .with_label_values(&[display, pool])
+            .get();
+        let stale_dispatch_before = metrics::GENERATION_STALE_ATTEMPT_CHUNKS
+            .with_label_values(&[dispatch, pool])
+            .get();
+
+        let (tx2, _rx2) = oneshot::channel();
+        let mut c2 = StreamCollector::new(tx2, dispatch.to_string(), pool.to_string());
+        c2.display_model = display.to_string();
+        // Latch attempt "att-A", then feed a chunk from a different attempt.
+        assert_eq!(
+            c2.apply(_make_chunk("att-A", 0, "hi", false)),
+            ChunkApplied::Delta
+        );
+        assert_eq!(
+            c2.apply(_make_chunk("att-B", 1, "x", false)),
+            ChunkApplied::Stale
+        );
+
+        assert!(
+            (metrics::GENERATION_STALE_ATTEMPT_CHUNKS
+                .with_label_values(&[display, pool])
+                .get()
+                - stale_display_before
+                - 1.0)
+                .abs()
+                < f64::EPSILON,
+            "display series should increment"
+        );
+        assert!(
+            (metrics::GENERATION_STALE_ATTEMPT_CHUNKS
+                .with_label_values(&[dispatch, pool])
+                .get()
+                - stale_dispatch_before)
+                .abs()
+                < f64::EPSILON,
+            "dispatch (:no-spec) series must NOT be labelled"
         );
     }
 

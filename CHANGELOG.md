@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.6.7
+
+- chore(main): release 0.6.7
+- fix: guard model ready timeout against liveness budget
+- fix: wire model ready timeout through helm
+- docs: address sidecar guide review feedback
+- fix: address qwen 27b review feedback
+- docs: revise sidecar architecture guide
+- fix: route qwen 27b fp8 cold starts
+- fix: make worker config reconciliation no-op safe
+- style(lighton_ocr): hoist test imports to module top per CodeRabbit review
+- fix: add qwen3.6 27b 32k rtx serving profile
+- fix(generate): label streaming collector/publisher metrics with display model
+- fix(generate): route explicit profile variants through grammar_profile
+- perf(adapters): extract shared vision patch-embed rebind helper (#1151)
+- fix(generate): keep requested model id in /v1/generate grammar gate errors + variant-narrowing tests
+- test(generate): handler-level grammar routing dispatch-vs-display tests
+- fix(generate): split display vs dispatch model for grammar routing + chat gate ordering
+- fix(generate): address review — grammar routing before profile gates + delta refresh
+- fix(generate): route grammar requests to a non-speculative profile
+- test(lighton_ocr): address CodeRabbit review on #1223
+- perf(lighton_ocr): batch generate() across pages to fix #601 L4 throughput
+
 ## v0.6.6
 
 - chore(main): release 0.6.6

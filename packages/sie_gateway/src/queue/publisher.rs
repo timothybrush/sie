@@ -1583,9 +1583,14 @@ impl WorkPublisher {
     /// is appropriate; the gateway-side timeout taxonomy lives in
     /// ``handlers/proxy.rs`` (Phase F).
     #[allow(clippy::too_many_arguments)]
+    /// ``display_model`` is the requested base id surfaced on all
+    /// metric labels for this request; ``target.model()`` is the
+    /// dispatch id (a ``:no-spec`` grammar variant when routing fired)
+    /// used for the NATS subject / work item. Equal unless routing fired.
     pub async fn publish_generate_streaming(
         &self,
         target: PublishTarget,
+        display_model: &str,
         engine: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
@@ -1622,6 +1627,9 @@ impl WorkPublisher {
         // that a fast worker can't beat us to the inbox.
         let (tx, rx) = oneshot::channel::<StreamOutcome>();
         let mut collector = StreamCollector::new(tx, model.clone(), pool.clone());
+        // Metric labels surface the requested (display) id, never the
+        // ``:no-spec`` dispatch variant (#1324).
+        collector.display_model = display_model.to_string();
         collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
         // Capture the activity handle before the collector moves into
         // ``pending_streams`` so the caller never has to re-look it up
@@ -1696,6 +1704,7 @@ impl WorkPublisher {
     pub async fn publish_generate_streaming_sse(
         &self,
         target: PublishTarget,
+        display_model: &str,
         engine: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
@@ -1731,6 +1740,9 @@ impl WorkPublisher {
         // subscriber.
         let (tx, rx) = oneshot::channel::<StreamOutcome>();
         let mut collector = StreamCollector::new(tx, model.clone(), pool.clone());
+        // Metric labels surface the requested (display) id, never the
+        // ``:no-spec`` dispatch variant (#1324).
+        collector.display_model = display_model.to_string();
         collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
         let chunk_rx = collector.install_chunk_tap();
         self.pending_streams.insert(request_id.clone(), collector);
@@ -2032,7 +2044,7 @@ impl WorkPublisher {
         // the encoded bytes + the pool subject, bump the attempt
         // generation. We drop the entry lock before awaiting the
         // JetStream publish to avoid holding the DashMap shard.
-        let (subject, payload, generation, model, pool) = {
+        let (subject, payload, generation, display_model, pool) = {
             let Some(mut entry) = self.pending_streams.get_mut(request_id) else {
                 return Ok(RepublishOutcome::NotPossible);
             };
@@ -2060,7 +2072,7 @@ impl WorkPublisher {
             {
                 metrics::GENERATION_FALLBACK_REFUSED_TOTAL
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(entry.model.as_str()),
+                        &metrics::sanitize_model_label(entry.display_model.as_str()),
                         &metrics::sanitize_label(entry.pool.as_str()),
                         "rate_limited",
                     ])
@@ -2073,7 +2085,7 @@ impl WorkPublisher {
                 subject,
                 payload,
                 gen,
-                entry.model.clone(),
+                entry.display_model.clone(),
                 entry.pool.clone(),
             )
         };
@@ -2109,7 +2121,7 @@ impl WorkPublisher {
             Ok(ack) => {
                 metrics::ROUTING_FALLBACK_TOTAL
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(model.as_str()),
+                        &metrics::sanitize_model_label(display_model.as_str()),
                         &metrics::sanitize_label(pool.as_str()),
                         reason,
                     ])
@@ -2405,14 +2417,14 @@ impl WorkPublisher {
                 // so don't leave the client hanging until the first-chunk
                 // timeout — surface a 429 immediately, mirroring the
                 // pool-republish-failed arm below.
-                let (model, pool) = self
+                let (display_model, pool) = self
                     .pending_streams
                     .get(&nak.request_id)
-                    .map(|e| (e.value().model.clone(), e.value().pool.clone()))
+                    .map(|e| (e.value().display_model.clone(), e.value().pool.clone()))
                     .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                 metrics::RATE_LIMIT_TOTAL
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(&model),
+                        &metrics::sanitize_model_label(&display_model),
                         &metrics::sanitize_label(&pool),
                         "kv_pool_saturated",
                     ])
@@ -2462,14 +2474,14 @@ impl WorkPublisher {
                 // a concurrent terminal — avoids polluting the metric
                 // with empty label series that don't render in
                 // dashboards.
-                let (model, pool) = self
+                let (display_model, pool) = self
                     .pending_streams
                     .get(&nak.request_id)
-                    .map(|e| (e.value().model.clone(), e.value().pool.clone()))
+                    .map(|e| (e.value().display_model.clone(), e.value().pool.clone()))
                     .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                 metrics::RATE_LIMIT_TOTAL
                     .with_label_values(&[
-                        &metrics::sanitize_model_label(&model),
+                        &metrics::sanitize_model_label(&display_model),
                         &metrics::sanitize_label(&pool),
                         "kv_pool_saturated",
                     ])

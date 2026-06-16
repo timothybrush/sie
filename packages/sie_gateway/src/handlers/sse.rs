@@ -76,7 +76,14 @@ pub enum SseEndpoint {
 pub struct SseParams<'a> {
     pub state: &'a AppState,
     pub work_publisher: Arc<WorkPublisher>,
+    /// DISPLAY id (the requested model) — surfaced in the streamed chunk
+    /// ``model`` field and the routing/timeout metric labels.
     pub model: String,
+    /// DISPATCH id — the grammar ``:no-spec`` variant when routing fired,
+    /// otherwise equal to ``model``. Governs ONLY the NATS subject + work item
+    /// (worker selection / publish target) so the request runs on the profile
+    /// that enforces the grammar. See ``proxy::route_grammar_to_profile``.
+    pub dispatch_model: String,
     pub bundle: String,
     pub engine: String,
     pub gpu: String,
@@ -101,6 +108,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
         state,
         work_publisher,
         model,
+        dispatch_model,
         bundle,
         engine,
         gpu,
@@ -146,7 +154,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
                 pool: pool.clone(),
                 machine_profile: gpu.clone(),
                 bundle: bundle.clone(),
-                model: model.clone(),
+                model: dispatch_model.clone(),
             },
             0,
         )
@@ -163,7 +171,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
             admitted_worker_names.as_ref(),
         );
         let ring = state.registry.ring_snapshot_for_admitted(
-            &model,
+            &dispatch_model,
             &pool,
             &gpu,
             &bundle,
@@ -180,7 +188,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
                     pool: pool.clone(),
                     machine_profile: gpu.clone(),
                     bundle: bundle.clone(),
-                    model: model.clone(),
+                    model: dispatch_model.clone(),
                     worker_id: worker_id.to_string(),
                 },
                 fallback_lane_worker_count,
@@ -194,7 +202,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
                         pool: pool.clone(),
                         machine_profile: gpu.clone(),
                         bundle: bundle.clone(),
-                        model: model.clone(),
+                        model: dispatch_model.clone(),
                     },
                     fallback_lane_worker_count,
                 )
@@ -204,7 +212,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
 
     let (request_id, outcome_rx, chunk_rx) = match work_publisher
-        .publish_generate_streaming_sse(target, &engine, &bundle_config_hash, &work_params)
+        .publish_generate_streaming_sse(target, &model, &engine, &bundle_config_hash, &work_params)
         .await
     {
         Ok(triple) => triple,
@@ -241,7 +249,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
         .unwrap_or(512);
     let timeout_config = crate::handlers::proxy::generation_timeout_config(
         state,
-        &model,
+        &dispatch_model,
         &work_params,
         max_new_tokens,
     );

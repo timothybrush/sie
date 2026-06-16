@@ -357,6 +357,7 @@ pub struct IpcClient {
     pool: Arc<Pool>,
     next_request_id: AtomicU64,
     request_timeout: Duration,
+    model_ready_timeout: Duration,
     metrics: Option<Arc<MetricsRegistry>>,
     /// When `Some`, every `call(…)` is delegated to the multiplexed
     /// transport instead of acquiring a slot from the pool. Lazily
@@ -390,6 +391,7 @@ impl IpcClient {
             pool: Arc::new(Pool::new(capacity, None)),
             next_request_id: AtomicU64::new(1),
             request_timeout: Duration::from_secs(60),
+            model_ready_timeout: Duration::from_secs(60),
             metrics: None,
             mux,
         }
@@ -397,6 +399,11 @@ impl IpcClient {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    pub fn with_model_ready_timeout(mut self, timeout: Duration) -> Self {
+        self.model_ready_timeout = timeout;
         self
     }
 
@@ -487,6 +494,20 @@ impl IpcClient {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
+        self.call_with_timeout(method, body, self.request_timeout)
+            .await
+    }
+
+    async fn call_with_timeout<Req, Resp>(
+        &self,
+        method: &str,
+        body: Req,
+        request_timeout: Duration,
+    ) -> Result<Resp, IpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
         let request_id = self.next_id();
         let envelope = RequestEnvelope {
             version: IPC_VERSION,
@@ -515,7 +536,7 @@ impl IpcClient {
         // confused with a stale response.
         if let Some(mux) = &self.mux {
             let first = self
-                .mux_call::<Resp>(mux, method, request_id.clone(), &payload)
+                .mux_call::<Resp>(mux, method, request_id.clone(), &payload, request_timeout)
                 .await;
             return match first {
                 Ok(v) => {
@@ -532,7 +553,7 @@ impl IpcClient {
                         m.ipc_reconnect_total.inc();
                     }
                     match self
-                        .mux_call::<Resp>(mux, method, request_id, &payload)
+                        .mux_call::<Resp>(mux, method, request_id, &payload, request_timeout)
                         .await
                     {
                         Ok(v) => {
@@ -558,7 +579,7 @@ impl IpcClient {
         let mut slot_guard = self.pool.acquire().await;
         slot_guard.arm();
         let first = timeout(
-            self.request_timeout,
+            request_timeout,
             self.call_inner::<Resp>(method, &payload, slot_guard.slot_mut()),
         )
         .await;
@@ -600,7 +621,7 @@ impl IpcClient {
                 let mut retry_guard = self.pool.acquire().await;
                 retry_guard.arm();
                 let second = timeout(
-                    self.request_timeout,
+                    request_timeout,
                     self.call_inner::<Resp>(method, &payload, retry_guard.slot_mut()),
                 )
                 .await;
@@ -652,16 +673,12 @@ impl IpcClient {
         method: &str,
         request_id: String,
         payload: &[u8],
+        request_timeout: Duration,
     ) -> Result<Resp, IpcError>
     where
         Resp: DeserializeOwned,
     {
-        let raw = match timeout(
-            self.request_timeout,
-            mux.call_raw(request_id, payload.to_vec()),
-        )
-        .await
-        {
+        let raw = match timeout(request_timeout, mux.call_raw(request_id, payload.to_vec())).await {
             Ok(r) => r,
             Err(_) => return Err(IpcError::Timeout),
         };
@@ -903,11 +920,12 @@ impl IpcClient {
         &self,
         model_id: impl Into<String>,
     ) -> Result<EnsureModelReadyResponse, IpcError> {
-        self.call(
+        self.call_with_timeout(
             METHOD_ENSURE_MODEL_READY,
             EnsureModelReadyRequest {
                 model_id: model_id.into(),
             },
+            self.model_ready_timeout,
         )
         .await
     }

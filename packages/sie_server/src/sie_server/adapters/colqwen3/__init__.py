@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
+from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import media_bytes
 
@@ -141,8 +142,8 @@ class ColQwen3Adapter(BaseAdapter):
         # FIX[#1055]: replace the vision Conv3d patch-embed with its matmul
         # equivalent. It dominated the forward at ~169s/6-image batch (99.7% of
         # the vision tower; the transformer blocks were only ~140ms each) — see
-        # _patch_vision_patch_embed for why.
-        self._patch_vision_patch_embed()
+        # rebind_vision_patch_embed for why.
+        rebind_vision_patch_embed(self._model, "colqwen3")
 
     def _resolve_dtype(self) -> torch.dtype:
         if not self._device or not str(self._device).startswith("cuda"):
@@ -183,40 +184,6 @@ class ColQwen3Adapter(BaseAdapter):
             logger.info("ColQwen3: set inner-VLM attn_implementation=%s", attn_impl)
         except Exception:  # noqa: BLE001 - best-effort, keep loaded default on failure
             logger.warning("ColQwen3: could not set inner-VLM attn=%s; keeping default", attn_impl, exc_info=True)
-
-    def _patch_vision_patch_embed(self) -> None:
-        """Rebind the Qwen3-VL vision Conv3d patch-embed to its matmul equivalent.
-
-        ``Qwen3VLVisionPatchEmbed`` projects patches with a ``nn.Conv3d`` whose
-        kernel equals its stride, i.e. a non-overlapping per-patch linear
-        projection. On this GPU the cuDNN Conv3d path for the (~30k-patch,
-        tiny-kernel) shape is pathologically slow — measured at ~169s for a
-        6-image batch, ~99.7% of the whole vision-tower forward, while the 24
-        transformer blocks took only ~140ms each. Reshaping to ``F.linear`` with
-        the *same weights* is numerically identical but runs as a fast matmul.
-
-        Best-effort: on any structural mismatch we leave the original Conv3d.
-        """
-        try:
-            visual = self._model.vlm.model.visual
-            patch_embed = visual.patch_embed
-            proj = patch_embed.proj
-            if not isinstance(proj, torch.nn.Conv3d):
-                return
-            embed_dim = proj.out_channels
-            in_features = proj.in_channels * proj.kernel_size[0] * proj.kernel_size[1] * proj.kernel_size[2]
-
-            def fast_patch_embed_forward(
-                hidden_states: torch.Tensor, _pe: Any = patch_embed, _embed: int = embed_dim, _in: int = in_features
-            ) -> torch.Tensor:
-                weight = _pe.proj.weight
-                hs = hidden_states.to(weight.dtype).reshape(-1, _in)
-                return F.linear(hs, weight.reshape(_embed, _in), _pe.proj.bias)
-
-            patch_embed.forward = fast_patch_embed_forward
-            logger.info("ColQwen3: replaced vision Conv3d patch-embed with matmul equivalent")
-        except Exception:  # noqa: BLE001 - best-effort, keep the original Conv3d on failure
-            logger.warning("ColQwen3: could not rebind vision patch-embed; keeping Conv3d", exc_info=True)
 
     # ------------------------------------------------------------------
     # Encode

@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
+from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import media_bytes
 
@@ -170,6 +171,11 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         else:
             logger.warning("Could not determine hidden_size from config, defaulting to 2048")
             self._dense_dim = self._validate_or_set_dense_dim(2048)
+
+        # FIX[#1151]: rebind the Qwen3-VL vision Conv3d patch-embed to its matmul
+        # equivalent (same weights). The non-overlapping per-patch Conv3d hits a
+        # pathologically slow cuDNN path that dominates the vision-tower forward.
+        rebind_vision_patch_embed(self._model, "qwen3_vl_embedding")
 
     def _validate_or_set_dense_dim(self, observed_dim: int) -> int:
         """Validate observed model width against configured dense_dim."""

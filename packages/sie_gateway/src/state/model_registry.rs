@@ -69,6 +69,26 @@ pub type AddModelConfigOutcome = (Vec<String>, Vec<String>, Vec<String>);
 const DEFAULT_MODEL_POOL: &str = "default";
 const MAX_POOL_NAME_LEN: usize = 128;
 
+/// Outcome of resolving where a grammar-constrained request must dispatch.
+///
+/// A model declares ``tasks.generate.grammar_profile`` (surfaced as
+/// ``ModelInfoExtras::grammar_profile`` on its *base* entry) naming the profile
+/// that honours SGLang's Outlines grammar FSM. Speculative-decoding profiles
+/// (NEXTN/MTP) bypass that FSM, so every grammar request — whatever id it names
+/// — must land on ``{base}:{grammar_profile}``.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarRoute {
+    /// Rewrite the dispatch id to this ``{base}:{grammar_profile}`` variant.
+    Rewrite(String),
+    /// No rewrite: the model declares no ``grammar_profile``, or the request
+    /// already names the grammar-safe target variant.
+    Keep,
+    /// A ``grammar_profile`` is declared but its variant is absent from the
+    /// registry (gateway/config skew). Degrade to the requested id; the caller
+    /// should log it. Carries the declared profile name for the log line.
+    MissingVariant(String),
+}
+
 #[derive(Debug, Clone, Default)]
 struct RegistrySnapshot {
     bundles: HashMap<String, BundleInfo>,
@@ -413,6 +433,14 @@ impl ModelRegistry {
         profile_name: &str,
     ) -> ModelInfoExtras {
         let mut narrowed = base.clone();
+        // Clear the per-variant routing hint. A variant entry IS a concrete
+        // profile already; keeping the hint here would make
+        // ``grammar_route_variant`` target ``{base}:{p}:{grammar_profile}`` (a
+        // profile-of-a-profile that doesn't exist). Grammar routing for an
+        // explicit variant id instead resolves the hint off the *base* entry
+        // (see ``base_grammar_profile``), so a sibling variant such as
+        // ``…:a100-40gb`` still reroutes to ``{base}:{grammar_profile}``.
+        narrowed.grammar_profile = None;
         if let Some(map) = base.profile_lora_adapters.as_ref() {
             let scoped = map.get(profile_name).cloned().unwrap_or_default();
             if scoped.is_empty() {
@@ -839,6 +867,72 @@ impl ModelRegistry {
         let snap = self.snapshot.load();
         snap.model_names_lower.contains_key(&model.to_lowercase())
             || snap.models.contains_key(model)
+    }
+
+    /// Resolve the dispatch model id for a grammar-constrained request.
+    ///
+    /// When a model declares ``tasks.generate.grammar_profile`` (surfaced as
+    /// ``ModelInfoExtras::grammar_profile``), grammar requests must run on the
+    /// ``{base}:{grammar_profile}`` profile variant rather than a speculative
+    /// one — NEXTN/MTP speculative decoding bypasses SGLang's Outlines grammar
+    /// FSM, so the constraint must be enforced on a profile that honours it
+    /// (e.g. ``no-spec``).
+    ///
+    /// The routing target is resolved off the request's *base* model, so the
+    /// rewrite fires regardless of which id the caller named:
+    /// - base id (``Qwen/Qwen3.5-4B``)            → ``…:no-spec``
+    /// - sibling variant (``…:a100-40gb``, NEXTN) → ``…:no-spec``
+    /// - target variant (``…:no-spec``)           → ``Keep`` (already safe)
+    /// - no ``grammar_profile`` declared          → ``Keep``
+    /// - target variant missing from registry     → ``MissingVariant`` (degrade)
+    ///
+    /// Resolving off the base is what closes the explicit-variant bypass:
+    /// variant entries clear their own ``grammar_profile`` hint (so they don't
+    /// recursively re-route to ``{base}:{p}:{grammar_profile}``), so the hint is
+    /// read from the base entry here. The caller only invokes this when a
+    /// grammar is actually present.
+    pub fn grammar_route_variant(&self, model: &str) -> GrammarRoute {
+        let snap = self.snapshot.load();
+        let Some((base, profile)) = Self::base_grammar_profile(&snap, model) else {
+            return GrammarRoute::Keep;
+        };
+        let target = format!("{base}:{profile}");
+        // The request already names the grammar-safe variant (compare canonical
+        // ids so a differently-cased ``…:NO-SPEC`` is still recognised).
+        if Self::canonical_model_name(&snap, model).as_deref() == Some(target.as_str()) {
+            return GrammarRoute::Keep;
+        }
+        if snap.models.contains_key(&target) {
+            GrammarRoute::Rewrite(target)
+        } else {
+            GrammarRoute::MissingVariant(profile)
+        }
+    }
+
+    /// Resolve the *base* model id and its declared ``grammar_profile`` for a
+    /// possibly-variant request id. The hint lives on the base entry only —
+    /// variant entries clear it (see ``narrow_info_extras_to_profile``) so a
+    /// variant never recursively re-routes — so an explicit sibling-variant id
+    /// (e.g. ``…:a100-40gb``) resolves the *base's* profile here. Returns
+    /// ``None`` when no ``grammar_profile`` is declared.
+    fn base_grammar_profile(snap: &RegistrySnapshot, model: &str) -> Option<(String, String)> {
+        let canonical = Self::canonical_model_name(snap, model)?;
+        // Base entry carrying the hint.
+        if let Some(gp) = snap
+            .models
+            .get(&canonical)
+            .and_then(|e| e.info_extras.grammar_profile.clone())
+        {
+            return Some((canonical, gp));
+        }
+        // Otherwise it may be a variant ``{base}:{profile}`` (variants clear the
+        // hint). Strip the trailing ``:profile`` and read the base entry's hint.
+        let (base, _profile) = canonical.rsplit_once(':')?;
+        let gp = snap
+            .models
+            .get(base)
+            .and_then(|e| e.info_extras.grammar_profile.clone())?;
+        Some((base.to_string(), gp))
     }
 
     /// Resolve a caller-supplied model id to the registry's canonical
@@ -1609,6 +1703,12 @@ impl ModelRegistry {
             // tighten the advertised set without a full reload.
             existing.grammar_capabilities = refreshed.grammar_capabilities;
             existing.tools_supported = refreshed.tools_supported;
+            // ``grammar_profile`` is likewise derived from
+            // ``tasks.generate`` — refresh it too so a delta that changes
+            // the grammar-routing target takes effect without a full
+            // reload (otherwise grammar_route_variant keeps routing to the
+            // stale profile).
+            existing.grammar_profile = refreshed.grammar_profile;
         }
         if config.max_sequence_length.is_some() {
             existing.max_sequence_length = refreshed.max_sequence_length;
@@ -1710,6 +1810,166 @@ mod tests {
             })
             .unwrap();
         assert!(registry.has_any_models(), "must report populated after add");
+    }
+
+    #[test]
+    fn test_grammar_route_variant() {
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let mk = || ProfileConfig {
+            adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+            max_batch_tokens: Some(4096),
+            compute_precision: None,
+            adapter_options: None,
+            extends: None,
+        };
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), mk());
+        // A speculative sibling variant (mirrors the Qwen ``a100-40gb``/``h100``
+        // profiles that run NEXTN) and the grammar-safe ``no-spec`` target each
+        // expand into ``org/g:<profile>`` variant entries.
+        profiles.insert("a100-40gb".to_string(), mk());
+        profiles.insert("no-spec".to_string(), mk());
+        // ``tasks.generate.grammar_profile: no-spec`` is the routing hint the
+        // gateway reads off the base entry.
+        let tasks: serde_yaml::Value =
+            serde_yaml::from_str("generate:\n  grammar_profile: no-spec\n").unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/g".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+
+        // Base id + grammar → rewrite to the declared ``no-spec`` variant.
+        assert_eq!(
+            registry.grammar_route_variant("org/g"),
+            GrammarRoute::Rewrite("org/g:no-spec".to_string())
+        );
+        // Case-insensitive: the base id resolves canonically before routing.
+        assert_eq!(
+            registry.grammar_route_variant("ORG/G"),
+            GrammarRoute::Rewrite("org/g:no-spec".to_string())
+        );
+        // Explicit *sibling* variant (NEXTN) + grammar → still rewrite to
+        // ``no-spec``. This is the bypass the fix closes: the variant entry
+        // clears its own hint, so routing resolves it off the base.
+        assert_eq!(
+            registry.grammar_route_variant("org/g:a100-40gb"),
+            GrammarRoute::Rewrite("org/g:no-spec".to_string())
+        );
+        // The grammar-safe target variant itself → no-op (no recursive reroute
+        // to ``org/g:no-spec:no-spec``).
+        assert_eq!(
+            registry.grammar_route_variant("org/g:no-spec"),
+            GrammarRoute::Keep
+        );
+    }
+
+    #[test]
+    fn test_grammar_route_variant_no_profile_keeps() {
+        // A model that declares no ``grammar_profile`` never reroutes.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/n".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap();
+
+        assert_eq!(registry.grammar_route_variant("org/n"), GrammarRoute::Keep);
+    }
+
+    #[test]
+    fn test_grammar_route_variant_missing_target_degrades() {
+        // ``grammar_profile`` names a profile whose variant is absent from the
+        // registry (gateway/config skew): degrade with the declared name so the
+        // caller can log it, rather than rerouting to a non-existent variant.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        // Only a ``default`` profile exists, so no ``org/g:ghost`` variant is
+        // ever minted — but the hint points at ``ghost``.
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        let tasks: serde_yaml::Value =
+            serde_yaml::from_str("generate:\n  grammar_profile: ghost\n").unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/g".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+
+        assert_eq!(
+            registry.grammar_route_variant("org/g"),
+            GrammarRoute::MissingVariant("ghost".to_string())
+        );
     }
 
     #[test]

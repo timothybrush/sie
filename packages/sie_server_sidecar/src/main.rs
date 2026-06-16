@@ -35,6 +35,21 @@ struct Cli {
     #[arg(long, env = "SIE_IPC_POOL_SIZE")]
     ipc_pool_size: Option<usize>,
 
+    /// Timeout, in seconds, for ordinary sidecar → Python IPC calls.
+    #[arg(long, env = "SIE_IPC_REQUEST_TIMEOUT_S", default_value = "60")]
+    ipc_request_timeout_s: u64,
+
+    /// Timeout, in seconds, for EnsureModelReady cold-load calls. Large SGLang
+    /// models can spend minutes here while the subprocess loads and reaches
+    /// health.
+    #[arg(long, env = "SIE_MODEL_READY_TIMEOUT_S")]
+    model_ready_timeout_s: Option<u64>,
+
+    /// Python worker liveness budget in seconds. When set by Helm, the sidecar
+    /// rejects an EnsureModelReady timeout kubelet would kill before completion.
+    #[arg(long, env = "SIE_WORKER_LIVENESS_BUDGET_S")]
+    worker_liveness_budget_s: Option<u64>,
+
     #[arg(long, env = "SIE_PAYLOAD_STORE_URL")]
     payload_store_url: Option<String>,
 
@@ -146,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = validate_lane_segment("SIE_POOL", cli.pool)?;
     let bundle = validate_lane_segment("SIE_BUNDLE", cli.bundle)?;
     let machine_profile = validate_lane_segment("SIE_MACHINE_PROFILE", cli.machine_profile)?;
+    let model_ready_timeout_s = cli.model_ready_timeout_s.unwrap_or(900).max(1);
+    validate_model_ready_liveness_budget(model_ready_timeout_s, cli.worker_liveness_budget_s)?;
     let config = WorkerConfig {
         nats_url: cli.nats_url,
         pool,
@@ -155,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
             .ipc_pool_size
             .filter(|&n| n > 0)
             .unwrap_or_else(default_max_concurrent_batches),
+        ipc_request_timeout_s: cli.ipc_request_timeout_s.max(1),
+        model_ready_timeout_s,
         payload_store_url: cli.payload_store_url,
         gateway_url: cli.gateway_url.filter(|url| !url.trim().is_empty()),
         gateway_api_key: cli.gateway_api_key.filter(|token| !token.trim().is_empty()),
@@ -239,9 +258,30 @@ fn seconds_to_millis(seconds: f64, min_ms: u64) -> u64 {
     ((seconds * 1_000.0).round() as u64).max(min_ms)
 }
 
+fn validate_model_ready_liveness_budget(
+    model_ready_timeout_s: u64,
+    worker_liveness_budget_s: Option<u64>,
+) -> anyhow::Result<()> {
+    let Some(worker_liveness_budget_s) = worker_liveness_budget_s else {
+        return Ok(());
+    };
+    if worker_liveness_budget_s == 0 {
+        anyhow::bail!("SIE_WORKER_LIVENESS_BUDGET_S must be positive when set");
+    }
+    if model_ready_timeout_s >= worker_liveness_budget_s {
+        anyhow::bail!(
+            "SIE_MODEL_READY_TIMEOUT_S ({model_ready_timeout_s}s) must be lower than \
+             SIE_WORKER_LIVENESS_BUDGET_S ({worker_liveness_budget_s}s) so kubelet liveness \
+             does not kill the worker mid-load"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_lane_segment;
+    use super::validate_model_ready_liveness_budget;
 
     #[test]
     fn validate_lane_segment_trims_valid_values() {
@@ -256,5 +296,18 @@ mod tests {
         for raw in ["", "   ", "foo.bar", "foo*", "foo>", "foo bar"] {
             assert!(validate_lane_segment("SIE_POOL", raw.to_string()).is_err());
         }
+    }
+
+    #[test]
+    fn validate_model_ready_liveness_budget_accepts_missing_or_larger_budget() {
+        validate_model_ready_liveness_budget(900, None).unwrap();
+        validate_model_ready_liveness_budget(900, Some(1080)).unwrap();
+    }
+
+    #[test]
+    fn validate_model_ready_liveness_budget_rejects_impossible_budget() {
+        assert!(validate_model_ready_liveness_budget(900, Some(0)).is_err());
+        assert!(validate_model_ready_liveness_budget(900, Some(900)).is_err());
+        assert!(validate_model_ready_liveness_budget(1200, Some(1080)).is_err());
     }
 }

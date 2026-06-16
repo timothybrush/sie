@@ -90,6 +90,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         lora_paths: dict[str, str] | None = None,
         max_loras_per_batch: int = 8,
         dense_dim: int | None = None,
+        startup_timeout_s: float | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         r"""Initialize the adapter.
@@ -115,6 +116,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
                 At request time, select via lora parameter in encode().
             max_loras_per_batch: Maximum LoRA adapters per batch. Default 8.
             dense_dim: Configured dense embedding dimension.
+            startup_timeout_s: SGLang startup-health timeout in seconds.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -130,6 +132,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._pooling_method = pooling_method
         self._lora_paths = lora_paths or {}
         self._max_loras_per_batch = max_loras_per_batch
+        self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
 
         self._process: subprocess.Popen[bytes] | None = None
         self._server_url: str | None = None
@@ -220,7 +223,12 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._output_file = _server.open_output_log()
         self._process = _server.launch_sglang_server(cmd, device_index=device_index, output_file=self._output_file)
 
-        if not _server.wait_for_server(self._server_url, self._process, output_file=self._output_file):
+        if not _server.wait_for_server(
+            self._server_url,
+            self._process,
+            output_file=self._output_file,
+            timeout_s=self._startup_timeout_s,
+        ):
             _server.terminate_process(self._process)
             self._process = None
             raise RuntimeError(_server.ERR_SERVER_STARTUP)

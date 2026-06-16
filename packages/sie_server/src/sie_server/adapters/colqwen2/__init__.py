@@ -33,6 +33,7 @@ from torch import nn
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
+from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import media_bytes
 
@@ -218,6 +219,12 @@ class ColQwen2Adapter(BaseAdapter):
         ).eval()
 
         self._multivector_dim = getattr(self._model, "dim", 128)
+
+        # FIX[#1151]: rebind the Qwen2.5-VL vision Conv3d patch-embed (kernel ==
+        # stride, run per-patch) to its matmul equivalent. The non-overlapping
+        # Conv3d hits a pathologically slow per-patch cuDNN path that dominates the
+        # vision-tower forward; the rebind is numerically identical (same weights).
+        rebind_vision_patch_embed(self._model, "colqwen2")
 
     def _resolve_dtype(self) -> torch.dtype:
         if not self._device or not str(self._device).startswith("cuda"):

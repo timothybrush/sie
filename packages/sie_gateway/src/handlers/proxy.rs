@@ -1287,6 +1287,34 @@ async fn queue_mode_proxy(
             .into_response();
     }
 
+    // Grammar routing: a grammar-constrained generate request runs on the
+    // model's declared non-speculative ``grammar_profile`` variant (see
+    // ``route_grammar_to_profile``). Resolve it HERE — before the capability and
+    // profile-scoped LoRA gates below and the dispatch — and shadow ``model`` so
+    // every gate validates against, and the work item dispatches to, the profile
+    // the request will actually execute on. Non-generate / non-grammar requests
+    // leave ``model`` unchanged (no allocation).
+    let routed_model: Option<String> = if endpoint == "generate"
+        && params
+            .generate
+            .as_ref()
+            .and_then(|p| p.grammar.as_ref())
+            .is_some()
+    {
+        let mut routed = model.to_string();
+        route_grammar_to_profile(&state.model_registry, &mut routed);
+        Some(routed)
+    } else {
+        None
+    };
+    // Preserve the requested (base) id for the DISPLAY surfaces — response body,
+    // ``record_generation_success``, audit log. ``model`` below shadows to the
+    // DISPATCH id (the routed variant); only that id changes which worker-loaded
+    // model serves the request (NATS subject + work item). They are equal unless
+    // routing fired.
+    let display_model = model.to_string();
+    let model: &str = routed_model.as_deref().unwrap_or(model);
+
     // Grammar capability gate. After ``parse_grammar`` has accepted
     // the wire shape and enforced the safety caps, check the model's
     // YAML-declared ``capabilities.grammar`` list. Rejecting here (not
@@ -1300,7 +1328,11 @@ async fn queue_mode_proxy(
                 .get_model_info(model)
                 .as_ref()
                 .and_then(|m| m.info_extras.grammar_capabilities.clone());
-            if let Err(resp) = super::grammar::check_capability(g, caps.as_deref(), model) {
+            // Look the capabilities up on the DISPATCH variant, but name the
+            // requested (DISPLAY) model in the rejection so the client never
+            // sees the internal ``:no-spec`` id (mirrors the chat path).
+            if let Err(resp) = super::grammar::check_capability(g, caps.as_deref(), &display_model)
+            {
                 metrics::record_rejected_request_for_pool(pool, gpu, bundle, "grammar_capability");
                 return resp;
             }
@@ -1338,7 +1370,9 @@ async fn queue_mode_proxy(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(json_openai_error(
-                                format!("unknown profile '{profile_name}' for model '{model}'"),
+                                format!(
+                                    "unknown profile '{profile_name}' for model '{display_model}'"
+                                ),
                                 oai_type::INVALID_REQUEST,
                                 Some("profile"),
                                 oai_code::INVALID_REQUEST,
@@ -1356,7 +1390,9 @@ async fn queue_mode_proxy(
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(json_openai_error(
-                                format!("unknown lora_adapter '{req_lora}' for model '{model}'"),
+                                format!(
+                                    "unknown lora_adapter '{req_lora}' for model '{display_model}'"
+                                ),
                                 oai_type::INVALID_REQUEST,
                                 Some("lora_adapter"),
                                 oai_code::UNKNOWN_LORA_ADAPTER,
@@ -1402,7 +1438,8 @@ async fn queue_mode_proxy(
                 return super::sse::build_sse_response(super::sse::SseParams {
                     state,
                     work_publisher: work_publisher_arc,
-                    model: model.to_string(),
+                    model: display_model.clone(),
+                    dispatch_model: model.to_string(),
                     bundle: bundle.to_string(),
                     engine: engine.to_string(),
                     gpu: gpu.to_string(),
@@ -1419,6 +1456,7 @@ async fn queue_mode_proxy(
         return queue_mode_streaming_generate(
             state,
             work_publisher_arc,
+            display_model.as_str(),
             model,
             bundle,
             engine,
@@ -1877,7 +1915,12 @@ pub(crate) enum StreamingDriverErr {
 pub(crate) async fn run_streaming_generate(
     state: &AppState,
     work_publisher: Arc<publisher::WorkPublisher>,
+    // DISPLAY id (the requested model) — drives metric labels + the cancel
+    // guard. ``dispatch_model`` below is the id actually published to NATS /
+    // the work item (the grammar ``:no-spec`` variant when routing fired);
+    // they are equal for non-routed requests. See ``route_grammar_to_profile``.
     model: &str,
+    dispatch_model: &str,
     bundle: &str,
     engine: &str,
     gpu: &str,
@@ -1931,7 +1974,7 @@ pub(crate) async fn run_streaming_generate(
                 pool: pool.to_string(),
                 machine_profile: gpu.to_string(),
                 bundle: bundle.to_string(),
-                model: model.to_string(),
+                model: dispatch_model.to_string(),
             },
             0,
         )
@@ -1948,7 +1991,7 @@ pub(crate) async fn run_streaming_generate(
             admitted_worker_names.as_ref(),
         );
         let ring = state.registry.ring_snapshot_for_admitted(
-            model,
+            dispatch_model,
             pool,
             gpu,
             bundle,
@@ -1975,7 +2018,7 @@ pub(crate) async fn run_streaming_generate(
                         pool: pool.to_string(),
                         machine_profile: gpu.to_string(),
                         bundle: bundle.to_string(),
-                        model: model.to_string(),
+                        model: dispatch_model.to_string(),
                         worker_id: worker_id.to_string(),
                     },
                     fallback_lane_worker_count,
@@ -1996,7 +2039,7 @@ pub(crate) async fn run_streaming_generate(
                         pool: pool.to_string(),
                         machine_profile: gpu.to_string(),
                         bundle: bundle.to_string(),
-                        model: model.to_string(),
+                        model: dispatch_model.to_string(),
                     },
                     fallback_lane_worker_count,
                 )
@@ -2006,7 +2049,7 @@ pub(crate) async fn run_streaming_generate(
     // Capture this before the move into `publish_generate_streaming`.
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
     let (request_id, rx, activity) = match work_publisher
-        .publish_generate_streaming(target, engine, bundle_config_hash, params)
+        .publish_generate_streaming(target, model, engine, bundle_config_hash, params)
         .await
     {
         Ok(r) => r,
@@ -2061,7 +2104,7 @@ pub(crate) async fn run_streaming_generate(
         .as_ref()
         .map(|g| g.max_new_tokens)
         .unwrap_or(512);
-    let timeout_config = generation_timeout_config(state, model, params, max_new_tokens);
+    let timeout_config = generation_timeout_config(state, dispatch_model, params, max_new_tokens);
     let first_chunk_timeout = timeout_config.first_chunk;
     let inter_chunk_timeout = timeout_config.inter_chunk;
     let effective_overall = timeout_config.overall;
@@ -2527,7 +2570,11 @@ pub(crate) fn build_streaming_publish_failed_for_sse(
 async fn queue_mode_streaming_generate(
     state: &AppState,
     work_publisher: Arc<publisher::WorkPublisher>,
+    // DISPLAY id (requested model) — response body, success metrics, audit log.
     model: &str,
+    // DISPATCH id (grammar ``:no-spec`` variant when routed) — NATS subject +
+    // work item. Equal to ``model`` for non-routed requests.
+    dispatch_model: &str,
     bundle: &str,
     engine: &str,
     gpu: &str,
@@ -2543,6 +2590,7 @@ async fn queue_mode_streaming_generate(
         state,
         work_publisher,
         model,
+        dispatch_model,
         bundle,
         engine,
         gpu,
@@ -4732,6 +4780,59 @@ async fn resolve_generation_route(
     })
 }
 
+/// Rewrite a grammar-constrained request's dispatch model id to the model's
+/// declared ``grammar_profile`` variant (e.g. ``no-spec``), in place.
+///
+/// Shared by every grammar-capable surface (``/v1/chat/completions`` and the
+/// native ``/v1/generate`` path) so they route identically. NEXTN/MTP
+/// speculative decoding bypasses SGLang's Outlines grammar FSM (leaks
+/// out-of-schema keys, truncates mid-JSON), so a model whose default profile is
+/// speculative points ``grammar_profile`` at a non-speculative profile. The
+/// target is resolved off the request's *base* model
+/// (``ModelRegistry::grammar_route_variant``), so an explicit sibling-variant
+/// id (``…:a100-40gb``, also speculative) reroutes to ``{base}:{grammar_profile}``
+/// too, and the grammar-safe variant itself is a no-op (same bundle/pool/lane —
+/// only the worker-loaded model changes). Call this BEFORE the capability/LoRA
+/// gates and resolve those gates against the routed variant: the variant
+/// preserves the base capabilities but narrows the profile-scoped LoRA
+/// allow-list, so a gate run against the base would accept an adapter the
+/// dispatched profile does not serve. The rewritten (DISPATCH) id governs only
+/// the NATS subject + work item; the caller keeps the requested (DISPLAY) id for
+/// the response body, success metrics, and audit log. Invoke ONLY when a grammar
+/// is present. Degrades to the requested id when no profile is declared or the
+/// variant is absent (the cluster still serves on the requested profile — never
+/// hang/5xx).
+///
+/// Both grammar-capable surfaces (``/v1/generate`` and ``/v1/chat/completions``)
+/// now route *before* their capability/LoRA gates so those validate against the
+/// routed variant. This is safe because grammar capabilities are model/task-level
+/// (identical across a model's profiles), so the gate verdict is the same on the
+/// base and the routed variant.
+fn route_grammar_to_profile(
+    registry: &crate::state::model_registry::ModelRegistry,
+    model: &mut String,
+) {
+    use crate::state::model_registry::GrammarRoute;
+    match registry.grammar_route_variant(model) {
+        GrammarRoute::Rewrite(variant) => {
+            tracing::info!(
+                base = %model,
+                variant = %variant,
+                "routing grammar-constrained request to non-speculative profile variant"
+            );
+            *model = variant;
+        }
+        GrammarRoute::Keep => {}
+        GrammarRoute::MissingVariant(grammar_profile) => {
+            tracing::warn!(
+                base = %model,
+                grammar_profile = %grammar_profile,
+                "declared grammar_profile variant not in registry; serving grammar on the requested profile"
+            );
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -4858,8 +4959,24 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         Err(resp) => return resp,
     };
 
-    // -- per-request max_output_tokens cap from model config + grammar capability
-    if let Some(info) = state.model_registry.get_model_info(&model_name) {
+    // Grammar routing (follow-up: chat-path gate ordering). Resolve the model's
+    // declared ``grammar_profile`` variant and compute the DISPATCH id BEFORE the
+    // capability/LoRA gates below, so the gates validate against — and the work
+    // item dispatches to — the profile the request actually runs on. The
+    // profile-scoped LoRA allow-list is narrowed per variant, so gating the base
+    // would accept an adapter the ``:no-spec`` profile does not serve. The
+    // DISPLAY id (``model_name``) stays the requested model for the response
+    // body, success metrics, and audit log. Equal to ``model_name`` unless a
+    // grammar is present and a variant exists. See ``route_grammar_to_profile``.
+    let mut dispatch_model = model_name.clone();
+    if params.grammar.is_some() {
+        route_grammar_to_profile(&state.model_registry, &mut dispatch_model);
+    }
+
+    // -- per-request max_output_tokens cap from model config + grammar capability.
+    //    Gates resolve against the routed DISPATCH model so the profile-scoped
+    //    LoRA allow-list and capabilities match the profile that will serve.
+    if let Some(info) = state.model_registry.get_model_info(&dispatch_model) {
         // Multi-LoRA: pre-validate the requested adapter against the
         // *selected profile's* advertised served-names — not the union
         // across profiles. The chat path has no explicit profile
@@ -5117,6 +5234,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             state: state.as_ref(),
             work_publisher: work_publisher_arc,
             model: model_name.clone(),
+            dispatch_model: dispatch_model.clone(),
             bundle: bundle.clone(),
             engine: engine.clone(),
             gpu: effective_machine_profile.clone(),
@@ -5134,6 +5252,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         &state,
         work_publisher_arc,
         &model_name,
+        &dispatch_model,
         &bundle,
         &engine,
         &effective_machine_profile,
@@ -5698,6 +5817,9 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
             state: state.as_ref(),
             work_publisher: work_publisher_arc,
             model: model_name.clone(),
+            // /v1/completions does not accept grammar, so it never routes:
+            // dispatch == display.
+            dispatch_model: model_name.clone(),
             bundle: bundle.clone(),
             engine: engine.clone(),
             gpu: effective_machine_profile.clone(),
@@ -5712,6 +5834,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
     let driver = run_streaming_generate(
         &state,
         work_publisher_arc,
+        &model_name,
         &model_name,
         &bundle,
         &engine,
@@ -6269,6 +6392,9 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         &state,
         work_publisher_arc,
         &model_name,
+        // /v1/responses does not accept grammar, so it never routes:
+        // dispatch == display.
+        &model_name,
         &bundle,
         &engine,
         &effective_machine_profile,
@@ -6762,35 +6888,61 @@ fn canonicalize_with_aliases(
     if let Some(canonical) = canonicalize(id) {
         return Some(canonical);
     }
-    lookup_alias(aliases, id).map(|target| {
+    lookup_alias(aliases, id).map(|alias| {
         // The alias target may be `bundle:/model`; the bundle is routed
         // separately (resolve_model_spec_with_aliases), so resolve only the
         // model portion here. A bare target leaves the model unchanged.
         // Resolve it like any path id: handles the SIE-safe "__"->"/" form and
         // canonical case-folding, falling back to the target model verbatim (so
         // model-not-found references the resolved model).
-        let (_bundle, model) = parse_model_spec(target);
+        let model = alias_model_target(alias.target, alias.requested_profile);
         resolve_path_model_id(&model, &canonicalize)
     })
 }
 
-/// Look up a job/friendly alias by its name, tolerating a `:profile` variant
-/// suffix on the request.
+struct AliasLookup<'a, 'b> {
+    target: &'a String,
+    requested_profile: Option<&'b str>,
+}
+
+/// Look up a job/friendly alias by its name, tolerating a `:profile` suffix.
 ///
-/// Tries the full (lowercased) id first, then the base before the first `:`, so
-/// `sql:rtx-pro-6000` still resolves the `sql` alias. The `:profile` suffix
-/// can't route by precision anyway (it's stripped before worker dispatch), so
-/// dropping it for alias resolution is safe; the alias's own bundle is what
-/// routes. (A real model id with a `:` resolves through `canonicalize` before
-/// this is reached, so this never shadows one.)
-fn lookup_alias<'a>(
+/// Tries the full lowercased id first, then the base before the first `:`.
+/// When the base alias matches, the suffix is returned so callers can apply it
+/// to the alias target unless that target already names a concrete profile.
+/// A real model id with a `:` resolves through `canonicalize` before this is
+/// reached, so alias suffix handling never shadows a registered variant.
+fn lookup_alias<'a, 'b>(
     aliases: &'a std::collections::HashMap<String, String>,
-    id: &str,
-) -> Option<&'a String> {
+    id: &'b str,
+) -> Option<AliasLookup<'a, 'b>> {
     let key = id.to_ascii_lowercase();
-    aliases
-        .get(&key)
-        .or_else(|| key.split_once(':').and_then(|(base, _)| aliases.get(base)))
+    if let Some(target) = aliases.get(&key) {
+        return Some(AliasLookup {
+            target,
+            requested_profile: None,
+        });
+    }
+    id.split_once(':')
+        .filter(|(_, profile)| !profile.is_empty())
+        .and_then(|(base, profile)| {
+            let base_key = base.to_ascii_lowercase();
+            aliases.get(&base_key).map(|target| AliasLookup {
+                target,
+                requested_profile: Some(profile),
+            })
+        })
+}
+
+fn alias_model_target(target: &str, requested_profile: Option<&str>) -> String {
+    let (_bundle, model) = parse_model_spec(target);
+    if model.contains(':') {
+        return model;
+    }
+    requested_profile
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| format!("{model}:{profile}"))
+        .unwrap_or(model)
 }
 
 /// Resolve a request's model spec to `(bundle_override, canonical_model_name)`,
@@ -6801,10 +6953,8 @@ fn lookup_alias<'a>(
 /// target, else the `__`->`/` form, else verbatim). The addition: an alias
 /// *target* may be a full `bundle:/org/model` spec, so an operator can pin a
 /// precision/profile bundle for a job alias — e.g. map `sql` to a BF16 bundle
-/// that avoids the FP8 SQL-accuracy regression (ADR 0001), since the `:profile`
-/// variant suffix is stripped before worker dispatch and cannot itself route by
-/// precision. An explicit caller bundle (`somebundle:/sql`) always wins over the
-/// alias's bundle.
+/// that avoids the FP8 SQL-accuracy regression (ADR 0001). An explicit caller
+/// bundle (`somebundle:/sql`) always wins over the alias's bundle.
 pub(crate) fn resolve_model_spec_with_aliases(
     aliases: &std::collections::HashMap<String, String>,
     spec: &str,
@@ -6819,8 +6969,8 @@ pub(crate) fn resolve_model_spec_with_aliases(
     // `:profile`-tolerant lookup as the model-name resolution above, so a
     // `sql:profile` request adopts the `sql` alias bundle too.
     if req_bundle.is_empty() && canonicalize(&req_model).is_none() {
-        if let Some(target) = lookup_alias(aliases, &req_model) {
-            let (alias_bundle, _) = parse_model_spec(target);
+        if let Some(alias) = lookup_alias(aliases, &req_model) {
+            let (alias_bundle, _) = parse_model_spec(alias.target);
             return (alias_bundle, model_name);
         }
     }
@@ -9661,17 +9811,43 @@ mod tests {
     #[test]
     fn test_resolve_model_spec_alias_with_profile_suffix_still_routes() {
         // A profile-suffixed alias request (`sql:rtx-pro-6000`) must still hit
-        // the `sql` alias and adopt its BF16 bundle; the (precision-inert)
-        // profile suffix is dropped for alias resolution.
+        // the `sql` alias and adopt its BF16 bundle. The suffix applies to
+        // the alias target unless the target already names a concrete profile.
         let mut aliases = std::collections::HashMap::new();
         aliases.insert("sql".to_string(), "bf16:/Qwen/Qwen3.6-27B".to_string());
         let (bundle, model) = resolve_model_spec_with_aliases(
             &aliases,
             "sql:rtx-pro-6000",
-            canon_of("Qwen/Qwen3.6-27B"),
+            canon_of("Qwen/Qwen3.6-27B:rtx-pro-6000"),
         );
         assert_eq!(bundle, "bf16");
-        assert_eq!(model, "Qwen/Qwen3.6-27B");
+        assert_eq!(model, "Qwen/Qwen3.6-27B:rtx-pro-6000");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_empty_alias_profile_suffix_does_not_fallback() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("sql".to_string(), "bf16:/Qwen/Qwen3.6-27B".to_string());
+        let (bundle, model) =
+            resolve_model_spec_with_aliases(&aliases, "sql:", canon_of("Qwen/Qwen3.6-27B"));
+        assert_eq!(bundle, "");
+        assert_eq!(model, "sql:");
+    }
+
+    #[test]
+    fn test_resolve_model_spec_alias_target_profile_wins_over_request_suffix() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "sql".to_string(),
+            "bf16:/Qwen/Qwen3.6-27B:bf16-sql".to_string(),
+        );
+        let (bundle, model) = resolve_model_spec_with_aliases(
+            &aliases,
+            "sql:rtx-pro-6000",
+            canon_of("Qwen/Qwen3.6-27B:bf16-sql"),
+        );
+        assert_eq!(bundle, "bf16");
+        assert_eq!(model, "Qwen/Qwen3.6-27B:bf16-sql");
     }
 
     #[test]
@@ -12647,6 +12823,278 @@ mod tests {
         assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
     }
 
+    // ── grammar routing: dispatch vs display model ─────────────────
+    //
+    // The chat (`proxy_chat`) and native generate (`queue_mode_proxy`)
+    // handlers route a grammar-constrained request to the model's declared
+    // `:no-spec` `grammar_profile` variant for DISPATCH (NATS subject + work
+    // item) while keeping the requested base id for DISPLAY (response body,
+    // `record_generation_success`, audit log). Both read
+    // `info_extras.grammar_profile` off the resolved model, then call
+    // `route_grammar_to_profile`. These tests exercise that exact composition
+    // against a live `ModelRegistry`, one level above the
+    // `ModelRegistry::grammar_route_variant` unit test (which checks the
+    // registry lookup in isolation). A full handler call cannot observe the
+    // dispatch id — it is internal to the NATS publish, which the queue-only
+    // gateway skips when `work_publisher` is `None`.
+
+    /// An empty `ModelRegistry` with a `default` bundle advertising the
+    /// `sentence_transformer` adapter — callers add their model configs. The
+    /// temp dirs are read at construction only, so they can drop here.
+    fn empty_registry() -> crate::state::model_registry::ModelRegistry {
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            bundles_dir.path().join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        crate::state::model_registry::ModelRegistry::new(
+            bundles_dir.path(),
+            models_dir.path(),
+            true,
+        )
+    }
+
+    fn grammar_routed_registry() -> crate::state::model_registry::ModelRegistry {
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let registry = empty_registry();
+        let mk = || ProfileConfig {
+            adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+            max_batch_tokens: Some(4096),
+            compute_precision: None,
+            adapter_options: None,
+            extends: None,
+        };
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), mk());
+        // A non-`default` profile expands into the `org/g:no-spec` variant
+        // entry that grammar routing dispatches to.
+        profiles.insert("no-spec".to_string(), mk());
+        // `tasks.generate.grammar_profile: no-spec` is what surfaces on
+        // `info_extras.grammar_profile` — the field the handlers read.
+        let tasks: serde_yaml::Value = serde_yaml::from_str(
+            "generate:\n  grammar_profile: no-spec\n  capabilities:\n    grammar: [json_schema]\n",
+        )
+        .unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/g".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+        registry
+    }
+
+    /// Mirror the handler routing step: route the requested model in place.
+    /// The variant is resolved off the base model inside
+    /// `route_grammar_to_profile`. Returns `(display_id, dispatch_id)`.
+    fn route_like_handler(
+        registry: &crate::state::model_registry::ModelRegistry,
+        requested: &str,
+    ) -> (String, String) {
+        let display = requested.to_string();
+        let mut dispatch = display.clone();
+        route_grammar_to_profile(registry, &mut dispatch);
+        (display, dispatch)
+    }
+
+    #[test]
+    fn test_grammar_request_dispatches_variant_display_stays_base() {
+        let registry = grammar_routed_registry();
+        // Precondition: the declared profile surfaces for the handlers to read.
+        assert_eq!(
+            registry
+                .get_model_info("org/g")
+                .and_then(|m| m.info_extras.grammar_profile.clone())
+                .as_deref(),
+            Some("no-spec"),
+        );
+
+        let (display, dispatch) = route_like_handler(&registry, "org/g");
+        // DISPATCH id is rewritten to the `:no-spec` variant; the DISPLAY id
+        // (response body / metrics / audit) stays the requested base model.
+        assert_eq!(dispatch, "org/g:no-spec");
+        assert_eq!(display, "org/g");
+    }
+
+    #[test]
+    fn test_grammar_request_on_variant_id_does_not_double_route() {
+        // A request that already names the variant must not re-route to
+        // `org/g:no-spec:no-spec`: the variant entry clears its own
+        // `grammar_profile` routing hint, so display == dispatch.
+        let registry = grammar_routed_registry();
+        let (display, dispatch) = route_like_handler(&registry, "org/g:no-spec");
+        assert_eq!(dispatch, "org/g:no-spec");
+        assert_eq!(display, "org/g:no-spec");
+    }
+
+    #[test]
+    fn test_non_grammar_model_keeps_base_dispatch() {
+        // A model that declares no `grammar_profile` never rewrites: the
+        // dispatch id equals the display id.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let registry = grammar_routed_registry();
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/plain".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: None,
+            })
+            .unwrap();
+
+        let (display, dispatch) = route_like_handler(&registry, "org/plain");
+        assert_eq!(dispatch, "org/plain");
+        assert_eq!(display, "org/plain");
+    }
+
+    #[test]
+    fn test_grammar_gate_validates_against_narrowed_variant_adapters() {
+        // The gate-ordering fix routes a grammar request to the `:no-spec`
+        // variant BEFORE the LoRA gate runs, so the gate validates against the
+        // variant's *narrowed* per-profile allow-list, not the base. Here the
+        // `default` profile serves adapter `a1` and `no-spec` serves `a2`. A
+        // grammar request dispatches to `org/g2:no-spec`, whose allow-list must
+        // REJECT `a1` (served only by the base default profile) and accept `a2`.
+        // Gating the base — the pre-fix behaviour — would wrongly accept `a1`.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let registry = empty_registry();
+        let default_profile = ProfileConfig {
+            adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+            max_batch_tokens: Some(4096),
+            compute_precision: None,
+            adapter_options: Some(serde_json::json!({
+                "loadtime": { "lora_paths": { "a1": "org/a1" } }
+            })),
+            extends: None,
+        };
+        let nospec_profile = ProfileConfig {
+            adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+            max_batch_tokens: Some(4096),
+            compute_precision: None,
+            adapter_options: Some(serde_json::json!({
+                "loadtime": { "lora_paths": { "a2": "org/a2" } }
+            })),
+            extends: None,
+        };
+        let mut profiles = StdHashMap::new();
+        profiles.insert("default".to_string(), default_profile);
+        profiles.insert("no-spec".to_string(), nospec_profile);
+        let tasks: serde_yaml::Value =
+            serde_yaml::from_str("generate:\n  grammar_profile: no-spec\n").unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/g2".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+
+        let (display, dispatch) = route_like_handler(&registry, "org/g2");
+        assert_eq!(display, "org/g2");
+        assert_eq!(dispatch, "org/g2:no-spec");
+
+        let base_info = registry.get_model_info(&display).unwrap();
+        let variant_info = registry.get_model_info(&dispatch).unwrap();
+        // Base default profile serves `a1` — gating the base would accept it.
+        assert!(matches!(
+            validate_lora_for_profile(&base_info, "default", "a1"),
+            LoraValidation::Ok
+        ));
+        // The routed variant's narrowed allow-list rejects `a1`, accepts `a2`.
+        assert!(matches!(
+            validate_lora_for_profile(&variant_info, "default", "a1"),
+            LoraValidation::UnknownAdapter
+        ));
+        assert!(matches!(
+            validate_lora_for_profile(&variant_info, "default", "a2"),
+            LoraValidation::Ok
+        ));
+    }
+
+    #[test]
+    fn test_grammar_variant_absent_degrades_to_base() {
+        // Safety contract: a declared `grammar_profile` whose variant is not in
+        // the registry degrades to the base model (never hang / 5xx). Here
+        // `grammar_profile: ghost` names a profile that is not defined, so no
+        // `org/g3:ghost` variant entry is minted and routing keeps the base.
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let registry = empty_registry();
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("sie_server.adapters.sentence_transformer:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        let tasks: serde_yaml::Value =
+            serde_yaml::from_str("generate:\n  grammar_profile: ghost\n").unwrap();
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/g3".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                max_sequence_length: None,
+                tasks: Some(tasks),
+            })
+            .unwrap();
+
+        // The declared (but undefined) profile is still surfaced...
+        assert_eq!(
+            registry
+                .get_model_info("org/g3")
+                .and_then(|m| m.info_extras.grammar_profile.clone())
+                .as_deref(),
+            Some("ghost"),
+        );
+        // ...yet routing degrades to base because `org/g3:ghost` does not exist.
+        let (display, dispatch) = route_like_handler(&registry, "org/g3");
+        assert_eq!(display, "org/g3");
+        assert_eq!(dispatch, "org/g3");
+    }
+
     // ── /v1/chat/completions parsing + body composition ────────────
 
     fn _chat_body_min(model: &str) -> serde_json::Value {
@@ -15263,6 +15711,7 @@ mod tests {
             max_sequence_length: None,
             max_output_tokens: None,
             grammar_capabilities: None,
+            grammar_profile: None,
             tools_supported: None,
             code: false,
             sql: false,

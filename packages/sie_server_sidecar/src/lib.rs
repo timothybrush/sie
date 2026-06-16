@@ -321,12 +321,15 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     // raw IPC client, only the backend trait object.
     let ipc = Arc::new(
         IpcClient::new_pool(&config.ipc_socket_path, config.ipc_pool_size)
-            .with_timeout(Duration::from_secs(60))
+            .with_timeout(Duration::from_secs(config.ipc_request_timeout_s))
+            .with_model_ready_timeout(Duration::from_secs(config.model_ready_timeout_s))
             .with_metrics(Arc::clone(&metrics_registry)),
     );
     info!(
         socket = %config.ipc_socket_path.display(),
         ipc_pool_size = config.ipc_pool_size,
+        ipc_request_timeout_s = config.ipc_request_timeout_s,
+        model_ready_timeout_s = config.model_ready_timeout_s,
         "IPC client initialized with connection pool"
     );
     let generation_capable = detect_generation_capable(&ipc).await;

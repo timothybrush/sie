@@ -16,6 +16,20 @@ fast at render time.
 {{- if and $root.Values.workers.common.workerSidecar.enabled (not $root.Values.nats.config.jetstream.enabled) }}
 {{- fail "workers.common.workerSidecar.enabled=true requires nats.config.jetstream.enabled=true (the sidecar consumes JetStream)" }}
 {{- end }}
+{{- $modelReadyTimeoutS := int (dig "modelReadyTimeoutSec" 900 $root.Values.workers.common) -}}
+{{- if le $modelReadyTimeoutS 0 }}
+{{- fail "workers.common.modelReadyTimeoutSec must be a positive integer number of seconds" }}
+{{- end }}
+{{- $workerLiveness := default dict $root.Values.workers.common.probes.liveness -}}
+{{- $workerLivenessPeriodS := int (default 30 $workerLiveness.periodSeconds) -}}
+{{- $workerLivenessFailures := int (default 36 $workerLiveness.failureThreshold) -}}
+{{- if or (le $workerLivenessPeriodS 0) (le $workerLivenessFailures 0) }}
+{{- fail "workers.common.probes.liveness.periodSeconds and failureThreshold must be positive when modelReadyTimeoutSec is configured" }}
+{{- end }}
+{{- $workerLivenessBudgetS := mul $workerLivenessPeriodS $workerLivenessFailures -}}
+{{- if le $workerLivenessBudgetS $modelReadyTimeoutS }}
+{{- fail (printf "workers.common.modelReadyTimeoutSec=%d must be lower than the Python worker liveness budget (%d * %d = %ds); increase workers.common.probes.liveness.failureThreshold/periodSeconds or lower modelReadyTimeoutSec" $modelReadyTimeoutS $workerLivenessFailures $workerLivenessPeriodS $workerLivenessBudgetS) }}
+{{- end }}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
 {{- if not $pool.bundles }}
@@ -122,6 +136,13 @@ spec:
             # Bundle for multi-bundle routing
             - name: SIE_BUNDLE
               value: {{ $bundle | quote }}
+            # Shared cold-load timeout used by Python SGLang health waits.
+            - name: SIE_MODEL_READY_TIMEOUT_S
+              value: {{ $modelReadyTimeoutS | quote }}
+            # Lets engine-backed adapters reject startup budgets kubelet would
+            # kill before completion.
+            - name: SIE_WORKER_LIVENESS_BUDGET_S
+              value: {{ $workerLivenessBudgetS | quote }}
             # Device configuration (cpu if no GPU, cuda otherwise)
             - name: SIE_DEVICE
               value: {{ if gt (int $pool.gpu.count) 0 }}cuda{{ else }}cpu{{ end }}
@@ -279,6 +300,12 @@ spec:
               value: {{ $queuePool | quote }}
             - name: SIE_BUNDLE
               value: {{ $bundle | quote }}
+            # Shared cold-load timeout used by Rust EnsureModelReady IPC calls.
+            - name: SIE_MODEL_READY_TIMEOUT_S
+              value: {{ $modelReadyTimeoutS | quote }}
+            # Same budget check on the Rust sidecar before it accepts the IPC timeout.
+            - name: SIE_WORKER_LIVENESS_BUDGET_S
+              value: {{ $workerLivenessBudgetS | quote }}
             - name: SIE_GATEWAY_URL
               value: {{ include "sie-cluster.gateway.internalUrl" $root | quote }}
             {{- if $root.Values.gateway.auth.tokenSecretName }}

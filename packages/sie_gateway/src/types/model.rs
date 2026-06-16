@@ -23,6 +23,14 @@ pub struct ModelInfoExtras {
     /// ``generate`` task; empty ``Vec`` when grammar is explicitly
     /// disabled.
     pub grammar_capabilities: Option<Vec<String>>,
+    /// ``tasks.generate.grammar_profile`` from the model YAML — the name of a
+    /// profile that grammar-constrained requests must be served on. When set,
+    /// the chat/completions/generate handlers rewrite a grammar request's model
+    /// id to the ``{model}:{grammar_profile}`` variant so it runs on a profile
+    /// that enforces the grammar correctly (e.g. ``no-spec`` — speculative
+    /// decoding bypasses SGLang's Outlines FSM). ``None`` when the model has no
+    /// ``generate`` task or does not declare the field (no rewrite).
+    pub grammar_profile: Option<String>,
     /// ``tasks.generate.capabilities.tools`` from the model YAML — a
     /// single boolean advertising whether the model supports
     /// OpenAI-style tool calling. The chat completion handler gates
@@ -171,6 +179,13 @@ impl ModelInfoExtras {
                     })
                     .unwrap_or_default();
                 extras.grammar_capabilities = Some(grammar);
+                // ``tasks.generate.grammar_profile: <name>`` — optional profile
+                // that grammar requests are routed to (the gateway rewrites the
+                // model id to ``{model}:{name}``). Absent => no rewrite.
+                extras.grammar_profile = gen
+                    .get("grammar_profile")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 // ``capabilities.tools: bool`` defaults to ``false``
                 // — mirrors :class:`GenerateCapabilities` in the
                 // worker config. Absent ``capabilities`` block also
@@ -264,6 +279,7 @@ impl ModelInfoExtras {
                 max_sequence_length: config.max_sequence_length,
                 max_output_tokens: None,
                 grammar_capabilities: None,
+                grammar_profile: None,
                 tools_supported: None,
                 code: false,
                 sql: false,

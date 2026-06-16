@@ -29,6 +29,17 @@ pub struct WorkerConfig {
     /// `SIE_MAX_CONCURRENT_BATCHES`'s default (4).
     pub ipc_pool_size: usize,
 
+    /// Per-RPC timeout for ordinary sidecar → Python IPC calls. Sourced from
+    /// `SIE_IPC_REQUEST_TIMEOUT_S`.
+    pub ipc_request_timeout_s: u64,
+
+    /// Timeout for sidecar → Python `EnsureModelReady` calls. Must be at least
+    /// as long as the slowest expected cold start; SGLang adapters may
+    /// legitimately spend many minutes loading large models before they can
+    /// answer the readiness handshake. Sourced from
+    /// `SIE_MODEL_READY_TIMEOUT_S`.
+    pub model_ready_timeout_s: u64,
+
     /// Optional payload store URL — if unset, workers expect items inline
     /// (large items will be rejected by the gateway's offload). Local paths
     /// point at a shared directory; `s3://…` / `gs://…` / `abfs://…` /
@@ -194,6 +205,8 @@ mod tests {
             bundle: "default".into(),
             ipc_socket_path: PathBuf::from("/tmp/sie-ipc.sock"),
             ipc_pool_size: 1,
+            ipc_request_timeout_s: 60,
+            model_ready_timeout_s: 900,
             payload_store_url: None,
             gateway_url: None,
             gateway_api_key: None,

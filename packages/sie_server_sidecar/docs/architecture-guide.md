@@ -1,365 +1,283 @@
 # SIE Server Sidecar Architecture
 
-This is the canonical reference for `packages/sie_server_sidecar`.
+`packages/sie_server_sidecar` contains the Rust queue runtime used by
+sidecar-enabled SIE worker pods.
 
-## Status
-
-The package is production-oriented but still deployment-gated by Helm:
-
-- Source package: `packages/sie_server_sidecar`
-- Cargo package: `sie-server-sidecar`
-- Binary: `sie-server-sidecar`
-- Kubernetes container: `worker-sidecar`
-- Container image: `ghcr.io/superlinked/sie-server-sidecar`
-- Prometheus metric prefix: `sie_worker_`
-
-The Kubernetes container is named `worker-sidecar`, while sidecar-only build
-artifacts use the `sie-server-sidecar` family to match the colocated
-`sie-server` adapter process. Prometheus metric families use the
-`sie_worker_*` prefix because they describe worker-side runtime behavior.
-
-GPU-independent preparation code lives in this package:
-
-- `src/protocol/` owns the Rust IPC schema.
-- `src/prep/` owns GPU-independent prep/framing helpers.
-- `src/ipc_types.rs` remains as a re-export so sidecar code can keep using
-  `crate::ipc_types`.
-
-`tools/ci/check_ipc_types_parity.py` checks the Rust protocol schema against
-`packages/sie_server/src/sie_server/ipc_types.py`.
-
-## Runtime Split
-
-A queue-mode worker pod has two cooperating containers:
+The sidecar runs next to `sie-server` in the same worker pod. It consumes NATS
+JetStream work, talks to the Python adapter over Unix-domain-socket IPC, and
+publishes results back to NATS Core.
 
 ```text
 gateway -> NATS JetStream -> worker-sidecar -> UDS IPC -> sie-server adapter
-                                       |
-                                       +-> NATS Core reply subject
+                                      |
+                                      +-> NATS Core reply subject
 ```
 
-Responsibilities:
+References:
 
-| Component | Owns |
-| --- | --- |
-| `sie_gateway` | HTTP/API edge, model and pool resolution, JetStream publish, inbox collection, DLQ listener |
-| `worker-sidecar` | JetStream pull consumer, subject validation, payload fetch, batch formation, adaptive scheduling, Rust tokenization fast path, result framing, ACK/NAK, reply publish, sidecar metrics/readiness |
-| `sie-server` | Python adapter execution, model registry and GPU lifecycle, adapter-specific preprocessing/fallbacks, IPC server, direct HTTP API |
+- [Worker runtime](../../../product/design/worker-runtime.md)
+- [Deployment topologies](../../../product/design/deployment-topologies.md)
+- [Gateway architecture guide](../../sie_gateway/docs/architecture-guide.md)
+- [Sidecar README](../README.md)
 
-The sidecar never loads model weights and has no GPU dependency. It talks to
-the colocated adapter over a Unix domain socket.
+## Component Boundaries
 
-## Request Path
+`sie_gateway` accepts client inference requests, resolves the model, bundle,
+machine profile, and pool, publishes work to JetStream, collects worker results,
+and owns DLQ publication from JetStream max-delivery advisories.
 
-1. Gateway publishes a msgpack `WorkItem` on `sie.work.{pool}.{machine_profile}.{bundle}.{model}`.
-2. The sidecar's long-lived JetStream pull stream receives messages from
-   stream `WORK_POOL_{pool}`.
-3. The dispatcher extracts the model from the subject and rejects malformed
-   subjects before trusting payload data.
-4. The dispatcher validates `reply_subject`; non-empty values must start with
-   `_INBOX.`.
-5. The sidecar groups by model, calls `EnsureModelReady`, and resolves payload
-   references if present.
-6. The Rust scheduler batches by `(operation, lora_key)` and sends `RunBatch`
-   over UDS IPC when the adapter declares `supports_run_batch`.
-7. Python returns `BatchOutcome` with per-item `ItemOutcome`s.
-8. The sidecar frames/publishes `WorkResult` and ACKs the JetStream message.
-   Publish failure skips ACK so JetStream redelivers.
+`worker-sidecar` owns JetStream consumption, subject validation, payload fetch,
+batch formation, adaptive scheduling, Rust tokenization when enabled by adapter
+descriptors, result framing, ACK/NAK decisions, reply publication, HTTP probes,
+Prometheus metrics, NATS health publication, pool admission, and bundle-scoped
+config apply.
 
-Failure rules:
+`sie-server` owns model registry behavior, lazy model loading, GPU residency,
+adapter execution, adapter-specific preprocessing and postprocessing, generation
+execution, and the IPC server.
 
-- Bad msgpack, malformed subject, transient backend failures, and draining
-  generally NAK with a delay.
-- Unsafe reply subjects are ACK-dropped to avoid publish amplification.
-- Unknown operations publish an error outcome and ACK when the reply publish
+The sidecar does not load model weights and does not link GPU libraries.
+
+Public names:
+
+- Rust package and binary: `sie-server-sidecar`
+- Kubernetes container: `worker-sidecar`
+- Container image: `ghcr.io/superlinked/sie-server-sidecar`
+- Metrics prefix: `sie_worker_*`
+
+## Request Flow
+
+Encode, score, and extract queue traffic follows this path:
+
+1. The gateway publishes a msgpack `WorkItem` to a lane-aware JetStream subject.
+2. The sidecar consumes the message from the matching durable consumer.
+3. The sidecar validates the NATS subject and reply subject.
+4. The sidecar resolves payload references when the work item uses external
+   payload storage.
+5. The sidecar groups work by model.
+6. The sidecar calls `EnsureModelReady` over IPC.
+7. The scheduler batches compatible items by operation and LoRA key.
+8. The sidecar sends scheduled batches over IPC with `RunBatch`.
+9. Python returns per-item outcomes.
+10. The sidecar publishes a `WorkResult` to the reply subject.
+11. The sidecar ACKs the JetStream message after successful reply publication.
+
+Message settlement:
+
+- Unsafe reply subjects are ACK-dropped.
+- Malformed subjects and bad msgpack payloads are NAKed.
+- Unknown operations publish per-item error outcomes when reply publication
   succeeds.
-- IPC transport errors retry once transparently before the group is NAKed.
-- Gateway owns DLQ publication by listening to JetStream max-delivery
-  advisories; the sidecar only ACKs or NAKs.
+- Transient backend, decode, stream, and drain failures are NAKed.
+- Reply publication failure leaves the JetStream message unacked.
 
-## NATS Contract
+Source: [`dispatcher.rs`](../src/dispatcher.rs),
+[`publisher.rs`](../src/publisher.rs), and [`work_types.rs`](../src/work_types.rs).
 
-Worker stream and consumer settings must stay aligned with the gateway and SDK:
+## NATS Subjects
 
-| Field | Value |
-| --- | --- |
-| Stream | `WORK_POOL_{pool}` |
-| Stream subjects | `sie.work.{pool}.*.*.*` |
-| Consumer filter | `sie.work.{pool}.{machine_profile}.{bundle}.*` |
-| Retention | WorkQueue |
-| Storage | Memory |
-| Consumer | `{pool}_{machine_profile}_{bundle}` |
-| Ack policy | Explicit |
-| Ack wait | 30 s |
-| Max deliver | `SIE_MAX_DELIVER`, default 20 |
-| Max ack pending | `SIE_MAX_ACK_PENDING`, default 1000 |
+Pool work uses this subject shape:
 
-On existing streams, the gateway and sidecar reconcile the subject list to
-exactly `sie.work.{pool}.*.*.*`. Legacy subjects such as `sie.work.*.{pool}` are
-intentionally removed from stream configuration. This release is a cutover to
-the lane-aware subject shape, not a mixed-version bridge: all gateways and
-workers in the cluster must use the new shape, and any old queued work should be
-drained or purged before rollout.
+```text
+sie.work.{pool}.{machine_profile}.{bundle}.{model}
+```
 
-The pull stream must be long-lived. Dropping and recreating pull streams inside
-the fetch loop can make async-nats mark unread messages as delivered, causing
-redelivery only after the 30 s `ack_wait`. The implementation creates one pull
-stream and polls it continuously.
-Integration tests guard this with concurrent and sustained-load scenarios that
-watch `sie_worker_nats_redelivery_total`.
+Generation direct dispatch uses this subject shape:
 
-The sidecar also runs a slow stream/durable reconciler. It periodically
-re-ensures `WORK_POOL_{pool}` and `{pool}_{machine_profile}_{bundle}` so NATS
-metadata drift can self-heal without adding reconnect-event work or locks to
-the fetch loop. It does not rebuild the active pull stream; terminal
-pull-stream errors still use the normal pull-loop recovery path.
+```text
+sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}
+```
 
-Generation models use a worker-specific JetStream subject
-`sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`. The sidecar
-creates and polls that worker stream only after Python `WorkerCapabilities`
-reports at least one generation model. If live config reconciliation later adds
-a generation model to an already-running sidecar, a capability reconciler
-activates the direct stream and cancel subscriber exactly once.
+The pool stream subject is:
 
-When `SIE_GATEWAY_URL` is set, the sidecar runs the pool admission gate before
-pulling from either the pool stream or the generation worker stream. Capped
-named pools fail closed unless `/v1/pools/{pool}` lists this pod in
-`status.assigned_workers`; uncapped pools and profile-uncapped workers continue
-pulling. The default pool fails open during transient gateway/status errors so
-baseline capacity remains available.
+```text
+sie.work.{pool}.*.*.*
+```
 
-## IPC Contract
+The pool durable filter is:
 
-Framing is:
+```text
+sie.work.{pool}.{machine_profile}.{bundle}.*
+```
+
+The sidecar extracts the model from the sixth subject token. Model IDs, bundle
+IDs, machine profiles, pool names, and worker IDs are normalized to single NATS
+subject tokens by the gateway and sidecar helpers.
+
+The sidecar creates one long-lived async-nats pull stream for pool work. A slow
+reconciler re-ensures stream and durable metadata outside the fetch loop.
+
+When generation direct dispatch is active, the sidecar also creates and polls
+the worker-specific generation stream and subscribes to `cancel.>`.
+
+Source: [`nats_consumer.rs`](../src/nats_consumer.rs),
+[`subject.rs`](../src/subject.rs), and the gateway
+[queue publisher](../../sie_gateway/src/queue/publisher.rs).
+
+## Pool Admission
+
+When `SIE_GATEWAY_URL` is configured and pool admission is enabled, the sidecar
+checks gateway pool status before pulling from the pool stream or the
+worker-specific generation stream.
+
+Capped named pools require the worker to appear in
+`status.assigned_workers`. The default pool continues pulling during transient
+gateway/status errors.
+
+Source: [`pool_admission.rs`](../src/pool_admission.rs).
+
+## Generation
+
+Generation work uses `ProcessGenerate` over IPC. The sidecar passes the
+msgpack-encoded `WorkItem` to Python and handles streaming IPC events.
+
+The gateway streaming path selects either a pool subject or a worker-specific
+subject. Worker-specific routing uses HRW over eligible workers. The gateway
+stores a pool fallback subject for streaming work and uses it for republish
+paths such as NAK handling and first-chunk timeout handling.
+
+The sidecar starts generation direct dispatch after `WorkerCapabilities`
+reports generation models. The generation capability reconciler repeats that
+probe after live config apply when direct dispatch is not active.
+
+The sidecar subscribes to `cancel.>`. Subjects shaped as
+`cancel.{router_id}.{request_id}` are forwarded to Python through
+`SignalGenerateCancel`.
+
+Source: [`lib.rs`](../src/lib.rs), [`dispatcher.rs`](../src/dispatcher.rs),
+[`ipc_client.rs`](../src/ipc_client.rs), and
+[`packages/sie_gateway/src/handlers/proxy.rs`](../../sie_gateway/src/handlers/proxy.rs).
+
+## IPC
+
+IPC framing is:
 
 ```text
 [4-byte big-endian length][msgpack named-map body]
 ```
 
-The method surface is:
+The Rust and Python protocol copies define the same method names:
 
 - `Ping`
 - `EnsureModelReady`
 - `ProcessEncodeBatch`
 - `ProcessScoreBatch`
 - `ProcessExtractBatch`
+- `ProcessGenerate`
+- `WorkerCapabilities`
+- `SignalGenerateCancel`
 - `RunBatch`
+- `ApplyModelConfig`
+- `ReplaceModelConfigs`
 - `Drain`
 
-`RunBatch` is the hot scheduler path. It carries a homogeneous-op batch; mixed
-ops are rejected by Python and pinned by parity fixtures under `tests/parity/`.
-Envelope identity fields on `RunBatchItem` preserve `work_item_id`,
-`request_id`, and `item_index` even when the operation-specific payload is
-missing.
+`tools/ci/check_ipc_types_parity.py` checks the Rust protocol schema against
+`packages/sie_server/src/sie_server/ipc_types.py`.
 
-`ModelDescriptor` is returned by `EnsureModelReady` and lets the sidecar learn
-per-model capabilities at runtime:
+`EnsureModelReady` returns readiness state and an optional `ModelDescriptor`.
+The descriptor carries tokenizer path, tokenizer content hash, maximum sequence
+length, output types, default text templates, and `supports_run_batch`.
 
-- tokenizer path and tokenizer content hash
-- maximum sequence length
-- supported output types
-- `supports_run_batch`
+Source: [`protocol/ipc_types.rs`](../src/protocol/ipc_types.rs),
+[`ipc_client.rs`](../src/ipc_client.rs), and
+[`packages/sie_server/src/sie_server/ipc_types.py`](../../sie_server/src/sie_server/ipc_types.py).
 
-## Scheduler And Batching
+## Scheduling
 
-The Rust scheduler is live for queue-mode traffic that reaches this sidecar.
-There is no sidecar-local active model list that gates the path; routing is a
-gateway/pool decision.
+The sidecar scheduler handles queue-mode encode, score, and extract batches for
+sidecar-enabled worker pools.
 
-Preserved Python semantics:
+Batching keys include operation and LoRA key. Batch formation uses item cost,
+request count, coalescing windows, adaptive pull timing, and model-specific
+scheduler state. Oversize items flush alone. Per-item outcomes are published
+without dropping the rest of the batch.
 
-- cost, count, max-wait, and coalesce-window flush triggers
-- oversize item flushes alone
-- cost-sorted sub-batch packing
-- per-model adaptive controller
-- score runs on the base LoRA path
-- per-item outcomes fan out without dropping the rest of the batch
+Routing remains gateway-owned. The sidecar has no local active-model allowlist
+for queue routing.
 
-Production-tuned sidecar defaults:
+Source: [`scheduler/`](../src/scheduler/), [`latency.rs`](../src/latency.rs),
+and [`dispatcher.rs`](../src/dispatcher.rs).
 
-| Knob | Default | Notes |
-| --- | ---: | --- |
-| `SIE_RUST_PIPELINE_DEPTH` | 2 | one active adapter batch plus one queued behind it |
-| `SIE_BATCHER_COALESCE_MS` | 5 | intentionally lower than Python reference |
-| `SIE_BATCHER_MAX_BATCH_REQUESTS` | 12 | intentionally lower than Python reference |
-| `SIE_ADAPTIVE_MIN_QUANTUM_MS` | 2 | pull-loop coalesce floor |
-| `SIE_ADAPTIVE_MAX_QUANTUM_MS` | 15 | pull-loop coalesce ceiling |
-| `SIE_ADAPTIVE_TARGET_P50_MS` | 50 | pull-loop latency target |
+## Preparation And Framing
 
-These worker-local defaults cap coalescing and queue depth for CPU-side
-responsiveness; they are locked by Rust tests and should be retuned together.
+The sidecar performs GPU-independent preparation and framing:
 
-`SIE_PULL_QUANTUM_INCLUDE_QUEUE_MS=1` opts into controller input that includes
-queue wait. Default is off because saturation queue time can collapse the pull
-quantum even when the pull loop is not the bottleneck.
+- text template application for Rust tokenization;
+- HF fast-tokenizer loading from adapter-declared paths;
+- `PreparedTokens` attachment for encode IPC items;
+- payload-store fetch and inline replacement for offloaded work items;
+- dense, sparse, multivector, score, and generated-output framing;
+- `msgpack_numpy` sentinel-compatible payload handling.
 
-## Prep And Result Framing
+Python retokenizes when prepared tokens are absent or the tokenizer hash does
+not match. Score pair construction stays in Python. Extract tokenization stays
+in Python.
 
-The sidecar owns GPU-independent work:
+Large generation and vision payloads are fetched from payload storage and
+inlined before `ProcessGenerate`, so Python receives a self-contained msgpack
+work item.
 
-- text template application for the safe Rust-tokenization path
-- HF fast-tokenizer loading from the adapter-declared tokenizer path
-- `PreparedTokens` attachment for encode IPC items where safe
-- dense, sparse, multivector, and score `RawOutput` framing
-- `msgpack_numpy` sentinel-compatible payload bytes
+Source: [`prep/`](../src/prep/), [`tokenize/`](../src/tokenize/),
+[`output/`](../src/output/), [`payload_store.rs`](../src/payload_store.rs), and
+[`dispatcher.rs`](../src/dispatcher.rs).
 
-Python remains the correctness fallback. If tokens are absent or the
-`tokenizer_id` mismatches, Python retokenizes. If a result cannot be represented
-by a typed `RawOutput`, Python-framed `result_msgpack` passes through.
+## Readiness, Health, And Metrics
 
-Current worker-side boundaries:
+The sidecar HTTP server exposes:
 
-- Encode tokenization fast path exists, but individual text adapters still need
-  byte-identity validation before consuming it everywhere.
-- Score pair construction stays adapter-side because query/document pair policy
-  is model-specific.
-- Extract tokenization stays Python-side.
-- Native Candle/tch-rs adapter work remains future work behind the same IPC boundary.
-
-## Readiness And Metrics
-
-The sidecar serves HTTP on `SIE_WORKER_METRICS_PORT`, default `9095`:
-
-- `/healthz`: always returns 200 while the process is alive.
-- `/readyz`: returns 200 only after a successful IPC `Ping`, while the most
-  recent ping is fresh, and before drain starts.
+- `/healthz`: process liveness;
+- `/readyz`: readiness based on successful IPC `Ping`, heartbeat freshness, and
+  drain state;
 - `/metrics`: Prometheus metrics.
 
-In Helm, the `worker-sidecar` container exposes container port `metrics`, the
-worker Service exposes it as service port `worker-metrics`, and the
-ServiceMonitor scrapes that endpoint. Metric families remain `sie_worker_*`
-and `sie_pull_loop_*`; do not rename them with the Kubernetes container.
+Readiness state is shared with the NATS health publisher. The health publisher
+emits worker identity, bundle, machine profile, readiness, and the current
+bundle config hash.
 
-Freshness is `SIE_WORKER_PING_INTERVAL_MS * SIE_WORKER_READYZ_STALE_MULT`.
-Defaults are 2000 ms and 3.
+Source: [`metrics.rs`](../src/metrics.rs),
+[`readiness.rs`](../src/readiness.rs), and
+[`health_publisher.rs`](../src/health_publisher.rs).
 
-Helm can route probes to the sidecar with
-`workers.common.workerSidecar.probes.enabled`. This is separate from enabling the
-sidecar container itself.
+## Live Config
 
-## Important Environment Variables
+The sidecar subscribes to bundle-scoped config deltas:
 
-| Variable | Purpose |
-| --- | --- |
-| `SIE_NATS_URL` | NATS endpoint; required |
-| `SIE_POOL` | pool segment in `sie.work.{pool}.{machine_profile}.{bundle}.{model}` |
-| `SIE_MACHINE_PROFILE` | machine-profile segment; required and set explicitly by Helm |
-| `SIE_BUNDLE` | bundle/runtime segment and consumer-name segment |
-| `SIE_IPC_SOCKET_PATH` | UDS path to the adapter |
-| `SIE_IPC_POOL_SIZE` | concurrent IPC connections, default matches dispatch concurrency |
-| `SIE_NATS_FETCH_BUDGET` | pull-stream credit and fallback model budget |
-| `SIE_NATS_PULL_EXPIRES_S` | server-side pull expiry, default 5 s and must stay below ack wait |
-| `SIE_NATS_CONSUMER_RECONCILE_INTERVAL_MS` | slow stream/durable reconcile interval, default 30000; non-zero values below 10000 are clamped; `0` disables |
-| `SIE_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS` | generation direct-dispatch activation check interval after startup reports no generation models, default 30000; non-zero values below 5000 are clamped; `0` disables |
-| `SIE_STREAM_MAX_AGE_S` | worker stream max age if worker creates the stream first |
-| `SIE_PAYLOAD_STORE_URL` | optional shared payload-store backend (`s3://`, `gs://`, `abfs://`, `abfss://`, or a local path shared with the gateway) |
-| `SIE_GATEWAY_URL` | optional gateway base URL used by the pool admission gate |
-| `SIE_GATEWAY_API_KEY` | optional bearer token for gateway pool-status reads |
-| `SIE_POOL_ADMISSION_ENABLED` | pool admission gate toggle, default true when `SIE_GATEWAY_URL` is set |
-| `SIE_POOL_ADMISSION_CHECK_INTERVAL_S` | pool admission status check cadence, default 5 s |
-| `SIE_POOL_ADMISSION_PAUSE_S` | sleep while this pod is not admitted to pull, default 1 s |
-| `SIE_POOL_ADMISSION_STALE_AFTER_S` | cached-decision window after transient gateway/status errors, default 30 s |
-| `SIE_WORKER_METRICS_PORT` | sidecar HTTP port |
-| `SIE_HEALTH_PUBLISH_ENABLED` | NATS heartbeat publisher toggle |
-| `SIE_HEALTH_PUBLISH_INTERVAL_MS` | NATS heartbeat publish interval |
-| `SIE_BUNDLE_CONFIG_HASH` | optional initial local bundle hash; normally populated by live apply/export reconciliation |
-| `SIE_CONFIG_SERVICE_URL` | optional `sie-config` base URL for worker-side epoch/export reconciliation |
-| `SIE_ADMIN_TOKEN` | optional bearer token for `GET /v1/configs/export` when config auth is enabled |
-| `SIE_WORKER_CONFIG_POLL_INTERVAL_MS` | worker config epoch poll interval, default 30000 |
-| `SIE_WORKER_CONFIG_FULL_EXPORT_INTERVAL_MS` | slow full-export reconcile interval, default 300000; `0` disables after startup |
-| `SIE_NATS_CONFIG_TRUSTED_PRODUCERS` | comma-separated producer allowlist for `sie.config.models.<bundle>`; binary default `sie-config`; Helm sets the release-scoped config Deployment name |
-| `SIE_NATS_CONFIG_TRUST_ANY_PRODUCER` | disables producer validation for local/dev only |
-
-Operator-provided Helm `extraEnv` is rendered after chart defaults so explicit
-overrides still win.
-
-## Live Config Apply
-
-The sidecar subscribes to `sie.config.models.<SIE_BUNDLE>`. Each notification is
-accepted only after producer allowlist, bundle, epoch, and size checks pass.
-Accepted deltas are forwarded to Python over IPC `ApplyModelConfig`; Python
-validates the YAML as `ModelConfig`, mutates its local `ModelRegistry`, clears
-the model descriptor cache, and returns the bundle hash it computes locally.
-
-When `SIE_CONFIG_SERVICE_URL` is set, the sidecar also runs an export
-reconciler. It performs a startup `GET /v1/configs/export`, then polls
-`GET /v1/configs/epoch`. If the control-plane epoch is ahead, if the
-control-plane `bundle_config_hashes_hash` changes, or if the slow full-export
-reconcile is due for an epoch-0/no-config-store deployment, it sends the full
-bundle-relevant export set to Python over IPC `ReplaceModelConfigs`. Python
-validates every entry, unloads removed or changed loaded models, and replaces
-the bundle-scoped registry view. The advertised hash advances only after that
-replacement succeeds, so a partial export does not produce a false worker ACK.
-
-The NATS health publisher reads that hash dynamically, so the gateway's
-`/v1/configs/models/{id}/status` endpoint observes worker convergence without
-an explicit ACK message. The dispatcher also checks each incoming work item's
-expected `bundle_config_hash` against the current local hash plus a small recent
-hash history. Unknown hashes are NAKed before `EnsureModelReady` or Python IPC,
-so workers behind the gateway redeliver work after their live NATS subscriber or
-export reconciler catches up, while accepted in-flight work remains processable
-after an append-only config advance.
-
-Config apply also nudges the generation capability reconciler. This covers the
-case where a bundle starts encode-only and later receives a generation model:
-the sidecar keeps the encode-only hot path until Python exposes the generation
-task, then creates the worker-specific generation stream.
-
-## Known Caveats
-
-- **Stream `max_age` race.** Gateway and worker can both create the stream.
-  Whichever side creates it first wins. Keep gateway and worker settings aligned
-  when changing retention.
-- **Durable config drift.** The sidecar cleans up overlapping consumers, but a
-  pure durable config change may still need operator cleanup if JetStream
-  rejects an update.
-- **Config replay scope.** Worker-side export reconciliation replaces model
-  configs, not bundle definitions or adapter code. Bundle changes still require
-  a matching `sie-config`/worker image rollout; the running sidecar can only
-  apply configs for adapters already present in the co-located Python image.
-- **Subject shape coupling.** The worker extracts the model from subject token
-  `parts[5]` in `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. Gateway
-  subject changes must update worker parsing in lock-step.
-- **Unit integration scope.** Rust integration tests use real NATS and a stub
-  Python IPC server; local Tilt E2E covers the real gateway-to-worker path.
-- **Sidecar enablement changes deployment behavior.** Keeping
-  `workers.common.workerSidecar.enabled` off leaves queue-mode worker pods without
-  a queue consumer. Flipping that default changes Helm behavior and should be a
-  deliberate deployment decision.
-
-## Testing
-
-Use the repo tasks:
-
-```bash
-mise run server-sidecar-check
-mise run server-sidecar-fmt -- --check
-mise run server-sidecar-clippy
-mise run server-sidecar-test
-mise exec -- python tools/ci/check_ipc_types_parity.py
-mise run test -- packages/sie_server/tests/test_parity_run_batch.py
+```text
+sie.config.models.{bundle}
 ```
 
-What is covered:
+Each notification is checked for trusted producer, bundle, epoch, and payload
+size. Accepted deltas are forwarded to Python through `ApplyModelConfig`.
+Python returns the applied bundle config hash. The sidecar stores that hash in
+`ConfigApplyState`.
 
-- Rust unit tests for scheduler, adaptive controller, IPC framing/retry,
-  payload confinement, metrics, output framing, tokenizer registry, publisher,
-  shutdown, and NATS helpers. `mise run server-sidecar-test` runs the crate once with
-  default features and once with `cloud-storage` so S3/GCS/Azure payload-store
-  code is compiled and tested in the normal worker path.
-- Rust integration smoke tests with real `nats-server`, real `sie-server-sidecar`, and
-  a Python IPC harness.
-- Python parity tests for `RunBatch` fixtures under `tests/parity/`.
-- IPC type parity between Rust and Python schema declarations.
+When `SIE_CONFIG_SERVICE_URL` is configured, the export reconciler fetches
+`/v1/configs/epoch` and `/v1/configs/export` from `sie-config`. Bundle-relevant
+exports are sent to Python through `ReplaceModelConfigs`.
 
-## Architecture Decisions
+Export reconciliation skips unchanged periodic exports. Exports older than the
+local epoch are skipped unless the reconciler is handling an epoch-rewind
+recovery. Partial or rejected replacements do not update the advertised bundle
+hash.
 
-- Use a sidecar around Python adapters, not a full native rewrite.
-- Keep the adapter boundary over UDS msgpack IPC.
-- Use a long-lived async-nats pull stream.
-- Keep the runtime binary name stable as `sie-server-sidecar`; render the Kubernetes
-  sidecar container as `worker-sidecar`; publish the container image as
-  `sie-server-sidecar`.
-- Keep queue/runtime/prep/framing work in Rust while adapters remain in Python.
-- Treat native Candle/tch-rs backends as future work behind the same adapter
-  boundary.
+Grouped encode, score, and extract work carries the gateway's expected bundle
+config hash for the resolved pool and bundle. The dispatcher compares that hash
+with the current local hash and the accepted recent-hash window before
+`EnsureModelReady`. Unknown hashes are NAKed.
+
+Live config apply updates model configuration in the colocated Python registry.
+It does not update adapter code or bundle definitions inside the running worker
+image.
+
+Source: [`config_subscriber.rs`](../src/config_subscriber.rs),
+[`config_reconciler.rs`](../src/config_reconciler.rs),
+[`dispatcher.rs`](../src/dispatcher.rs), and the gateway
+[config guide](../../sie_gateway/docs/architecture-guide.md#43-live-deltas).
+
+## Source Links
+
+- Package summary: [README](../README.md)
+- Helm values: [`deploy/helm/sie-cluster/values.yaml`](../../../deploy/helm/sie-cluster/values.yaml)
+- Runtime config parsing: [`config.rs`](../src/config.rs) and [`main.rs`](../src/main.rs)
+- IPC parity check: [`tools/ci/check_ipc_types_parity.py`](../../../tools/ci/check_ipc_types_parity.py)
+- Gateway queue contract: [gateway architecture guide](../../sie_gateway/docs/architecture-guide.md)

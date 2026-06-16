@@ -13,6 +13,8 @@ Model loading workflow is delegated to ModelLoader.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from collections.abc import Iterable
@@ -51,6 +53,16 @@ logger = logging.getLogger(__name__)
 _ERR_MODEL_NOT_FOUND = "Model '{name}' not found in registry"
 _ERR_MODEL_NOT_LOADED = "Model '{name}' is not loaded"
 _ERR_MODEL_ALREADY_LOADED = "Model '{name}' is already loaded"
+
+
+def _model_config_semantic_hash(config: ModelConfig) -> str:
+    """Stable hash for config equality that ignores Pydantic private attrs."""
+    payload = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _model_configs_semantically_equal(left: ModelConfig | None, right: ModelConfig) -> bool:
+    return left is not None and _model_config_semantic_hash(left) == _model_config_semantic_hash(right)
 
 
 class ModelRegistry:
@@ -1104,8 +1116,17 @@ class ModelRegistry:
         lock = self._get_load_lock()
         async with lock:
             removed = set(self._configs) - set(new_configs)
-            changed = {name for name, config in new_configs.items() if self._configs.get(name) != config}
+            changed = {
+                name
+                for name, config in new_configs.items()
+                if not _model_configs_semantically_equal(self._configs.get(name), config)
+            }
+            if model_dir is not None:
+                changed.update(name for name in new_configs if self._model_dirs.get(name) != model_dir)
             invalidated = removed | changed
+
+            if not invalidated:
+                return set()
 
             for name in sorted(invalidated):
                 if name in self._loaded:
