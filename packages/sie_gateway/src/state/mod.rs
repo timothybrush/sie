@@ -9,4 +9,5 @@ pub mod k8s_pool_backend;
 pub mod k8s_pool_watcher;
 pub mod model_registry;
 pub mod pool_manager;
+pub mod warm_floor;
 pub mod worker_registry;

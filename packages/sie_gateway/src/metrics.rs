@@ -105,6 +105,7 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r.register(Box::new(PROVISIONING_RESPONSES.clone()))
         .unwrap();
     r.register(Box::new(PENDING_DEMAND.clone())).unwrap();
+    r.register(Box::new(POOL_WARM_FLOOR.clone())).unwrap();
     r.register(Box::new(REJECTED_REQUESTS.clone())).unwrap();
     r.register(Box::new(ACTIVE_LEASE_GPUS.clone())).unwrap();
     r.register(Box::new(WORKER_COUNT.clone())).unwrap();
@@ -204,6 +205,48 @@ pub static PENDING_DEMAND: LazyLock<GaugeVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+// sie_gateway_pool_warm_floor
+//
+// Per-pool warm floor (minimum warm machines) the operator set via
+// `PoolSpec.minimum_worker_count`. The gateway re-emits this every 30s for
+// every (pool, machine_profile, bundle) lane the pool can name; KEDA reads it
+// as a separate trigger and, because KEDA takes the max desiredReplicas across
+// triggers, keeps ceil(N/1)=N machines warm. When `minimum_worker_count` is 0
+// the series is absent (or cleared), so `or vector(0)` in the trigger leaves
+// scale-from-zero unchanged. Distinct from `PENDING_DEMAND` (request-driven,
+// 120s expiry): this one is config-driven and persists while
+// minimum_worker_count>0.
+pub static POOL_WARM_FLOOR: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "sie_gateway_pool_warm_floor",
+            "Per-pool warm floor (minimum warm machines) — KEDA trigger",
+        ),
+        &["pool", "machine_profile", "bundle"],
+    )
+    .unwrap()
+});
+
+/// Set the warm-floor gauge for one `(pool, machine_profile, bundle)`
+/// lane to `value` (the pool's `minimum_worker_count`). Called by the gateway's
+/// warm-floor emitter loop on every tick for each lane a pool can name.
+pub fn set_pool_warm_floor(pool: &str, machine_profile: &str, bundle: &str, value: f64) {
+    POOL_WARM_FLOOR
+        .with_label_values(&[pool, machine_profile, bundle])
+        .set(value);
+}
+
+/// Zero the warm-floor gauge for a lane the emitter previously set but
+/// no longer wants (pool deleted, `minimum_worker_count` dropped to 0, or the
+/// profile/bundle changed). Driving it to 0 — rather than dropping the
+/// series — keeps `or vector(0)` in the KEDA trigger satisfied so the
+/// lane can scale back to zero.
+pub fn clear_pool_warm_floor(pool: &str, machine_profile: &str, bundle: &str) {
+    POOL_WARM_FLOOR
+        .with_label_values(&[pool, machine_profile, bundle])
+        .set(0.0);
+}
 
 // 5. sie_gateway_active_lease_gpus
 pub static ACTIVE_LEASE_GPUS: LazyLock<GaugeVec> = LazyLock::new(|| {
@@ -922,6 +965,7 @@ pub fn init_metric_families() {
     REQUEST_COUNT.with_label_values(&["", "", ""]).inc_by(0.0);
     PROVISIONING_RESPONSES.with_label_values(&[""]).inc_by(0.0);
     PENDING_DEMAND.with_label_values(&["", "", ""]).set(0.0);
+    POOL_WARM_FLOOR.with_label_values(&["", "", ""]).set(0.0);
     ACTIVE_LEASE_GPUS.with_label_values(&["", "", ""]).set(0.0);
     REJECTED_REQUESTS
         .with_label_values(&["", "", "", ""])
@@ -2088,5 +2132,74 @@ mod tests {
                 "§4.11 gateway metric {expected:?} missing from REGISTRY.gather()"
             );
         }
+    }
+
+    /// The warm-floor gauge must be registered so KEDA can scrape it from
+    /// `/metrics`; an unregistered series never reaches the encoder.
+    #[test]
+    fn test_pool_warm_floor_is_registered() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        // Drive one observation so the family has at least one sample.
+        set_pool_warm_floor("warm-pool", "l4", "default", 1.0);
+        let families: std::collections::HashSet<String> = REGISTRY
+            .gather()
+            .iter()
+            .map(|mf| mf.name().to_string())
+            .collect();
+        assert!(
+            families.contains("sie_gateway_pool_warm_floor"),
+            "sie_gateway_pool_warm_floor missing from REGISTRY.gather()"
+        );
+        clear_pool_warm_floor("warm-pool", "l4", "default");
+    }
+
+    /// `set_pool_warm_floor` writes `value` and `clear_pool_warm_floor`
+    /// zeroes it, both keyed in `(pool, machine_profile, bundle)` label
+    /// order, across multiple independent lanes.
+    #[test]
+    fn test_pool_warm_floor_set_and_clear_multiple_lanes() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        POOL_WARM_FLOOR.reset();
+
+        set_pool_warm_floor("tenant", "l4", "default", 2.0);
+        set_pool_warm_floor("tenant", "a100", "sglang", 3.0);
+
+        assert!(
+            (POOL_WARM_FLOOR
+                .with_label_values(&["tenant", "l4", "default"])
+                .get()
+                - 2.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (POOL_WARM_FLOOR
+                .with_label_values(&["tenant", "a100", "sglang"])
+                .get()
+                - 3.0)
+                .abs()
+                < f64::EPSILON
+        );
+
+        clear_pool_warm_floor("tenant", "l4", "default");
+        assert!(
+            POOL_WARM_FLOOR
+                .with_label_values(&["tenant", "l4", "default"])
+                .get()
+                .abs()
+                < f64::EPSILON
+        );
+        // The other lane is untouched by clearing the first.
+        assert!(
+            (POOL_WARM_FLOOR
+                .with_label_values(&["tenant", "a100", "sglang"])
+                .get()
+                - 3.0)
+                .abs()
+                < f64::EPSILON
+        );
+        POOL_WARM_FLOOR.reset();
     }
 }

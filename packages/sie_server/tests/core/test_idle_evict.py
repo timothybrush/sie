@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_server.config.engine import EngineConfig
@@ -103,6 +103,50 @@ async def test_start_stop_idempotent_when_enabled() -> None:
 # --------------------------------------------------------------------------
 # Behaviour
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_start_worker_refreshes_idle_timestamp(mock_load_adapter: MagicMock) -> None:
+    """Score/extract worker use must count as model activity for idle eviction."""
+    adapter = MagicMock()
+    adapter.capabilities.outputs = ["dense"]
+    mock_load_adapter.return_value = adapter
+
+    reg = _build_registry(idle_evict_s=10)
+    reg.add_config(_make_config(name="model-score"))
+    await reg.load_async("model-score", device="cpu")
+
+    worker = reg.get_worker("model-score")
+    assert worker is not None
+    worker.start = AsyncMock()
+
+    info = reg._memory_manager.get_model_info("model-score")
+    assert info is not None
+    stale_time = time.monotonic() - 100.0
+    info.last_used_at = stale_time
+
+    await reg.start_worker("model-score")
+
+    assert info.last_used_at > stale_time
+    assert "model-score" not in reg._memory_manager.get_idle_models(idle_threshold_s=10)
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_start_worker_rejects_model_being_unloaded(mock_load_adapter: MagicMock) -> None:
+    """Requests must not revive or use a model after unload has started."""
+    adapter = MagicMock()
+    adapter.capabilities.outputs = ["dense"]
+    mock_load_adapter.return_value = adapter
+
+    reg = _build_registry(idle_evict_s=10)
+    reg.add_config(_make_config(name="model-score"))
+    await reg.load_async("model-score", device="cpu")
+    reg._unloading.add("model-score")
+
+    with pytest.raises(RuntimeError, match="currently being unloaded"):
+        await reg.start_worker("model-score")
 
 
 @pytest.mark.asyncio

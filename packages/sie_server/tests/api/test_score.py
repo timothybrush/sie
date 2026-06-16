@@ -1,6 +1,7 @@
 """Tests for score endpoint."""
 
 import asyncio
+import base64
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -48,11 +49,14 @@ def _mock_score_impl(
 def _create_mock_worker(mock_adapter: MagicMock) -> MagicMock:
     """Create a mock worker for score tests."""
     worker = MagicMock()
+    worker.submitted_score_batches = []
 
     # Mock submit_score to return a future that resolves to WorkerResult
     async def mock_submit_score(
         prepared_items, query, items, *, instruction=None, options=None, request_id=None, timing=None
     ):
+        worker.submitted_score_batches.append(list(prepared_items))
+
         # Create a real future
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -257,6 +261,26 @@ class TestScoreEndpoint:
         mock_adapter.score.assert_called_once()
         call_kwargs = mock_adapter.score.call_args
         assert call_kwargs.kwargs["instruction"] == "Rank documents by relevance"
+
+    def test_score_multimodal_items_contribute_media_batch_cost(
+        self, client: TestClient, mock_registry: MagicMock
+    ) -> None:
+        """Direct /score path includes media placeholders in BatchFormer cost."""
+        image_b64 = base64.b64encode(b"fake-png").decode("ascii")
+
+        response = client.post(
+            "/v1/score/test-reranker",
+            json={
+                "query": {"text": "query"},
+                "items": [{"id": "doc-image", "images": [{"data": image_b64, "format": "png"}]}],
+            },
+            headers=JSON_HEADERS,
+        )
+
+        assert response.status_code == 200
+        worker = mock_registry.start_worker.return_value
+        prepared_items = worker.submitted_score_batches[-1]
+        assert prepared_items[0].cost == 5 + 1024
 
     def test_score_model_not_found(self, client: TestClient, mock_registry: MagicMock) -> None:
         """Returns 404 for unknown model."""

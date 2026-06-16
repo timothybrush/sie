@@ -933,6 +933,7 @@
             "type": "object"
           },
           "minimum_worker_count": {
+            "description": "Per-pool warm floor (minimum machines kept warm via KEDA). Default 0\nkeeps scale-from-zero. See `PoolSpec::minimum_worker_count`.",
             "format": "int32",
             "minimum": 0,
             "type": "integer"
@@ -2341,6 +2342,7 @@
             "type": "object"
           },
           "minimum_worker_count": {
+            "description": "Per-pool warm floor: the minimum number of machines the gateway keeps\nwarm (via KEDA) so the first request to the pool never hits a cold VM.\nThe gateway publishes it as `sie_gateway_pool_warm_floor` for KEDA.\nDefault 0 leaves scale-from-zero unchanged.",
             "format": "int32",
             "minimum": 0,
             "type": "integer"
@@ -2886,7 +2888,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.7"
+    "version": "0.6.8"
   },
   "openapi": "3.1.0",
   "paths": {

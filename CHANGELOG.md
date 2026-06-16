@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.8
+
+- chore(main): release 0.6.8
+- fix(server): share score media batch cost
+- fix(server): serialize worker use with unload state
+- fix(server): keep score traffic from idle-evicting rerankers
+- refactor(gateway): consolidate warm floor onto minimum_worker_count; retire admission gate
+- feat(gateway): add per-pool warm floor (min_machines) with KEDA enforcement
+
 ## v0.6.7
 
 - chore(main): release 0.6.7

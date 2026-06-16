@@ -24,6 +24,8 @@ pub struct CreatePoolRequest {
     pub bundle: Option<String>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// Per-pool warm floor (minimum machines kept warm via KEDA). Default 0
+    /// keeps scale-from-zero. See `PoolSpec::minimum_worker_count`.
     #[serde(default)]
     pub minimum_worker_count: u32,
 }

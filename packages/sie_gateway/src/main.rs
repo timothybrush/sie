@@ -569,6 +569,25 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Per-pool warm floor emitter (every 30s, matches KEDA pollingInterval).
+    // The gateway never writes KEDA/StatefulSets directly; it re-emits the
+    // `sie_gateway_pool_warm_floor` gauge for each lane a pool with
+    // `minimum_worker_count > 0` can name, and clears lanes that disappear so
+    // KEDA can scale them back to zero. Default `minimum_worker_count == 0`
+    // emits nothing, leaving scale-from-zero unchanged.
+    if pools_enabled {
+        let pm = Arc::clone(&pool_manager);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut prev = state::warm_floor::WarmFloorLanes::new();
+            loop {
+                interval.tick().await;
+                let pools = pm.list_pools().await;
+                state::warm_floor::reconcile_and_emit(&pools, &mut prev);
+            }
+        });
+    }
+
     // Pool worker reassignment (triggered by on_worker_healthy or every 5s)
     {
         let pm = Arc::clone(&pool_manager);

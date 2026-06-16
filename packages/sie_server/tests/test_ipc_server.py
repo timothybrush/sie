@@ -77,6 +77,15 @@ class _Client:
         return msgpack.unpackb(resp_bytes, raw=False)
 
 
+class _ClosedWriter:
+    def write(self, _payload: bytes) -> None:
+        msg = "unable to perform operation on <UnixTransport closed=True>; the handler is closed"
+        raise RuntimeError(msg)
+
+    async def drain(self) -> None:
+        return None
+
+
 def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg = MagicMock()
     reg.model_names = ["test/model"]
@@ -176,6 +185,21 @@ class TestFraming:
             assert data == b""  # connection closed on protocol error
         finally:
             await client.close()
+
+    @pytest.mark.asyncio
+    async def test_background_response_to_closed_peer_is_not_method_crash(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        executor, _reg = _make_executor()
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="w")
+
+        caplog.set_level("INFO", logger="sie_server.ipc_server")
+        await srv._run_method_task("Ping", "r1", {"timestamp_ms": 1.0}, _ClosedWriter())  # type: ignore[arg-type]
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("IPC client disconnected before Ping response" in message for message in messages)
+        assert not any("IPC method Ping crashed" in message for message in messages)
 
 
 # -----------------------------------------------------------------------------

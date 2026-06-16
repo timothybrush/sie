@@ -568,9 +568,9 @@ class PoolSpec(TypedDict, total=False):
         gpus: Optional GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
-        minimum_worker_count: Desired minimum warm workers in the pool. Stored in pool
-            spec and forwarded to the gateway; enforcement depends on cluster autoscaler
-            configuration. Defaults to 0 (scale to zero).
+        minimum_worker_count: Per-pool warm floor (minimum machines kept warm). The
+            gateway publishes it as ``sie_gateway_pool_warm_floor`` for KEDA, which keeps
+            that many machines warm. Defaults to 0 (scale to zero).
     """
 
     name: str
@@ -622,7 +622,7 @@ class PoolSpecResponse(TypedDict, total=False):
         gpus: GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
-        minimum_worker_count: Minimum warm workers in the pool.
+        minimum_worker_count: Per-pool warm floor (minimum machines kept warm via KEDA).
     """
 
     gpus: dict[str, int]

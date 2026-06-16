@@ -74,6 +74,19 @@ class IpcServerError(Exception):
     """Raised for protocol-level IPC failures (framing, encoding)."""
 
 
+class IpcClientDisconnectedError(IpcServerError):
+    """Raised when the IPC peer disconnects before a response is written."""
+
+
+def _is_disconnected_write_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return "closed" in message and ("transport" in message or "handler" in message)
+    return False
+
+
 class _IpcGenerateSink:
     """Serializes generation events back to the Rust sidecar over one IPC stream."""
 
@@ -306,6 +319,8 @@ class IpcServer:
                 await self._dispatch_frame(frame, writer)
         except asyncio.CancelledError:
             raise
+        except IpcClientDisconnectedError as e:
+            logger.info("IPC client disconnected: %s", e)
         except IpcServerError as e:
             logger.warning("IPC protocol error: %s — closing connection", e)
         except Exception:
@@ -338,8 +353,13 @@ class IpcServer:
             raise IpcServerError("truncated frame body") from e
 
     async def _write_frame(self, writer: asyncio.StreamWriter, payload: bytes) -> None:
-        writer.write(_LEN_STRUCT.pack(len(payload)) + payload)
-        await writer.drain()
+        try:
+            writer.write(_LEN_STRUCT.pack(len(payload)) + payload)
+            await writer.drain()
+        except Exception as e:
+            if _is_disconnected_write_error(e):
+                raise IpcClientDisconnectedError("peer closed before IPC response write completed") from e
+            raise
 
     # -- Dispatch ----------------------------------------------------------
 
@@ -393,6 +413,8 @@ class IpcServer:
     ) -> None:
         try:
             await self._run_method(method, request_id, body, writer)
+        except IpcClientDisconnectedError:
+            logger.info("IPC client disconnected before %s response could be sent", method)
         except Exception:
             logger.exception("IPC method %s crashed", method)
 

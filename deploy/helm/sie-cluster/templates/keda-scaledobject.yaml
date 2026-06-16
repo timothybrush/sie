@@ -164,6 +164,18 @@ data:
         - type: prometheus
           metadata:
             serverAddress: {{ $promAddr }}
+            # Per-pool warm floor (PoolSpec.minimum_worker_count): the gateway emits N
+            # here so KEDA keeps N machines warm even with zero pending demand.
+            # `or vector(0)` + activationThreshold "0" means an unset floor
+            # contributes 0, so scale-to-zero is preserved; rendered per lane
+            # unconditionally (NOT gated on the static minReplicas floor).
+            metricName: sie_gateway_pool_warm_floor_{{ $poolName }}_{{ $bundleName }}
+            query: sum(sie_gateway_pool_warm_floor{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)
+            threshold: "1"
+            activationThreshold: "0"
+        - type: prometheus
+          metadata:
+            serverAddress: {{ $promAddr }}
             metricName: sie_gateway_rejected_rate_{{ $poolName }}_{{ $bundleName }}
             # Filter out reasons the SDK already retries against the same
             # worker pool; they are per-request transient signals, not

@@ -661,6 +661,21 @@ mod tests {
     }
 
     #[test]
+    fn test_env_static_queue_pools_minimum_worker_count_defaults_to_zero() {
+        with_env(
+            &[(
+                "_TEST_STATIC_QUEUE_POOLS",
+                r#"{"companyC": {"gpus": {"l4": 0}}}"#,
+            )],
+            || {
+                let result = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].minimum_worker_count, 0);
+            },
+        );
+    }
+
+    #[test]
     fn test_env_static_queue_pools_invalid_panics() {
         with_env(&[("_TEST_STATIC_QUEUE_POOLS", "not-json")], || {
             let result = std::panic::catch_unwind(|| {

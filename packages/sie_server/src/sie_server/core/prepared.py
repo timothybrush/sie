@@ -141,11 +141,12 @@ class ScorePreparedItem:
     """Prepared item for score (reranking) operations.
 
     Satisfies HasCost protocol for BatchFormer.
-    Cost is based on combined character count of query + document.
+    Cost is an approximate batching budget: query/document text length plus
+    media placeholders for multimodal rerankers.
     Cross-encoder rerankers process (query, doc) pairs together.
 
     Attributes:
-        cost: Character count of query + doc (approximate batching budget).
+        cost: Approximate query + doc batching budget.
         original_index: Index of this doc in the request's items list.
     """
 

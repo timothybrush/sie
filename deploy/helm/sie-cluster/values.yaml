@@ -1111,6 +1111,8 @@ queueRouting:
   #     gpus:
   #       l4: 0
   #     gpuCaps: {}
+  #     # Per-pool warm floor: minimum machines kept warm via KEDA.
+  #     # Default 0 = scale to zero.
   #     minimumWorkerCount: 0
   staticQueuePools: {}
   # -- NATS fetch budget: max messages pulled per fetch() call.

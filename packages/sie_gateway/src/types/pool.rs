@@ -31,6 +31,10 @@ pub struct PoolSpec {
     pub gpu_caps: HashMap<String, u32>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// Per-pool warm floor: the minimum number of machines the gateway keeps
+    /// warm (via KEDA) so the first request to the pool never hits a cold VM.
+    /// The gateway publishes it as `sie_gateway_pool_warm_floor` for KEDA.
+    /// Default 0 leaves scale-from-zero unchanged.
     #[serde(default)]
     pub minimum_worker_count: u32,
 }
@@ -204,5 +208,24 @@ mod tests {
         assert_eq!(deserialized.spec.name, "test");
         assert_eq!(deserialized.status.state, PoolState::Active);
         assert_eq!(deserialized.status.assigned_workers.len(), 1);
+    }
+
+    #[test]
+    fn test_pool_spec_minimum_worker_count_roundtrips() {
+        let mut pool = make_pool(PoolState::Pending, vec![]);
+        pool.spec.minimum_worker_count = 3;
+        let json = serde_json::to_string(&pool).unwrap();
+        assert!(json.contains("\"minimum_worker_count\":3"));
+        let deserialized: Pool = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.spec.minimum_worker_count, 3);
+    }
+
+    #[test]
+    fn test_pool_spec_minimum_worker_count_defaults_to_zero_when_absent() {
+        // A spec JSON that omits `minimum_worker_count` must default to 0 so
+        // older persisted ConfigMap state and bare create requests keep working.
+        let json = r#"{"name":"test","gpus":{"l4":1}}"#;
+        let spec: PoolSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.minimum_worker_count, 0);
     }
 }

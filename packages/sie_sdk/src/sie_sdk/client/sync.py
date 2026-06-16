@@ -600,9 +600,9 @@ class SIEClient:
                 {"l4": 4}. If omitted, all matching workers can be assigned.
             bundle: Optional bundle filter. When set, only workers running this
                 bundle will be assigned to the pool.
-            minimum_worker_count: Desired minimum number of warm workers in the pool.
-                Stored in pool spec and forwarded to the gateway; enforcement depends
-                on cluster autoscaler configuration. Defaults to 0 (scale to zero).
+            minimum_worker_count: Per-pool warm floor (minimum machines kept warm).
+                The gateway publishes it as ``sie_gateway_pool_warm_floor`` for KEDA,
+                which keeps that many machines warm. Defaults to 0 (scale to zero).
 
         Raises:
             PoolError: If pool creation fails (e.g., invalid machine profile).

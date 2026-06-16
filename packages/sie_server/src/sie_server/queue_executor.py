@@ -12,8 +12,9 @@ import yaml
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
 from sie_server.core.oom import is_oom_error
-from sie_server.core.prepared import ExtractPreparedItem, ScorePreparedItem
+from sie_server.core.prepared import ExtractPreparedItem
 from sie_server.core.registry import ModelRegistry
+from sie_server.core.score_cost import build_score_prepared_items
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.extract import ExtractHandler
 from sie_server.ipc_types import (
@@ -939,12 +940,8 @@ class QueueExecutor:
         try:
             timing = RequestTiming()
 
-            query_len = len(query_item.text) if query_item.text else 0
             timing.start_tokenization()
-            prepared_items = []
-            for i, it in enumerate(score_items):
-                doc_len = len(it.text) if it.text else 0
-                prepared_items.append(ScorePreparedItem(cost=query_len + doc_len, original_index=i))
+            prepared_items = build_score_prepared_items(query_item, score_items)
             timing.end_tokenization()
 
             future = await worker.submit_score(

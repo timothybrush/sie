@@ -622,18 +622,9 @@ impl PoolManager {
         let pools = self.pools.read().await;
         let key = pool_key_for_name(&pools, pool_name)?;
         let pool = pools.get(&key)?;
-        let mut profiles: Vec<String> = Vec::new();
-        for profile in pool.spec.gpus.keys().chain(pool.spec.gpu_caps.keys()) {
-            if profiles
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(profile))
-            {
-                continue;
-            }
-            profiles.push(profile.to_lowercase());
-        }
+        let profiles = machine_profiles_for_pool(pool);
         if profiles.len() == 1 {
-            profiles.pop()
+            profiles.into_iter().next()
         } else {
             None
         }
@@ -790,7 +781,7 @@ impl PoolManager {
             } else {
                 PoolState::Active
             }
-        } else if all_met && assigned.len() as u32 >= pool.spec.minimum_worker_count {
+        } else if all_met {
             PoolState::Active
         } else {
             PoolState::Pending
@@ -998,6 +989,25 @@ pub(crate) fn normalize_pool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+/// Deduplicated, lowercased machine-profile set for a pool, taken from the
+/// union of `spec.gpus` (requirements) and `spec.gpu_caps` (admission caps).
+/// This is the same set `single_machine_profile_for_pool` collapses to one;
+/// the warm-floor emitter keeps all of them so each lane gets its own
+/// `sie_gateway_pool_warm_floor` series.
+pub(crate) fn machine_profiles_for_pool(pool: &Pool) -> Vec<String> {
+    let mut profiles: Vec<String> = Vec::new();
+    for profile in pool.spec.gpus.keys().chain(pool.spec.gpu_caps.keys()) {
+        if profiles
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(profile))
+        {
+            continue;
+        }
+        profiles.push(profile.to_lowercase());
+    }
+    profiles
+}
+
 fn validate_pool_name(name: &str) -> Result<(), InvalidPoolNameError> {
     if !name.is_empty()
         && name.len() <= 128
@@ -1082,6 +1092,19 @@ mod tests {
         let pool = pm.create_pool("test", gpus, None, None, 0).await.unwrap();
         assert_eq!(pool.spec.name, "test");
         assert_eq!(pool.status.state, PoolState::Pending);
+        assert_eq!(pool.spec.minimum_worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_stores_minimum_worker_count() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 2);
+
+        // Trailing arg is the warm floor; it must round-trip onto the spec.
+        let pool = pm.create_pool("test", gpus, None, None, 3).await.unwrap();
+        assert_eq!(pool.spec.minimum_worker_count, 3);
     }
 
     #[tokio::test]
@@ -1889,53 +1912,6 @@ mod tests {
 
         let pool = pm.get_pool("test").await.unwrap();
         assert_eq!(pool.status.state, PoolState::Pending);
-    }
-
-    #[tokio::test]
-    async fn test_minimum_worker_count_enforced() {
-        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
-
-        let mut gpus = HashMap::new();
-        gpus.insert("l4-spot".to_string(), 1);
-        // Require at least 3 workers total
-        pm.create_pool("test", gpus, None, None, 3).await.unwrap();
-
-        // Provide only 1 matching worker — GPU requirement met but worker count too low
-        let workers = vec![worker_in_pool(
-            "w1",
-            "http://w1:8080",
-            "l4-spot",
-            "default",
-            "test",
-        )];
-
-        let all_met = pm.assign_workers("test", &workers).await;
-        // GPU count met (1/1) but minimum_worker_count (3) not met → stays Pending
-        assert!(all_met); // all GPU types met
-        let pool = pm.get_pool("test").await.unwrap();
-        assert_eq!(pool.status.state, PoolState::Pending);
-        assert_eq!(pool.status.assigned_workers.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_minimum_worker_count_met() {
-        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
-
-        let mut gpus = HashMap::new();
-        gpus.insert("l4-spot".to_string(), 2);
-        // Require at least 2 workers
-        pm.create_pool("test", gpus, None, None, 2).await.unwrap();
-
-        let workers = vec![
-            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
-        ];
-
-        let all_met = pm.assign_workers("test", &workers).await;
-        assert!(all_met);
-        let pool = pm.get_pool("test").await.unwrap();
-        assert_eq!(pool.status.state, PoolState::Active);
-        assert_eq!(pool.status.assigned_workers.len(), 2);
     }
 
     #[tokio::test]

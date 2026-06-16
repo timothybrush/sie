@@ -457,6 +457,38 @@ class TestProcessScoreBatch:
         assert o.raw_output.score.scores == pytest.approx([0.9, 0.1])
 
     @pytest.mark.asyncio
+    async def test_multimodal_score_items_contribute_media_batch_cost(self) -> None:
+        reg = _make_registry()
+        worker = AsyncMock()
+        score_output = ScoreOutput(scores=np.array([0.7], dtype=np.float32))
+        wr = WorkerResult(output=score_output, timing=RequestTiming())
+        fut: asyncio.Future[WorkerResult] = asyncio.Future()
+        fut.set_result(wr)
+        worker.submit_score = AsyncMock(return_value=fut)
+        reg.start_worker = AsyncMock(return_value=worker)
+
+        ex = QueueExecutor(reg)
+        await ex.process_score_batch(
+            ProcessScoreBatchRequest(
+                model_id="test/model",
+                items=[
+                    ScoreBatchItem(
+                        work_item_id="req-1.0",
+                        request_id="req-1",
+                        item_index=0,
+                        total_items=1,
+                        timestamp=time.time(),
+                        query_item={"text": "query"},
+                        score_items=[{"id": "doc-image", "images": [{"data": b"fake-png", "format": "png"}]}],
+                    )
+                ],
+            )
+        )
+
+        prepared_items = worker.submit_score.await_args.kwargs["prepared_items"]
+        assert prepared_items[0].cost == 5 + 1024
+
+    @pytest.mark.asyncio
     async def test_model_evicted_naks_individual_item(self) -> None:
         reg = _make_registry()
         reg.start_worker = AsyncMock(side_effect=KeyError("test/model"))

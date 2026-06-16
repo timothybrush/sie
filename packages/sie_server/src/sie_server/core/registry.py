@@ -1202,7 +1202,9 @@ class ModelRegistry:
     async def start_worker(self, name: str) -> ModelWorker:
         """Start the worker for a loaded model.
 
-        If already running, this is a no-op.
+        If already running, this is a no-op. Uses the load/unload lock so
+        request-driven idle touches cannot race an idle-eviction unload
+        decision.
 
         Args:
             name: Model name.
@@ -1216,19 +1218,27 @@ class ModelRegistry:
         if name not in self._configs:
             msg = _ERR_MODEL_NOT_FOUND.format(name=name)
             raise KeyError(msg)
-        if name not in self._loaded:
-            msg = _ERR_MODEL_NOT_LOADED.format(name=name)
-            raise KeyError(msg)
+        lock = self._get_load_lock()
+        async with lock:
+            if name not in self._loaded:
+                msg = _ERR_MODEL_NOT_LOADED.format(name=name)
+                raise KeyError(msg)
+            if name in self._unloading:
+                msg = f"Model '{name}' is currently being unloaded"
+                raise RuntimeError(msg)
 
-        worker = self._loaded[name].worker
-        if worker is None:
-            msg = f"Worker not available for model '{name}'"
-            raise RuntimeError(msg)
+            loaded = self._loaded[name]
+            worker = loaded.worker
+            if worker is None:
+                msg = f"Worker not available for model '{name}'"
+                raise RuntimeError(msg)
 
-        if not worker.is_running:
-            await worker.start()
-            logger.info("Worker started for model '%s'", name)
-        return worker
+            self._memory_manager.touch(name)
+
+            if not worker.is_running:
+                await worker.start()
+                logger.info("Worker started for model '%s'", name)
+            return worker
 
     async def stop_worker(self, name: str) -> None:
         """Stop the worker for a loaded model.

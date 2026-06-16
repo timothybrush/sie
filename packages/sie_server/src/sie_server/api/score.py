@@ -16,7 +16,7 @@ from sie_server.api.options import resolve_runtime_options
 from sie_server.api.serialization import MsgPackResponse
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.core.inference_output import ScoreOutput
-from sie_server.core.prepared import ScorePreparedItem
+from sie_server.core.score_cost import build_score_prepared_items
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker import QueueFullError, WorkerResult
 from sie_server.observability.metrics import record_request
@@ -99,21 +99,9 @@ async def _score_via_worker(
     # Create timing tracker for this request
     timing = RequestTiming()
 
-    # Get query text length for cost calculation
-    query_text = query.text
-    query_len = len(query_text) if query_text else 0
-
-    # Create PreparedItems for batching (cost = query + doc char count)
+    # Create PreparedItems for batching.
     timing.start_tokenization()  # Using tokenization timing for prep phase
-    prepared_items = []
-    for i, item in enumerate(items):
-        item_text = item.text
-        doc_len = len(item_text) if item_text else 0
-        prepared = ScorePreparedItem(
-            cost=query_len + doc_len,
-            original_index=i,
-        )
-        prepared_items.append(prepared)
+    prepared_items = build_score_prepared_items(query, items)
     timing.end_tokenization()
 
     # Start worker if not running
