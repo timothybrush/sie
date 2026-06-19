@@ -54,11 +54,15 @@ data/multivectors.npz     # page multivectors from ingest.py
 
 ## Run it
 
-You need Python 3.12 and a reachable SIE cluster.
+You need Python 3.12 and a **GPU-backed SIE deployment**. The `Qwen/Qwen3.5-4B`
+answer model runs on SIE's generation bundle, which is CUDA-only, so the
+`latest-cpu-default` image can't serve it — use a local CUDA image or point
+`SIE_CLUSTER_URL` / `SIE_API_KEY` at a managed GPU cluster.
 
 ```bash
-# 1. SIE locally, or point SIE_CLUSTER_URL / SIE_API_KEY at a managed cluster.
-docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default
+# 1. SIE on a local NVIDIA GPU, or point SIE_CLUSTER_URL / SIE_API_KEY at a
+#    managed GPU cluster.
+docker run --gpus all -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cuda12-default
 
 # 2. Fetch public PDFs and render selected pages to PNG.
 cd examples/vision-doc-rag

@@ -1,5 +1,7 @@
-# SIE server (defaults to local Docker: docker run -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cpu-default).
-# Override with SIE_CLUSTER_URL / SIE_API_KEY env vars when targeting a managed cluster.
+# SIE server. The Qwen3.5-4B answer model runs on SIE's generation bundle (GPU),
+# so use a CUDA image locally:
+#   docker run --gpus all -p 8080:8080 ghcr.io/superlinked/sie-server:latest-cuda12-default
+# or override with SIE_CLUSTER_URL / SIE_API_KEY to target a managed GPU cluster.
 cluster:
   url: "http://localhost:8080"
   api_key: ""
