@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vision-First Document RAG · SIE</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --fg: #0f172a;
+        --muted: #475569;
+        --bg: #f8fafc;
+        --card: #ffffff;
+        --border: #e2e8f0;
+        --accent: #0ea5e9;
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      header {
+        padding: 24px 32px;
+        border-bottom: 1px solid var(--border);
+        background: var(--card);
+      }
+      h1 { margin: 0 0 4px 0; font-size: 20px; }
+      header p { margin: 0; color: var(--muted); font-size: 14px; }
+      main { padding: 24px 32px; max-width: 1200px; margin: 0 auto; }
+      form {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+      }
+      select, input[type=text], button {
+        font: inherit;
+        padding: 10px 14px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--card);
+      }
+      input[type=text] { flex: 1; min-width: 280px; }
+      button {
+        background: var(--accent);
+        color: white;
+        border-color: var(--accent);
+        cursor: pointer;
+      }
+      button:hover { background: #0284c7; }
+      .stats { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+      .answer-card {
+        padding: 16px 20px;
+        margin-bottom: 20px;
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-radius: 12px;
+      }
+      .answer-card .label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #15803d;
+        font-weight: 600;
+      }
+      .answer-card .text { font-size: 16px; line-height: 1.5; margin-top: 4px; }
+      .result {
+        display: grid;
+        grid-template-columns: 220px 1fr;
+        gap: 20px;
+        padding: 20px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        margin-bottom: 16px;
+      }
+      .result img {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        cursor: zoom-in;
+      }
+      .title { font-size: 16px; font-weight: 600; margin: 0 0 4px 0; }
+      .meta { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+      .scores {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .snippet {
+        font-size: 14px;
+        line-height: 1.5;
+        color: var(--fg);
+        background: var(--bg);
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+      }
+      .empty, .loading { color: var(--muted); padding: 12px 0; }
+      .tag {
+        display: inline-block;
+        padding: 2px 8px;
+        background: #e0f2fe;
+        color: #075985;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 500;
+        margin-right: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Multi-Tenant Visual Doc Search + QA</h1>
+      <p>ColQwen2.5 ranks pages by looking at the images. Qwen3.5-4B reads the top page image and answers the question. All on one SIE endpoint.</p>
+    </header>
+    <main>
+      <form id="searchForm">
+        <select id="clientSel"><option value="">All clients</option></select>
+        <input id="q" type="text" placeholder="e.g. Raspberry Pi Pico pinout GP21" autofocus />
+        <button type="submit">Search</button>
+      </form>
+      <div id="stats" class="stats"></div>
+      <div id="answer"></div>
+      <div id="results"></div>
+    </main>
+    <script>
+      const clientSel = document.getElementById("clientSel");
+      const form = document.getElementById("searchForm");
+      const q = document.getElementById("q");
+      const resultsEl = document.getElementById("results");
+      const answerEl = document.getElementById("answer");
+      const statsEl = document.getElementById("stats");
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      async function loadStats() {
+        const r = await fetch("/api/stats").then(r => r.json());
+        for (const c of r.clients) {
+          const opt = document.createElement("option");
+          opt.value = c;
+          opt.textContent = c;
+          clientSel.appendChild(opt);
+        }
+        const rerank = r.visual_rerank ? "on" : "off";
+        statsEl.textContent =
+          `${r.total_pages} pages · ${r.clients.length} clients · ` +
+          `retriever=${r.models.retriever} · answer=${r.models.answer} · visual rerank=${rerank}`;
+      }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const query = q.value.trim();
+        if (!query) return;
+        answerEl.innerHTML = "";
+        resultsEl.innerHTML = `<div class="loading">Searching…</div>`;
+        const params = new URLSearchParams({ q: query });
+        if (clientSel.value) params.set("client", clientSel.value);
+        const res = await fetch(`/api/search?${params}`).then(r => r.json());
+        if (res.answer) {
+          answerEl.innerHTML = `
+            <div class="answer-card">
+              <div class="label">Answer (Qwen3.5-4B vision)</div>
+              <div class="text">${escapeHtml(res.answer)}</div>
+            </div>`;
+        }
+        if (!res.results.length) {
+          resultsEl.innerHTML = `<div class="empty">No results.</div>`;
+          return;
+        }
+        resultsEl.innerHTML = res.results.map(r => {
+          const rerank = r.scores.rerank == null ? "—" : r.scores.rerank;
+          return `
+          <div class="result">
+            <a href="${escapeHtml(r.page_image)}" target="_blank"><img src="${escapeHtml(r.page_image)}" alt="${escapeHtml(r.title)}"/></a>
+            <div>
+              <div class="title">${escapeHtml(r.title)}</div>
+              <div class="meta"><span class="tag">${escapeHtml(r.client)}</span> ${escapeHtml(r.citation)} · ${escapeHtml(r.publisher)}</div>
+              <div class="meta">${escapeHtml(r.license)} · <a href="${escapeHtml(r.source_url)}" target="_blank" rel="noreferrer">source PDF</a></div>
+              <div class="scores">maxsim=${r.scores.maxsim}   rerank=${rerank}</div>
+            </div>
+          </div>`;
+        }).join("");
+      });
+
+      loadStats();
+    </script>
+  </body>
+</html>
