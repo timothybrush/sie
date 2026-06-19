@@ -115,7 +115,7 @@
   <body>
     <header>
       <h1>Multi-Tenant Visual Doc Search + QA</h1>
-      <p>ColQwen2.5 ranks pages by looking at the images. Florence-2-DocVQA reads the top page and answers the question. All on one SIE endpoint.</p>
+      <p>ColQwen2.5 ranks pages by looking at the images. Qwen3.5-4B reads the top page image and answers the question. All on one SIE endpoint.</p>
     </header>
     <main>
       <form id="searchForm">
@@ -154,7 +154,7 @@
         const rerank = r.visual_rerank ? "on" : "off";
         statsEl.textContent =
           `${r.total_pages} pages · ${r.clients.length} clients · ` +
-          `retriever=${r.models.retriever} · docvqa=${r.models.docvqa} · visual rerank=${rerank}`;
+          `retriever=${r.models.retriever} · answer=${r.models.answer} · visual rerank=${rerank}`;
       }
 
       form.addEventListener("submit", async (e) => {
@@ -169,7 +169,7 @@
         if (res.answer) {
           answerEl.innerHTML = `
             <div class="answer-card">
-              <div class="label">Answer (Florence-2-DocVQA)</div>
+              <div class="label">Answer (Qwen3.5-4B vision)</div>
               <div class="text">${escapeHtml(res.answer)}</div>
             </div>`;
         }
@@ -187,7 +187,6 @@
               <div class="meta"><span class="tag">${escapeHtml(r.client)}</span> ${escapeHtml(r.citation)} · ${escapeHtml(r.publisher)}</div>
               <div class="meta">${escapeHtml(r.license)} · <a href="${escapeHtml(r.source_url)}" target="_blank" rel="noreferrer">source PDF</a></div>
               <div class="scores">maxsim=${r.scores.maxsim}   rerank=${rerank}</div>
-              ${r.ocr_snippet ? `<div class="snippet">${escapeHtml(r.ocr_snippet)}</div>` : ""}
             </div>
           </div>`;
         }).join("");

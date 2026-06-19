@@ -1,19 +1,18 @@
 """Visual document search + question answering, vision end-to-end.
 
-Pipeline per query:
-  1. encode(ColQwen2.5, text)          — query multivector
-  2. sie_sdk.scoring.maxsim             — late interaction against page images
-  3. score(Qwen3-VL-Reranker, query, images)   — optional, off by default
-  4. extract(Florence-2-FT-DocVQA, instruction=query, images=[top page])
-                                        — textual answer + citation
-  5. extract(Florence-2-FT-DocVQA, images=[top page])
-                                        — OCR snippet for the UI (display only,
-                                          NOT in the ranking path)
+The whole pipeline is Qwen-family and never collapses a page through OCR:
+
+  1. encode(ColQwen2.5, text)                  — query multivector
+  2. sie_sdk.scoring.maxsim                     — late interaction against page images
+  3. score(Qwen3-VL-Reranker, query, images)    — optional second stage, off by default
+  4. Qwen3.5-4B (vision) via /v1/chat/completions — reads the winning page image
+                                                  and answers the question
 
 The ranking is decided by a vision model looking at the page image, so charts,
-screenshots, tables, and any other visual signal that OCR would erase still
-contributes. OCR runs only on the chosen page, only to provide on-screen text
-the user can read or copy.
+schematics, pinout diagrams, scanned engineering drawings, and any other layout
+cue that an OCR round-trip would erase still contributes to the score. The
+answer step also reads the page as an image, so the page never has to have a
+text layer at all.
 
 Multi-tenant isolation is a Python filter on metadata before MaxSim, so a
 query scoped to one client never sees another client's pages.
@@ -21,11 +20,13 @@ query scoped to one client never sees another client's pages.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
 from pathlib import Path
 
+import httpx
 import numpy as np
 import yaml
 
@@ -57,30 +58,66 @@ def load_index():
     return multivectors, metadata
 
 
-def _ocr_snippet(entities: list[dict], max_chars: int = 400) -> str:
-    """Concatenate OCR text regions into a single readable snippet."""
-    pieces = []
-    for e in entities or []:
-        text = (e.get("text") or "").replace("</s>", "").strip()
-        if text:
-            pieces.append(text)
-    joined = " · ".join(pieces)
-    if len(joined) > max_chars:
-        return joined[: max_chars - 1] + "…"
-    return joined
+_ANSWER_SYSTEM = (
+    "You are shown one page of a document as an image and a question about it. "
+    "Answer with the shortest exact value, name, or phrase taken from the page — "
+    "no explanation. If the page does not contain the answer, reply exactly: "
+    "not shown on this page."
+)
 
 
-def _docvqa_answer(entities: list[dict]) -> str:
-    """Pick the answer string out of a Florence-2 DocVQA response.
+def _vqa_answer(
+    cluster_url: str,
+    api_key: str,
+    model: str,
+    question: str,
+    image_path: str,
+    provision_timeout_s: float,
+) -> str:
+    """Answer a question about one page image with a vision LLM.
 
-    Florence-2 returns the answer as an entity (often the single one when the
-    `<DocVQA>` task token is dispatched). We take the first non-empty text.
+    Qwen3.5-4B is a vision+text generation model, so it reads the page image
+    directly. SIE exposes generation through the OpenAI-compatible
+    `/v1/chat/completions` endpoint (the SIE SDK's `generate()` is text-only),
+    so this is a plain multimodal chat call rather than an SDK method.
     """
-    for e in entities or []:
-        text = (e.get("text") or "").replace("</s>", "").strip()
-        if text:
-            return text
-    return ""
+    data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _ANSWER_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
+                ],
+            },
+        ],
+        "max_tokens": 64,
+        "temperature": 0.0,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # The generation bundle can scale from zero. While it provisions, the
+    # gateway may answer 202/503 ("still loading") or hold the connection until
+    # it times out; retry both under the provisioning budget, like the SDK does.
+    deadline = time.time() + provision_timeout_s
+    while True:
+        try:
+            resp = httpx.post(f"{cluster_url}/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
+        except httpx.TransportError:
+            if time.time() < deadline:
+                time.sleep(5)
+                continue
+            raise
+        if resp.status_code in (202, 503) and time.time() < deadline:
+            time.sleep(5)
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 def search(
@@ -97,7 +134,8 @@ def search(
     top_k_results = config["search"]["top_k_results"]
     do_visual_rerank = config["search"].get("visual_rerank", False)
     do_answer = config["search"].get("answer", True)
-    do_ocr_snippet = config["search"].get("ocr_snippet", True)
+    answer_url = os.environ.get("SIE_CLUSTER_URL", config["cluster"]["url"])
+    answer_key = os.environ.get("SIE_API_KEY", config["cluster"]["api_key"])
 
     corpus = [m for m in metadata if not client_filter or m["client"] == client_filter]
     if not corpus:
@@ -135,8 +173,8 @@ def search(
         candidates.append(c)
 
     # 3. Optional visual rerank. Image-in cross-encoder so OCR never enters the
-    #    ranking path. Disabled by default — see config.yaml for the cluster
-    #    bug we're waiting on.
+    #    ranking path. Off by default; see config.yaml for what a deployment
+    #    needs to serve it.
     if do_visual_rerank and candidates:
         try:
             t0 = time.time()
@@ -159,50 +197,31 @@ def search(
                 c["_rerank_score"] = float(s["score"]) if s else 0.0
             candidates.sort(key=lambda c: c["_rerank_score"] or 0.0, reverse=True)
         except Exception as exc:
-            # Cluster adapter bug fallback: keep MaxSim ordering, surface the
-            # failure to the caller. See sie-internal#1026.
+            # If the deployment can't serve the reranker, keep the MaxSim
+            # ordering and surface the failure to the caller.
             timings["visual_rerank_error"] = type(exc).__name__
 
     results = candidates[:top_k_results]
 
-    # 4. DocVQA answer from the top page image. instruction= goes in as the
-    #    plain question; the adapter prepends Florence-2's `<DocVQA>` task
-    #    token. See superlinked.com/docs/extract/vision.
+    # 4. Answer from the top page image with the Qwen3.5-4B vision model. It
+    #    reads the page as an image, so the answer survives even on a scanned
+    #    page with no text layer.
     answer = None
     if do_answer and results:
         top = results[0]
         try:
             t0 = time.time()
-            qa = client.extract(
-                config["models"]["docvqa"],
-                Item(images=[str(pages_root / top["image_path"])]),
-                instruction=query,
-                gpu=gpu,
-                wait_for_capacity=True,
-                provision_timeout_s=timeout,
+            answer = _vqa_answer(
+                answer_url,
+                answer_key,
+                config["models"]["answer"],
+                query,
+                str(pages_root / top["image_path"]),
+                timeout,
             )
-            timings["docvqa_s"] = round(time.time() - t0, 3)
-            answer = _docvqa_answer(qa["entities"])
+            timings["answer_s"] = round(time.time() - t0, 3)
         except Exception as exc:
-            timings["docvqa_error"] = type(exc).__name__
-
-    # 5. OCR snippet for display — only on the top result so users see the
-    #    text on the page they're being shown. Never used as a ranking signal.
-    if do_ocr_snippet and results:
-        top = results[0]
-        try:
-            t0 = time.time()
-            ocr = client.extract(
-                config["models"]["docvqa"],   # same model, no `instruction` ⇒ OCR mode
-                Item(images=[str(pages_root / top["image_path"])]),
-                gpu=gpu,
-                wait_for_capacity=True,
-                provision_timeout_s=timeout,
-            )
-            timings["ocr_snippet_s"] = round(time.time() - t0, 3)
-            top["ocr_snippet"] = _ocr_snippet(ocr["entities"])
-        except Exception as exc:
-            timings["ocr_snippet_error"] = type(exc).__name__
+            timings["answer_error"] = type(exc).__name__
 
     return {"results": results, "answer": answer, "timings": timings}
 
@@ -222,8 +241,6 @@ def print_run(out: dict, query: str, client_filter: str | None):
         print(f"\n  {i}. [{r['client']}] {r['title']}")
         print(f"     {r['source_pdf']}  ·  p.{r['page_number']}  ·  {r['publisher']}")
         print(f"     maxsim={r['_maxsim_score']:.3f}  {rerank_str}")
-        if r.get("ocr_snippet"):
-            print(f"     OCR snippet: {r['ocr_snippet'][:200]}")
         print(f"     url: {r['source_url']}")
 
 
@@ -236,19 +253,21 @@ def main():
     api_key = os.environ.get("SIE_API_KEY", config["cluster"]["api_key"])
 
     demo = [
-        # Visual signal — ranking is driven by the page image.
-        ("Raspberry Pi Pico pinout GP21", "embedded-lab"),
-        ("cloud native architecture diagram", "ops-eng"),
-        ("solid rocket motor nozzle design figure", "aerospace"),
-        # No tenant filter: shows the query routes across tenants.
-        ("ATmega16U2 power tree diagram", None),
-        # Table / value lookup — DocVQA must return a specific value, not the title.
-        ("What is the operating voltage range of the Raspberry Pi Pico?", "embedded-lab"),
-        ("PostgreSQL default listening port", "ops-eng"),
-        # Disambiguation — two PDFs in one tenant; the right one must win.
-        ("solid propellant rocket nozzle cross-section", "aerospace"),
-        # Tenant-leak negative — the matching content lives in aerospace; scoping
-        # to ops-eng must return no aerospace pages.
+        # Read a value straight off a dense config page.
+        ("What is the default TCP port a PostgreSQL server listens on?", "ops-eng"),
+        ("What is the default value of max_connections in PostgreSQL?", "ops-eng"),
+        # Read a spec off a hardware datasheet.
+        ("What is the GPIO (IO) voltage of the Raspberry Pi Pico?", "embedded-lab"),
+        # Scanned engineering drawing: the page has no text layer, so only the
+        # visual retrieval finds it — and the vision model still reads the figure.
+        ("What does Figure 7 in the solid rocket motor nozzle report show?", "aerospace"),
+        # No tenant filter: the question routes to the right tenant on its own.
+        ("Which Arduino UNO datasheet section covers the power tree?", None),
+        # Disambiguation: regenerative cooling is liquid-specific, so the liquid
+        # report must win over the solid one in the same aerospace tenant.
+        ("regeneratively cooled nozzle", "aerospace"),
+        # Tenant isolation: that content lives in aerospace; scoped to ops-eng it
+        # must surface zero aerospace pages.
         ("regeneratively cooled nozzle", "ops-eng"),
     ]
     with SIEClient(cluster_url, api_key=api_key) as client:

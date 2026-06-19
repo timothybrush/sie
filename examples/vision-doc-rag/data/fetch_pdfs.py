@@ -52,7 +52,7 @@ SOURCES = [
         "publisher": "PostgreSQL Global Development Group",
         "license": "PostgreSQL License",
         "url": "https://www.postgresql.org/files/documentation/pdf/18/postgresql-18-A4.pdf",
-        "pages": [19, 20, 21, 22, 23, 24],
+        "pages": [673, 674, 675, 676],
     },
     {
         "client": "ops-eng",
@@ -75,29 +75,22 @@ SOURCES = [
     {
         "client": "aerospace",
         "slug": "solid-rocket-motor-nozzles",
-        "title": "Solid Rocket Motor Nozzles",
+        "title": "Solid Rocket Motor Nozzles (NASA SP-8115)",
         "publisher": "NASA Technical Reports Server",
         "license": "NASA STI public release",
-        "url": "https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/19760013126.pdf",
-        "pages": [1, 2, 3, 4, 5, 6],
+        # NTRS citation-download API returns the actual scanned report (with the
+        # engineering drawings); the /archive/ path returns the HTML landing page.
+        "url": "https://ntrs.nasa.gov/api/citations/19760013126/downloads/19760013126.pdf",
+        "pages": [14, 15, 20, 22, 49, 50],
     },
     {
         "client": "aerospace",
         "slug": "liquid-rocket-engine-nozzles",
-        "title": "Liquid Rocket Engine Nozzles",
+        "title": "Liquid Rocket Engine Nozzles (NASA SP-8120)",
         "publisher": "NASA Technical Reports Server",
         "license": "NASA STI public release",
-        "url": "https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/19770009165.pdf",
-        "pages": [1, 2, 3, 4, 5, 6],
-    },
-    {
-        "client": "aerospace",
-        "slug": "sls-booster-state-machine",
-        "title": "State Machine Modeling of the Space Launch System Solid Rocket Boosters",
-        "publisher": "NASA Technical Reports Server",
-        "license": "NASA STI public release",
-        "url": "https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/20160000328.pdf",
-        "pages": [1, 2, 3, 4, 5, 6],
+        "url": "https://ntrs.nasa.gov/api/citations/19770009165/downloads/19770009165.pdf",
+        "pages": [23, 27, 42, 43, 46, 49],
     },
 ]
 

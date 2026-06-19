@@ -88,7 +88,6 @@ def api_search(
                 "page_number": r["page_number"],
                 "citation": f"{r['source_pdf']} · p.{r['page_number']}",
                 "page_image": f"/{r['image_path']}",
-                "ocr_snippet": r.get("ocr_snippet", ""),
                 "scores": {
                     "maxsim": round(r["_maxsim_score"], 4),
                     "rerank": round(r["_rerank_score"], 4) if r.get("_rerank_score") is not None else None,

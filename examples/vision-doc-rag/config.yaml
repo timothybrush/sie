@@ -6,25 +6,27 @@ cluster:
   gpu: ""                       # only set for managed multi-GPU clusters (e.g. "l4-spot"); ignored locally
   provision_timeout_s: 600
 
-# Models. The retrieval signal is vision end-to-end: ColQwen2.5 reads each page
-# as an image and we late-interact (MaxSim) against the same model's text-side
-# embedding of the query. No OCR is involved in ranking, so charts, screenshots,
-# tables, and any other layout cue that wouldn't survive an OCR round-trip
-# still contributes to the score.
+# Models. The pipeline is Qwen-family end to end and never collapses a page
+# through OCR. ColQwen2.5 reads each page as an image and we late-interact
+# (MaxSim) against the same model's text-side embedding of the query, so charts,
+# screenshots, tables, and any other layout cue that wouldn't survive an OCR
+# round-trip still contributes to the score.
 #
-# DocVQA produces a textual answer for the top page. The model takes the page
-# image + the user's question (passed via `instruction`) and returns the answer
-# as an entity in the response — no separate LLM call needed.
+# The answer model (Qwen3.5-4B) is a vision+text LLM: it reads the winning page
+# image and the user's question and returns a short textual answer. Because it
+# reads the image, the page never needs a text layer — scanned drawings work.
+# It runs over SIE's OpenAI-compatible /v1/chat/completions endpoint (the SIE
+# SDK's generate() is text-only); see python/search.py:_vqa_answer.
 models:
   retriever: "vidore/colqwen2.5-v0.2"
-  docvqa: "mynkchaudhry/Florence-2-FT-DocVQA"
-  # Optional second-stage cross-encoder rerank. Visual model so we don't have to
-  # collapse the page through OCR before reranking. Disabled by default — two
-  # blockers as of 0.6.4 (verified against sie-test 2026-06-12):
-  #   https://github.com/superlinked/sie-internal/issues/1368  (sdk: score() image inputs)
-  #   https://github.com/superlinked/sie-internal/issues/1367  (server: adapter image tokens)
-  # Text-only rerank works. Re-enable with search.visual_rerank: true once both
-  # fixes ship.
+  answer: "Qwen/Qwen3.5-4B"
+  # Optional second-stage cross-encoder rerank over (query text, page image), so
+  # layout cues survive reranking instead of being flattened through OCR. Off by
+  # default: it needs a SIE deployment recent enough to serve the visual reranker,
+  # and multi-image score requests rely on the gateway payload store being
+  # configured (large work items get offloaded to object storage rather than sent
+  # inline over the queue). Flip search.visual_rerank: true to enable it; if the
+  # stack can't serve it, search falls back to the MaxSim ranking.
   reranker: "Qwen/Qwen3-VL-Reranker-2B"
 
 # Page rendering. `auto` tries pdf2image/Poppler first and falls back to
@@ -38,5 +40,4 @@ search:
   top_k_candidates: 5           # how many pages survive MaxSim
   top_k_results: 3              # how many pages return after optional rerank
   visual_rerank: false          # see models.reranker note above
-  answer: true                  # run DocVQA on the top page for a textual answer
-  ocr_snippet: true             # OCR the top page for a display-only snippet in the UI
+  answer: true                  # read the top page with the vision LLM for a textual answer
