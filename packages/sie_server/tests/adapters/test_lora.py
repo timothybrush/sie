@@ -217,10 +217,19 @@ class TestPEFTLoRAMixin:
             with patch("peft.PeftModel") as mock_peft_model_cls:
                 mock_peft_model_cls.from_pretrained.return_value = mock_peft_model
 
+                base_model = adapter._model
                 result = adapter.load_lora("org/my-lora")
+                peft_adapter_name = adapter._lora_adapter_names["org/my-lora"]
 
                 # PeftModel.from_pretrained should be called
-                mock_peft_model_cls.from_pretrained.assert_called_once()
+                mock_peft_model_cls.from_pretrained.assert_called_once_with(
+                    base_model,
+                    "org/my-lora",
+                    adapter_name=peft_adapter_name,
+                )
+                assert peft_adapter_name.startswith("sie_lora_")
+                assert "/" not in peft_adapter_name
+                assert "." not in peft_adapter_name
                 assert adapter._peft_model is mock_peft_model
                 assert "org/my-lora" in adapter._loaded_loras
                 assert isinstance(result, int)
@@ -244,9 +253,45 @@ class TestPEFTLoRAMixin:
                 # Load second LoRA - should use load_adapter
                 adapter.load_lora("org/lora2")
 
-                mock_peft_model.load_adapter.assert_called_once_with("org/lora2", adapter_name="org/lora2")
+                second_adapter_name = adapter._lora_adapter_names["org/lora2"]
+                mock_peft_model.load_adapter.assert_called_once_with("org/lora2", adapter_name=second_adapter_name)
                 assert "org/lora1" in adapter._loaded_loras
                 assert "org/lora2" in adapter._loaded_loras
+                assert adapter._lora_adapter_names["org/lora1"] != second_adapter_name
+
+    def test_load_lora_aliases_dotted_hf_repo_id_for_peft(self) -> None:
+        """Test LoRA ids with dots/slashes are not passed to PEFT as adapter names."""
+        with patch.dict("sys.modules", {"peft": MagicMock()}):
+            adapter = MockAdapterWithLoRA()
+            adapter.load("cuda:0")
+
+            mock_peft_model = MagicMock()
+            mock_peft_model.named_parameters.return_value = []
+
+            with patch("peft.PeftModel") as mock_peft_model_cls:
+                mock_peft_model_cls.from_pretrained.return_value = mock_peft_model
+
+                lora_id = "gauravprasadgp/qwen3-embedding_0.6B_lora"
+                adapter.load_lora(lora_id)
+
+                peft_adapter_name = adapter._lora_adapter_names[lora_id]
+                assert peft_adapter_name != lora_id
+                assert "gauravprasadgp_qwen3_embedding_0_6B_lora" in peft_adapter_name
+                assert "__" in peft_adapter_name
+                assert "/" not in peft_adapter_name
+                assert "." not in peft_adapter_name
+                mock_peft_model_cls.from_pretrained.assert_called_once()
+                assert mock_peft_model_cls.from_pretrained.call_args.kwargs["adapter_name"] == peft_adapter_name
+                assert lora_id in adapter._loaded_loras
+
+    def test_peft_adapter_name_uses_hash_suffix_to_avoid_sanitized_collisions(self) -> None:
+        """Test readable aliases remain distinct when sanitized names collide."""
+        dotted = PEFTLoRAMixin._peft_adapter_name("org/a.b-lora")
+        underscored = PEFTLoRAMixin._peft_adapter_name("org/a_b-lora")
+
+        assert dotted != underscored
+        assert dotted.startswith("sie_lora_org_a_b_lora__")
+        assert underscored.startswith("sie_lora_org_a_b_lora__")
 
     def test_load_lora_duplicate_skipped(self) -> None:
         """Test loading same LoRA twice is skipped."""
@@ -285,12 +330,13 @@ class TestPEFTLoRAMixin:
         adapter = MockAdapterWithLoRA()
         adapter._peft_model = MagicMock()
         adapter._loaded_loras = {"org/my-lora"}
+        adapter._lora_adapter_names = {"org/my-lora": "sie_lora_test"}
 
         adapter.set_active_lora("org/my-lora")
 
         # Uses PEFT's enable_adapter_layers() instead of transformers' enable_adapters()
         adapter._peft_model.enable_adapter_layers.assert_called_once()
-        adapter._peft_model.set_adapter.assert_called_once_with("org/my-lora")
+        adapter._peft_model.set_adapter.assert_called_once_with("sie_lora_test")
         assert adapter._active_lora == "org/my-lora"
 
     def test_set_active_lora_not_loaded_raises(self) -> None:
@@ -316,12 +362,17 @@ class TestPEFTLoRAMixin:
         mock_peft_model = MagicMock()
         adapter._peft_model = mock_peft_model
         adapter._loaded_loras = {"org/my-lora", "org/another-lora"}  # Keep one so model isn't unwrapped
+        adapter._lora_adapter_names = {
+            "org/my-lora": "sie_lora_test",
+            "org/another-lora": "sie_lora_other",
+        }
         adapter._active_lora = None
 
         adapter.unload_lora("org/my-lora")
 
-        mock_peft_model.delete_adapter.assert_called_once_with("org/my-lora")
+        mock_peft_model.delete_adapter.assert_called_once_with("sie_lora_test")
         assert "org/my-lora" not in adapter._loaded_loras
+        assert "org/my-lora" not in adapter._lora_adapter_names
         assert "org/another-lora" in adapter._loaded_loras  # Still present
 
 

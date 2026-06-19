@@ -15,7 +15,9 @@ Usage:
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -38,8 +40,8 @@ class PEFTLoRAMixin:
     How it works:
     1. First LoRA load: Creates PeftModel.from_pretrained(base_model, lora_path)
     2. Additional LoRAs: Calls peft_model.load_adapter(lora_path, adapter_name)
-    3. Switching: Calls peft_model.set_adapter(lora_name) before inference
-    4. Unloading: Calls peft_model.delete_adapter(lora_name)
+    3. Switching: Calls peft_model.set_adapter(peft_adapter_name) before inference
+    4. Unloading: Calls peft_model.delete_adapter(peft_adapter_name)
 
     Memory management:
     - Each LoRA adds ~1-5% of base model memory
@@ -56,6 +58,7 @@ class PEFTLoRAMixin:
     _peft_model: PeftModel | None = None
     _active_lora: str | None = None
     _loaded_loras: set[str]  # Track which LoRAs are loaded
+    _lora_adapter_names: dict[str, str]  # Public LoRA id -> PEFT-safe adapter name
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Initialize _loaded_loras set for subclasses."""
@@ -66,6 +69,20 @@ class PEFTLoRAMixin:
         """Ensure LoRA tracking is initialized."""
         if not hasattr(self, "_loaded_loras"):
             self._loaded_loras = set()
+        if not hasattr(self, "_lora_adapter_names"):
+            self._lora_adapter_names = {}
+
+    @staticmethod
+    def _peft_adapter_name(lora_name: str) -> str:
+        """Return a deterministic, readable PEFT-safe adapter name."""
+        readable = re.sub(r"[^0-9A-Za-z_]+", "_", lora_name).strip("_")
+        readable = readable[:48].rstrip("_") or "adapter"
+        digest = hashlib.sha256(lora_name.encode("utf-8")).hexdigest()
+        return f"sie_lora_{readable}__{digest}"
+
+    def _get_peft_adapter_name(self, lora_name: str) -> str:
+        """Return the PEFT adapter name for a loaded public LoRA id."""
+        return self._lora_adapter_names.get(lora_name, self._peft_adapter_name(lora_name))
 
     def supports_lora(self) -> bool:
         """Return True - PEFT adapters support LoRA."""
@@ -87,7 +104,7 @@ class PEFTLoRAMixin:
 
         Args:
             lora_path: HuggingFace path (e.g., "org/lora-name") or local path.
-                This path is also used as the adapter name for switching.
+                This path is the public LoRA id used for switching.
 
         Returns:
             Memory usage of the loaded LoRA in bytes.
@@ -116,6 +133,7 @@ class PEFTLoRAMixin:
             raise RuntimeError(msg) from e
 
         logger.info("Loading LoRA adapter: %s", lora_path)
+        peft_adapter_name = self._peft_adapter_name(lora_path)
 
         if self._peft_model is None:
             # First LoRA - wrap the base model
@@ -123,7 +141,7 @@ class PEFTLoRAMixin:
             self._peft_model = PeftModel.from_pretrained(
                 base_model,
                 lora_path,
-                adapter_name=lora_path,
+                adapter_name=peft_adapter_name,
             )
             # Update self._model to point to the PEFT-wrapped model
             # This ensures encode() uses the LoRA-enhanced model
@@ -131,9 +149,10 @@ class PEFTLoRAMixin:
         else:
             # Additional LoRA - add to existing PeftModel
             logger.debug("Adding adapter to existing PeftModel")
-            self._peft_model.load_adapter(lora_path, adapter_name=lora_path)
+            self._peft_model.load_adapter(lora_path, adapter_name=peft_adapter_name)
 
         self._loaded_loras.add(lora_path)
+        self._lora_adapter_names[lora_path] = peft_adapter_name
 
         # Force-disable adapter layers after loading.
         # PEFT's load_adapter() can re-enable adapter layers, so we must
@@ -176,8 +195,9 @@ class PEFTLoRAMixin:
             self.set_active_lora(None)
 
         # Delete the adapter
-        self._peft_model.delete_adapter(lora_name)
+        self._peft_model.delete_adapter(self._get_peft_adapter_name(lora_name))
         self._loaded_loras.discard(lora_name)
+        self._lora_adapter_names.pop(lora_name, None)
 
         # If no LoRAs remain, unwrap the model
         if not self._loaded_loras:
@@ -223,7 +243,7 @@ class PEFTLoRAMixin:
             # Re-enable adapter layers if they were disabled, then set the active adapter
             # Use PEFT's enable_adapter_layers() instead of transformers' enable_adapters()
             self._peft_model.enable_adapter_layers()
-            self._peft_model.set_adapter(lora_name)
+            self._peft_model.set_adapter(self._get_peft_adapter_name(lora_name))
 
         self._active_lora = lora_name
 
@@ -242,6 +262,7 @@ class PEFTLoRAMixin:
             return 0
 
         total_bytes = 0
+        peft_adapter_name = self._get_peft_adapter_name(lora_name)
 
         try:
             import torch
@@ -250,7 +271,7 @@ class PEFTLoRAMixin:
             for name, param in self._peft_model.named_parameters():
                 # LoRA parameters typically have adapter name in their path
                 # and contain "lora_" in the name
-                if lora_name in name and "lora_" in name and isinstance(param, torch.Tensor):
+                if peft_adapter_name in name and "lora_" in name and isinstance(param, torch.Tensor):
                     total_bytes += param.numel() * param.element_size()
 
         except (AttributeError, RuntimeError) as e:

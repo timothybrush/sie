@@ -150,6 +150,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus::default(),
         }

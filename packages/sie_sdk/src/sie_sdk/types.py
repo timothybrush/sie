@@ -571,6 +571,11 @@ class PoolSpec(TypedDict, total=False):
         minimum_worker_count: Per-pool warm floor (minimum machines kept warm). The
             gateway publishes it as ``sie_gateway_pool_warm_floor`` for KEDA, which keeps
             that many machines warm. Defaults to 0 (scale to zero).
+        pinned_models: Per-pool set of model ids kept loaded so the first request to
+            them pays no cold model-load. Each id must be a model the gateway already
+            tracks (see ``GET /v1/configs/models``) and may be profile-qualified
+            (``model-name:profile_name``); unknown ids are rejected. Defaults to an
+            empty list (lazy-loading unchanged).
     """
 
     name: str
@@ -578,6 +583,7 @@ class PoolSpec(TypedDict, total=False):
     gpu_caps: dict[str, int]
     bundle: str
     minimum_worker_count: int
+    pinned_models: list[str]
 
 
 # --- Pool Response Types (nested structure matching gateway API) ---
@@ -623,12 +629,14 @@ class PoolSpecResponse(TypedDict, total=False):
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
         minimum_worker_count: Per-pool warm floor (minimum machines kept warm via KEDA).
+        pinned_models: Per-pool set of model ids kept loaded (no cold model-load).
     """
 
     gpus: dict[str, int]
     gpu_caps: dict[str, int]
     bundle: str | None
     minimum_worker_count: int
+    pinned_models: list[str]
 
 
 class PoolResponse(TypedDict, total=False):

@@ -260,6 +260,7 @@ impl PoolManager {
                 gpu_caps: spec.gpu_caps.clone(),
                 ttl_seconds: None,
                 minimum_worker_count: spec.minimum_worker_count,
+                pinned_models: spec.pinned_models.clone(),
             };
             if !desired_names.insert(static_spec.name.clone()) {
                 return Err(format!("duplicate static queue pool '{}'", name).into());
@@ -371,7 +372,7 @@ impl PoolManager {
             .collect();
 
         match self
-            .create_pool(DEFAULT_POOL_NAME, gpus, None, None, 0)
+            .create_pool(DEFAULT_POOL_NAME, gpus, None, None, 0, Vec::new())
             .await
         {
             Ok(_) => {
@@ -393,6 +394,7 @@ impl PoolManager {
         bundle: Option<String>,
         ttl_seconds: Option<u64>,
         minimum_worker_count: u32,
+        pinned_models: Vec<String>,
     ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
         self.create_pool_with_caps(
             name,
@@ -401,10 +403,12 @@ impl PoolManager {
             bundle,
             ttl_seconds,
             minimum_worker_count,
+            pinned_models,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pool_with_caps(
         &self,
         name: &str,
@@ -413,6 +417,7 @@ impl PoolManager {
         bundle: Option<String>,
         ttl_seconds: Option<u64>,
         minimum_worker_count: u32,
+        pinned_models: Vec<String>,
     ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
         let raw_name = name;
         validate_pool_name(name)?;
@@ -442,7 +447,8 @@ impl PoolManager {
                 || existing.spec.gpus != gpus
                 || existing.spec.gpu_caps != gpu_caps
                 || existing.spec.ttl_seconds != ttl_seconds
-                || existing.spec.minimum_worker_count != minimum_worker_count;
+                || existing.spec.minimum_worker_count != minimum_worker_count
+                || existing.spec.pinned_models != pinned_models;
 
             if pool_key.eq_ignore_ascii_case(DEFAULT_POOL_NAME) && spec_changed {
                 return Err(Box::new(DefaultPoolMutationError));
@@ -455,6 +461,7 @@ impl PoolManager {
                 existing.spec.gpu_caps = gpu_caps;
                 existing.spec.ttl_seconds = ttl_seconds;
                 existing.spec.minimum_worker_count = minimum_worker_count;
+                existing.spec.pinned_models = pinned_models.clone();
                 existing.status.state = PoolState::Pending;
                 existing.status.assigned_workers.clear();
                 "updated"
@@ -494,6 +501,7 @@ impl PoolManager {
                 gpu_caps,
                 ttl_seconds,
                 minimum_worker_count,
+                pinned_models,
             },
             status: PoolStatus {
                 state: PoolState::Pending,
@@ -1089,7 +1097,10 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 2);
 
-        let pool = pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        let pool = pm
+            .create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
         assert_eq!(pool.spec.name, "test");
         assert_eq!(pool.status.state, PoolState::Pending);
         assert_eq!(pool.spec.minimum_worker_count, 0);
@@ -1103,8 +1114,26 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 2);
 
         // Trailing arg is the warm floor; it must round-trip onto the spec.
-        let pool = pm.create_pool("test", gpus, None, None, 3).await.unwrap();
+        let pool = pm
+            .create_pool("test", gpus, None, None, 3, vec![])
+            .await
+            .unwrap();
         assert_eq!(pool.spec.minimum_worker_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_stores_pinned_models() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 2);
+
+        // Trailing arg is the pinned-model set; it must round-trip onto the spec.
+        let pool = pm
+            .create_pool("test", gpus, None, None, 0, vec!["BAAI/bge-m3".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(pool.spec.pinned_models, vec!["BAAI/bge-m3"]);
     }
 
     #[tokio::test]
@@ -1115,10 +1144,13 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 2);
 
         let pool1 = pm
-            .create_pool("test", gpus.clone(), None, None, 0)
+            .create_pool("test", gpus.clone(), None, None, 0, vec![])
             .await
             .unwrap();
-        let pool2 = pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        let pool2 = pm
+            .create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
         assert_eq!(pool1.spec.name, pool2.spec.name);
     }
 
@@ -1128,7 +1160,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers = vec![worker_in_pool(
             "w1",
@@ -1144,7 +1178,7 @@ mod tests {
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 2);
         let pool = pm
-            .create_pool_with_caps("test", updated_gpus, gpu_caps, None, Some(60), 0)
+            .create_pool_with_caps("test", updated_gpus, gpu_caps, None, Some(60), 0, vec![])
             .await
             .unwrap();
 
@@ -1162,7 +1196,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        let result = pm.create_pool(DEFAULT_POOL_NAME, gpus, None, None, 0).await;
+        let result = pm
+            .create_pool(DEFAULT_POOL_NAME, gpus, None, None, 0, vec![])
+            .await;
 
         assert!(result.is_err());
     }
@@ -1174,7 +1210,7 @@ mod tests {
         for name in ["", "bench.l4", "bench*", "bench>", "bench pool", "_default"] {
             let mut gpus = HashMap::new();
             gpus.insert("l4-spot".to_string(), 1);
-            let result = pm.create_pool(name, gpus, None, None, 0).await;
+            let result = pm.create_pool(name, gpus, None, None, 0, vec![]).await;
             assert!(result.is_err(), "{name:?} should fail");
             assert!(result
                 .unwrap_err()
@@ -1190,7 +1226,7 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        let result = pm.create_pool("Default", gpus, None, None, 0).await;
+        let result = pm.create_pool("Default", gpus, None, None, 0, vec![]).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("default pool"));
@@ -1199,7 +1235,7 @@ mod tests {
         assert_eq!(pools[0].spec.name, DEFAULT_POOL_NAME);
 
         let idempotent_case_variant = pm
-            .create_pool("Default", HashMap::new(), None, None, 0)
+            .create_pool("Default", HashMap::new(), None, None, 0, vec![])
             .await;
         assert!(idempotent_case_variant.is_err());
     }
@@ -1210,12 +1246,14 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("Bench", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("Bench", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let mut updated_gpus = HashMap::new();
         updated_gpus.insert("l4-spot".to_string(), 2);
         let pool = pm
-            .create_pool("bench", updated_gpus, None, Some(60), 0)
+            .create_pool("bench", updated_gpus, None, Some(60), 0, vec![])
             .await
             .unwrap();
 
@@ -1244,7 +1282,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let deleted = pm.delete_pool("test").await.unwrap();
         assert!(deleted);
@@ -1266,6 +1306,7 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: Some(1),
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
 
         let count = pm.sync_static_pools(&specs).await.unwrap();
@@ -1303,6 +1344,7 @@ mod tests {
             gpu_caps,
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
 
         pm.sync_static_pools(&specs).await.unwrap();
@@ -1336,13 +1378,14 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
         pm.sync_static_pools(&specs).await.unwrap();
 
         let mut changed_gpus = HashMap::new();
         changed_gpus.insert("l4-spot".to_string(), 1);
         let result = pm
-            .create_pool("bench", changed_gpus, None, Some(60), 0)
+            .create_pool("bench", changed_gpus, None, Some(60), 0, vec![])
             .await;
         assert!(result.is_err());
         assert!(result
@@ -1372,6 +1415,7 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
         pm.sync_static_pools(&specs).await.unwrap();
 
@@ -1380,7 +1424,7 @@ mod tests {
         let mut changed_gpus = HashMap::new();
         changed_gpus.insert("l4-spot".to_string(), 1);
         let result = pm
-            .create_pool("BENCH", changed_gpus, None, Some(60), 0)
+            .create_pool("BENCH", changed_gpus, None, Some(60), 0, vec![])
             .await;
         assert!(result.is_err());
         assert!(result
@@ -1408,6 +1452,7 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
 
         let result = pm.sync_static_pools(&specs).await;
@@ -1433,6 +1478,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             PoolSpec {
                 name: "bench".to_string(),
@@ -1441,6 +1487,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
         ];
 
@@ -1459,7 +1506,7 @@ mod tests {
 
         let mut dynamic_gpus = HashMap::new();
         dynamic_gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("Bench", dynamic_gpus, None, Some(60), 0)
+        pm.create_pool("Bench", dynamic_gpus, None, Some(60), 0, vec![])
             .await
             .unwrap();
 
@@ -1472,6 +1519,7 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
         pm.sync_static_pools(&specs).await.unwrap();
 
@@ -1495,6 +1543,7 @@ mod tests {
             gpu_caps: HashMap::new(),
             ttl_seconds: None,
             minimum_worker_count: 0,
+            pinned_models: Vec::new(),
         }];
         pm.sync_static_pools(&specs).await.unwrap();
 
@@ -1508,6 +1557,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: Some(60),
                 minimum_worker_count: 1,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Active,
@@ -1540,7 +1590,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 2);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers = vec![
             worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
@@ -1562,7 +1614,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 3);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers: Vec<(String, String, String, String, String)> = (1..=5)
             .map(|i| {
@@ -1592,7 +1646,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 3);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 4);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1624,7 +1678,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 2);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1655,7 +1709,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 1);
-        pm.create_pool_with_caps("bench", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("bench", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1685,7 +1739,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("bench", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("bench", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers = vec![worker(
             "default-worker",
@@ -1709,7 +1765,7 @@ mod tests {
         let gpus = HashMap::new();
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 2);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1740,7 +1796,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 0);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers = Vec::new();
         let all_met = pm.assign_workers("test", &workers).await;
@@ -1759,7 +1817,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 2);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1792,7 +1850,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 1);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1817,7 +1875,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 2);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1853,7 +1911,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("a100".to_string(), 1);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1871,7 +1929,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let mut gpu_caps = HashMap::new();
         gpu_caps.insert("l4-spot".to_string(), 0);
-        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0)
+        pm.create_pool_with_caps("test", gpus, gpu_caps, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -1897,7 +1955,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 3);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let workers = vec![worker_in_pool(
             "w1",
@@ -1920,7 +1980,9 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("test", gpus, None, None, 0).await.unwrap();
+        pm.create_pool("test", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
 
         let renewed = pm.renew_pool("test").await;
         assert!(renewed);
@@ -1936,7 +1998,7 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("invalid-gpu".to_string(), 1);
 
-        let result = pm.create_pool("test", gpus, None, None, 0).await;
+        let result = pm.create_pool("test", gpus, None, None, 0, vec![]).await;
         assert!(result.is_err());
     }
 
@@ -1948,12 +2010,12 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 1);
 
         // Pool with short TTL (1 second)
-        pm.create_pool("short-ttl", gpus.clone(), None, Some(1), 0)
+        pm.create_pool("short-ttl", gpus.clone(), None, Some(1), 0, vec![])
             .await
             .unwrap();
 
         // Pool with no TTL (uses global default = 1200s)
-        pm.create_pool("default-ttl", gpus, None, None, 0)
+        pm.create_pool("default-ttl", gpus, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -2060,6 +2122,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Pending,
@@ -2097,6 +2160,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Pending,
@@ -2122,7 +2186,7 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 0);
         let local = pm
-            .create_pool("bench", gpus.clone(), None, Some(60), 0)
+            .create_pool("bench", gpus.clone(), None, Some(60), 0, vec![])
             .await
             .unwrap();
 
@@ -2150,7 +2214,14 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 0);
         let local = pm
-            .create_pool("bench", gpus, Some("default".to_string()), Some(60), 0)
+            .create_pool(
+                "bench",
+                gpus,
+                Some("default".to_string()),
+                Some(60),
+                0,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2172,7 +2243,14 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 0);
         let local = pm
-            .create_pool("bench", gpus, Some("default".to_string()), Some(60), 0)
+            .create_pool(
+                "bench",
+                gpus,
+                Some("default".to_string()),
+                Some(60),
+                0,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2195,7 +2273,7 @@ mod tests {
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
         let local = pm
-            .create_pool("Bench", gpus, None, Some(60), 0)
+            .create_pool("Bench", gpus, None, Some(60), 0, vec![])
             .await
             .unwrap();
 
@@ -2225,6 +2303,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: Some(60),
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Pending,
@@ -2255,7 +2334,7 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 1);
-        pm.create_pool("Bench", gpus, None, Some(60), 0)
+        pm.create_pool("Bench", gpus, None, Some(60), 0, vec![])
             .await
             .unwrap();
 

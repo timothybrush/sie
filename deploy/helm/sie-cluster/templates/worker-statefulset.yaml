@@ -50,6 +50,13 @@ fast at render time.
 {{- fail (printf "workers.pools.%s.bundles.%s: `maxReplicas` (%d) must be >= `minReplicas` (%d)." $poolName $bundleName (int $bundleCfg.maxReplicas) (int $bundleCfg.minReplicas)) }}
 {{- end }}
 {{- $bundle := $bundleName }}
+{{- $preloadModels := $root.Values.workers.common.preloadModels }}
+{{- if hasKey $pool "preloadModels" }}
+{{- $preloadModels = $pool.preloadModels }}
+{{- end }}
+{{- if hasKey $bundleCfg "preloadModels" }}
+{{- $preloadModels = $bundleCfg.preloadModels }}
+{{- end }}
 {{- /* imageBundle decouples the image-tag suffix from the logical bundle name.
        Defaults to $bundle, but bundles whose logical name has no dedicated
        Docker image (e.g. `sglang-embedding`, which shares deps and image with
@@ -146,10 +153,10 @@ spec:
             # Device configuration (cpu if no GPU, cuda otherwise)
             - name: SIE_DEVICE
               value: {{ if gt (int $pool.gpu.count) 0 }}cuda{{ else }}cpu{{ end }}
-            {{- if $root.Values.workers.common.preloadModels }}
+            {{- if $preloadModels }}
             # Models to eagerly load at startup (before readiness)
             - name: SIE_PRELOAD_MODELS
-              value: {{ join "," $root.Values.workers.common.preloadModels | quote }}
+              value: {{ join "," $preloadModels | quote }}
             {{- end }}
             {{- $workerLogLevel := trim ($root.Values.logging.workerLevel | default "") }}
             # Logging configuration (``logging.workerLevel`` overrides workers when non-empty)

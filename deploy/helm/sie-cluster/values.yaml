@@ -336,7 +336,11 @@ workers:
     # -- Port for SIE server
     port: 8080
 
-    # -- Models to preload on startup (empty = lazy loading)
+    # -- Models to preload on startup for every worker lane (empty = lazy loading).
+    # Override with workers.pools.<name>.preloadModels or
+    # workers.pools.<name>.bundles.<bundle>.preloadModels when different
+    # machine-profile/bundle lanes must eagerly load different models. An
+    # explicit empty override disables inherited preloading for that lane.
     preloadModels: []
 
     # -- Python ModelWorker passthrough mode. When `true` (and the Rust
@@ -630,6 +634,8 @@ workers:
   #                    image-tag suffix for the worker image
   #                    (e.g. `<repo>:<tag>-cpu-<bundle>`),
   #                    NOT propagated to a pod env var.
+  #   preloadModels:   Optional list of models to preload on every bundle lane
+  #                    in this worker group. Overrides workers.common.preloadModels.
   #   queuePool:       string. Optional override of common.queuePool.
   #                    Defaults to `default` via workers.common.queuePool.
   #   resources:       requests/limits for the Python ``worker``
@@ -643,6 +649,8 @@ workers:
   #     imageBundle:   string. Optional image-tag bundle suffix override.
   #                    Set only when the logical bundle reuses another
   #                    bundle's image (e.g. `sglang-embedding` -> `sglang`).
+  #     preloadModels: Optional list of models to preload for this specific
+  #                    worker lane. Overrides pool/common preloadModels.
   #     extraEnv:      list. Extra env vars on the ``worker`` container.
   #                    Rendered after workers.common.extraEnv so a
   #                    bundle-level entry wins on duplicate names.

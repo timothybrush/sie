@@ -10014,7 +10014,7 @@ mod tests {
         gpus.insert("l4".to_string(), 0);
         let mut caps = std::collections::HashMap::new();
         caps.insert("l4".to_string(), 0);
-        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0, vec![])
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
@@ -10041,7 +10041,7 @@ mod tests {
         gpus.insert("l4".to_string(), 0);
         let mut caps = std::collections::HashMap::new();
         caps.insert("l4".to_string(), 0);
-        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0, vec![])
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
@@ -10075,7 +10075,7 @@ mod tests {
         gpus.insert("l4".to_string(), 0);
         let mut caps = std::collections::HashMap::new();
         caps.insert("l4".to_string(), 1);
-        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0, vec![])
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
@@ -10121,7 +10121,7 @@ mod tests {
         gpus.insert("l4".to_string(), 0);
         let mut caps = std::collections::HashMap::new();
         caps.insert("l4".to_string(), 1);
-        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0)
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0, vec![])
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
@@ -12726,7 +12726,7 @@ mod tests {
         let pm = PoolManager::new(vec!["l4".into()]);
         let mut gpus = std::collections::HashMap::new();
         gpus.insert("l4".to_string(), 0);
-        pm.create_pool("my-bench", gpus, None, None, 0)
+        pm.create_pool("my-bench", gpus, None, None, 0, vec![])
             .await
             .unwrap();
 
@@ -12743,7 +12743,7 @@ mod tests {
         let mut gpus = std::collections::HashMap::new();
         gpus.insert("l4".to_string(), 0);
         gpus.insert("a100".to_string(), 0);
-        pm.create_pool("my-bench", gpus, None, None, 0)
+        pm.create_pool("my-bench", gpus, None, None, 0, vec![])
             .await
             .unwrap();
 

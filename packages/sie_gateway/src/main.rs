@@ -588,6 +588,42 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Per-pool pinned-model loaded-signal emitter (every 30s). Observability
+    // only: reports whether each pinned model is loaded on a pool's healthy
+    // workers via the `sie_gateway_pool_pinned_model_loaded` gauge. It does not
+    // load or pin models (worker-side LRU pinning is a separate project). A pool
+    // with an empty `pinned_models` set emits nothing.
+    if pools_enabled {
+        let pm = Arc::clone(&pool_manager);
+        let reg = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut prev = state::pinned_models::PinnedLanes::new();
+            loop {
+                interval.tick().await;
+                let pools = pm.list_pools().await;
+                // Build the per-pool loaded-model view: the union of loaded
+                // models across the healthy workers assigned to each pool.
+                let workers = reg.workers().await;
+                let mut loaded = state::pinned_models::PoolLoadedModels::new();
+                for pool in &pools {
+                    if pool.spec.pinned_models.is_empty() {
+                        continue;
+                    }
+                    let set = loaded.entry(pool.spec.name.clone()).or_default();
+                    for assigned in &pool.status.assigned_workers {
+                        if let Some(w) = workers.get(&assigned.url) {
+                            if w.healthy() {
+                                set.extend(w.models.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                state::pinned_models::reconcile_and_emit(&pools, &loaded, &mut prev);
+            }
+        });
+    }
+
     // Pool worker reassignment (triggered by on_worker_healthy or every 5s)
     {
         let pm = Arc::clone(&pool_manager);

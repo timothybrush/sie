@@ -945,6 +945,13 @@
             "pattern": "^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$",
             "type": "string"
           },
+          "pinned_models": {
+            "description": "Per-pool pinned-model set. Each id is validated against the models the\ngateway already tracks and stored canonicalized; ids may be\nprofile-qualified (`model-name:profile_name`). Default empty leaves\nlazy-loading unchanged. See `PoolSpec::pinned_models`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "ttl_seconds": {
             "format": "int64",
             "minimum": 0,
@@ -2350,6 +2357,13 @@
           "name": {
             "type": "string"
           },
+          "pinned_models": {
+            "description": "Per-pool pinned-model set: models the gateway keeps loaded so the first\nrequest to them pays no cold model-load. Chosen from the models the\ngateway already tracks (see `GET /v1/configs/models`); ids may be\nprofile-qualified (`model-name:profile_name`). Default empty leaves\nlazy-loading unchanged.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "ttl_seconds": {
             "format": "int64",
             "minimum": 0,
@@ -2888,7 +2902,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.8"
+    "version": "0.6.9"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -174,6 +174,8 @@ workers:
         sglang:           # generation, scale-from-zero on same GPUs
           minReplicas: 0
           maxReplicas: 5
+          preloadModels:
+            - Qwen/Qwen3.6-27B:rtx-pro-6000
 
 # Gateway configuration
 gateway:

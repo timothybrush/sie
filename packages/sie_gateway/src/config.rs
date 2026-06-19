@@ -161,6 +161,8 @@ struct StaticQueuePoolEnvSpec {
     gpu_caps: HashMap<String, u32>,
     #[serde(default, alias = "minimum_worker_count")]
     minimum_worker_count: u32,
+    #[serde(default, alias = "pinned_models")]
+    pinned_models: Vec<String>,
 }
 
 fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
@@ -198,6 +200,9 @@ fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
                 gpu_caps: spec.gpu_caps,
                 ttl_seconds: None,
                 minimum_worker_count: spec.minimum_worker_count,
+                // Static-pool pinned sets are intentionally NOT registry-validated:
+                // they are parsed at startup before the model registry is populated.
+                pinned_models: spec.pinned_models,
             })
         })
         .collect();
@@ -631,13 +636,15 @@ mod tests {
                     "companyA": {
                         "gpus": {"l4": 0},
                         "gpuCaps": {},
-                        "minimumWorkerCount": 1
+                        "minimumWorkerCount": 1,
+                        "pinnedModels": ["BAAI/bge-m3"]
                     },
                     "companyB": {
                         "bundle": "sglang",
                         "gpus": {"a100": 1},
                         "gpu_caps": {"a100": 2},
-                        "minimum_worker_count": 2
+                        "minimum_worker_count": 2,
+                        "pinned_models": ["intfloat/e5-base-v2"]
                     }
                 }"#,
             )],
@@ -649,6 +656,7 @@ mod tests {
                 assert_eq!(result[0].gpus.get("l4"), Some(&0));
                 assert!(result[0].gpu_caps.is_empty());
                 assert_eq!(result[0].minimum_worker_count, 1);
+                assert_eq!(result[0].pinned_models, vec!["BAAI/bge-m3"]);
                 assert_eq!(result[0].ttl_seconds, None);
 
                 assert_eq!(result[1].name, "companyB");
@@ -656,6 +664,7 @@ mod tests {
                 assert_eq!(result[1].gpus.get("a100"), Some(&1));
                 assert_eq!(result[1].gpu_caps.get("a100"), Some(&2));
                 assert_eq!(result[1].minimum_worker_count, 2);
+                assert_eq!(result[1].pinned_models, vec!["intfloat/e5-base-v2"]);
             },
         );
     }
@@ -671,6 +680,7 @@ mod tests {
                 let result = env_static_queue_pools("_TEST_STATIC_QUEUE_POOLS");
                 assert_eq!(result.len(), 1);
                 assert_eq!(result[0].minimum_worker_count, 0);
+                assert!(result[0].pinned_models.is_empty());
             },
         );
     }

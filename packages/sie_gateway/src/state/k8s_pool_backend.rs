@@ -504,6 +504,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: Some(600),
                 minimum_worker_count: 2,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Pending,
@@ -595,6 +596,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: Some(300),
                 minimum_worker_count: 1,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state: PoolState::Pending,

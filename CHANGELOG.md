@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.9
+
+- chore(main): release 0.6.9
+- chore(gateway): regenerate openapi.json for pinned_models profile docstrings
+- feat(gateway): support profile-qualified ids in per-pool pinned-model set
+- fix(gateway): bound pinned-model metric labels and add handler validation tests
+- feat(gateway): add per-pool pinned-model set to the pool config API
+- fix(server): alias PEFT LoRA adapter names
+- fix: scope worker preload models by lane
+
 ## v0.6.8
 
 - chore(main): release 0.6.8

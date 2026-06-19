@@ -106,6 +106,8 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap();
     r.register(Box::new(PENDING_DEMAND.clone())).unwrap();
     r.register(Box::new(POOL_WARM_FLOOR.clone())).unwrap();
+    r.register(Box::new(POOL_PINNED_MODEL_LOADED.clone()))
+        .unwrap();
     r.register(Box::new(REJECTED_REQUESTS.clone())).unwrap();
     r.register(Box::new(ACTIVE_LEASE_GPUS.clone())).unwrap();
     r.register(Box::new(WORKER_COUNT.clone())).unwrap();
@@ -246,6 +248,52 @@ pub fn clear_pool_warm_floor(pool: &str, machine_profile: &str, bundle: &str) {
     POOL_WARM_FLOOR
         .with_label_values(&[pool, machine_profile, bundle])
         .set(0.0);
+}
+
+// sie_gateway_pool_pinned_model_loaded
+//
+// Observability for the per-pool pinned-model set (`PoolSpec.pinned_models`):
+// 1 iff at least one healthy worker assigned to the pool currently has the
+// pinned model in its loaded set, 0 otherwise. The gateway re-emits this every
+// 30s for each `(pool, model)` pinned lane and clears lanes that disappear
+// (pool deleted or the model unpinned). This is a loaded-signal only: keeping
+// the model actually loaded (worker preload / LRU no-evict) is out of scope
+// here. A pool with an empty `pinned_models` emits nothing.
+pub static POOL_PINNED_MODEL_LOADED: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "sie_gateway_pool_pinned_model_loaded",
+            "1 iff a pool's pinned model is loaded on at least one healthy assigned worker",
+        ),
+        &["pool", "model"],
+    )
+    .unwrap()
+});
+
+/// Set the pinned-model-loaded gauge for one `(pool, model)` lane to
+/// `value` (1.0 = loaded on at least one healthy assigned worker, 0.0 =
+/// not). Called by the gateway's pinned-models reconciler on every tick for
+/// each model a pool pins.
+pub fn set_pool_pinned_model_loaded(pool: &str, model: &str, value: f64) {
+    // Bound the label cardinality/charset: API pool ids are canonicalized, but
+    // static-pool pinned ids are accepted as-is, so sanitize both components
+    // (same backstop the model-load metrics use) before they become labels.
+    let pool = sanitize_label(pool);
+    let model = sanitize_model_label(model);
+    POOL_PINNED_MODEL_LOADED
+        .with_label_values(&[&pool, &model])
+        .set(value);
+}
+
+/// Drop the pinned-model-loaded gauge for a `(pool, model)` lane the
+/// reconciler previously set but no longer wants (pool deleted or the model
+/// unpinned), so a stale lane does not linger on `/metrics`.
+pub fn clear_pool_pinned_model_loaded(pool: &str, model: &str) {
+    // Sanitize identically to `set_pool_pinned_model_loaded` so the series key
+    // matches and the lane is actually removed.
+    let pool = sanitize_label(pool);
+    let model = sanitize_model_label(model);
+    let _ = POOL_PINNED_MODEL_LOADED.remove_label_values(&[&pool, &model]);
 }
 
 // 5. sie_gateway_active_lease_gpus
@@ -1193,6 +1241,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state,
@@ -2201,5 +2250,90 @@ mod tests {
                 < f64::EPSILON
         );
         POOL_WARM_FLOOR.reset();
+    }
+
+    /// A pinned-model-loaded gauge series must be registered so it reaches
+    /// `/metrics`; an unregistered series never reaches the encoder.
+    #[test]
+    fn test_pool_pinned_model_loaded_is_registered() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        set_pool_pinned_model_loaded("pinned-pool", "BAAI/bge-m3", 1.0);
+        let families: std::collections::HashSet<String> = REGISTRY
+            .gather()
+            .iter()
+            .map(|mf| mf.name().to_string())
+            .collect();
+        assert!(
+            families.contains("sie_gateway_pool_pinned_model_loaded"),
+            "sie_gateway_pool_pinned_model_loaded missing from REGISTRY.gather()"
+        );
+        clear_pool_pinned_model_loaded("pinned-pool", "BAAI/bge-m3");
+    }
+
+    /// `set_pool_pinned_model_loaded` writes `value` keyed in `(pool, model)`
+    /// label order; `clear_pool_pinned_model_loaded` drops the series (a fresh
+    /// read re-creates it at the default `0`), and clearing one lane leaves
+    /// other lanes untouched.
+    #[test]
+    fn test_pool_pinned_model_loaded_set_and_clear() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        POOL_PINNED_MODEL_LOADED.reset();
+
+        set_pool_pinned_model_loaded("tenant", "BAAI/bge-m3", 1.0);
+        set_pool_pinned_model_loaded("tenant", "intfloat/e5-base-v2", 1.0);
+
+        assert!(
+            (POOL_PINNED_MODEL_LOADED
+                .with_label_values(&["tenant", "BAAI/bge-m3"])
+                .get()
+                - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+
+        clear_pool_pinned_model_loaded("tenant", "BAAI/bge-m3");
+        // The cleared series is dropped; a fresh read re-creates it at 0.
+        assert!(
+            POOL_PINNED_MODEL_LOADED
+                .with_label_values(&["tenant", "BAAI/bge-m3"])
+                .get()
+                .abs()
+                < f64::EPSILON
+        );
+        // The other lane is untouched by clearing the first.
+        assert!(
+            (POOL_PINNED_MODEL_LOADED
+                .with_label_values(&["tenant", "intfloat/e5-base-v2"])
+                .get()
+                - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        POOL_PINNED_MODEL_LOADED.reset();
+    }
+
+    /// The helpers sanitize their labels (static-pool pinned ids are accepted
+    /// as-is), so a junk model id is bounded to the `sanitize_model_label`
+    /// backstop rather than becoming an unbounded label.
+    #[test]
+    fn test_pool_pinned_model_loaded_sanitizes_labels() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        POOL_PINNED_MODEL_LOADED.reset();
+        // A newline-bearing id is rejected by `sanitize_model_label` to "invalid".
+        set_pool_pinned_model_loaded("tenant", "evil\nmodel", 1.0);
+        assert!(
+            (POOL_PINNED_MODEL_LOADED
+                .with_label_values(&["tenant", "invalid"])
+                .get()
+                - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        // Clearing with the same raw id sanitizes identically and removes it.
+        clear_pool_pinned_model_loaded("tenant", "evil\nmodel");
+        POOL_PINNED_MODEL_LOADED.reset();
     }
 }

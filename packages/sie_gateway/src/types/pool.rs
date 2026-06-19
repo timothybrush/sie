@@ -37,6 +37,13 @@ pub struct PoolSpec {
     /// Default 0 leaves scale-from-zero unchanged.
     #[serde(default)]
     pub minimum_worker_count: u32,
+    /// Per-pool pinned-model set: models the gateway keeps loaded so the first
+    /// request to them pays no cold model-load. Chosen from the models the
+    /// gateway already tracks (see `GET /v1/configs/models`); ids may be
+    /// profile-qualified (`model-name:profile_name`). Default empty leaves
+    /// lazy-loading unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -115,6 +122,7 @@ mod tests {
                 gpu_caps: HashMap::new(),
                 ttl_seconds: None,
                 minimum_worker_count: 0,
+                pinned_models: Vec::new(),
             },
             status: PoolStatus {
                 state,
@@ -227,5 +235,24 @@ mod tests {
         let json = r#"{"name":"test","gpus":{"l4":1}}"#;
         let spec: PoolSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.minimum_worker_count, 0);
+    }
+
+    #[test]
+    fn test_pool_spec_pinned_models_roundtrips() {
+        let mut pool = make_pool(PoolState::Pending, vec![]);
+        pool.spec.pinned_models = vec!["BAAI/bge-m3".to_string()];
+        let json = serde_json::to_string(&pool).unwrap();
+        assert!(json.contains("\"pinned_models\":[\"BAAI/bge-m3\"]"));
+        let deserialized: Pool = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.spec.pinned_models, vec!["BAAI/bge-m3"]);
+    }
+
+    #[test]
+    fn test_pool_spec_pinned_models_defaults_empty_when_absent() {
+        // A spec JSON that omits `pinned_models` must default to empty so
+        // older persisted ConfigMap state and bare create requests keep working.
+        let json = r#"{"name":"test","gpus":{"l4":1}}"#;
+        let spec: PoolSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.pinned_models.is_empty());
     }
 }

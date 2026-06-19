@@ -575,6 +575,8 @@ class SIEAsyncClient:
                 request_body["bundle"] = self._pool_spec["bundle"]
             if self._pool_spec.get("minimum_worker_count") is not None:
                 request_body["minimum_worker_count"] = self._pool_spec["minimum_worker_count"]
+            if self._pool_spec.get("pinned_models") is not None:
+                request_body["pinned_models"] = self._pool_spec["pinned_models"]
 
             try:
                 response = await self._post(
@@ -708,6 +710,7 @@ class SIEAsyncClient:
         gpu_caps: dict[str, int] | None = None,
         bundle: str | None = None,
         minimum_worker_count: int | None = None,
+        pinned_models: list[str] | None = None,
     ) -> None:
         """Create or update a resource pool for isolated capacity.
 
@@ -723,6 +726,10 @@ class SIEAsyncClient:
             minimum_worker_count: Per-pool warm floor (minimum machines kept warm).
                 The gateway publishes it as ``sie_gateway_pool_warm_floor`` for KEDA,
                 which keeps that many machines warm. Defaults to 0 (scale to zero).
+            pinned_models: Optional set of model ids to keep loaded so the first
+                request to them pays no cold model-load. Each id must be a model the
+                gateway already tracks and may be profile-qualified
+                (``model-name:profile_name``); unknown ids are rejected. Defaults to none.
 
         Raises:
             PoolError: If pool creation fails (e.g., invalid machine profile).
@@ -771,6 +778,8 @@ class SIEAsyncClient:
             request_body["bundle"] = bundle
         if minimum_worker_count is not None:
             request_body["minimum_worker_count"] = minimum_worker_count
+        if pinned_models is not None:
+            request_body["pinned_models"] = pinned_models
 
         try:
             response = await self._post(
