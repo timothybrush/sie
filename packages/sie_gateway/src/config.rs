@@ -342,7 +342,7 @@ impl Config {
 
             request_timeout: env_float("SIE_GATEWAY_REQUEST_TIMEOUT", 30.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
-            stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 120),
+            stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 1_800),
 
             configured_gpus,
             gpu_profile_map,
@@ -890,7 +890,7 @@ mod tests {
     fn test_stream_max_age_default_matches_worker_contract() {
         without_env(&["SIE_STREAM_MAX_AGE_S"], || {
             let cfg = Config::load();
-            assert_eq!(cfg.stream_max_age_s, 120);
+            assert_eq!(cfg.stream_max_age_s, 1_800);
         });
     }
 

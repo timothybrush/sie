@@ -1585,6 +1585,9 @@
             },
             "type": "array"
           },
+          "pending_generation": {
+            "$ref": "#/components/schemas/PendingGenerationSnapshot"
+          },
           "status": {
             "type": "string"
           },
@@ -1853,6 +1856,9 @@
           "no_bundles": {
             "type": "boolean"
           },
+          "pending_generation": {
+            "$ref": "#/components/schemas/PendingGenerationSnapshot"
+          },
           "source": {
             "type": "string"
           }
@@ -1949,6 +1955,9 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "pending_generation": {
+            "$ref": "#/components/schemas/PendingGenerationSnapshot"
           },
           "profiles": {
             "additionalProperties": {
@@ -2288,6 +2297,75 @@
           "multivector"
         ],
         "type": "string"
+      },
+      "PendingGenerationGroup": {
+        "properties": {
+          "active_streams": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "display_model": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "oldest_request_age_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pool": {
+            "type": "string"
+          },
+          "republished": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "waiting_first_chunk": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "display_model",
+          "pool",
+          "count",
+          "waiting_first_chunk",
+          "active_streams",
+          "republished",
+          "oldest_request_age_ms"
+        ],
+        "type": "object"
+      },
+      "PendingGenerationSnapshot": {
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/PendingGenerationGroup"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "groups"
+        ],
+        "type": "object"
       },
       "Pool": {
         "properties": {
@@ -2902,7 +2980,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.9"
+    "version": "0.6.10"
   },
   "openapi": "3.1.0",
   "paths": {

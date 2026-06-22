@@ -67,6 +67,8 @@ static OPENAPI_JSON: LazyLock<String> = LazyLock::new(|| {
         ConfigModelSummary,
         ConfigModelsResponse,
         crate::handlers::pools::CreatePoolRequest,
+        crate::queue::publisher::PendingGenerationGroup,
+        crate::queue::publisher::PendingGenerationSnapshot,
         ErrorDetailCore,
         StandardApiError,
         GpuNotConfiguredDetail,
@@ -1928,6 +1930,8 @@ pub struct HealthResponse {
     pub cluster: ClusterSummary,
     pub workers: Vec<crate::types::worker::WorkerInfo>,
     pub models: Vec<crate::types::worker::ModelInfo>,
+    #[serde(default)]
+    pub pending_generation: crate::queue::publisher::PendingGenerationSnapshot,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1966,6 +1970,8 @@ pub struct ModelInfoWire {
     /// ``capabilities.lora_adapters`` union summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<ModelCapabilitiesWire>,
+    #[serde(default)]
+    pub pending_generation: crate::queue::publisher::PendingGenerationSnapshot,
 }
 
 /// Capability summary surfaced on each entry of ``GET /v1/models``.
@@ -2092,6 +2098,8 @@ pub struct ModelConfigStatusResponse {
     pub all_bundles_acked: bool,
     pub no_bundles: bool,
     pub bundles: Vec<ModelAckBundleStatus>,
+    #[serde(default)]
+    pub pending_generation: crate::queue::publisher::PendingGenerationSnapshot,
     pub source: String,
 }
 

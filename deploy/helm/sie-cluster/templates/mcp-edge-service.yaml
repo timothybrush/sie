@@ -1,0 +1,20 @@
+{{- if .Values.mcpEdge.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sie-cluster.mcpEdge.serviceName" . }}
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.mcpEdge.labels" . | nindent 4 }}
+spec:
+  # Hardcoded ClusterIP: the edge is reached only via the TLS-terminating ingress;
+  # a LoadBalancer/NodePort would expose it (and its bearer auth) without TLS.
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.mcpEdge.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "sie-cluster.mcpEdge.selectorLabels" . | nindent 4 }}
+{{- end }}

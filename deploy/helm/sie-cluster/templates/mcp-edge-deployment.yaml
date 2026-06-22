@@ -1,0 +1,97 @@
+{{- if .Values.mcpEdge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sie-cluster.mcpEdge.serviceName" . }}
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.mcpEdge.labels" . | nindent 4 }}
+spec:
+  {{- /* Single replica: the OAuth authorization-code store is in-process. */}}
+  replicas: {{ .Values.mcpEdge.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sie-cluster.mcpEdge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- include "sie-cluster.mcpEdge.selectorLabels" . | nindent 8 }}
+      {{- with .Values.mcpEdge.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "sie-cluster.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "sie-cluster.serviceAccountName" . }}
+      containers:
+        - name: mcp-edge
+          image: {{ include "sie-cluster.mcpEdge.image" . }}
+          imagePullPolicy: {{ .Values.mcpEdge.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpEdge.service.port }}
+              protocol: TCP
+          env:
+            - name: SIE_BASE_URL
+              value: {{ include "sie-cluster.mcpEdge.clusterBaseUrl" . | quote }}
+            {{- if or .Values.mcpEdge.connectorSecrets .Values.mcpEdge.existingSecretName }}
+            - name: SIE_MCP_CONNECTOR_SECRETS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sie-cluster.mcpEdge.secretName" . }}
+                  key: connector-secrets
+            {{- end }}
+            {{- if .Values.mcpEdge.publicUrl }}
+            - name: SIE_MCP_PUBLIC_URL
+              value: {{ .Values.mcpEdge.publicUrl | quote }}
+            {{- end }}
+            {{- if not .Values.mcpEdge.oauthEnabled }}
+            - name: SIE_MCP_OAUTH_ENABLED
+              value: "0"
+            {{- end }}
+            {{- if .Values.mcpEdge.clusterApiKey.existingSecretName }}
+            - name: SIE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mcpEdge.clusterApiKey.existingSecretName }}
+                  key: {{ .Values.mcpEdge.clusterApiKey.secretKey }}
+            {{- end }}
+            - name: SIE_LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+            {{- if .Values.logging.json }}
+            - name: SIE_LOG_JSON
+              value: "true"
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.mcpEdge.probes.startup | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.mcpEdge.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.mcpEdge.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.mcpEdge.resources | nindent 12 }}
+      {{- with .Values.mcpEdge.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcpEdge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcpEdge.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -193,7 +193,7 @@ spec:
             - name: SIE_MAX_DELIVER
               value: {{ .maxDeliver | default 20 | quote }}
             - name: SIE_STREAM_MAX_AGE_S
-              value: {{ .streamMaxAgeSec | default 120 | quote }}
+              value: {{ .streamMaxAgeSec | default 1800 | quote }}
             - name: SIE_NATS_FETCH_BUDGET
               value: {{ .natsFetchBudget | default 64 | quote }}
             {{- end }}
@@ -369,7 +369,7 @@ spec:
             # Whoever creates the stream first wins, so both producers and
             # consumers must agree on max_age or retries race against purge.
             - name: SIE_STREAM_MAX_AGE_S
-              value: {{ .streamMaxAgeSec | default 120 | quote }}
+              value: {{ .streamMaxAgeSec | default 1800 | quote }}
             {{- if .maxAckPending }}
             - name: SIE_MAX_ACK_PENDING
               value: {{ .maxAckPending | quote }}

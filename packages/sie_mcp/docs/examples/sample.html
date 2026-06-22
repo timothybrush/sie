@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Superlinked SIE — Quarterly Service Memo</title>
+</head>
+<body>
+  <h1>Quarterly Service Memo</h1>
+  <p><strong>Date:</strong> 2026-06-15 &nbsp; <strong>Prepared for:</strong> Finance / Operations</p>
+
+  <h2>1. Summary</h2>
+  <p>This memo summarizes document-offload usage on the managed Superlinked
+  inference cluster for the quarter. Converting documents to markdown before
+  ingestion reduces the tokens billed for document-heavy agent work.</p>
+
+  <h2>2. Usage by document type</h2>
+  <table border="1" cellpadding="4" cellspacing="0">
+    <thead>
+      <tr><th>Document type</th><th>Files</th><th>Pages</th><th>Token reduction</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>PDF (born-digital)</td><td>412</td><td>3,980</td><td>82.6%</td></tr>
+      <tr><td>DOCX</td><td>168</td><td>1,204</td><td>79.1%</td></tr>
+      <tr><td>PPTX</td><td>54</td><td>620</td><td>88.3%</td></tr>
+      <tr><td>Scanned PDF</td><td>37</td><td>451</td><td>74.0%</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. Notes</h2>
+  <ul>
+    <li>Born-digital documents convert cleanly through the standard converter.</li>
+    <li>Scanned pages route to a vision-language OCR model for higher-quality text.</li>
+    <li>Question-answering uses transient retrieval inside the serving layer.</li>
+  </ul>
+
+  <h2>4. Recommendation</h2>
+  <p>Continue routing document-heavy work through the offload path. The blended
+  token reduction across the corpus this quarter was approximately 82.9%.</p>
+</body>
+</html>

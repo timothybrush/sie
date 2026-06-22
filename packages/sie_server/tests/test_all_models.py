@@ -998,11 +998,6 @@ def test_naver_clova_ix_donut_base_finetuned_docvqa_extract() -> None:
     pass
 
 
-@pytest.mark.skip(reason="requires image input and special extract handling")
-def test_naver_clova_ix_donut_base_finetuned_rvlcdip_extract() -> None:
-    pass
-
-
 # =============================================================================
 # Extract models (image input - OWLv2 detection)
 # =============================================================================

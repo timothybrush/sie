@@ -10,8 +10,8 @@
 
 <h1>SIE: Superlinked Inference Engine</h1>
 
-<p><strong>Open-source inference server and production cluster for embeddings, reranking, and extraction.</strong></p>
-<p>85+ models. Three functions. From laptop to Kubernetes. All Apache 2.0.</p>
+<p><strong>Self-hosted inference for agents. Every model your agents call, served from one open-source cluster in your cloud.</strong></p>
+<p>85+ models: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more. One API. From laptop to Kubernetes. All Apache 2.0.</p>
 
 <p>
   <a href="https://superlinked.com/docs/">Docs</a> |
@@ -28,13 +28,25 @@
 
 ## About
 
-SIE is an open-source inference engine that serves embeddings, reranking, and entity extraction through a single unified API. It replaces the patchwork of separate model servers with one system that handles 85+ models across dense, sparse, multi-vector, vision, and cross-encoder architectures.
+SIE is an open-source inference engine that runs the models behind every agent task through one API: search and retrieval, document-to-markdown conversion, structured output, content safety, and the agent loop itself. It replaces the patchwork of a separate model server per task with one system that serves 85+ models, loading each on demand.
 
 - 85+ pre-configured models, hot-swappable, all quality-verified against MTEB in CI
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
 - Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE/EKS
 - Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, and Weaviate
 - OpenAI-compatible `/v1/embeddings` endpoint for drop-in migration
+
+## Tasks
+
+One SIE cluster runs the inference behind a whole agent. Each task is a handful of swappable models; browse [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models) for the full set.
+
+| Task | What it does | Models |
+|---|---|---|
+| **Search** | Embed, match, and rerank to retrieve the right context. | `bge-m3`, `splade-v3`, `colbertv2`, `qwen3-reranker` |
+| **Document to markdown** | PDFs, Office files, and scans become clean markdown. | `glm-ocr`, `mineru`, `paddleocr-vl`, `docling` |
+| **Structured output** | Schema-valid JSON, extracted or generated. | `gliner2`, `nuner-zero`, `qwen3.6-27b` |
+| **Guard content** | A safety verdict with a probability you threshold. | `granite-guardian-2b` |
+| **Run the agent loop** | Plan steps and call tools with an open LLM, streaming included. | `qwen3.6-27b` |
 
 ## Quickstart
 
@@ -66,7 +78,7 @@ pip install sie-sdk           # Python
 pnpm add @superlinked/sie-sdk # TypeScript
 ```
 
-The entire API is three functions: `encode`, `score`, `extract`.
+The same `SIEClient` talks to every model. Four of them, one call each:
 
 ```python
 from sie_sdk import SIEClient
@@ -76,11 +88,11 @@ client = SIEClient("http://localhost:8080")
 # First call to each model downloads weights from Hugging Face (seconds for
 # these tinies, longer for larger models). After that, calls are warm in ms.
 
-# Encode: dense embeddings (all-MiniLM-L6-v2, ~90 MB)
+# all-MiniLM-L6-v2: compact dense embeddings (~90 MB)
 result = client.encode("sentence-transformers/all-MiniLM-L6-v2", Item(text="Hello world"))
 print(result["dense"].shape)  # (384,)
 
-# Score: rerank documents by relevance (ms-marco MiniLM, ~80 MB)
+# ms-marco-MiniLM: cross-encoder that reranks documents by relevance (~80 MB)
 scores = client.score(
     "cross-encoder/ms-marco-MiniLM-L-6-v2",
     Item(text="What is machine learning?"),
@@ -91,7 +103,7 @@ print(scores["scores"])
 #  {'item_id': 'item-1', 'score': -11.048, 'rank': 1}]
 # (cross-encoder logits; relative order is what matters, not the absolute value)
 
-# Extract: zero-shot named entity recognition, no training data
+# GLiNER: zero-shot entity extraction with any labels, no training data
 result = client.extract(
     "urchade/gliner_multi-v2.1",
     Item(text="Tim Cook is the CEO of Apple."),
@@ -100,6 +112,24 @@ result = client.extract(
 print(result["entities"])
 # [{'text': 'Tim Cook', 'label': 'person',       'score': 0.991},
 #  {'text': 'Apple',    'label': 'organization', 'score': 0.978}]
+
+# Qwen3-0.6B: open-weight text generation (~1.2 GB). Generation needs a GPU and
+# the generation image (latest-cuda12-sglang below), not the latest-cpu-default
+# server above; SGLang has no CPU path.
+result = client.generate(
+    "Qwen/Qwen3-0.6B",
+    "Reply with a single word: the capital of France.",
+    max_new_tokens=16,
+)
+print(result["text"])   # 'Paris'
+print(result["usage"])  # {'prompt_tokens': 12, 'completion_tokens': 1, 'total_tokens': 13}
+```
+
+`encode`, `score`, and `extract` run on the `latest-cpu-default` server above.
+Generation ships in a separate GPU image (the `sglang` bundle); start it with:
+
+```bash
+docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-sglang
 ```
 
 For the equivalent TypeScript example, see the [TypeScript SDK docs](https://superlinked.com/docs/reference/typescript-sdk/). For more, see the [full quickstart guide](https://superlinked.com/docs/quickstart/) and [SDK reference](https://superlinked.com/docs/reference/sdk/).
@@ -126,9 +156,8 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 ### Explore
 
-[**85+ models**](https://superlinked.com/models): `Stella v5`, `BGE-M3`, `SPLADE v3`, `SigLIP`, `ColQwen2.5`, `BGE-reranker`, `GLiNER`, `Florence-2`, and [more](https://superlinked.com/models).
-Dense, sparse, multi-vector, vision, rerankers, extractors. All pre-configured. All quality-verified against MTEB in CI.
-Pass the full Hugging Face model ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `NovaSearch/stella_en_400M_v5`); see the [catalog](https://superlinked.com/models) for the complete list.
+[**85+ models**](https://superlinked.com/models) across embedders, rerankers, extractors, and generators: dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. All pre-configured, all quality-verified in CI.
+Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`). Browse the rendered [catalog](https://superlinked.com/models) for the complete list.
 
 [**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
 

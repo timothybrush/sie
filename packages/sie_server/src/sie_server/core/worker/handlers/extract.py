@@ -38,7 +38,8 @@ class ExtractHandler(OperationHandler[ExtractOutput]):
         Returns:
             Hashable tuple for grouping.
         """
-        labels_key = tuple(sorted(metadata.labels)) if metadata.labels else None
+        # Label order is part of the model input for label-conditioned extractors.
+        labels_key = tuple(metadata.labels) if metadata.labels else None
         options_key = make_hashable(metadata.options) if metadata.options else None
         return (
             labels_key,

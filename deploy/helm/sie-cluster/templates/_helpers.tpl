@@ -376,8 +376,16 @@ Runs from NOTES.txt so every install/upgrade is checked, regardless of which (or
 {{- fail (printf "Invalid configuration: ingress.tlsConfig.mode=%q. Must be one of: \"byo\", \"cert-manager\", \"self-signed\", \"disabled\"." $mode) }}
 {{- end }}
 {{- if eq $mode "cert-manager" }}
-{{- if not $hosts }}
-{{- fail "Invalid configuration: ingress.tlsConfig.mode=cert-manager requires ingress.host or ingress.hosts to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
+{{- /* The MCP edge ingress (mcpEdge.ingress.host) is its own cert-manager-issued host on
+       its own TLS secret, independent of the gateway ingress — so its hostname also
+       satisfies this "cert-manager needs something to issue against" check. This lets the
+       with-domain edge connector path enable cert-manager without forcing a global
+       ingress.host (which would collide gateway + edge on the same host/path). */ -}}
+{{- $mcpEdge := default (dict) .Values.mcpEdge }}
+{{- $mcpEdgeIngress := default (dict) $mcpEdge.ingress }}
+{{- $edgeHost := and $mcpEdge.enabled $mcpEdgeIngress.enabled (trim (default "" $mcpEdgeIngress.host)) }}
+{{- if and (not $hosts) (not $edgeHost) }}
+{{- fail "Invalid configuration: ingress.tlsConfig.mode=cert-manager requires ingress.host or ingress.hosts (gateway) or mcpEdge.ingress.host (MCP edge) to be set (cert-manager has nothing to issue a certificate against without a hostname)." }}
 {{- end }}
 {{- $certManager := default (dict) $tls.certManager }}
 {{- $kind := default "" $certManager.kind }}
@@ -446,12 +454,14 @@ Templates that consume this should treat a non-empty result as "payload
 store enabled" and an empty result as "off".
 */}}
 {{- define "sie-cluster.payloadStoreUrl" -}}
+{{- if .Values.payloadStore.enabled -}}
 {{- if .Values.payloadStore.url -}}
 {{- .Values.payloadStore.url -}}
-{{- else if and .Values.workers.common.clusterCache.enabled .Values.workers.common.clusterCache.url -}}
+{{- else if .Values.workers.common.clusterCache.url -}}
 {{- $cache := trimSuffix "/" .Values.workers.common.clusterCache.url -}}
 {{- $base := trimSuffix "/models" $cache -}}
 {{- printf "%s/payloads" $base -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -491,4 +501,50 @@ Returns a comma-joined, sorted list of distinct machine profiles.
 {{- end -}}
 {{- end -}}
 {{- keys $profiles | sortAlpha | join "," -}}
+{{- end }}
+
+{{/*
+MCP edge (Req 12) — the hosted MCP server fronting the cluster's document jobs.
+*/}}
+{{- define "sie-cluster.mcpEdge.serviceName" -}}
+{{- printf "%s-mcp" (include "sie-cluster.fullname" .) }}
+{{- end }}
+
+{{- define "sie-cluster.mcpEdge.labels" -}}
+{{ include "sie-cluster.labels" . }}
+app.kubernetes.io/component: mcp-edge
+{{- end }}
+
+{{- define "sie-cluster.mcpEdge.selectorLabels" -}}
+{{ include "sie-cluster.selectorLabels" . }}
+app.kubernetes.io/component: mcp-edge
+{{- end }}
+
+{{- define "sie-cluster.mcpEdge.image" -}}
+{{- $tag := default .Chart.AppVersion .Values.mcpEdge.image.tag }}
+{{- printf "%s:%s" .Values.mcpEdge.image.repository $tag }}
+{{- end }}
+
+{{/*
+In-cluster URL the edge uses to reach the gateway (SIE_BASE_URL). Overridable
+via mcpEdge.clusterBaseUrl; otherwise the in-namespace gateway Service.
+*/}}
+{{- define "sie-cluster.mcpEdge.clusterBaseUrl" -}}
+{{- if .Values.mcpEdge.clusterBaseUrl -}}
+{{- .Values.mcpEdge.clusterBaseUrl -}}
+{{- else -}}
+{{- printf "http://%s:%v" (include "sie-cluster.gateway.serviceName" .) .Values.gateway.service.port -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the connector secrets. Uses an existing Secret when
+mcpEdge.existingSecretName is set; otherwise the chart-managed one.
+*/}}
+{{- define "sie-cluster.mcpEdge.secretName" -}}
+{{- if .Values.mcpEdge.existingSecretName -}}
+{{- .Values.mcpEdge.existingSecretName -}}
+{{- else -}}
+{{- printf "%s-connector-secrets" (include "sie-cluster.mcpEdge.serviceName" .) -}}
+{{- end -}}
 {{- end }}

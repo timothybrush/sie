@@ -51,10 +51,12 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .map(|name| {
             let worker_urls = model_workers.get(name).cloned().unwrap_or_default();
             let loaded = !worker_urls.is_empty();
-            match state.model_registry.get_model_info(name) {
+            let mut body = match state.model_registry.get_model_info(name) {
                 Some(entry) => entry.to_model_info_value(loaded),
                 None => worker_only_model_info(name, loaded),
-            }
+            };
+            attach_pending_generation(&mut body, state.as_ref(), name);
+            body
         })
         .collect();
 
@@ -139,8 +141,20 @@ pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppSta
             }
         }
     }
+    attach_pending_generation(&mut body, state.as_ref(), &canonical_model);
 
     (StatusCode::OK, Json(body)).into_response()
+}
+
+fn attach_pending_generation(body: &mut Value, state: &AppState, model: &str) {
+    let pending_generation = state
+        .work_publisher
+        .as_ref()
+        .map(|publisher| publisher.pending_generation_for_model(model))
+        .unwrap_or_default();
+    if let Some(map) = body.as_object_mut() {
+        map.insert("pending_generation".to_string(), json!(pending_generation));
+    }
 }
 
 fn canonical_worker_models(
@@ -347,7 +361,7 @@ mod route_tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
-            stream_max_age_s: 120,
+            stream_max_age_s: 1_800,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             static_queue_pools: Vec::new(),
@@ -588,6 +602,7 @@ mod route_tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["name"], "BAAI/bge-m3");
         assert_eq!(models[0]["loaded"], false);
+        assert_eq!(models[0]["pending_generation"]["total"], 0);
     }
 
     #[tokio::test]
@@ -724,6 +739,7 @@ mod route_tests {
         assert_eq!(body["object"], "model");
         assert_eq!(body["owned_by"], "sie");
         assert!(body["created"].is_i64());
+        assert_eq!(body["pending_generation"]["total"], 0);
     }
 
     #[tokio::test]

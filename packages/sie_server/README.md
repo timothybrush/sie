@@ -17,6 +17,22 @@ GPU inference server for embeddings, reranking, and entity extraction.
 pip install sie-server
 ```
 
+`sie-server` ships several model bundles, and a single environment can only hold one
+`transformers` version — install the one your bundle needs:
+
+- **Default bundle** (embeddings, reranking, extraction) — verified on `transformers` 4.x:
+
+  ```bash
+  pip install sie-server "transformers<5"
+  ```
+
+- **OCR-VLM bundle** (LightOnOCR, GLM-OCR) — requires `transformers` 5.x, and is served with `-b transformers5`:
+
+  ```bash
+  pip install sie-server "transformers>=5,<6"
+  sie-server serve -b transformers5
+  ```
+
 ## Quick Start
 
 ```bash

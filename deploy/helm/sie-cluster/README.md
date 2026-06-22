@@ -63,7 +63,7 @@ Pre-populate shared object storage with model weights so worker pods don't re-do
 **AWS (Terraform-managed bucket):**
 
 ```bash
-# 1. Provision the bucket via the AWS Terraform module (opt-in via create_model_cache=true)
+# 1. Provision the bucket via the AWS Terraform module (created by default; create_model_cache=true)
 cd deploy/terraform/aws/examples/dev-g6-spot
 terraform apply
 
@@ -80,6 +80,32 @@ helm upgrade --install sie-cluster . \
 The Terraform output already includes the `/models` prefix, so the same URL is used for both `sie-admin --target` and `clusterCache.url`.
 
 **Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...`, `gs://...`, `abfs://...`, or `abfss://...` URL the workload identity can read; populate it with the same `sie-admin cache weights sync --dest ...` command.
+
+## Payload store
+
+Work items larger than 1MB (for example images or long documents) are too big to put on the NATS queue inline, so the gateway offloads the payload to object storage and enqueues only a reference; workers fetch it back. **This is required for >1MB requests**: without a payload store the gateway cannot enqueue them and the request fails.
+
+It is therefore **enabled by default** (`payloadStore.enabled=true`) and is **decoupled from the optional cluster cache** above. When the payload store is enabled, the chart resolves a store URL and **fails the install if none is found**, so a missing payload store surfaces at deploy time instead of silently failing >1MB requests at runtime.
+
+URL resolution, in order:
+
+1. `payloadStore.url`, if set: the terraform `payload_store_url` output (the `/payloads` prefix of the shared bucket), or any `s3://` / `gs://` / `abfs(s)://` URL the workload identity can read and write.
+2. otherwise derived from `workers.common.clusterCache.url` by swapping the trailing `/models` prefix for `/payloads` (the same bucket).
+
+```bash
+# The terraform modules provision the bucket by default (create_model_cache=true)
+# and expose its /payloads URL:
+helm upgrade --install sie-cluster . \
+  --set payloadStore.url=$(terraform output -raw payload_store_url)
+```
+
+To run without large-payload support (for example a local/dev cluster), opt out:
+
+```bash
+helm upgrade --install sie-cluster . --set payloadStore.enabled=false
+```
+
+> **Upgrade note:** the payload store is on by default. An existing queue-mode install with *no* payload store and *no* cluster cache will fail on upgrade until it either sets a URL (above) or `payloadStore.enabled=false`. Installs that already set `workers.common.clusterCache.url` keep working; the payload store derives its URL from it.
 
 ## Autoscaling
 

@@ -29,7 +29,7 @@ const ACK_WAIT_SECS: u64 = 30;
 const GENERATION_ACK_WAIT_SECS: u64 = 300;
 const DEFAULT_MAX_DELIVER: i64 = 20;
 const DEFAULT_MAX_ACK_PENDING: i64 = 1000;
-const DEFAULT_STREAM_MAX_AGE_SECS: u64 = ACK_WAIT_SECS * (DEFAULT_MAX_DELIVER as u64);
+const DEFAULT_STREAM_MAX_AGE_SECS: u64 = 1_800;
 const STREAM_MAX_MSGS: i64 = 100_000;
 
 /// Env-overridable `max_deliver`. Mirrors Python's `SIE_MAX_DELIVER`
@@ -44,8 +44,8 @@ fn max_deliver() -> i64 {
 }
 
 /// Env-overridable stream `max_age`. Mirrors Python's
-/// `SIE_STREAM_MAX_AGE_S` (default 600). Should be >=
-/// `max_deliver * ack_wait` so messages don't expire mid-retry.
+/// `SIE_STREAM_MAX_AGE_S` (default 1800). Should be >
+/// `max_deliver * ack_wait` so messages remain inspectable after DLQ.
 fn stream_max_age_secs() -> u64 {
     std::env::var("SIE_STREAM_MAX_AGE_S")
         .ok()
@@ -160,6 +160,41 @@ async fn reconcile_stream_subjects(
         observed_subjects = ?observed_subjects,
         desired_subject = %desired_subject,
         "reconciled NATS stream subjects to canonical queue lane routing"
+    );
+    Ok(())
+}
+
+async fn reconcile_stream_max_age(
+    js: &JsContext,
+    stream: &mut JsStream,
+    stream_name: &str,
+    desired_max_age: Duration,
+) -> Result<(), NatsSetupError> {
+    let observed_max_age = stream.cached_info().config.max_age;
+    if observed_max_age == desired_max_age {
+        return Ok(());
+    }
+
+    let mut updated = stream.cached_info().config.clone();
+    updated.max_age = desired_max_age;
+    js.update_stream(updated)
+        .await
+        .map_err(|e| NatsSetupError::EnsureStream {
+            name: stream_name.to_string(),
+            source: e.into(),
+        })?;
+    *stream = js
+        .get_stream(stream_name)
+        .await
+        .map_err(|e| NatsSetupError::EnsureStream {
+            name: stream_name.to_string(),
+            source: e.into(),
+        })?;
+    info!(
+        stream = %stream_name,
+        observed_max_age_s = observed_max_age.as_secs(),
+        desired_max_age_s = desired_max_age.as_secs(),
+        "reconciled NATS stream max_age"
     );
     Ok(())
 }
@@ -373,13 +408,14 @@ pub async fn ensure_worker_stream_and_consumer(
     let stream_name = config.worker_stream_name();
     let subject = config.worker_subject_filter();
     let consumer_name = config.worker_consumer_name();
+    let desired_max_age = Duration::from_secs(generation_stream_max_age_secs());
 
     let stream_cfg = StreamConfig {
         name: stream_name.clone(),
         subjects: vec![subject.clone()],
         retention: RetentionPolicy::WorkQueue,
         storage: StorageType::Memory,
-        max_age: Duration::from_secs(generation_stream_max_age_secs()),
+        max_age: desired_max_age,
         max_messages: STREAM_MAX_MSGS,
         num_replicas: 1,
         discard: DiscardPolicy::New,
@@ -397,6 +433,7 @@ pub async fn ensure_worker_stream_and_consumer(
                 source: e.into(),
             })?;
     reconcile_stream_subjects(js, &mut stream, &stream_name, &subject).await?;
+    reconcile_stream_max_age(js, &mut stream, &stream_name, desired_max_age).await?;
 
     cleanup_overlapping_consumers(&stream, &consumer_name, &subject).await;
 
@@ -486,26 +523,7 @@ async fn ensure_stream_and_consumer_inner(
                 source: e.into(),
             })?;
     reconcile_stream_subjects(js, &mut stream, &stream_name, &stream_subject).await?;
-
-    // `get_or_create_stream` is a no-op against an EXISTING stream with a
-    // different config (the first writer's config wins). We reconcile
-    // subject filters above to the canonical lane-aware shape. This is a
-    // cutover, not a mixed-version bridge: old subjects are intentionally
-    // removed from the stream config. Other config drift (such as max_age)
-    // is still warned below: if the gateway and the worker disagree on
-    // `max_age`, retries may be purged before `max_deliver` is reached —
-    // silent data loss.
-    let observed_max_age = stream.cached_info().config.max_age;
-    if observed_max_age != desired_max_age {
-        warn!(
-            stream = %stream_name,
-            observed_max_age_s = observed_max_age.as_secs(),
-            desired_max_age_s = desired_max_age.as_secs(),
-            "stream max_age drift: existing stream config disagrees with this worker's intent; \
-             whoever created the stream first wins. This can cause retries to expire before \
-             max_deliver is reached. Align SIE_STREAM_MAX_AGE_S across gateway + workers."
-        );
-    }
+    reconcile_stream_max_age(js, &mut stream, &stream_name, desired_max_age).await?;
 
     // Self-heal stale durables whose filters overlap this concrete
     // `(pool, machine_profile, bundle)` lane. Without this, NATS rejects
@@ -639,12 +657,12 @@ mod tests {
         //   ack_wait = 30s
         //   max_deliver = 20            (env SIE_MAX_DELIVER)
         //   max_ack_pending = 1000      (env SIE_MAX_ACK_PENDING)
-        //   stream max_age = 600s       (env SIE_STREAM_MAX_AGE_S)
+        //   stream max_age = 1800s      (env SIE_STREAM_MAX_AGE_S)
         //   stream max_msgs = 100_000
         assert_eq!(ACK_WAIT_SECS, 30);
         assert_eq!(DEFAULT_MAX_DELIVER, 20);
         assert_eq!(DEFAULT_MAX_ACK_PENDING, 1000);
-        assert_eq!(DEFAULT_STREAM_MAX_AGE_SECS, 600);
+        assert_eq!(DEFAULT_STREAM_MAX_AGE_SECS, 1_800);
         assert_eq!(STREAM_MAX_MSGS, 100_000);
     }
 

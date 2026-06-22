@@ -119,6 +119,11 @@ pub async fn readyz() -> impl IntoResponse {
 )]
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cluster = state.registry.get_cluster_status().await;
+    let pending_generation = state
+        .work_publisher
+        .as_ref()
+        .map(|publisher| publisher.pending_generation_snapshot())
+        .unwrap_or_default();
     let status_str = if cluster.worker_count > 0 {
         "healthy"
     } else {
@@ -142,6 +147,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             },
             "workers": cluster.workers,
             "models": cluster.models,
+            "pending_generation": pending_generation,
         })),
     )
 }
@@ -164,6 +170,11 @@ async fn handle_cluster_status_ws(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         interval.tick().await;
         let status = state.registry.get_cluster_status().await;
+        let pending_generation = state
+            .work_publisher
+            .as_ref()
+            .map(|publisher| publisher.pending_generation_snapshot())
+            .unwrap_or_default();
         // nested cluster sub-object in WS feed
         let nested = serde_json::json!({
             "timestamp": status.timestamp,
@@ -175,6 +186,7 @@ async fn handle_cluster_status_ws(mut socket: WebSocket, state: Arc<AppState>) {
             },
             "workers": status.workers,
             "models": status.models,
+            "pending_generation": pending_generation,
         });
         let json = match serde_json::to_string(&nested) {
             Ok(j) => j,

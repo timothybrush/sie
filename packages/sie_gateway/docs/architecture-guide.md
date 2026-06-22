@@ -291,7 +291,7 @@ Per-subject transport:
 | Inference results | `_INBOX.{router_id}.{request_id}` | NATS Core | Gateway is waiting synchronously; a brief blip after publish but before delivery means the result is lost and the client retries (the gateway returns `503` with `X-SIE-Error-Code: MODEL_LOADING` and `Retry-After: 5` — see §2). Result payload is msgpack. |
 | Config deltas | `sie.config.models.{bundle}`, `sie.config.models._all` | NATS Core | Lightweight fan-out. Gateway durability comes from the snapshot/export path (§4), not the bus. JSON payload (control plane, not hot path). The gateway subscribes on `_all`; worker-sidecar containers subscribe on their bundle subject and apply through Python IPC. |
 | Worker health | `sie.health.>` | NATS Core | Ephemeral, last-heartbeat-wins. The gateway subscribes in `health_mode=nats` (see `discovery/nats_health.rs`) and supervises the subscriber task: reconnects normally resume in `async-nats`, but a terminated subscription stream is recreated with bounded backoff because there is no full-state health poller. Worker-sidecar containers publish this heartbeat and include the latest bundle hash after successful config apply; the **default `health_mode=ws`** still uses the Python WebSocket path. |
-| DLQ advisories | `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>` | NATS Core (advisory) | JetStream emits these; the gateway subscribes in `queue/dlq.rs`. |
+| DLQ advisories | `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>` | NATS Core (advisory) | JetStream emits these; gateway replicas subscribe in `queue/dlq.rs` and publish to `DEAD_LETTERS` with a deterministic `Nats-Msg-Id`, so JetStream dedupes replica fan-out. |
 | DLQ storage | `sie.dlq.{model_token}` | JetStream | Single stream `DEAD_LETTERS` (Limits retention, memory storage, 24 h `max_age`) captures `sie.dlq.>`. `model_token` is derived from the advisory's original work subject by taking the model segment and replacing `/` with `_`. |
 
 ### 8.2 Work-stream configuration and the model-ID constraint
@@ -303,11 +303,11 @@ name:      WORK_POOL_{pool}
 subjects:  ["sie.work.{pool}.*.*.*"]
 retention: WorkQueue
 storage:   Memory
-max_age:   60s  (gateway-side)
+max_age:   1800s (shared gateway/worker default)
 max_msgs:  100_000
 ```
 
-The worker-sidecar (`packages/sie_server_sidecar`, binary `sie-server-sidecar`) also calls `add_stream` with the **same** name but a default `max_age` of 120 s (`SIE_STREAM_MAX_AGE_S`). `get_or_create_stream` / `add_stream` does not update an existing stream's config, so whichever side races to the broker first wins. To avoid drift, pick one owner (either the gateway or the worker); the Helm values should set `SIE_STREAM_MAX_AGE_S` on workers to match the gateway's constant, or the gateway should read the same env.
+max_age defaults to 1800 s on both the gateway (`SIE_STREAM_MAX_AGE_S`) and worker sidecar. The default intentionally stays above `max_deliver * 30s` for the pool consumer so the original work payload remains fetchable after the retry/DLQ envelope trips. `get_or_create_stream` / `add_stream` does not update an existing stream's config, so both gateway and sidecar reconcile existing stream `max_age` during stream ensure; keep the Helm value wired to both gateway and workers so they repair to the same target.
 
 When a gateway or sidecar observes an existing `WORK_POOL_{pool}` stream, it
 reconciles the stream subjects to exactly `sie.work.{pool}.*.*.*`. Legacy

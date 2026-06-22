@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -30,6 +31,27 @@ _ERR_NO_INPUT = "Qwen3VLEmbeddingAdapter requires either text, images, or video 
 _DEFAULT_INSTRUCTION = "Represent the user's input."
 
 _SUPPORTED_POOLING = ("last", "mean")
+
+
+def _normalize_instruction(instruction: str) -> str:
+    """Match the official Qwen3-VL-Embedding ``format_model_input`` instruction shaping.
+
+    The reference recipe strips the instruction and appends a period unless it
+    already ends in a Unicode punctuation character::
+
+        instruction = instruction.strip()
+        if not unicodedata.category(instruction[-1]).startswith("P"):
+            instruction += "."
+
+    SIE previously passed the resolved instruction verbatim, so MTEB query
+    instructions without trailing punctuation (e.g. FiQA's "...best answer the
+    question") differed from the official prompt by a missing period token on
+    every query.
+    """
+    inst = instruction.strip()
+    if inst and not unicodedata.category(inst[-1]).startswith("P"):
+        inst += "."
+    return inst
 
 
 def _build_conversation(
@@ -226,7 +248,9 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         assert self._model is not None
         assert self._processor is not None
 
-        inst = instruction or self._default_instruction
+        # Blank/whitespace-only/None all coalesce to the default; a meaningful
+        # instruction is normalized. Avoids forwarding an empty system turn.
+        inst = _normalize_instruction(instruction or "") or _normalize_instruction(self._default_instruction)
 
         embeddings_list: list[np.ndarray] = []
         for item in items:
@@ -323,13 +347,17 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
         with torch.inference_mode():
-            outputs = self._model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            # Pool the POST-final-RMSNorm tensor, matching the official
+            # Qwen3VLForEmbedding recipe (method_output_name='last_hidden_state').
+            # Calling the CausalLM wrapper with output_hidden_states=True returns
+            # per-decoder-layer hidden states that are PRE-norm (the post-norm tie
+            # only fires on the base model's `last_hidden_state`, which the CausalLM
+            # output object does not expose). `self._model.model` is the base
+            # Qwen3VLModel whose forward applies the final RMSNorm and returns the
+            # post-norm `last_hidden_state`.
+            outputs = self._model.model(**inputs, return_dict=True)
 
-        last_hidden = outputs.hidden_states[-1]  # (1, seq_len, hidden_dim)
+        last_hidden = outputs.last_hidden_state  # (1, seq_len, hidden_dim), post-RMSNorm
         mask = inputs.get("attention_mask")
 
         if self._pooling == "mean":

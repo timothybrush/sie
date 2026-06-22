@@ -91,19 +91,6 @@ class TestFlorence2Adapter:
         assert abs(bbox[2] - 0.5) < 1e-6
         assert abs(bbox[3] - 0.5) < 1e-6
 
-    def test_normalize_bbox(self, adapter: Florence2Adapter) -> None:
-        """Bbox is correctly normalized."""
-        bbox = [50.0, 25.0, 150.0, 75.0]
-        image_size = (200, 100)
-
-        norm_bbox = adapter._normalize_bbox(bbox, image_size)
-
-        assert len(norm_bbox) == 4
-        assert abs(norm_bbox[0] - 0.25) < 1e-6
-        assert abs(norm_bbox[1] - 0.25) < 1e-6
-        assert abs(norm_bbox[2] - 0.75) < 1e-6
-        assert abs(norm_bbox[3] - 0.75) < 1e-6
-
     def test_build_prompt_basic_task(self, adapter: Florence2Adapter) -> None:
         """Build prompt returns task token for basic tasks."""
         prompt = adapter._build_prompt("<OCR>", labels=None, instruction=None)
@@ -167,7 +154,9 @@ class TestFlorence2Adapter:
         assert len(objects) == 1
         assert objects[0]["label"] == "car"
         assert objects[0]["score"] == 1.0
-        assert objects[0]["bbox"] is not None
+        # Pixel-space COCO [x, y, w, h] (NOT normalized) so the detection harness
+        # scores boxes directly: [x1, y1, x2, y2] -> [x1, y1, x2 - x1, y2 - y1].
+        assert objects[0]["bbox"] == [10, 20, 70, 70]
 
     def test_extract_threads_docvqa_task_into_postprocessing(
         self,

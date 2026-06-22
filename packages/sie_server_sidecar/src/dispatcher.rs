@@ -47,6 +47,53 @@ use crate::subject::extract_model_id;
 use crate::tokenize::TokenizerRegistry;
 use crate::work_types::WorkItem;
 
+#[derive(Debug, Clone)]
+struct DeliveryContext {
+    subject: String,
+    stream: String,
+    consumer: String,
+    stream_sequence: u64,
+    consumer_sequence: u64,
+    delivered: i64,
+    pending: u64,
+    has_metadata: bool,
+}
+
+impl DeliveryContext {
+    fn from_message(msg: &Message) -> Self {
+        match msg.info() {
+            Ok(info) => Self {
+                subject: msg.subject.to_string(),
+                stream: info.stream.to_string(),
+                consumer: info.consumer.to_string(),
+                stream_sequence: info.stream_sequence,
+                consumer_sequence: info.consumer_sequence,
+                delivered: info.delivered,
+                pending: info.pending,
+                has_metadata: true,
+            },
+            Err(_) => Self {
+                subject: msg.subject.to_string(),
+                stream: String::new(),
+                consumer: String::new(),
+                stream_sequence: 0,
+                consumer_sequence: 0,
+                delivered: 0,
+                pending: 0,
+                has_metadata: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GenerateDeliveryLogContext {
+    work_item_id: String,
+    request_id: String,
+    model_id: String,
+    delivery: DeliveryContext,
+}
+
 /// Base NAK delay in milliseconds. Mirrors Python's `_NAK_DELAY_S`
 /// (default 5 000 ms, overridable via `SIE_NAK_DELAY_S`). Used for:
 ///
@@ -514,6 +561,7 @@ impl Dispatcher {
 
     async fn handle_generate_item(self: Arc<Self>, mut wi: WorkItem, msg: Message) {
         let model_id = wi.model_id.clone();
+        let delivery = DeliveryContext::from_message(&msg);
         let model_lbl = self.metrics.model_label(&model_id).into_owned();
         let _timer = self
             .metrics
@@ -521,12 +569,35 @@ impl Dispatcher {
             .with_label_values(&[&model_lbl, "generate"])
             .start_timer();
         let base_delay_ms = base_nak_delay_ms();
+        info!(
+            work_item_id = %wi.work_item_id,
+            request_id = %wi.request_id,
+            model = %model_id,
+            subject = %delivery.subject,
+            stream = %delivery.stream,
+            consumer = %delivery.consumer,
+            stream_seq = delivery.stream_sequence,
+            consumer_seq = delivery.consumer_sequence,
+            delivery_count = delivery.delivered,
+            pending = delivery.pending,
+            has_metadata = delivery.has_metadata,
+            "generate delivery received"
+        );
 
         let readiness_resp = match self.backend.ensure_model_ready(&model_id).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(
+                    work_item_id = %wi.work_item_id,
+                    request_id = %wi.request_id,
                     model = %model_id,
+                    subject = %delivery.subject,
+                    stream = %delivery.stream,
+                    consumer = %delivery.consumer,
+                    stream_seq = delivery.stream_sequence,
+                    consumer_seq = delivery.consumer_sequence,
+                    delivery_count = delivery.delivered,
+                    pending = delivery.pending,
                     error = %ErrChain(&e),
                     "EnsureModelReady failed for generate — NAKing"
                 );
@@ -534,14 +605,45 @@ impl Dispatcher {
                 return;
             }
         };
-        match readiness_resp.state {
+        match &readiness_resp.state {
             ReadinessState::Ready => {}
             ReadinessState::LoadingStarted | ReadinessState::RetryLater => {
+                info!(
+                    work_item_id = %wi.work_item_id,
+                    request_id = %wi.request_id,
+                    model = %model_id,
+                    readiness = ?readiness_resp.state,
+                    delay_ms = base_delay_ms,
+                    subject = %delivery.subject,
+                    stream = %delivery.stream,
+                    consumer = %delivery.consumer,
+                    stream_seq = delivery.stream_sequence,
+                    consumer_seq = delivery.consumer_sequence,
+                    delivery_count = delivery.delivered,
+                    pending = delivery.pending,
+                    "generate model not ready — NAKing"
+                );
                 nak_one(&msg, base_delay_ms, &self.metrics).await;
                 return;
             }
             ReadinessState::LoadingInProgress => {
-                nak_one(&msg, base_delay_ms.saturating_mul(2), &self.metrics).await;
+                let delay_ms = base_delay_ms.saturating_mul(2);
+                info!(
+                    work_item_id = %wi.work_item_id,
+                    request_id = %wi.request_id,
+                    model = %model_id,
+                    readiness = ?readiness_resp.state,
+                    delay_ms,
+                    subject = %delivery.subject,
+                    stream = %delivery.stream,
+                    consumer = %delivery.consumer,
+                    stream_seq = delivery.stream_sequence,
+                    consumer_seq = delivery.consumer_sequence,
+                    delivery_count = delivery.delivered,
+                    pending = delivery.pending,
+                    "generate model still loading — NAKing"
+                );
+                nak_one(&msg, delay_ms, &self.metrics).await;
                 return;
             }
         }
@@ -562,6 +664,15 @@ impl Dispatcher {
                     Err(e) => {
                         warn!(
                             work_item_id = %wi.work_item_id,
+                            request_id = %wi.request_id,
+                            model = %model_id,
+                            subject = %delivery.subject,
+                            stream = %delivery.stream,
+                            consumer = %delivery.consumer,
+                            stream_seq = delivery.stream_sequence,
+                            consumer_seq = delivery.consumer_sequence,
+                            delivery_count = delivery.delivered,
+                            pending = delivery.pending,
                             error = %e,
                             "failed to decode offloaded generate payload — publishing error + ACK"
                         );
@@ -576,7 +687,15 @@ impl Dispatcher {
                             Ok(_) => match ack(&msg).await {
                                 Ok(()) => self.metrics.messages_acked_total.inc(),
                                 Err(e) => {
-                                    warn!(error = %e, "ack after offload-decode error failed");
+                                    warn!(
+                                        work_item_id = %wi.work_item_id,
+                                        request_id = %wi.request_id,
+                                        model = %model_id,
+                                        stream_seq = delivery.stream_sequence,
+                                        delivery_count = delivery.delivered,
+                                        error = %e,
+                                        "ack after offload-decode error failed"
+                                    );
                                     self.metrics.jetstream_ack_failures_total.inc();
                                 }
                             },
@@ -588,6 +707,15 @@ impl Dispatcher {
                 Err(e) => {
                     warn!(
                         work_item_id = %wi.work_item_id,
+                        request_id = %wi.request_id,
+                        model = %model_id,
+                        subject = %delivery.subject,
+                        stream = %delivery.stream,
+                        consumer = %delivery.consumer,
+                        stream_seq = delivery.stream_sequence,
+                        consumer_seq = delivery.consumer_sequence,
+                        delivery_count = delivery.delivered,
+                        pending = delivery.pending,
                         error = %e,
                         "failed to resolve offloaded generate payload — NAKing"
                     );
@@ -603,6 +731,14 @@ impl Dispatcher {
                 warn!(
                     work_item_id = %wi.work_item_id,
                     request_id = %wi.request_id,
+                    model = %model_id,
+                    subject = %delivery.subject,
+                    stream = %delivery.stream,
+                    consumer = %delivery.consumer,
+                    stream_seq = delivery.stream_sequence,
+                    consumer_seq = delivery.consumer_sequence,
+                    delivery_count = delivery.delivered,
+                    pending = delivery.pending,
                     error = %e,
                     "failed to re-encode generate WorkItem — publishing error + ACK"
                 );
@@ -613,7 +749,15 @@ impl Dispatcher {
                     Ok(_) => match ack(&msg).await {
                         Ok(()) => self.metrics.messages_acked_total.inc(),
                         Err(e) => {
-                            warn!(error = %e, "ack after generate encode error failed");
+                            warn!(
+                                work_item_id = %wi.work_item_id,
+                                request_id = %wi.request_id,
+                                model = %model_id,
+                                stream_seq = delivery.stream_sequence,
+                                delivery_count = delivery.delivered,
+                                error = %e,
+                                "ack after generate encode error failed"
+                            );
                             self.metrics.jetstream_ack_failures_total.inc();
                         }
                     },
@@ -625,10 +769,17 @@ impl Dispatcher {
 
         let settled = Arc::new(AtomicBool::new(false));
         let msg = Arc::new(msg);
+        let delivery_log = Arc::new(GenerateDeliveryLogContext {
+            work_item_id: wi.work_item_id.clone(),
+            request_id: wi.request_id.clone(),
+            model_id: model_id.clone(),
+            delivery,
+        });
         let publisher = Arc::clone(&self.publisher);
         let metrics = Arc::clone(&self.metrics);
         let settled_for_events = Arc::clone(&settled);
         let msg_for_events = Arc::clone(&msg);
+        let delivery_log_for_events = Arc::clone(&delivery_log);
         let result = self
             .ipc
             .process_generate(
@@ -641,8 +792,9 @@ impl Dispatcher {
                     let metrics = Arc::clone(&metrics);
                     let settled = Arc::clone(&settled_for_events);
                     let msg = Arc::clone(&msg_for_events);
+                    let delivery_log = Arc::clone(&delivery_log_for_events);
                     async move {
-                        handle_generate_event(event, publisher, metrics, settled, msg)
+                        handle_generate_event(event, publisher, metrics, settled, msg, delivery_log)
                             .await
                             .map_err(|e| IpcError::Server(e.to_string()))
                     }
@@ -656,6 +808,14 @@ impl Dispatcher {
                     warn!(
                         work_item_id = %wi.work_item_id,
                         request_id = %wi.request_id,
+                        model = %model_id,
+                        subject = %delivery_log.delivery.subject,
+                        stream = %delivery_log.delivery.stream,
+                        consumer = %delivery_log.delivery.consumer,
+                        stream_seq = delivery_log.delivery.stream_sequence,
+                        consumer_seq = delivery_log.delivery.consumer_sequence,
+                        delivery_count = delivery_log.delivery.delivered,
+                        pending = delivery_log.delivery.pending,
                         "ProcessGenerate ended without ACK/NAK event — NAKing"
                     );
                     nak_one(&msg, base_delay_ms, &self.metrics).await;
@@ -666,6 +826,13 @@ impl Dispatcher {
                     work_item_id = %wi.work_item_id,
                     request_id = %wi.request_id,
                     model = %model_id,
+                    subject = %delivery_log.delivery.subject,
+                    stream = %delivery_log.delivery.stream,
+                    consumer = %delivery_log.delivery.consumer,
+                    stream_seq = delivery_log.delivery.stream_sequence,
+                    consumer_seq = delivery_log.delivery.consumer_sequence,
+                    delivery_count = delivery_log.delivery.delivered,
+                    pending = delivery_log.delivery.pending,
                     error = %e,
                     "ProcessGenerate failed — NAKing if unsettled"
                 );
@@ -2070,6 +2237,7 @@ async fn handle_generate_event(
     metrics: Arc<MetricsRegistry>,
     settled: Arc<AtomicBool>,
     msg: Arc<Message>,
+    delivery_log: Arc<GenerateDeliveryLogContext>,
 ) -> Result<(), DispatchError> {
     match event.kind.as_str() {
         "publish" => {
@@ -2080,9 +2248,37 @@ async fn handle_generate_event(
         "ack" => {
             if !settled.swap(true, Ordering::SeqCst) {
                 match ack(&msg).await {
-                    Ok(()) => metrics.messages_acked_total.inc(),
+                    Ok(()) => {
+                        info!(
+                            work_item_id = %delivery_log.work_item_id,
+                            request_id = %delivery_log.request_id,
+                            model = %delivery_log.model_id,
+                            subject = %delivery_log.delivery.subject,
+                            stream = %delivery_log.delivery.stream,
+                            consumer = %delivery_log.delivery.consumer,
+                            stream_seq = delivery_log.delivery.stream_sequence,
+                            consumer_seq = delivery_log.delivery.consumer_sequence,
+                            delivery_count = delivery_log.delivery.delivered,
+                            pending = delivery_log.delivery.pending,
+                            "generate delivery ACKed"
+                        );
+                        metrics.messages_acked_total.inc();
+                    }
                     Err(e) => {
-                        warn!(error = %e, "generate ACK failed");
+                        warn!(
+                            work_item_id = %delivery_log.work_item_id,
+                            request_id = %delivery_log.request_id,
+                            model = %delivery_log.model_id,
+                            subject = %delivery_log.delivery.subject,
+                            stream = %delivery_log.delivery.stream,
+                            consumer = %delivery_log.delivery.consumer,
+                            stream_seq = delivery_log.delivery.stream_sequence,
+                            consumer_seq = delivery_log.delivery.consumer_sequence,
+                            delivery_count = delivery_log.delivery.delivered,
+                            pending = delivery_log.delivery.pending,
+                            error = %e,
+                            "generate ACK failed"
+                        );
                         metrics.jetstream_ack_failures_total.inc();
                     }
                 }
@@ -2091,15 +2287,56 @@ async fn handle_generate_event(
         "nak" => {
             if !settled.swap(true, Ordering::SeqCst) {
                 let delay_ms = event.delay_ms.unwrap_or_else(base_nak_delay_ms);
+                warn!(
+                    work_item_id = %delivery_log.work_item_id,
+                    request_id = %delivery_log.request_id,
+                    model = %delivery_log.model_id,
+                    delay_ms,
+                    subject = %delivery_log.delivery.subject,
+                    stream = %delivery_log.delivery.stream,
+                    consumer = %delivery_log.delivery.consumer,
+                    stream_seq = delivery_log.delivery.stream_sequence,
+                    consumer_seq = delivery_log.delivery.consumer_sequence,
+                    delivery_count = delivery_log.delivery.delivered,
+                    pending = delivery_log.delivery.pending,
+                    "generate delivery NAKed by Python"
+                );
                 nak_one(&msg, delay_ms, &metrics).await;
             }
         }
         "in_progress" => {
             if !settled.load(Ordering::SeqCst) {
                 match msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        debug!(
+                            work_item_id = %delivery_log.work_item_id,
+                            request_id = %delivery_log.request_id,
+                            model = %delivery_log.model_id,
+                            subject = %delivery_log.delivery.subject,
+                            stream = %delivery_log.delivery.stream,
+                            consumer = %delivery_log.delivery.consumer,
+                            stream_seq = delivery_log.delivery.stream_sequence,
+                            consumer_seq = delivery_log.delivery.consumer_sequence,
+                            delivery_count = delivery_log.delivery.delivered,
+                            pending = delivery_log.delivery.pending,
+                            "generate delivery progress ACKed"
+                        );
+                    }
                     Err(e) => {
-                        debug!(error = %e, "generate in-progress ACK failed");
+                        debug!(
+                            work_item_id = %delivery_log.work_item_id,
+                            request_id = %delivery_log.request_id,
+                            model = %delivery_log.model_id,
+                            subject = %delivery_log.delivery.subject,
+                            stream = %delivery_log.delivery.stream,
+                            consumer = %delivery_log.delivery.consumer,
+                            stream_seq = delivery_log.delivery.stream_sequence,
+                            consumer_seq = delivery_log.delivery.consumer_sequence,
+                            delivery_count = delivery_log.delivery.delivered,
+                            pending = delivery_log.delivery.pending,
+                            error = %e,
+                            "generate in-progress ACK failed"
+                        );
                         metrics.jetstream_ack_failures_total.inc();
                     }
                 }

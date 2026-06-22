@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
+use utoipa::ToSchema;
 
 use rmp::decode::read_str_from_slice;
 use rmp::Marker;
@@ -526,6 +528,78 @@ pub struct WorkResult {
 struct CachedStreamInfo {
     num_pending: u64,
     num_consumers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct PendingGenerationGroup {
+    pub model: String,
+    pub display_model: String,
+    pub pool: String,
+    pub count: u64,
+    pub waiting_first_chunk: u64,
+    pub active_streams: u64,
+    pub republished: u64,
+    pub oldest_request_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct PendingGenerationSnapshot {
+    pub total: u64,
+    pub groups: Vec<PendingGenerationGroup>,
+}
+
+impl PendingGenerationSnapshot {
+    pub fn for_model(&self, model_id: &str) -> Self {
+        let groups: Vec<PendingGenerationGroup> = self
+            .groups
+            .iter()
+            .filter(|group| group.display_model == model_id || group.model == model_id)
+            .cloned()
+            .collect();
+        Self {
+            total: groups.iter().map(|group| group.count).sum(),
+            groups,
+        }
+    }
+}
+
+fn accumulate_pending_generation_group(
+    grouped: &mut BTreeMap<(String, String, String), PendingGenerationGroup>,
+    collector: &StreamCollector,
+    now: Instant,
+) {
+    let key = (
+        collector.model.clone(),
+        collector.display_model.clone(),
+        collector.pool.clone(),
+    );
+    let age_ms = now
+        .saturating_duration_since(collector.published_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+
+    let group = grouped
+        .entry(key.clone())
+        .or_insert_with(|| PendingGenerationGroup {
+            model: key.0,
+            display_model: key.1,
+            pool: key.2,
+            count: 0,
+            waiting_first_chunk: 0,
+            active_streams: 0,
+            republished: 0,
+            oldest_request_age_ms: 0,
+        });
+    group.count += 1;
+    if collector.first_chunk_at.is_some() {
+        group.active_streams += 1;
+    } else {
+        group.waiting_first_chunk += 1;
+    }
+    if collector.republished {
+        group.republished += 1;
+    }
+    group.oldest_request_age_ms = group.oldest_request_age_ms.max(age_ms);
 }
 
 pub struct WorkPublisher {
@@ -1193,6 +1267,26 @@ impl WorkPublisher {
                 "reconciled JetStream stream subjects to canonical queue lane routing"
             );
         }
+        let observed_max_age = stream.cached_info().config.max_age;
+        if observed_max_age != self.stream_max_age {
+            let mut updated = stream.cached_info().config.clone();
+            updated.max_age = self.stream_max_age;
+            self.jetstream
+                .update_stream(updated)
+                .await
+                .map_err(|e| format!("update stream {} max_age: {}", name, e))?;
+            stream = self
+                .jetstream
+                .get_stream(name.clone())
+                .await
+                .map_err(|e| format!("refresh stream {} after max_age update: {}", name, e))?;
+            info!(
+                stream = %name,
+                observed_max_age_s = observed_max_age.as_secs(),
+                desired_max_age_s = self.stream_max_age.as_secs(),
+                "reconciled JetStream stream max_age"
+            );
+        }
 
         // Prime the backpressure cache so the very first request to
         // this pool sees real consumer/pending numbers instead of
@@ -1799,6 +1893,26 @@ impl WorkPublisher {
     /// subscriber stops accumulating chunks that nobody will read.
     pub fn drop_pending_stream(&self, request_id: &str) {
         self.pending_streams.remove(request_id);
+    }
+
+    pub fn pending_generation_snapshot(&self) -> PendingGenerationSnapshot {
+        let now = Instant::now();
+        let mut grouped: BTreeMap<(String, String, String), PendingGenerationGroup> =
+            BTreeMap::new();
+
+        for entry in self.pending_streams.iter() {
+            accumulate_pending_generation_group(&mut grouped, entry.value(), now);
+        }
+
+        let groups: Vec<PendingGenerationGroup> = grouped.into_values().collect();
+        PendingGenerationSnapshot {
+            total: groups.iter().map(|group| group.count).sum(),
+            groups,
+        }
+    }
+
+    pub fn pending_generation_for_model(&self, model_id: &str) -> PendingGenerationSnapshot {
+        self.pending_generation_snapshot().for_model(model_id)
     }
 
     /// Terminate an in-flight streaming request with a synthetic
@@ -2850,6 +2964,51 @@ mod tests {
             canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
             None
         );
+    }
+
+    #[test]
+    fn test_pending_generation_snapshot_groups_collectors() {
+        let now = Instant::now();
+        let mut grouped: BTreeMap<(String, String, String), PendingGenerationGroup> =
+            BTreeMap::new();
+
+        let (tx1, _rx1) = oneshot::channel();
+        let mut waiting = StreamCollector::new(tx1, "model-a:no-spec".into(), "default".into());
+        waiting.display_model = "model-a".into();
+        waiting.published_at = now.checked_sub(Duration::from_millis(250)).unwrap_or(now);
+        accumulate_pending_generation_group(&mut grouped, &waiting, now);
+
+        let (tx2, _rx2) = oneshot::channel();
+        let mut active = StreamCollector::new(tx2, "model-a:no-spec".into(), "default".into());
+        active.display_model = "model-a".into();
+        active.first_chunk_at = Some(now);
+        active.republished = true;
+        active.published_at = now.checked_sub(Duration::from_millis(100)).unwrap_or(now);
+        accumulate_pending_generation_group(&mut grouped, &active, now);
+
+        let (tx3, _rx3) = oneshot::channel();
+        let other = StreamCollector::new(tx3, "model-b".into(), "l4".into());
+        accumulate_pending_generation_group(&mut grouped, &other, now);
+
+        let groups: Vec<PendingGenerationGroup> = grouped.into_values().collect();
+        let snapshot = PendingGenerationSnapshot {
+            total: groups.iter().map(|group| group.count).sum(),
+            groups,
+        };
+
+        assert_eq!(snapshot.total, 3);
+        let model_a = snapshot.for_model("model-a");
+        assert_eq!(model_a.total, 2);
+        assert_eq!(model_a.groups.len(), 1);
+        assert_eq!(model_a.groups[0].count, 2);
+        assert_eq!(model_a.groups[0].waiting_first_chunk, 1);
+        assert_eq!(model_a.groups[0].active_streams, 1);
+        assert_eq!(model_a.groups[0].republished, 1);
+        assert!(model_a.groups[0].oldest_request_age_ms >= 250);
+
+        let model_b = snapshot.for_model("model-b");
+        assert_eq!(model_b.total, 1);
+        assert_eq!(model_b.groups[0].pool, "l4");
     }
 
     #[test]

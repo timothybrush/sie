@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_nats::jetstream;
 use futures_util::StreamExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const DLQ_STREAM_NAME: &str = "DEAD_LETTERS";
 const DLQ_SUBJECT: &str = "sie.dlq.>";
@@ -37,7 +37,11 @@ impl DlqListener {
             "dead letter queue stream ready"
         );
 
-        // Subscribe to max-delivery advisory events
+        // Subscribe every gateway replica to max-delivery advisories. The
+        // publish into DEAD_LETTERS is stamped with a deterministic message id
+        // below, so JetStream dedupes the fan-out while preserving HA: if one
+        // replica sees the advisory but fails before publishing, another
+        // replica can still persist it.
         let subscriber = client
             .subscribe(ADVISORY_SUBJECT.to_string())
             .await
@@ -124,6 +128,7 @@ impl DlqListener {
 
             // Forward the advisory payload to the DLQ stream
             let dlq_subject = format!("sie.dlq.{}", model_normalized);
+            let message_id = dlq_message_id(&advisory, stream_name, consumer_name, stream_seq);
 
             // `jetstream.publish(...).await` returns a
             // `PublishAckFuture` once the client has queued the
@@ -135,13 +140,29 @@ impl DlqListener {
             // per-message round-trip, which is acceptable here — DLQ
             // is a rare, degraded-state path, not the hot inference
             // loop.
-            let publish_result: Result<(), String> =
-                match jetstream.publish(dlq_subject.clone(), payload.into()).await {
-                    Ok(ack_future) => ack_future.await.map(|_| ()).map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
+            let publish_result: Result<jetstream::publish::PublishAck, String> = match jetstream
+                .send_publish(
+                    dlq_subject.clone(),
+                    jetstream::message::PublishMessage::build()
+                        .message_id(&message_id)
+                        .payload(payload.into()),
+                )
+                .await
+            {
+                Ok(ack_future) => ack_future.await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
             match publish_result {
-                Ok(()) => {
+                Ok(ack) if ack.duplicate => {
+                    debug!(
+                        subject = %dlq_subject,
+                        stream = %stream_name,
+                        seq = stream_seq,
+                        message_id = %message_id,
+                        "duplicate DLQ advisory publish deduped by JetStream"
+                    );
+                }
+                Ok(_) => {
                     crate::metrics::DLQ_EVENTS
                         .with_label_values(&[stream_name, consumer_name])
                         .inc();
@@ -169,9 +190,29 @@ impl DlqListener {
     }
 }
 
+fn dlq_message_id(
+    advisory: &serde_json::Value,
+    stream_name: &str,
+    consumer_name: &str,
+    stream_seq: u64,
+) -> String {
+    advisory
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("dlq-advisory:{}", id))
+        .unwrap_or_else(|| {
+            format!(
+                "dlq-advisory:{}:{}:{}",
+                stream_name, consumer_name, stream_seq
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_dlq_constants() {
@@ -191,5 +232,32 @@ mod tests {
         let model_normalized = "BAAI_bge-m3";
         let subject = format!("sie.dlq.{}", model_normalized);
         assert_eq!(subject, "sie.dlq.BAAI_bge-m3");
+    }
+
+    #[test]
+    fn test_dlq_message_id_prefers_advisory_id() {
+        let advisory = json!({"id": "abc-123"});
+        assert_eq!(
+            dlq_message_id(&advisory, "WORK_POOL_default", "consumer", 42),
+            "dlq-advisory:abc-123"
+        );
+    }
+
+    #[test]
+    fn test_dlq_message_id_falls_back_to_stream_consumer_sequence() {
+        let advisory = json!({});
+        assert_eq!(
+            dlq_message_id(&advisory, "WORK_POOL_default", "consumer", 42),
+            "dlq-advisory:WORK_POOL_default:consumer:42"
+        );
+    }
+
+    #[test]
+    fn test_dlq_message_id_empty_string_falls_back_to_stream_consumer_sequence() {
+        let advisory = json!({"id": ""});
+        assert_eq!(
+            dlq_message_id(&advisory, "WORK_POOL_default", "consumer", 42),
+            "dlq-advisory:WORK_POOL_default:consumer:42"
+        );
     }
 }

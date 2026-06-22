@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.9"
+version = "0.6.10"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -16,7 +16,7 @@ dependencies = [
     # ML / Inference
     # torch 2.9.x required - flash-attn prebuilt wheels are version-specific
     "torch>=2.9,<2.10",
-    "transformers>=4.57,<5",
+    "transformers>=4.57,<6",
     "tokenizers>=0.20,<1",
     "sentence-transformers>=5.0,<6",
     "safetensors>=0.4,<1",

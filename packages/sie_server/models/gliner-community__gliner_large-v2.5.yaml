@@ -16,4 +16,6 @@ profiles:
     adapter_path: sie_server.adapters.gliner:GLiNERAdapter
     adapter_options:
       loadtime: {}
-      runtime: {}
+      runtime:
+        # Empirically tuned for SIE CoNLL2003 F1 target 0.6518; GLiNER library default is 0.5.
+        threshold: 0.75

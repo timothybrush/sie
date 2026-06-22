@@ -198,6 +198,7 @@ class IpcServer:
         self._drain_deadline_s: float | None = None
         self._streaming_processor: Any | None = None
         self._streaming_processor_lock = asyncio.Lock()
+        self._generation_prewarm_lock = asyncio.Lock()
         self._generation_prewarmed = False
 
     # -- Public surface ----------------------------------------------------
@@ -582,7 +583,7 @@ class IpcServer:
     ) -> SignalGenerateCancelResponse:
         if not req.request_id:
             return SignalGenerateCancelResponse(matched=False)
-        processor = await self._get_streaming_processor()
+        processor = await self._get_streaming_processor(prewarm=False)
         return SignalGenerateCancelResponse(matched=bool(processor.signal_cancel(req.request_id)))
 
     async def _handle_process_generate(
@@ -592,34 +593,41 @@ class IpcServer:
         request_id: str,
         writer: asyncio.StreamWriter,
     ) -> None:
-        processor = await self._get_streaming_processor()
         sink = _IpcGenerateSink(self, writer, request_id)
         msg = _IpcGenerateMessage(sink, req.work_item_msgpack)
         token = _GENERATE_SINK.set(sink)
         try:
+            # Keep the JetStream lease alive while the first generation
+            # request lazily constructs the streaming processor and prewarms
+            # grammars. The processor's own heartbeat starts later, once
+            # request processing reaches the decode path.
+            await msg.in_progress()
+            processor = await self._get_streaming_processor()
             await processor.process(msg, req.model_id)
             await sink.send(GenerateEvent(kind="done"))
         finally:
             _GENERATE_SINK.reset(token)
 
-    async def _get_streaming_processor(self) -> Any:
+    async def _get_streaming_processor(self, *, prewarm: bool = True) -> Any:
         if self._streaming_processor is not None:
-            return self._streaming_processor
-        async with self._streaming_processor_lock:
-            if self._streaming_processor is not None:
-                return self._streaming_processor
-
-            from sie_server.processors.streaming import StreamingProcessor  # noqa: PLC0415
-
-            processor = StreamingProcessor(
-                nc=_IpcGenerateNatsShim(),  # type: ignore[arg-type]
-                registry=self._executor.registry,
-                worker_id=self._worker_id,
-                admission_resolver=self._resolve_generation_admission,
-            )
-            self._streaming_processor = processor
-            await self._prewarm_generation_grammars(processor)
+            processor = self._streaming_processor
+            if prewarm:
+                await self._prewarm_generation_grammars(processor)
             return processor
+        async with self._streaming_processor_lock:
+            if self._streaming_processor is None:
+                from sie_server.processors.streaming import StreamingProcessor  # noqa: PLC0415
+
+                self._streaming_processor = StreamingProcessor(
+                    nc=_IpcGenerateNatsShim(),  # type: ignore[arg-type]
+                    registry=self._executor.registry,
+                    worker_id=self._worker_id,
+                    admission_resolver=self._resolve_generation_admission,
+                )
+            processor = self._streaming_processor
+        if prewarm:
+            await self._prewarm_generation_grammars(processor)
+        return processor
 
     def _resolve_generation_admission(self, model_id: str) -> tuple[int | None, bool | None]:
         try:
@@ -643,21 +651,22 @@ class IpcServer:
         return budget, resolve_admission_enabled(profile_admission=profile_admission)
 
     async def _prewarm_generation_grammars(self, processor: Any) -> None:
-        if self._generation_prewarmed:
-            return
-        self._generation_prewarmed = True
-        try:
-            configs = self._executor.registry.get_configs_snapshot()
-        except Exception:  # noqa: BLE001
-            logger.debug("Could not snapshot configs for generation grammar prewarm", exc_info=True)
-            return
-        for model_id, config in configs.items():
+        async with self._generation_prewarm_lock:
+            if self._generation_prewarmed:
+                return
+            self._generation_prewarmed = True
             try:
-                if config.tasks.generate is None:
-                    continue
-                await processor.prewarm_grammars_for_model(model_id)
+                configs = self._executor.registry.get_configs_snapshot()
             except Exception:  # noqa: BLE001
-                logger.warning("Generation grammar prewarm failed for %s", model_id, exc_info=True)
+                logger.debug("Could not snapshot configs for generation grammar prewarm", exc_info=True)
+                return
+            for model_id, config in configs.items():
+                try:
+                    if config.tasks.generate is None:
+                        continue
+                    await processor.prewarm_grammars_for_model(model_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning("Generation grammar prewarm failed for %s", model_id, exc_info=True)
 
     # -- Error helper ------------------------------------------------------
 

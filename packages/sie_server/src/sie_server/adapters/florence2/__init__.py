@@ -510,18 +510,20 @@ class Florence2Adapter(BaseAdapter):
                 )
 
         elif task in (TASK_OD, TASK_DENSE_REGION_CAPTION, TASK_REGION_PROPOSAL):
-            # Object detection returns bboxes and labels
+            # Object detection returns pixel-space [x1, y1, x2, y2] boxes (the
+            # processor rescales the model's quantized coords back to image_size).
+            # Emit COCO [x, y, w, h] in pixels so the detection harness scores them
+            # directly — mirrors the owlv2 adapter's _results_to_objects.
             bboxes = task_output.get("bboxes", [])
             labels = task_output.get("labels", [])
 
             for bbox, label in zip(bboxes, labels, strict=False):
-                # Normalize bbox
-                norm_bbox = self._normalize_bbox(bbox, image_size)
+                x1, y1, x2, y2 = bbox
                 objects.append(
                     DetectedObject(
                         label=label or "object",
                         score=1.0,
-                        bbox=[int(b) for b in norm_bbox],  # Convert to int list
+                        bbox=[int(x1), int(y1), int(x2 - x1), int(y2 - y1)],
                     )
                 )
 
@@ -590,26 +592,4 @@ class Florence2Adapter(BaseAdapter):
             y1 / height,
             x2 / width,
             y2 / height,
-        ]
-
-    def _normalize_bbox(
-        self,
-        bbox: list[float],
-        image_size: tuple[int, int],
-    ) -> list[float]:
-        """Normalize bbox to [0, 1] range.
-
-        Args:
-            bbox: [x1, y1, x2, y2] in pixel coordinates.
-            image_size: (width, height) of original image.
-
-        Returns:
-            Normalized bbox [x1, y1, x2, y2] in range [0, 1].
-        """
-        width, height = image_size
-        return [
-            bbox[0] / width,
-            bbox[1] / height,
-            bbox[2] / width,
-            bbox[3] / height,
         ]

@@ -1,0 +1,71 @@
+{{- /* The MCP edge gets its OWN host (/ -> edge), separate from the gateway
+       ingress (/ -> gateway), so the OAuth well-known/authorize/token paths and
+       /mcp don't collide with the gateway. Reuses the chart's nginx +
+       cert-manager machinery; the cert lands in a dedicated TLS secret. */}}
+{{- if and .Values.mcpEdge.enabled .Values.mcpEdge.ingress.enabled }}
+{{- $host := required "mcpEdge.ingress.host is required when mcpEdge.ingress.enabled" (trim (default "" .Values.mcpEdge.ingress.host)) }}
+{{- /* The edge and gateway ingresses both serve path / on their host. If they
+       share a host the two Ingress objects collide; fail fast with guidance. */ -}}
+{{- if .Values.ingress.enabled }}
+{{- $gatewayHosts := include "sie-cluster.ingress.hosts" . | fromJsonArray }}
+{{- if has (trim $host) $gatewayHosts }}
+{{- fail (printf "Invalid configuration: mcpEdge.ingress.host (%s) collides with a gateway ingress host; both Ingresses would serve path / on the same hostname. Give the MCP edge a distinct host (e.g. sie-mcp.example.com)." $host) }}
+{{- end }}
+{{- end }}
+{{- $tls := include "sie-cluster.ingressTlsConfig" . | fromYaml }}
+{{- $tlsSecret := printf "%s-tls" (include "sie-cluster.mcpEdge.serviceName" .) }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sie-cluster.mcpEdge.serviceName" . }}
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.mcpEdge.labels" . | nindent 4 }}
+  {{- $annotations := dict }}
+  {{- /* base64 documents can be large; MCP streamable-HTTP needs unbuffered,
+         long-lived responses. */ -}}
+  {{- $nginxDefaults := dict
+        "nginx.ingress.kubernetes.io/proxy-body-size" "100m"
+        "nginx.ingress.kubernetes.io/proxy-read-timeout" "600"
+        "nginx.ingress.kubernetes.io/proxy-send-timeout" "600"
+        "nginx.ingress.kubernetes.io/proxy-buffering" "off"
+  }}
+  {{- $annotations = merge $annotations $nginxDefaults }}
+  {{- if .Values.ingress.annotations }}
+  {{- $annotations = merge $annotations .Values.ingress.annotations }}
+  {{- end }}
+  {{- /* The edge does its own auth (connector secret + OAuth bridge); never put
+         oauth2-proxy in front of it — Claude can't traverse a second auth wall. */ -}}
+  {{- if and $tls.enabled (eq (default "byo" $tls.mode) "cert-manager") }}
+  {{- $certManager := default (dict) $tls.certManager }}
+  {{- $issuerAnnotation := ternary "cert-manager.io/cluster-issuer" "cert-manager.io/issuer" (eq $certManager.kind "ClusterIssuer") }}
+  {{- $issuerName := $certManager.name }}
+  {{- if not $issuerName }}{{ $issuerName = printf "%s-letsencrypt-prod" (include "sie-cluster.fullname" .) }}{{ end }}
+  {{- $annotations = merge $annotations (dict $issuerAnnotation $issuerName) }}
+  {{- end }}
+  {{- if $annotations }}
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ $tlsSecret }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sie-cluster.mcpEdge.serviceName" . }}
+                port:
+                  number: {{ .Values.mcpEdge.service.port }}
+{{- end }}

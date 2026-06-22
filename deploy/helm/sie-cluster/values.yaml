@@ -375,7 +375,12 @@ workers:
     # -- Model cache size limit (emptyDir - ephemeral, no zone-lock issues)
     cacheStorageSize: 300Gi
 
-    # -- Cluster cache (object storage) configuration
+    # -- Cluster cache (object storage) for model WEIGHTS only. Optional
+    # perf/offline feature (a cache miss falls back to HuggingFace), default
+    # off. Decoupled from the payload store (top-level `payloadStore`), which
+    # is required for >1MB work items and on by default. When clusterCache.url
+    # is set, the payload store can derive its URL from the same bucket, but
+    # the two toggle independently.
     clusterCache:
       enabled: false
       # -- Object-store URL with the /models prefix. Supported schemes:
@@ -1104,8 +1109,9 @@ queueRouting:
   # Must be high enough to cover cold model downloads (10-60s+).
   maxDeliver: 20
   # -- Maximum age (seconds) for messages in the pool-level stream.
-  # Messages older than this are discarded. Set higher for slow model loads.
-  streamMaxAgeSec: 120
+  # Keep above maxDeliver * 30s so failed work remains fetchable
+  # after the retry/DLQ envelope for operator inspection.
+  streamMaxAgeSec: 1800
   # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
   # queue namespaces. Keys are queue pool names; names are normalized to
   # lowercase before gateway storage/routing. Use this when
@@ -1142,41 +1148,41 @@ queueRouting:
     staleAfterSec: 30
 
 # -- Payload store for large work item payloads (images, long documents).
-# When a work item exceeds 1MB, the payload is offloaded to this store.
-# IMPORTANT: payloadStore.url must point to shared storage accessible by both
-# gateway and worker pods. Supported schemes:
-#   - s3://<bucket>/<prefix>                                          (AWS S3)
-#   - gs://<bucket>/<prefix>                                          (GCP GCS)
-#   - abfs://<container>@<account>.dfs.core.windows.net/<prefix>      (Azure ADLS Gen2)
-#   - abfss://...                                                     (same as abfs, TLS-only enforced by the SDK)
-# Local filesystem paths (e.g., /tmp/payloads) will NOT work in queue mode
-# because gateway and worker pods have different filesystems.
+# When a work item exceeds 1MB, the gateway offloads the payload here and
+# publishes only a reference to NATS; workers fetch it back. This is REQUIRED
+# for >1MB requests in queue mode: with no payload store the gateway cannot
+# offload, falls back to an inline publish, and NATS rejects it (1MB
+# max_payload), so the request fails. It is therefore ENABLED BY DEFAULT and
+# is decoupled from the optional model-weights cache
+# (workers.common.clusterCache).
 #
-# Auto-derivation: when workers.common.clusterCache.enabled=true and
-# workers.common.clusterCache.url is set, the chart enables the payload store
-# automatically and points it at the sibling /payloads prefix of the same
-# bucket/container. By convention the terraform modules expose the cache URL as
-# "<scheme>://<bucket-or-container>/models", and the chart strips a trailing
-# "/models" segment before appending "/payloads" so the two features live at
-# top-level sibling prefixes:
-#   <bucket>/models/...    model weights (managed by sie-admin)
-#   <bucket>/payloads/...  large work-item refs (managed by gateway)
-# All three terraform modules (AWS, GCP, Azure) scope their workload IAM
-# grants to these top-level prefixes, so the auto-derived URL aligns with the
-# permissions out of the box. Set payloadStore.url explicitly only to override
-# the default (e.g., a separate bucket); leaving it empty is the right call
-# for most clusters.
+# URL resolution (when enabled):
+#   1. payloadStore.url, if set. Object storage only; local filesystem paths
+#      do NOT work in queue mode (gateway and workers have different
+#      filesystems) and are rejected.
+#   2. else derived from workers.common.clusterCache.url by swapping a trailing
+#      "/models" prefix for "/payloads" (shared bucket, sibling prefixes:
+#        <bucket>/models/...    model weights (managed by sie-admin)
+#        <bucket>/payloads/...  large work-item refs (managed by gateway)).
+# Supported schemes: s3:// (AWS), gs:// (GCP), abfs:// + abfss:// (Azure ADLS
+# Gen2). All three terraform modules expose `payload_store_url` (the /payloads
+# URL) and scope the workload IAM grant to that prefix, so the wiring aligns
+# out of the box.
+#
+# If enabled and clusterRouting=queue but no URL resolves, the chart FAILS the
+# install with guidance (see deploy/helm/sie-cluster/README.md). Set
+# payloadStore.enabled=false to opt out and accept that >1MB requests will fail.
 payloadStore:
-  # -- Payload store URL. Supported schemes: s3://, gs://, abfs://, abfss://
-  # (s3://bucket/prefix, gs://bucket/prefix, or abfs(s)://container@account.dfs.core.windows.net/prefix).
-  # Local paths are rejected when clusterRouting=queue (see gateway-deployment.yaml validation).
-  # Leave empty to auto-derive from workers.common.clusterCache.url (recommended).
+  # -- Enable the payload store. Default true: required for >1MB work items.
+  enabled: true
+  # -- Payload store URL (object storage: s3://, gs://, abfs://, abfss://).
+  # Empty derives from workers.common.clusterCache.url (the shared bucket's
+  # /payloads sibling). Set explicitly to the terraform `payload_store_url`
+  # output (or a separate bucket). Local paths are rejected in queue mode.
   url: ""
-  # -- TTL for stored payloads in seconds.
-  # For S3: configure via S3 lifecycle rules on the bucket.
-  # For GCS: configure via GCS lifecycle rules on the bucket.
-  # For Azure Blob: configure via lifecycle management rules on the storage account.
-  # This value is passed as SIE_PAYLOAD_STORE_TTL env var to the gateway.
+  # -- TTL for stored payloads in seconds (passed to the gateway as
+  # SIE_PAYLOAD_STORE_TTL). This is the runtime eviction hint; enforce actual
+  # deletion via bucket lifecycle rules (S3 / GCS / Azure Blob).
   ttlSeconds: 300
 
 # =============================================================================
@@ -1559,3 +1565,67 @@ kubernetes-event-exporter:
     limits:
       cpu: "100m"
       memory: "128Mi"
+
+# =============================================================================
+# MCP edge (Req 12) — hosted MCP server exposing the cluster's document jobs to
+# Claude surfaces (Cowork / claude.ai / desktop app) over remote streamable-HTTP.
+# A sie_sdk client of the gateway; holds no models. Default OFF so existing
+# cluster deploys are unaffected.
+# =============================================================================
+mcpEdge:
+  enabled: false
+  image:
+    repository: ghcr.io/superlinked/sie-mcp
+    # Defaults to the chart appVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Single replica: the OAuth authorization-code store is in-process, so a code
+  # issued on one replica cannot be redeemed on another (see
+  # packages/sie_mcp/plugin/superlinked.md operator notes). Keep at 1 until a
+  # shared store lands with Req 10 (#1313).
+  replicas: 1
+  service:
+    # type is hardcoded to ClusterIP in the template (security: the edge is only
+    # reached via the TLS-terminating ingress), so it is intentionally not exposed here.
+    port: 8088
+  # Connector secrets (the per-user auth shim). Comma-separated `secret[:user_id]`.
+  # Rendered into a chart-managed Secret when set; or point existingSecretName at
+  # a Secret you manage (key: connector-secrets). NEVER commit a real secret here.
+  connectorSecrets: ""
+  existingSecretName: ""
+  # SIE_MCP_PUBLIC_URL — the externally reachable https origin (e.g.
+  # https://mcp.example.com). Pin it so OAuth metadata URLs are stable.
+  publicUrl: ""
+  # OAuth bridge for claude.ai / desktop connectors (#1312). Disable for
+  # connector-secret-only (e.g. Cowork header) deployments.
+  oauthEnabled: true
+  # SIE_BASE_URL override; empty => the in-cluster gateway Service.
+  clusterBaseUrl: ""
+  # Optional cluster API key (SIE_API_KEY) from an existing Secret.
+  clusterApiKey:
+    existingSecretName: ""
+    secretKey: api-key
+  ingress:
+    # The edge gets its OWN host (/ -> edge) to avoid colliding with the
+    # gateway ingress (/ -> gateway). Reuses the chart's nginx + cert-manager.
+    enabled: false
+    host: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  probes:
+    startup:
+      periodSeconds: 5
+      failureThreshold: 30
+    liveness:
+      periodSeconds: 10
+    readiness:
+      periodSeconds: 5
+  podAnnotations: {}
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []

@@ -82,8 +82,7 @@ class TestModelWorkerExtract:
 
             mock_adapter.extract.assert_called_once()
             call_kwargs = mock_adapter.extract.call_args.kwargs
-            # Labels are sorted when grouping for batching
-            assert sorted(call_kwargs["labels"]) == sorted(["person", "organization", "location"])
+            assert call_kwargs["labels"] == ["person", "organization", "location"]
 
         finally:
             await worker.stop()
@@ -133,8 +132,8 @@ class TestModelWorkerExtract:
             await worker.stop()
 
     @pytest.mark.asyncio
-    async def test_submit_extract_groups_by_labels(self, mock_adapter: MagicMock) -> None:
-        """Requests with different labels are grouped separately."""
+    async def test_submit_extract_groups_by_ordered_labels(self, mock_adapter: MagicMock) -> None:
+        """Requests with different ordered labels are grouped separately."""
         from sie_server.core.prepared import ExtractPreparedItem
 
         config = WorkerConfig(
@@ -146,7 +145,9 @@ class TestModelWorkerExtract:
         await worker.start()
 
         try:
-            # Submit requests with different labels
+            # Submit requests with the same labels in different orders. Some
+            # extractors condition on label order, so the worker must not
+            # normalize it while grouping.
             item1 = ExtractPreparedItem(cost=6, original_index=0)
             item2 = ExtractPreparedItem(cost=6, original_index=0)
 
@@ -158,18 +159,17 @@ class TestModelWorkerExtract:
             future2 = await worker.submit_extract(
                 [item2],
                 [Item(text="Text 2")],
-                labels=["location"],  # Different labels!
+                labels=["organization", "person"],
             )
 
             await asyncio.gather(future1, future2)
 
-            # Should have been 2 separate calls (different label sets)
+            # Should have been 2 separate calls because label order differs.
             assert mock_adapter.extract.call_count >= 2
 
-            # Verify different labels were passed
-            label_sets = [tuple(sorted(call.kwargs["labels"])) for call in mock_adapter.extract.call_args_list]
-            assert ("location",) in label_sets
-            assert ("organization", "person") in label_sets
+            label_orders = [tuple(call.kwargs["labels"]) for call in mock_adapter.extract.call_args_list]
+            assert ("person", "organization") in label_orders
+            assert ("organization", "person") in label_orders
 
         finally:
             await worker.stop()

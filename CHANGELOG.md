@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.10
+
+- chore(main): release 0.6.10
+- fix: sync generation visibility api contract
+- fix: improve generation failure observability
+- feat(florence2): fix <OD> bbox conversion, re-task base-ft/large to COCO detection (#1347)
+- feat(bench): floor measure-first dark models, retire donut-rvlcdip (#1347)
+- fix(qwen3_vl_embedding): coalesce whitespace-only instruction to default
+- test(qwen3_vl_embedding): pin empty/None instruction -> default contract
+- fix(bench): align gliner label inputs
+- fix(bench): align gliner v2.5 conll protocol
+- fix(deploy): address payload-store review feedback
+- feat(deploy): provision and enable the payload store by default
+- fix(sie-cluster): address PR review findings on the self-host edge
+- fix(sie-cluster): make AWS self-host turnkey (warm default + edge nits)
+- fix(helm): let the MCP edge ingress drive cert-manager without a global gateway host
+- fix(worker): preserve label order when batching extract requests
+- fix(cluster): propagate --aws-region to terraform + standardize release name on 'sie'
+- docs(sie_mcp): runbook must actively wait through cluster create/destroy
+- docs(sie_mcp): clean-room AWS self-host runbook for a fresh agent
+- refactor(sie_mcp): consolidate the offload skill into one surface-agnostic SKILL.md
+- feat(helm): add sglang worker bundle to the AWS l4 pool
+- docs(sie_mcp): local Cowork verification guide + example MCP client
+- feat(helm): optional MCP-edge component for the sie-cluster chart
+- feat(sie_mcp): containerize the MCP edge
+- fix(qwen3_vl_embedding): pool post-RMSNorm last_hidden_state + normalize instruction (#1385)
+- fix(sie-server): make transformers5 bundle reachable via pip (#826)
+
 ## v0.6.9
 
 - chore(main): release 0.6.9

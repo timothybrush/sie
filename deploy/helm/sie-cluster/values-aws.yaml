@@ -134,9 +134,21 @@ workers:
           operator: Exists
           effect: NoSchedule
       bundles:
+        # docs→markdown, describe_image, VL-OCR, encode/score/extract. Kept warm
+        # (minReplicas: 1) — it serves the headline docs→markdown path, so a
+        # dropped document converts immediately rather than waiting on a GPU
+        # node + worker cold-start. Set to 0 to trade the always-on L4 for
+        # scale-from-zero (cheaper, but the first request is slow).
         default:
-          minReplicas: 0
+          minReplicas: 1
           maxReplicas: 10
+        # Generation (Qwen3.5-4B via SGLang) — powers extract_structured /
+        # generate_structured and answer_questions' answer step. Separate bundle
+        # = its own worker (sie-worker-l4-sglang); scale-to-zero so it costs
+        # nothing until a generation request arrives.
+        sglang:
+          minReplicas: 0
+          maxReplicas: 4
 
 # ServiceAccount — Helm manages creation; IRSA annotation must be injected at deploy time.
 # NAMING CONTRACT: name must match module.sie_irsa_role namespace_service_accounts

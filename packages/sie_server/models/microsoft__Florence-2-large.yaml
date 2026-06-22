@@ -18,6 +18,8 @@ profiles:
       loadtime:
         trust_remote_code: true
       runtime:
-        task: <OCR_WITH_REGION>
+        # Re-tasked to object detection (#1347): Florence-2's flagship capability,
+        # measured on COCO. The shared adapter's <OD> branch emits pixel COCO boxes.
+        task: <OD>
         max_new_tokens: 1024
         num_beams: 1

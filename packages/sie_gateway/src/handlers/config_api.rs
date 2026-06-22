@@ -191,6 +191,11 @@ async fn compute_model_status(
     // `all_bundles_acked` stays false.
     let mut all_acked = !model_info.bundles.is_empty();
     let model_pool = model_info.pool.as_deref().unwrap_or("default");
+    let pending_generation = state
+        .work_publisher
+        .as_ref()
+        .map(|publisher| publisher.pending_generation_for_model(&model_info.name))
+        .unwrap_or_default();
 
     for bundle_id in &model_info.bundles {
         let expected = state
@@ -247,6 +252,7 @@ async fn compute_model_status(
         "all_bundles_acked": all_acked,
         "no_bundles": model_info.bundles.is_empty(),
         "bundles": bundles_out,
+        "pending_generation": pending_generation,
         "source": "gateway-registry",
     })
 }
@@ -463,7 +469,7 @@ mod tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
-            stream_max_age_s: 120,
+            stream_max_age_s: 1_800,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             static_queue_pools: Vec::new(),
@@ -779,6 +785,7 @@ mod tests {
             serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert_eq!(parsed["model_id"], "BAAI/bge-m3");
         assert_eq!(parsed["all_bundles_acked"], false);
+        assert_eq!(parsed["pending_generation"]["total"], 0);
         let bundles = parsed["bundles"].as_array().unwrap();
         assert!(!bundles.is_empty());
         for bundle in bundles {
@@ -956,6 +963,7 @@ mod tests {
         let status = compute_model_status(state.as_ref(), &entry).await;
         assert_eq!(status["all_bundles_acked"], false);
         assert_eq!(status["no_bundles"], true);
+        assert_eq!(status["pending_generation"]["total"], 0);
         let bundles = status["bundles"].as_array().unwrap();
         assert!(bundles.is_empty());
 

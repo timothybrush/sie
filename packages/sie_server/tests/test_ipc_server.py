@@ -22,8 +22,10 @@ from sie_server.ipc_server import IpcServer, IpcServerError
 from sie_server.ipc_types import (
     IPC_VERSION,
     ApplyModelConfigRequest,
+    ProcessGenerateRequest,
     ReplaceModelConfigEntry,
     ReplaceModelConfigsRequest,
+    SignalGenerateCancelRequest,
 )
 from sie_server.queue_executor import QueueExecutor
 
@@ -84,6 +86,30 @@ class _ClosedWriter:
 
     async def drain(self) -> None:
         return None
+
+
+class _CapturingWriter:
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def write(self, payload: bytes) -> None:
+        self.buf.extend(payload)
+
+    async def drain(self) -> None:
+        return None
+
+
+def _decode_written_frames(writer: _CapturingWriter) -> list[dict]:
+    frames: list[dict] = []
+    offset = 0
+    data = bytes(writer.buf)
+    while offset < len(data):
+        (length,) = _LEN_STRUCT.unpack(data[offset : offset + _LEN_STRUCT.size])
+        offset += _LEN_STRUCT.size
+        payload = data[offset : offset + length]
+        offset += length
+        frames.append(msgpack.unpackb(payload, raw=False))
+    return frames
 
 
 def _make_executor() -> tuple[QueueExecutor, MagicMock]:
@@ -892,7 +918,72 @@ class TestGenerationSidecarIpc:
 
         assert resp["ok"] is True
         assert resp["body"] == {"matched": True}
+        srv._get_streaming_processor.assert_awaited_once_with(prewarm=False)  # type: ignore[attr-defined]
         processor.signal_cancel.assert_called_once_with("req-123")
+
+    @pytest.mark.asyncio
+    async def test_signal_generate_cancel_does_not_prewarm(self) -> None:
+        executor, _reg = _make_executor()
+        processor = MagicMock()
+        processor.signal_cancel.return_value = False
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="w")
+        srv._streaming_processor = processor
+        srv._prewarm_generation_grammars = AsyncMock()  # type: ignore[method-assign]
+
+        resp = await srv._handle_signal_generate_cancel(
+            SignalGenerateCancelRequest(request_id="req-123"),
+        )
+
+        assert resp.matched is False
+        srv._prewarm_generation_grammars.assert_not_awaited()  # type: ignore[attr-defined]
+        processor.signal_cancel.assert_called_once_with("req-123")
+
+    @pytest.mark.asyncio
+    async def test_cancel_created_processor_still_prewarms_on_generate(self) -> None:
+        executor, _reg = _make_executor()
+        processor = MagicMock()
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="w")
+        srv._prewarm_generation_grammars = AsyncMock()  # type: ignore[method-assign]
+
+        with patch("sie_server.processors.streaming.StreamingProcessor", return_value=processor):
+            cancel_processor = await srv._get_streaming_processor(prewarm=False)
+            generate_processor = await srv._get_streaming_processor()
+
+        assert cancel_processor is processor
+        assert generate_processor is processor
+        srv._prewarm_generation_grammars.assert_awaited_once_with(processor)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_process_generate_sends_progress_before_lazy_processor(self) -> None:
+        executor, _reg = _make_executor()
+        processor = MagicMock()
+        processor.process = AsyncMock()
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="w")
+        writer = _CapturingWriter()
+        work_item_msgpack = msgpack.packb({"request_id": "req-1"}, use_bin_type=True)
+
+        async def get_processor() -> MagicMock:
+            frames = _decode_written_frames(writer)
+            assert [frame["body"]["kind"] for frame in frames] == ["in_progress"]
+            return processor
+
+        get_processor_mock = AsyncMock(side_effect=get_processor)
+        srv._get_streaming_processor = get_processor_mock  # type: ignore[method-assign]
+
+        await srv._handle_process_generate(
+            ProcessGenerateRequest(model_id="test/model", work_item_msgpack=work_item_msgpack),
+            request_id="ipc-req-1",
+            writer=writer,  # type: ignore[arg-type]
+        )
+
+        frames = _decode_written_frames(writer)
+        assert [frame["body"]["kind"] for frame in frames] == ["in_progress", "done"]
+        assert [frame["request_id"] for frame in frames] == ["ipc-req-1", "ipc-req-1"]
+        get_processor_mock.assert_awaited_once()
+        processor.process.assert_awaited_once()
 
 
 # -----------------------------------------------------------------------------

@@ -1,0 +1,111 @@
+"""Connector-secret auth at the MCP edge (the Req 12 shim).
+
+A per-user connector secret (Bearer) is validated here and mapped to a stable
+user identity, so per-user metering can attach later (Req 10, #1313). The cluster
+credential the service uses downstream is held server-side and never travels
+through this edge.
+
+Implemented as pure ASGI (not ``BaseHTTPMiddleware``) so it does not buffer the
+streaming MCP responses.
+"""
+
+from typing import Any
+
+from starlette.datastructures import Headers
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from sie_mcp.config import MCPConfig
+
+# The OAuth bridge endpoints bootstrap auth for claude.ai connectors, so they sit
+# in front of the connector-secret gate (#1312). Metadata + DCR + authorize + token
+# must all be reachable unauthenticated.
+_EXEMPT_PATHS = frozenset(
+    {
+        "/healthz",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+        "/register",
+        "/authorize",
+        "/token",
+    }
+)
+
+
+def base_url(config: MCPConfig, *, scheme: str, headers: Headers) -> str:
+    """Resolve the externally reachable origin for OAuth metadata URLs.
+
+    Prefers the pinned ``SIE_MCP_PUBLIC_URL``; otherwise derives it from forwarded
+    proxy headers (falling back to the request's own scheme/host).
+    """
+    if config.public_base_url:
+        return config.public_base_url
+    proto = headers.get("x-forwarded-proto") or scheme
+    host = headers.get("x-forwarded-host") or headers.get("host") or ""
+    return f"{proto}://{host}"
+
+
+def bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    value = authorization.strip()
+    if not value:
+        return None
+    if value[:7].lower() == "bearer ":
+        return value[7:].strip() or None
+    # A bare "Bearer" scheme with no token is not a credential.
+    if value.lower() == "bearer":
+        return None
+    # Otherwise accept a raw token sent without the scheme prefix.
+    return value
+
+
+def authenticate(config: MCPConfig, token: str | None) -> str | None:
+    """Return a user identity for the token, or ``None`` to reject the request."""
+    if config.connector_secrets:
+        if token and token in config.connector_secrets:
+            return config.connector_secrets[token]
+        if not token and config.allow_anonymous:
+            return "anonymous"
+        return None
+    # No secrets configured: open only when anonymous access is explicitly allowed.
+    return "anonymous" if config.allow_anonymous else None
+
+
+class ConnectorSecretAuthMiddleware:
+    """Pure-ASGI auth gate that maps a connector secret to a user identity."""
+
+    def __init__(self, app: ASGIApp, config: MCPConfig) -> None:
+        self._app = app
+        self._config = config
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") in _EXEMPT_PATHS:
+            await self._app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        token = bearer_token(headers.get("authorization"))
+        identity = authenticate(self._config, token)
+        if identity is None:
+            response = JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers=self._challenge_headers(scope, headers),
+            )
+            await response(scope, receive, send)
+            return
+
+        state: dict[str, Any] = dict(scope.get("state") or {})
+        state["user_id"] = identity
+        scope["state"] = state
+        await self._app(scope, receive, send)
+
+    def _challenge_headers(self, scope: Scope, headers: Headers) -> dict[str, str]:
+        """Point unauthenticated clients at the OAuth bridge (RFC 9728)."""
+        if not self._config.oauth_enabled:
+            return {}
+        origin = base_url(self._config, scheme=scope.get("scheme", "http"), headers=headers)
+        metadata = f"{origin}/.well-known/oauth-protected-resource"
+        return {"WWW-Authenticate": f'Bearer resource_metadata="{metadata}"'}
