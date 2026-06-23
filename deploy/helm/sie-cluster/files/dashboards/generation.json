@@ -322,7 +322,7 @@
       },
       "id": 20,
       "type": "timeseries",
-      "title": "Timeouts / sec by kind",
+      "title": "Timeouts / sec by model, pool, kind",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -346,8 +346,8 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum by (kind) (rate(sie_gateway_generation_timeout_total{namespace=\"$namespace\"}[$rate_window]))",
-          "legendFormat": "{{kind}}",
+          "expr": "sum by (model, pool, kind) (rate(sie_gateway_generation_timeout_total{namespace=\"$namespace\"}[$rate_window]))",
+          "legendFormat": "{{model}} / {{pool}} / {{kind}}",
           "refId": "A"
         }
       ]

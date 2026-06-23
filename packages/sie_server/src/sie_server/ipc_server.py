@@ -25,6 +25,7 @@ from sie_server.ipc_types import (
     METHOD_PROCESS_SCORE_BATCH,
     METHOD_REPLACE_MODEL_CONFIGS,
     METHOD_RUN_BATCH,
+    METHOD_SET_PINNED_MODELS,
     METHOD_SIGNAL_GENERATE_CANCEL,
     METHOD_WORKER_CAPABILITIES,
     ApplyModelConfigRequest,
@@ -44,6 +45,8 @@ from sie_server.ipc_types import (
     ReplaceModelConfigsResponse,
     ResponseEnvelope,
     RunBatchRequest,
+    SetPinnedModelsRequest,
+    SetPinnedModelsResponse,
     SignalGenerateCancelRequest,
     SignalGenerateCancelResponse,
     WorkerCapabilitiesRequest,
@@ -458,6 +461,8 @@ class IpcServer:
                 resp_body = self._handle_apply_model_config(msgspec.convert(body, ApplyModelConfigRequest))
             elif method == METHOD_REPLACE_MODEL_CONFIGS:
                 resp_body = await self._handle_replace_model_configs(msgspec.convert(body, ReplaceModelConfigsRequest))
+            elif method == METHOD_SET_PINNED_MODELS:
+                resp_body = await self._handle_set_pinned_models(msgspec.convert(body, SetPinnedModelsRequest))
             elif method == METHOD_SIGNAL_GENERATE_CANCEL:
                 resp_body = await self._handle_signal_generate_cancel(
                     msgspec.convert(body, SignalGenerateCancelRequest)
@@ -513,10 +518,16 @@ class IpcServer:
                 bundle_config_hash = self._executor.compute_bundle_config_hash(self._bundle_id)
             except Exception:  # noqa: BLE001
                 logger.debug("Could not compute bundle_config_hash for ping", exc_info=True)
+        loaded_models: list[str] = []
+        try:
+            loaded_models = self._executor.loaded_model_names()
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not compute loaded_models for ping", exc_info=True)
         return PingResponse(
             timestamp_ms=req.timestamp_ms,
             worker_id=self._worker_id,
             bundle_config_hash=bundle_config_hash,
+            loaded_models=loaded_models,
         )
 
     async def _handle_ensure_ready(self, req: EnsureModelReadyRequest) -> EnsureModelReadyResponse:
@@ -555,6 +566,9 @@ class IpcServer:
         req: ReplaceModelConfigsRequest,
     ) -> ReplaceModelConfigsResponse:
         return await self._executor.replace_model_configs(req)
+
+    async def _handle_set_pinned_models(self, req: SetPinnedModelsRequest) -> SetPinnedModelsResponse:
+        return await self._executor.set_pinned_models(req)
 
     def _handle_worker_capabilities(self, _req: WorkerCapabilitiesRequest) -> WorkerCapabilitiesResponse:
         generation_models: list[str] = []

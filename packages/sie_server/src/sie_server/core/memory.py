@@ -14,6 +14,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from collections.abc import Container
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -195,9 +196,6 @@ class MemoryConfig:
     # Alternative to ratio-based threshold
     min_free_bytes: int | None = None
 
-    # Whether to enable proactive eviction
-    proactive_eviction: bool = True
-
     # Background memory monitor check interval (seconds)
     memory_check_interval_s: float = 1.0
 
@@ -353,33 +351,30 @@ class MemoryManager:
 
         return False
 
-    def get_lru_model(self) -> str | None:
-        """Get the least-recently-used model name.
-
-        Returns:
-            Name of the LRU model, or None if no models are loaded.
-        """
-        if not self._models:
-            return None
-        # First item in OrderedDict is the least recently used
-        return next(iter(self._models))
-
-    def get_eviction_candidates(self, count: int = 1) -> list[str]:
-        """Get a list of models to evict (in LRU order).
+    def get_lru_model(self, *, exclude: Container[str] = frozenset()) -> str | None:
+        """Get the least-recently-used model name that is not in ``exclude``.
 
         Args:
-            count: Number of candidates to return.
+            exclude: Lowercased model names to skip (e.g. the pinned set).
+                     Matched case-insensitively against the loaded names.
 
         Returns:
-            List of model names to evict (oldest first).
+            Name of the LRU non-excluded model, or None if all models are
+            excluded or no models are loaded.
         """
-        return list(self._models.keys())[:count]
+        # First item in OrderedDict is the least recently used. Loaded names
+        # preserve case (HF ids), so lowercase before testing the set.
+        for name in self._models:
+            if name.lower() not in exclude:
+                return name
+        return None
 
     def get_idle_models(
         self,
         *,
         idle_threshold_s: float,
         now: float | None = None,
+        exclude: Container[str] = frozenset(),
     ) -> list[str]:
         """Return loaded models whose ``last_used_at`` is older than the threshold.
 
@@ -394,9 +389,12 @@ class MemoryManager:
                 tracked model (intended for tests, not production).
             now: Override the reference time (for tests). Defaults to
                 ``time.monotonic()``.
+            exclude: Lowercased model names to skip (e.g. the pinned set).
+                     Matched case-insensitively against the loaded names.
 
         Returns:
-            Model names sorted oldest-first (longest-idle leads).
+            Model names sorted oldest-first (longest-idle leads), excluding
+            any name in ``exclude``.
         """
         if idle_threshold_s < 0:
             msg = f"idle_threshold_s must be >= 0, got {idle_threshold_s}"
@@ -404,6 +402,9 @@ class MemoryManager:
         ref = time.monotonic() if now is None else now
         idle: list[tuple[float, str]] = []
         for name, info in self._models.items():
+            # Loaded names preserve case (HF ids); lowercase before the test.
+            if name.lower() in exclude:
+                continue
             age = ref - info.last_used_at
             if age >= idle_threshold_s:
                 idle.append((info.last_used_at, name))
@@ -437,35 +438,3 @@ class MemoryManager:
                 return True
 
         return False
-
-    def get_eviction_candidates_if_needed(self) -> list[str]:
-        """Check memory pressure and return models that should be evicted.
-
-        Synchronous version for callers that don't need async.
-
-        Returns:
-            List of model names that should be evicted (caller must handle eviction).
-        """
-        if not self._config.proactive_eviction:
-            return []
-
-        if not self.check_pressure() or not self._models:
-            return []
-
-        lru = self.get_lru_model()
-        if lru is None:
-            return []
-
-        logger.info("Memory pressure detected, recommending eviction of: %s", lru)
-        return [lru]
-
-    async def check_memory_pressure(self) -> list[str]:
-        """Check memory pressure and return models that should be evicted.
-
-        Async wrapper for use in async request handlers.
-        The underlying check is fast and non-blocking.
-
-        Returns:
-            List of model names that should be evicted (caller must handle eviction).
-        """
-        return self.get_eviction_candidates_if_needed()

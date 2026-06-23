@@ -92,9 +92,9 @@ groups:
         # All three are auto-retried by the SDK under the SDK's
         # ``provision_timeout_s`` / ``max_oom_retries`` budgets — see
         # ``packages/sie_sdk/src/sie_sdk/client/_shared.py``. Operators
-        # still see these events via the dedicated
-        # ``SIEResourceExhaustedSpike`` informational alert and the
-        # ``sie_gateway_rejected_requests_total`` counter.
+        # still see these events via the dedicated informational alerts
+        # ``SIEResourceExhaustedSpike`` / ``SIEModelLoadingRetrySpike``
+        # and the ``sie_gateway_rejected_requests_total`` counter.
         #
         # PromQL ``=~`` is full-string anchored (RE2 with implicit
         # ``^…$``); the list below matches exact reasons only. Keep in
@@ -121,6 +121,30 @@ groups:
         annotations:
           summary: "SIE p95 latency > 5s"
           description: "95th percentile latency is {{ $value | humanizeDuration }}."
+
+      - alert: SIEGenerationFirstChunkTimeoutSpike
+        expr: |
+          sum by (model, pool) (
+            rate(sie_gateway_generation_timeout_total{kind="first_chunk"}[5m])
+          ) > 0.02
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SIE generation first-chunk timeouts for {{ $labels.model }}"
+          description: "Generation requests for model {{ $labels.model }} in pool {{ $labels.pool }} are timing out before the first chunk at {{ $value | humanize }} req/s. Check worker-side MODEL_LOADING, SGLang startup, and preload/warm-floor policy for the matching bundle."
+
+      - alert: SIEModelLoadingRetrySpike
+        expr: |
+          sum by (pool, machine_profile, bundle, reason) (
+            rate(sie_gateway_rejected_requests_total{reason=~"upstream_model_loading|upstream_timeout_model_loading"}[5m])
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "SIE retryable model-loading responses on {{ $labels.pool }}/{{ $labels.machine_profile }}/{{ $labels.bundle }}"
+          description: "The gateway is returning retryable MODEL_LOADING responses at {{ $value | humanize }} req/s for reason {{ $labels.reason }}. This is expected during cold lazy-loads, but sustained traffic usually means the model should be preloaded, pinned, or served from a warmer lane."
 
       - alert: SIEResourceExhaustedSpike
         # Informational signal: workers are exhausting OOM recovery and

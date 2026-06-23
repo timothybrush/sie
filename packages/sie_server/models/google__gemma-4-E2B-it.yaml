@@ -1,0 +1,118 @@
+sie_id: google/gemma-4-E2B-it
+hf_id: google/gemma-4-E2B-it
+# ── Engine (see issue #1415) ──
+#
+# Served by the dedicated ``gemma`` bundle (packages/sie_server/bundles/
+# gemma.yaml): sglang 0.5.13 + torch 2.11 (cu130) on a CUDA 13 base. 0.5.13 is
+# the validated engine; 0.5.11 (first release with Gemma 4) has a JIT-kernel
+# compile bug. E2B was smoke-validated on a Modal L4 2026-06-18 (serves +
+# /v1/chat/completions 200). ``kv_budget_tokens`` / ``mem_fraction_static`` /
+# ``context_length`` remain conservative placeholders pending per-variant KV
+# calibration.
+inputs:
+  # Gemma 4 is a vision-language model; the wire surface accepts text+image
+  # via the OpenAI chat-completions ``image_url`` content parts. The E-models
+  # additionally accept 16 kHz mono audio per the cookbook, but audio/video are
+  # not wired through the SIE gateway yet (same stance as the Qwen3.x configs).
+  text: true
+  image: true
+  audio: false
+  video: false
+tasks:
+  generate:
+    # Conservative contract pending calibration on a Gemma-4-capable engine.
+    context_length: 8192
+    max_output_tokens: 4096
+    # Grammar (response_format / json_schema / regex) is served by the
+    # non-speculative ``no-spec`` profile — validated with xgrammar. NEXTN/MTP
+    # bypasses SGLang's grammar FSM (leaks/truncates), so grammar must never run
+    # on ``:mtp``. ``grammar_profile`` makes the gateway reroute every grammar
+    # request — INCLUDING an explicit ``…:mtp`` pin — to the named variant (it
+    # strips the pinned suffix and rewrites to the base's grammar_profile). The
+    # validator forbids naming ``default``, so the route is a thin non-spec
+    # ``no-spec`` profile (mirrors Qwen3.5-4B).
+    grammar_profile: no-spec
+    capabilities:
+      # xgrammar supports json_schema/regex/ebnf; advertise the universally
+      # safe subset until a GPU smoke validates ebnf for this model.
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      tools: true
+    # Gemma 4 thinking is off by default; set explicitly so the OpenAI-compat
+    # path returns the answer only. Operators wanting CoT flip this
+    # profile-side or pass chat_template_kwargs.enable_thinking=true per request.
+    chat_template_kwargs:
+      enable_thinking: false
+max_sequence_length: 8192
+profiles:
+  # Single ``default`` profile — E2B (~2B) fits comfortably on L4/A100/H100.
+  default:
+    max_batch_tokens: 8192
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.gemma:SGLangGemmaAdapter
+    # Placeholder — recalibrate via a GPU smoke once SGLang supports Gemma 4.
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: google/gemma-4-E2B-it
+        disable_cuda_graph: true
+        # triton attention matches the cookbook recommendation for Gemma 4's
+        # bidirectional image attention.
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        # Speculative OFF here; the ``mtp`` variant below enables Gemma 4 MTP
+        # (NEXTN + the ``-it-assistant`` draft). No ``--mamba-scheduler-strategy``
+        # — that is the Qwen3.x Gated-DeltaNet recipe, not Gemma 4.
+      runtime:
+        first_chunk_timeout_s: 60
+        inter_chunk_timeout_s: 10
+        overall_timeout_s: 300
+        # Gemma-family recommended sampling defaults; a request-supplied value
+        # still wins (the adapter merges this dict via setdefault).
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 64
+          # Conservative floor against an empty-first-token EOS completion.
+          min_new_tokens: 1
+        stop_tokens:
+          - "<end_of_turn>"
+  # ``no-spec`` — the grammar-safe route (see tasks.generate.grammar_profile).
+  # Identical to ``default`` (non-speculative); named distinctly so
+  # ``grammar_profile`` can point here (the validator forbids naming ``default``).
+  no-spec:
+    extends: default
+  # ``mtp`` variant — Gemma 4 multi-token prediction (speculative decoding):
+  # NEXTN with the paired external draft ``google/gemma-4-E2B-it-assistant``
+  # (sglang 0.5.12+ Gemma 4 MTP; cookbook recipe num_steps=5 / num_draft_tokens=6
+  # / eagle_topk=1). Same engine path as the E4B ``mtp`` variant validated on a
+  # Modal H100 2026-06-19. ``speculative_needs_extra_buffer: false`` opts out of
+  # the Qwen Gated-DeltaNet mamba-scheduler guard (Gemma 4 is hybrid attention).
+  mtp:
+    extends: default
+    kv_budget_tokens: 6144
+    adapter_options:
+      # loadtime is FULL-REPLACED when extending, so restated in full; runtime
+      # is identical to default and inherited (omitted here).
+      loadtime:
+        mem_fraction_static: 0.80
+        served_model_name: google/gemma-4-E2B-it
+        # MTP REQUIRES cuda graph ON: the eager path (--disable-cuda-graph)
+        # crashes in sglang's speculative buffer view. Same engine path as the
+        # E4B mtp variant validated cuda-graph-on (Modal H100 2026-06-19).
+        disable_cuda_graph: false
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        speculative_needs_extra_buffer: false
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 5
+          eagle_topk: 1
+          num_draft_tokens: 6
+          draft_model: google/gemma-4-E2B-it-assistant

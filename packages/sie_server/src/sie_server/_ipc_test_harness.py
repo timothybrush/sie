@@ -122,6 +122,9 @@ class _StubExecutor:
     def get_model_descriptor(self, model_id: str) -> ModelDescriptor | None:  # noqa: ARG002
         return self._descriptor
 
+    def loaded_model_names(self) -> list[str]:
+        return []
+
     async def _maybe_sleep(self) -> None:
         if self._per_request_delay_ms > 0:
             await asyncio.sleep(self._per_request_delay_ms / 1000.0)

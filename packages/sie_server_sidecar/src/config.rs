@@ -47,8 +47,10 @@ pub struct WorkerConfig {
     pub payload_store_url: Option<String>,
 
     /// Optional gateway URL used by the worker-side pool admission gate.
-    /// When set and admission is enabled, the sidecar asks
-    /// `/v1/pools/{pool}` before pulling from NATS.
+    /// When set and admission is enabled, the sidecar polls `/v1/pools`
+    /// before pulling from NATS so it can enforce both the physical
+    /// `SIE_POOL` assignment and logical `admission_pool` assignments backed
+    /// by that queue.
     pub gateway_url: Option<String>,
 
     /// Optional bearer token for gateway pool-status reads.

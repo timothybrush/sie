@@ -142,19 +142,16 @@ class TestMemoryConfig:
 
         assert config.pressure_threshold == 0.95
         assert config.min_free_bytes is None
-        assert config.proactive_eviction is True
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = MemoryConfig(
             pressure_threshold=0.9,
             min_free_bytes=4 * (1024**3),
-            proactive_eviction=False,
         )
 
         assert config.pressure_threshold == 0.9
         assert config.min_free_bytes == 4 * (1024**3)
-        assert config.proactive_eviction is False
 
 
 class TestMemoryManager:
@@ -234,15 +231,58 @@ class TestMemoryManager:
         """Test LRU with no models."""
         assert manager.get_lru_model() is None
 
-    def test_get_eviction_candidates(self, manager: MemoryManager) -> None:
-        """Test getting eviction candidates."""
-        manager.register_model("model-a")
-        manager.register_model("model-b")
-        manager.register_model("model-c")
+    def test_get_lru_model_excludes_pinned(self, manager: MemoryManager) -> None:
+        """get_lru_model skips names in the exclude set."""
+        manager.register_model("a")
+        manager.register_model("b")
+        manager.register_model("c")
+        # a is oldest (LRU); b is second-oldest; c is newest
 
-        # Get 2 candidates (oldest first)
-        candidates = manager.get_eviction_candidates(2)
-        assert candidates == ["model-a", "model-b"]
+        # Excluding {a} must return b (the next oldest)
+        assert manager.get_lru_model(exclude={"a"}) == "b"
+
+        # Excluding all must return None
+        assert manager.get_lru_model(exclude={"a", "b", "c"}) is None
+
+        # Default (no exclude) still returns a
+        assert manager.get_lru_model() == "a"
+
+    def test_get_idle_models_excludes_pinned(self, manager: MemoryManager) -> None:
+        """get_idle_models skips names in the exclude set."""
+        manager.register_model("pinned")
+        manager.register_model("evictable")
+
+        now = time.monotonic()
+        # Both stale
+        manager.get_model_info("pinned").last_used_at = now - 500.0  # type: ignore[union-attr]
+        manager.get_model_info("evictable").last_used_at = now - 200.0  # type: ignore[union-attr]
+
+        # Without exclude: both returned (oldest first)
+        idle_all = manager.get_idle_models(idle_threshold_s=50.0, now=now)
+        assert idle_all == ["pinned", "evictable"]
+
+        # With exclude: only evictable returned
+        idle_filtered = manager.get_idle_models(idle_threshold_s=50.0, now=now, exclude={"pinned"})
+        assert idle_filtered == ["evictable"]
+
+    def test_get_lru_model_exclude_is_case_insensitive(self, manager: MemoryManager) -> None:
+        """Loaded names keep their case (HF ids); the lowercased exclude set still matches."""
+        manager.register_model("Org/Model-A")  # uppercase, oldest (LRU)
+        manager.register_model("org/model-b")
+
+        # The pinned set is normalised to lowercase, but the loaded key is not.
+        assert manager.get_lru_model(exclude={"org/model-a"}) == "org/model-b"
+
+    def test_get_idle_models_exclude_is_case_insensitive(self, manager: MemoryManager) -> None:
+        """Idle exclusion lowercases the loaded name before testing the set."""
+        manager.register_model("Org/Pinned")
+        manager.register_model("org/evictable")
+        now = time.monotonic()
+        manager.get_model_info("Org/Pinned").last_used_at = now - 500.0  # type: ignore[union-attr]
+        manager.get_model_info("org/evictable").last_used_at = now - 200.0  # type: ignore[union-attr]
+
+        idle = manager.get_idle_models(idle_threshold_s=50.0, now=now, exclude={"org/pinned"})
+        assert idle == ["org/evictable"]
 
     def test_get_idle_models_returns_sorted_by_age(self, manager: MemoryManager) -> None:
         """Stale models are returned oldest-first regardless of insertion order."""
@@ -373,49 +413,6 @@ class TestMemoryManager:
 
         # Need less than available
         assert manager.should_evict_for_load(required_bytes=4 * (1024**3)) is False
-
-    @pytest.mark.asyncio
-    async def test_check_memory_pressure_async(self) -> None:
-        """Test async memory pressure check."""
-        manager = MemoryManager(device="cpu")
-        manager.register_model("model-a")
-
-        # Mock high memory usage
-        mock_stats = MemoryStats(
-            used_bytes=96,
-            total_bytes=100,
-            device_type="cpu",
-        )
-        manager._tracker = MagicMock()
-        manager._tracker.get_stats.return_value = mock_stats
-
-        candidates = await manager.check_memory_pressure()
-
-        assert len(candidates) == 1
-        assert candidates[0] == "model-a"
-
-    @pytest.mark.asyncio
-    async def test_check_memory_pressure_disabled(self) -> None:
-        """Test that proactive eviction can be disabled."""
-        manager = MemoryManager(
-            device="cpu",
-            config=MemoryConfig(proactive_eviction=False),
-        )
-        manager.register_model("model-a")
-
-        # Mock high memory usage
-        mock_stats = MemoryStats(
-            used_bytes=9 * (1024**3),
-            total_bytes=10 * (1024**3),
-            device_type="cpu",
-        )
-        manager._tracker = MagicMock()
-        manager._tracker.get_stats.return_value = mock_stats
-
-        candidates = await manager.check_memory_pressure()
-
-        # Should return empty because proactive eviction is disabled
-        assert candidates == []
 
 
 class TestCUDAMemoryTracker:

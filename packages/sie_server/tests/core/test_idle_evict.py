@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Container
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -53,6 +54,7 @@ def _build_registry(
     *,
     idle_evict_s: int | None,
     check_interval_s: float = 0.01,
+    pinned_models: list[str] | None = None,
 ) -> ModelRegistry:
     """Construct a registry wired with ``EngineConfig.idle_evict_s`` set.
 
@@ -70,6 +72,7 @@ def _build_registry(
     return ModelRegistry(
         memory_config=MemoryConfig(memory_check_interval_s=check_interval_s),
         engine_config=engine_config,
+        pinned_models=pinned_models,
     )
 
 
@@ -288,8 +291,10 @@ async def test_idle_eviction_skips_already_unloaded(mock_load_adapter: MagicMock
     # is genuinely gone. Exercises the snapshot-vs-recheck race path.
     original_get_idle = reg._memory_manager.get_idle_models
 
-    def racing_get_idle(*, idle_threshold_s: float, now: float | None = None) -> list[str]:
-        result = original_get_idle(idle_threshold_s=idle_threshold_s, now=now)
+    def racing_get_idle(
+        *, idle_threshold_s: float, now: float | None = None, exclude: Container[str] = frozenset()
+    ) -> list[str]:
+        result = original_get_idle(idle_threshold_s=idle_threshold_s, now=now, exclude=exclude)
         # Synchronous unload: drop from the loaded dict directly to avoid
         # awaiting an async call from a sync side-effect. This mimics what
         # any other sync code path that mutated `_loaded` would do.
@@ -305,3 +310,39 @@ async def test_idle_eviction_skips_already_unloaded(mock_load_adapter: MagicMock
     # No crash, model stays unloaded, and crucially the loop did not try
     # to call ``_do_unload`` on a model that was already gone.
     assert not reg.is_loaded("model-y")
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_idle_evictor_skips_pinned_model(mock_load_adapter: MagicMock) -> None:
+    """Idle evictor must not unload a pinned model even when it is stale.
+
+    Both models are forced stale; only the non-pinned one should be evicted.
+    """
+
+    def make_adapter() -> MagicMock:
+        m = MagicMock()
+        m.capabilities.outputs = ["dense"]
+        return m
+
+    mock_load_adapter.side_effect = [make_adapter(), make_adapter()]
+
+    reg = _build_registry(idle_evict_s=1, pinned_models=["model-pinned"])
+    for name in ["model-pinned", "model-evictable"]:
+        reg.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+        await reg.load_async(name, device="cpu")
+
+    # Force both models stale
+    now = time.monotonic()
+    for name in ["model-pinned", "model-evictable"]:
+        info = reg._memory_manager.get_model_info(name)
+        assert info is not None
+        info.last_used_at = now - 200.0
+
+    await reg.start_idle_evictor()
+    await asyncio.sleep(0.05)
+    await reg.stop_idle_evictor()
+
+    # Non-pinned model evicted; pinned model kept
+    assert not reg.is_loaded("model-evictable")
+    assert reg.is_loaded("model-pinned")

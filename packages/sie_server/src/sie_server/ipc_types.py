@@ -46,6 +46,7 @@ METHOD_SIGNAL_GENERATE_CANCEL = "SignalGenerateCancel"
 METHOD_RUN_BATCH = "RunBatch"
 METHOD_APPLY_MODEL_CONFIG = "ApplyModelConfig"
 METHOD_REPLACE_MODEL_CONFIGS = "ReplaceModelConfigs"
+METHOD_SET_PINNED_MODELS = "SetPinnedModels"
 METHOD_DRAIN = "Drain"
 
 
@@ -62,6 +63,7 @@ class PingResponse(msgspec.Struct):
     timestamp_ms: float
     worker_id: str
     bundle_config_hash: str = ""
+    loaded_models: list[str] = msgspec.field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -180,6 +182,27 @@ class ReplaceModelConfigsResponse(msgspec.Struct):
     bundle_config_hash: str
     config_version: int = 0
     applied_models: list[str] = msgspec.field(default_factory=list)
+
+
+# -----------------------------------------------------------------------------
+# SetPinnedModels
+# -----------------------------------------------------------------------------
+#
+# Runtime delivery of a pool's pinned-model set from the gateway to the worker.
+# The worker-sidecar polls the pool's ``PoolSpec.pinned_models`` (the single
+# source of truth, set via the /v1/pools API or SIE_GATEWAY_STATIC_QUEUE_POOLS)
+# and pushes it here on change. ``models`` carries gateway-canonical ids (bare
+# ``sie_id`` or profile-qualified ``sie_id:profile``); the registry normalizes
+# them. The set is authoritative and REPLACES the worker's current pinned set.
+
+
+class SetPinnedModelsRequest(msgspec.Struct):
+    models: list[str]
+
+
+class SetPinnedModelsResponse(msgspec.Struct):
+    applied: bool
+    pinned_count: int = 0
 
 
 # -----------------------------------------------------------------------------

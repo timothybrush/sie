@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod nats_consumer;
 pub mod output;
 pub mod payload_store;
+pub mod pinned_reconciler;
 pub mod pool_admission;
 pub mod prep;
 pub mod protocol;
@@ -33,12 +34,12 @@ pub mod tokenize;
 pub mod work_types;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, warn};
@@ -100,11 +101,6 @@ const NATS_CONSUMER_RECONCILE_INTERVAL_ENV: &str = "SIE_NATS_CONSUMER_RECONCILE_
 const DEFAULT_NATS_CONSUMER_RECONCILE_INTERVAL_MS: u64 = 30_000;
 const MIN_NATS_CONSUMER_RECONCILE_INTERVAL_MS: u64 = 10_000;
 
-const GENERATION_CAPABILITY_RECONCILE_INTERVAL_ENV: &str =
-    "SIE_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS";
-const DEFAULT_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS: u64 = 30_000;
-const MIN_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS: u64 = 5_000;
-
 fn parse_nats_consumer_reconcile_interval_ms(raw: Option<&str>) -> Option<u64> {
     match raw.map(str::trim) {
         Some("0") => None,
@@ -121,28 +117,6 @@ fn parse_nats_consumer_reconcile_interval_ms(raw: Option<&str>) -> Option<u64> {
 fn nats_consumer_reconcile_interval() -> Option<Duration> {
     parse_nats_consumer_reconcile_interval_ms(
         std::env::var(NATS_CONSUMER_RECONCILE_INTERVAL_ENV)
-            .ok()
-            .as_deref(),
-    )
-    .map(Duration::from_millis)
-}
-
-fn parse_generation_capability_reconcile_interval_ms(raw: Option<&str>) -> Option<u64> {
-    match raw.map(str::trim) {
-        Some("0") => None,
-        Some(value) if !value.is_empty() => value
-            .parse::<u64>()
-            .ok()
-            .filter(|millis| *millis > 0)
-            .map(|millis| millis.max(MIN_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS))
-            .or(Some(DEFAULT_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS)),
-        _ => Some(DEFAULT_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS),
-    }
-}
-
-fn generation_capability_reconcile_interval() -> Option<Duration> {
-    parse_generation_capability_reconcile_interval_ms(
-        std::env::var(GENERATION_CAPABILITY_RECONCILE_INTERVAL_ENV)
             .ok()
             .as_deref(),
     )
@@ -297,6 +271,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         config.ping_interval_ms,
         config.ready_stale_mult,
     ));
+    let loaded_models = Arc::new(RwLock::new(Vec::<String>::new()));
     info!(
         ping_interval_ms = config.ping_interval_ms,
         ready_stale_mult = config.ready_stale_mult,
@@ -332,8 +307,6 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         model_ready_timeout_s = config.model_ready_timeout_s,
         "IPC client initialized with connection pool"
     );
-    let generation_capable = detect_generation_capable(&ipc).await;
-
     // --- NATS
     let (nats_client, jetstream) = connect(&config.nats_url).await.context("connect NATS")?;
     info!(nats = %config.nats_url, "NATS connected");
@@ -375,6 +348,13 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
             gate.run(shutdown).await;
         })
     });
+
+    // Pinned-model reconciler: polls the pool's PoolSpec.pinned_models and pushes
+    // it to the Python worker over IPC. Decoupled from admission so pinned models
+    // work even when the admission gate is disabled or fails open.
+    let pinned_reconciler_handle =
+        crate::pinned_reconciler::spawn(&config, Arc::clone(&ipc), Arc::clone(&shutdown))
+            .context("spawn pinned reconciler")?;
 
     // --- Backend router
     //
@@ -440,6 +420,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Some(Arc::clone(&scheduler_registry)),
         Some(shutdown.clone()),
         Some(Arc::clone(&config_apply_state)),
+        pool_admission.clone(),
     ));
 
     let generation_direct_dispatch = Arc::new(GenerationDirectDispatch::new(
@@ -454,20 +435,10 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Arc::clone(&ipc),
         Arc::clone(&nats_direct_active),
     ));
-    if generation_capable {
-        generation_direct_dispatch
-            .activate("startup")
-            .await
-            .context("activate generation direct-dispatch at startup")?;
-    } else {
-        info!("generation: no generation models in this bundle; direct-dispatch stream disabled");
-    }
-    let generation_capability_reconciler_handle = spawn_generation_capability_reconciler(
-        Arc::clone(&ipc),
-        Arc::clone(&generation_direct_dispatch),
-        shutdown.clone(),
-    );
-    let generation_notify = Some(generation_direct_dispatch.reconcile_notifier());
+    generation_direct_dispatch
+        .activate("startup")
+        .await
+        .context("activate worker direct-dispatch at startup")?;
 
     let config_subscriber_handle = crate::config_subscriber::spawn(
         nats_client.clone(),
@@ -478,7 +449,6 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         shutdown.clone(),
         crate::config_subscriber::ConfigSubscriberOptions {
             trusted_producers: config.nats_config_trusted_producers.clone(),
-            generation_reconcile: generation_notify.clone(),
         },
     );
     let config_reconciler_handle = crate::config_reconciler::spawn(
@@ -499,7 +469,6 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Arc::clone(&config_apply_state),
         Arc::clone(&metrics_registry),
         shutdown.clone(),
-        generation_notify,
     );
 
     // --- Background: heartbeat pings into IPC so /readyz reflects liveness
@@ -508,6 +477,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Duration::from_millis(config.ping_interval_ms),
         Arc::clone(&readiness),
         Arc::clone(&config_apply_state),
+        Arc::clone(&loaded_models),
         shutdown.clone(),
     );
 
@@ -532,6 +502,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
             machine_profile: config.machine_profile.clone(),
             gpu_count: config.gpu_count,
             bundle_config_hash: config_apply_state.bundle_config_hash(),
+            loaded_models: Arc::clone(&loaded_models),
             interval: Duration::from_millis(config.health_publish_interval_ms),
         })
     } else {
@@ -609,7 +580,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         h.abort();
         let _ = h.await;
     }
-    if let Some(h) = generation_capability_reconciler_handle {
+    if let Some(h) = pinned_reconciler_handle {
         h.abort();
         let _ = h.await;
     }
@@ -715,12 +686,12 @@ struct GenerationDirectHandles {
     cancel: Option<JoinHandle<()>>,
 }
 
-/// Owns the worker-specific generation stream and cancel subscription.
+/// Owns the worker-specific direct-dispatch stream and generation cancel
+/// subscription.
 ///
-/// Startup detection keeps encode-only workers on the single pool consumer.
-/// Live config apply can add a generation model later, so this controller can
-/// activate the direct-dispatch path exactly once after WorkerCapabilities
-/// reports generation support.
+/// The stream is always active: capped logical batch requests can target an
+/// assigned worker directly, and generation uses the same worker subject for
+/// cache-aware direct dispatch.
 struct GenerationDirectDispatch {
     jetstream: async_nats::jetstream::Context,
     nats_client: async_nats::Client,
@@ -732,7 +703,6 @@ struct GenerationDirectDispatch {
     pool_admission: Option<Arc<PoolAdmissionGate>>,
     ipc: Arc<IpcClient>,
     active: Arc<AtomicBool>,
-    reconcile_notify: Arc<Notify>,
     handles: Mutex<GenerationDirectHandles>,
 }
 
@@ -761,17 +731,8 @@ impl GenerationDirectDispatch {
             pool_admission,
             ipc,
             active,
-            reconcile_notify: Arc::new(Notify::new()),
             handles: Mutex::new(GenerationDirectHandles::default()),
         }
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-
-    fn reconcile_notifier(&self) -> Arc<Notify> {
-        Arc::clone(&self.reconcile_notify)
     }
 
     async fn activate(&self, reason: &str) -> anyhow::Result<bool> {
@@ -785,7 +746,7 @@ impl GenerationDirectDispatch {
 
         let worker_consumer = match ensure_worker_stream_and_consumer(&self.jetstream, &self.config)
             .await
-            .context("ensure generation direct-dispatch stream/consumer")
+            .context("ensure worker direct-dispatch stream/consumer")
         {
             Ok(consumer) => consumer,
             Err(e) => {
@@ -820,7 +781,7 @@ impl GenerationDirectDispatch {
         let mut handles = self.handles.lock().await;
         handles.pull = Some(pull);
         handles.cancel = Some(cancel);
-        info!(reason, "generation: direct-dispatch activated");
+        info!(reason, "worker direct-dispatch activated");
         Ok(true)
     }
 
@@ -877,134 +838,12 @@ fn spawn_nats_consumer_reconciler(
                     Ok(()) => {}
                     Err(e) => warn!(
                         error = %e,
-                        "nats-consumer: generation direct-dispatch reconcile failed"
+                        "nats-consumer: worker direct-dispatch reconcile failed"
                     ),
                 }
             }
         }
     }))
-}
-
-fn spawn_generation_capability_reconciler(
-    ipc: Arc<IpcClient>,
-    direct_dispatch: Arc<GenerationDirectDispatch>,
-    shutdown: Arc<Shutdown>,
-) -> Option<JoinHandle<()>> {
-    if direct_dispatch.is_active() {
-        return None;
-    }
-    let every = generation_capability_reconcile_interval()?;
-    Some(tokio::spawn(async move {
-        info!(
-            interval_ms = every.as_millis() as u64,
-            minimum_interval_ms = MIN_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS,
-            "generation: capability reconciler enabled"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => return,
-                _ = direct_dispatch.reconcile_notify.notified() => {},
-                _ = sleep(every) => {},
-            }
-
-            if direct_dispatch.is_active() {
-                return;
-            }
-
-            match probe_generation_capable(&ipc).await {
-                Some(true) => match direct_dispatch.activate("capability_reconcile").await {
-                    Ok(true) => return,
-                    Ok(false) => return,
-                    Err(e) => warn!(
-                        error = %ErrChain(e.as_ref()),
-                        "generation: direct-dispatch activation failed; will retry"
-                    ),
-                },
-                Some(false) => {
-                    debug!("generation: WorkerCapabilities still reports no generation models");
-                }
-                None => {
-                    debug!("generation: WorkerCapabilities probe unavailable; will retry");
-                }
-            }
-        }
-    }))
-}
-
-async fn detect_generation_capable(ipc: &Arc<IpcClient>) -> bool {
-    let attempts = worker_capabilities_attempts();
-    let timeout_ms = worker_capabilities_timeout_ms();
-    let mut last_error = String::new();
-    for attempt in 1..=attempts {
-        match timeout(Duration::from_millis(timeout_ms), ipc.worker_capabilities()).await {
-            Ok(Ok(capabilities)) => {
-                info!(
-                    has_generation_models = capabilities.has_generation_models,
-                    generation_models = ?capabilities.generation_models,
-                    "worker capabilities loaded from Python IPC"
-                );
-                return capabilities.has_generation_models;
-            }
-            Ok(Err(e)) => {
-                last_error = e.to_string();
-            }
-            Err(_) => {
-                last_error = format!("timeout after {timeout_ms}ms");
-            }
-        }
-        if attempt < attempts {
-            sleep(Duration::from_millis(200)).await;
-        }
-    }
-    warn!(
-        attempts,
-        timeout_ms,
-        error = %last_error,
-        "worker capabilities unavailable; enabling generation direct-dispatch conservatively"
-    );
-    true
-}
-
-async fn probe_generation_capable(ipc: &Arc<IpcClient>) -> Option<bool> {
-    let timeout_ms = worker_capabilities_timeout_ms();
-    match timeout(Duration::from_millis(timeout_ms), ipc.worker_capabilities()).await {
-        Ok(Ok(capabilities)) => {
-            info!(
-                has_generation_models = capabilities.has_generation_models,
-                generation_models = ?capabilities.generation_models,
-                "generation: WorkerCapabilities reconcile probe complete"
-            );
-            Some(capabilities.has_generation_models)
-        }
-        Ok(Err(e)) => {
-            debug!(error = %e, "generation: WorkerCapabilities reconcile probe failed");
-            None
-        }
-        Err(_) => {
-            debug!(
-                timeout_ms,
-                "generation: WorkerCapabilities reconcile probe timed out"
-            );
-            None
-        }
-    }
-}
-
-fn worker_capabilities_attempts() -> usize {
-    std::env::var("SIE_WORKER_CAPABILITIES_ATTEMPTS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(30)
-}
-
-fn worker_capabilities_timeout_ms() -> u64 {
-    std::env::var("SIE_WORKER_CAPABILITIES_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1_000)
 }
 
 fn spawn_generation_cancel_subscriber(
@@ -1075,6 +914,7 @@ fn spawn_heartbeat(
     every: Duration,
     readiness: Arc<Readiness>,
     config_apply_state: Arc<ConfigApplyState>,
+    loaded_models: crate::health_publisher::SharedLoadedModels,
     shutdown: Arc<Shutdown>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1099,7 +939,15 @@ fn spawn_heartbeat(
                             if config_apply_state.current_bundle_config_hash().is_empty()
                                 && !resp.bundle_config_hash.is_empty()
                             {
-                                config_apply_state.set_bundle_hash(resp.bundle_config_hash);
+                                config_apply_state.set_bundle_hash(resp.bundle_config_hash.clone());
+                            }
+                            match loaded_models.write() {
+                                Ok(mut guard) => {
+                                    *guard = resp.loaded_models;
+                                }
+                                Err(_) => {
+                                    warn!("loaded_models lock poisoned; NATS health will keep the previous model list");
+                                }
                             }
                             readiness.record_ping_success();
                             if consecutive_failures > 0 {
@@ -1249,11 +1097,12 @@ async fn run_pull_loop(
 
     'outer: loop {
         if let Some(gate) = pool_admission.as_ref() {
-            if !gate.admitted() {
+            if !gate.pull_admitted() {
                 // Drop the long-lived pull stream while not admitted. Keeping
                 // it open would leave server-side pull credits active and let
                 // JetStream deliver messages into this client even though this
-                // worker is outside the pool assignment.
+                // worker is outside the physical queue or every assigned
+                // logical pool backed by that queue.
                 stream = None;
                 tokio::select! {
                     biased;

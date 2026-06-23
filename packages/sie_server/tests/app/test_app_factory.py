@@ -263,6 +263,87 @@ class TestPreloadModels:
         assert registry.load_async.call_count == 2
 
 
+class TestPinnedModels:
+    """Tests for pinned model startup behavior."""
+
+    @pytest.mark.asyncio
+    async def test_pinned_models_are_loaded_at_startup(self) -> None:
+        """_load_pinned_models calls load_async for each pinned model."""
+        registry = AsyncMock()
+        # is_loaded and resolve_model_id are sync; sync mocks avoid truthy coroutines.
+        registry.is_loaded = MagicMock(return_value=False)
+        registry.resolve_model_id = MagicMock(side_effect=lambda raw: raw)
+        config = AppStateConfig(device="cpu", pinned_models=["model-a", "model-b"])
+
+        await AppFactory._load_pinned_models(registry, config)
+
+        assert registry.load_async.call_count == 2
+        registry.load_async.assert_any_call("model-a", "cpu")
+        registry.load_async.assert_any_call("model-b", "cpu")
+
+    @pytest.mark.asyncio
+    async def test_pinned_models_skips_when_none(self) -> None:
+        """_load_pinned_models is a no-op when pinned_models is None."""
+        registry = AsyncMock()
+        config = AppStateConfig(device="cpu", pinned_models=None)
+
+        await AppFactory._load_pinned_models(registry, config)
+
+        registry.load_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pinned_models_continues_on_failure(self) -> None:
+        """A failed pinned model load does not crash startup."""
+        registry = AsyncMock()
+        registry.is_loaded = MagicMock(return_value=False)
+        registry.resolve_model_id = MagicMock(side_effect=lambda raw: raw)
+        registry.load_async.side_effect = [RuntimeError("OOM"), AsyncMock()]
+        config = AppStateConfig(device="cpu", pinned_models=["model-a", "model-b"])
+
+        await AppFactory._load_pinned_models(registry, config)  # must not raise
+
+        assert registry.load_async.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pinned_model_in_preload_loaded_only_once(self) -> None:
+        """A model in both preload and pinned is loaded exactly once."""
+        registry = AsyncMock()
+        # Simulate already loaded after preload (sync mocks: not async methods)
+        registry.is_loaded = MagicMock(return_value=True)
+        registry.resolve_model_id = MagicMock(side_effect=lambda raw: raw)
+        config = AppStateConfig(device="cpu", pinned_models=["model-a"])
+
+        await AppFactory._load_pinned_models(registry, config)
+
+        # Already loaded, so load_async must NOT be called again
+        registry.load_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pinned_profile_qualified_id_loads_bare_sie_id(self) -> None:
+        """A profile-qualified pin (``sie_id:profile``) eager-loads the bare sie_id."""
+        registry = AsyncMock()
+        registry.is_loaded = MagicMock(return_value=False)
+        # resolve_model_id strips the :profile suffix to the config's bare id.
+        registry.resolve_model_id = MagicMock(return_value="org/model")
+        config = AppStateConfig(device="cpu", pinned_models=["org/model:fast"])
+
+        await AppFactory._load_pinned_models(registry, config)
+
+        registry.resolve_model_id.assert_called_once_with("org/model:fast")
+        registry.load_async.assert_called_once_with("org/model", "cpu")
+
+    @pytest.mark.asyncio
+    async def test_pinned_unresolved_id_skipped(self) -> None:
+        """A pin with no matching config is skipped without crashing startup."""
+        registry = AsyncMock()
+        registry.resolve_model_id = MagicMock(return_value=None)
+        config = AppStateConfig(device="cpu", pinned_models=["does/not-exist"])
+
+        await AppFactory._load_pinned_models(registry, config)  # must not raise
+
+        registry.load_async.assert_not_called()
+
+
 class TestPreloadModelsEnvRoundTrip:
     """Tests for preload_models env var serialization."""
 
@@ -274,6 +355,7 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
         monkeypatch.delenv("SIE_POOL", raising=False)
+        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
 
         config = AppStateConfig(preload_models=["model-a", "model-b"])
         config.save_to_env_vars()
@@ -287,6 +369,7 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
         monkeypatch.delenv("SIE_POOL", raising=False)
+        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
 
         config = AppStateConfig(preload_models=None)
         config.save_to_env_vars()
@@ -301,43 +384,81 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
         monkeypatch.delenv("SIE_POOL", raising=False)
+        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
 
         config = AppStateConfig(pool_name="customer-a")
         config.save_to_env_vars()
         restored = AppStateConfig.from_env_vars()
         assert restored.pool_name == "customer-a"
 
+    def test_pinned_models_env_round_trip(self, monkeypatch) -> None:
+        """SIE_PINNED_MODELS='a,b' round-trips to pinned_models == ['a', 'b']."""
+        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
+        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
+
+        config = AppStateConfig(pinned_models=["a", "b"])
+        config.save_to_env_vars()
+        restored = AppStateConfig.from_env_vars()
+        assert restored.pinned_models == ["a", "b"]
+
+    def test_pinned_models_none_round_trip(self, monkeypatch) -> None:
+        """pinned_models=None survives env round-trip (unset => None)."""
+        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
+        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
+
+        config = AppStateConfig(pinned_models=None)
+        config.save_to_env_vars()
+        restored = AppStateConfig.from_env_vars()
+        assert restored.pinned_models is None
+
 
 class TestModelRegistryConfig:
+    class _FakeRegistry:
+        async def start_memory_monitor(self) -> None:
+            pass
+
+        async def start_idle_evictor(self) -> None:
+            pass
+
+        async def start_hot_reload(self) -> None:
+            pass
+
+        async def stop_memory_monitor(self) -> None:
+            pass
+
+        async def stop_idle_evictor(self) -> None:
+            pass
+
+        async def stop_hot_reload(self) -> None:
+            pass
+
+        async def unload_all_async(self) -> None:
+            pass
+
+        def is_loaded(self, name: str) -> bool:
+            return False
+
+        def resolve_model_id(self, raw_id: str) -> str | None:
+            return raw_id
+
+        async def load_async(self, name: str, device: str) -> None:
+            pass
+
     @pytest.mark.asyncio
     async def test_model_registry_receives_pool_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         created_kwargs: dict[str, Any] = {}
 
-        class FakeRegistry:
-            async def start_memory_monitor(self) -> None:
-                pass
-
-            async def start_idle_evictor(self) -> None:
-                pass
-
-            async def start_hot_reload(self) -> None:
-                pass
-
-            async def stop_memory_monitor(self) -> None:
-                pass
-
-            async def stop_idle_evictor(self) -> None:
-                pass
-
-            async def stop_hot_reload(self) -> None:
-                pass
-
-            async def unload_all_async(self) -> None:
-                pass
-
-        def fake_model_registry(**kwargs: Any) -> FakeRegistry:
+        def fake_model_registry(**kwargs: Any) -> TestModelRegistryConfig._FakeRegistry:
             created_kwargs.update(kwargs)
-            return FakeRegistry()
+            return TestModelRegistryConfig._FakeRegistry()
 
         monkeypatch.setattr("sie_server.app.app_factory.ModelRegistry", fake_model_registry)
 
@@ -345,6 +466,22 @@ class TestModelRegistryConfig:
             pass
 
         assert created_kwargs["pool_name"] == "pool-a"
+
+    @pytest.mark.asyncio
+    async def test_model_registry_receives_pinned_models(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ModelRegistry constructor receives pinned_models from AppStateConfig."""
+        created_kwargs: dict[str, Any] = {}
+
+        def fake_model_registry(**kwargs: Any) -> TestModelRegistryConfig._FakeRegistry:
+            created_kwargs.update(kwargs)
+            return TestModelRegistryConfig._FakeRegistry()
+
+        monkeypatch.setattr("sie_server.app.app_factory.ModelRegistry", fake_model_registry)
+
+        async with AppFactory._model_registry(AppStateConfig(pinned_models=["model-x", "model-y"])):
+            pass
+
+        assert created_kwargs["pinned_models"] == ["model-x", "model-y"]
 
 
 class TestConfigureTorchThreads:

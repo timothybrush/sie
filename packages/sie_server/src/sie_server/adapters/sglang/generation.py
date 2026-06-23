@@ -93,6 +93,28 @@ def _resolve_read_timeout() -> float | None:
 _GENERATE_READ_TIMEOUT_S: float | None = _resolve_read_timeout()
 
 
+def _mamba_scheduler_strategy_value(extra_launch_args: list[str]) -> str | None:
+    """Return the value passed to ``--mamba-scheduler-strategy``, or ``None``.
+
+    Parses both the two-token form (``["--mamba-scheduler-strategy",
+    "extra_buffer"]``) and the ``--mamba-scheduler-strategy=value`` form; the
+    last occurrence wins (argparse semantics). Returns ``None`` when the flag is
+    absent. The speculative guard uses this to require the value be *exactly*
+    ``extra_buffer`` — substring-matching the joined args would let a wrong value
+    (e.g. ``--mamba-scheduler-strategy default``) slip past if the token
+    ``extra_buffer`` happened to appear elsewhere in the args.
+    """
+    flag = "--mamba-scheduler-strategy"
+    prefix = f"{flag}="
+    value: str | None = None
+    for i, arg in enumerate(extra_launch_args):
+        if arg == flag:
+            value = extra_launch_args[i + 1] if i + 1 < len(extra_launch_args) else None
+        elif arg.startswith(prefix):
+            value = arg[len(prefix) :]
+    return value
+
+
 # Format hints we re-embed into the SGLang ``image_data`` MIME type. Anything
 # else falls back to ``jpeg`` (the engine sniffs the real format from bytes).
 _ALLOWED_IMAGE_FORMATS = frozenset({"png", "jpeg", "jpg", "webp", "gif"})
@@ -192,6 +214,14 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # this, so it is inert for every other model.
         guard: dict[str, Any] | None = None,
         speculative: dict[str, Any] | None = None,
+        # When ``speculative.enabled``, the adapter normally REQUIRES
+        # ``--mamba-scheduler-strategy extra_buffer`` in ``extra_launch_args``
+        # — the Qwen3.x Gated-DeltaNet NEXTN + radix-cache pairing. Models whose
+        # speculative path doesn't need it (e.g. Gemma 4 MTP — a standard
+        # hybrid-attention model using an external ``-it-assistant`` NEXTN draft)
+        # set this ``False`` so the guard doesn't reject an otherwise-valid
+        # launch. Default ``True`` keeps the Qwen3.x contract unchanged.
+        speculative_needs_extra_buffer: bool = True,
         extra_launch_args: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         startup_timeout_s: float | None = None,
@@ -250,6 +280,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         # Qwen3-4B-Instruct-2507 (no NEXTN heads — see the
         # speculative-decoding investigation result).
         self._speculative = speculative
+        self._speculative_needs_extra_buffer = speculative_needs_extra_buffer
         self._extra_launch_args = list(extra_launch_args or [])
         self._extra_env = dict(extra_env or {})
         self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
@@ -392,11 +423,21 @@ class SGLangGenerationAdapter(GenerationAdapter):
             # buffer" trace. Refuse to launch when the YAML omits the
             # flag so the misconfiguration surfaces as a startup error
             # instead of a runtime OOM that pages oncall.
-            if not any("mamba-scheduler-strategy" in str(arg) for arg in self._extra_launch_args):
+            # Require the flag AND its exact ``extra_buffer`` value — a present
+            # flag with a wrong value (e.g. ``--mamba-scheduler-strategy default``)
+            # must not bypass the guard. Parse the flag's value precisely (both
+            # the two-token and ``flag=value`` forms; last occurrence wins) rather
+            # than substring-matching the joined args, which a stray
+            # ``extra_buffer`` token elsewhere could satisfy.
+            if (
+                self._speculative_needs_extra_buffer
+                and _mamba_scheduler_strategy_value(self._extra_launch_args) != "extra_buffer"
+            ):
                 raise RuntimeError(
                     "speculative decoding requires '--mamba-scheduler-strategy extra_buffer' "
-                    "in extra_launch_args (see Qwen3.5-4B model YAML). Add the flag or "
-                    "disable speculative.enabled in the model config."
+                    "in extra_launch_args (see Qwen3.5-4B model YAML). Add the flag, set "
+                    "speculative_needs_extra_buffer=false (non-DeltaNet models e.g. Gemma 4 "
+                    "MTP), or disable speculative.enabled in the model config."
                 )
         logger.warning(
             "Resolved SGLang generation command: %s",

@@ -571,6 +571,8 @@ class SIEAsyncClient:
                 request_body["gpus"] = self._pool_spec["gpus"]
             if "gpu_caps" in self._pool_spec:
                 request_body["gpu_caps"] = self._pool_spec["gpu_caps"]
+            if "queue_pool" in self._pool_spec:
+                request_body["queue_pool"] = self._pool_spec["queue_pool"]
             if "bundle" in self._pool_spec:
                 request_body["bundle"] = self._pool_spec["bundle"]
             if self._pool_spec.get("minimum_worker_count") is not None:
@@ -711,6 +713,8 @@ class SIEAsyncClient:
         bundle: str | None = None,
         minimum_worker_count: int | None = None,
         pinned_models: list[str] | None = None,
+        *,
+        queue_pool: str | None = None,
     ) -> None:
         """Create or update a resource pool for isolated capacity.
 
@@ -730,6 +734,8 @@ class SIEAsyncClient:
                 request to them pays no cold model-load. Each id must be a model the
                 gateway already tracks and may be profile-qualified
                 (``model-name:profile_name``); unknown ids are rejected. Defaults to none.
+            queue_pool: Optional Helm/NATS queue namespace backing this logical
+                pool. Defaults to "default", drawing from base capacity.
 
         Raises:
             PoolError: If pool creation fails (e.g., invalid machine profile).
@@ -774,6 +780,8 @@ class SIEAsyncClient:
             request_body["gpus"] = gpus
         if gpu_caps is not None:
             request_body["gpu_caps"] = gpu_caps
+        if queue_pool:
+            request_body["queue_pool"] = queue_pool
         if bundle:
             request_body["bundle"] = bundle
         if minimum_worker_count is not None:

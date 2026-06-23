@@ -28,11 +28,10 @@
 //!   gate on the local [`Readiness`] state so the heartbeat agrees
 //!   with `/readyz`.
 //!
-//! `loaded_models` and the GPU memory fields are informational; the
-//! sidecar does not own a list of model IDs (the adapter does), so
-//! we publish an empty list and let the gateway's per-model state
-//! reflect what it observes from successful work-result publishes
-//! plus its own model registry.
+//! `loaded_models` and the GPU memory fields are informational. The
+//! sidecar mirrors the adapter-owned loaded-model list from the IPC
+//! heartbeat so gateway model/capacity views reflect the live worker
+//! registry without adding a second probe path.
 //!
 //! [`WorkerStatusMessage`]: https://github.com/search?q=WorkerStatusMessage+repo%3Asie-internal
 //! [`resolve_queue_route`]: https://github.com/search?q=resolve_queue_route+repo%3Asie-internal
@@ -51,6 +50,7 @@ use crate::readiness::Readiness;
 use crate::shutdown::Shutdown;
 
 pub type SharedBundleConfigHash = Arc<RwLock<String>>;
+pub type SharedLoadedModels = Arc<RwLock<Vec<String>>>;
 
 /// Default subject prefix used by the gateway. Workers always
 /// publish to `sie.health.<worker_id>` because the gateway's
@@ -98,6 +98,8 @@ pub struct HealthPublisherConfig {
     /// model registry epoch. Updated by the config subscriber after a
     /// successful Python registry apply.
     pub bundle_config_hash: SharedBundleConfigHash,
+    /// Last loaded-model list observed from the Python IPC heartbeat.
+    pub loaded_models: SharedLoadedModels,
     /// How often to publish. Defaults to [`DEFAULT_PUBLISH_INTERVAL`].
     pub interval: Duration,
 }
@@ -132,11 +134,7 @@ struct WorkerStatusPayload<'a> {
     pool_name: &'a str,
     bundle: &'a str,
     bundle_config_hash: &'a str,
-    /// Empty — the sidecar has no authoritative list of loaded
-    /// models. The adapter knows; surfacing that would require a
-    /// new IPC round-trip per heartbeat which isn't worth the
-    /// cost for an informational field.
-    loaded_models: &'a [&'a str],
+    loaded_models: &'a [String],
 }
 
 fn encode_payload(
@@ -148,6 +146,17 @@ fn encode_payload(
         .bundle_config_hash
         .read()
         .expect("bundle config hash lock poisoned");
+    let loaded_models_guard = match config.loaded_models.read() {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            warn!("loaded_models lock poisoned; publishing empty loaded model list");
+            None
+        }
+    };
+    let loaded_models = match &loaded_models_guard {
+        Some(guard) => guard.as_slice(),
+        None => &[],
+    };
     let payload = WorkerStatusPayload {
         name: &config.worker_id,
         ready,
@@ -157,7 +166,7 @@ fn encode_payload(
         pool_name: &config.pool_name,
         bundle: &config.bundle,
         bundle_config_hash: hash.as_str(),
-        loaded_models: &[],
+        loaded_models,
     };
     serde_json::to_vec(&payload)
 }
@@ -292,6 +301,7 @@ mod tests {
             machine_profile: "l4".into(),
             gpu_count: 1,
             bundle_config_hash: Arc::new(RwLock::new("hash-abc".into())),
+            loaded_models: Arc::new(RwLock::new(Vec::new())),
             interval: DEFAULT_PUBLISH_INTERVAL,
         }
     }
@@ -360,6 +370,20 @@ mod tests {
             serde_json::to_value(&payload).unwrap()
         };
         assert_eq!(json["bundle_config_hash"], "hash-next");
+    }
+
+    #[test]
+    fn payload_reads_updated_loaded_models() {
+        let c = cfg();
+        {
+            let mut loaded_models = c.loaded_models.write().unwrap();
+            *loaded_models = vec!["BAAI/bge-m3".into()];
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&encode_payload(&c, true, false).unwrap()).unwrap();
+
+        assert_eq!(json["loaded_models"], serde_json::json!(["BAAI/bge-m3"]));
     }
 
     #[test]

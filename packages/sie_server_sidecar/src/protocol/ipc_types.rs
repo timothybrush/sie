@@ -41,6 +41,7 @@ pub const METHOD_SIGNAL_GENERATE_CANCEL: &str = "SignalGenerateCancel";
 pub const METHOD_RUN_BATCH: &str = "RunBatch";
 pub const METHOD_APPLY_MODEL_CONFIG: &str = "ApplyModelConfig";
 pub const METHOD_REPLACE_MODEL_CONFIGS: &str = "ReplaceModelConfigs";
+pub const METHOD_SET_PINNED_MODELS: &str = "SetPinnedModels";
 pub const METHOD_DRAIN: &str = "Drain";
 
 // -----------------------------------------------------------------------------
@@ -150,6 +151,8 @@ pub struct PingResponse {
     pub worker_id: String,
     #[serde(default)]
     pub bundle_config_hash: String,
+    #[serde(default)]
+    pub loaded_models: Vec<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -307,6 +310,29 @@ pub struct ReplaceModelConfigsResponse {
     pub config_version: u64,
     #[serde(default)]
     pub applied_models: Vec<String>,
+}
+
+// -----------------------------------------------------------------------------
+// SetPinnedModels
+// -----------------------------------------------------------------------------
+
+/// Runtime delivery of a pool's pinned-model set from the gateway to the
+/// worker. The sidecar polls the pool's `PoolSpec.pinned_models` (the single
+/// source of truth, set via the `/v1/pools` API or
+/// `SIE_GATEWAY_STATIC_QUEUE_POOLS`) and pushes it here on change. `models`
+/// carries gateway-canonical ids (bare `sie_id` or `sie_id:profile`); Python
+/// normalizes them. The set is authoritative and REPLACES the worker's current
+/// pinned set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPinnedModelsRequest {
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPinnedModelsResponse {
+    pub applied: bool,
+    #[serde(default)]
+    pub pinned_count: u32,
 }
 
 // -----------------------------------------------------------------------------
@@ -1136,6 +1162,7 @@ mod tests {
         assert_eq!(back.worker_id, "w-1");
         assert_eq!(back.timestamp_ms, 123.0);
         assert_eq!(back.bundle_config_hash, "");
+        assert!(back.loaded_models.is_empty());
     }
 
     #[test]

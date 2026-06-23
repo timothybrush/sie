@@ -271,6 +271,15 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
                 "Pool name used in gpu=\"pool/machine_profile\" routing. Names are stored and routed in lowercase. Only ASCII letters, digits, '_' and '-' are allowed; '_default' is reserved."
             );
         }
+        if let Some(queue_pool_schema) = create_pool
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut("queue_pool"))
+        {
+            queue_pool_schema["minLength"] = json!(1);
+            queue_pool_schema["maxLength"] = json!(128);
+            queue_pool_schema["pattern"] =
+                json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$");
+        }
         create_pool["anyOf"] = json!([
             {
                 "required": ["gpus"],
@@ -289,6 +298,18 @@ fn apply_gateway_openapi_overrides(value: &mut Value) {
                 }
             }
         ]);
+    }
+
+    if let Some(queue_pool_schema) = value
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(|schemas| schemas.get_mut("PoolSpec"))
+        .and_then(|pool_spec| pool_spec.get_mut("properties"))
+        .and_then(|properties| properties.get_mut("queue_pool"))
+    {
+        queue_pool_schema["minLength"] = json!(1);
+        queue_pool_schema["maxLength"] = json!(128);
+        queue_pool_schema["pattern"] = json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$");
     }
 
     patch_chat_completion_schema(value);
@@ -2458,6 +2479,18 @@ mod tests {
             create_pool["properties"]["name"]["pattern"],
             json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$")
         );
+        assert_eq!(
+            create_pool["properties"]["queue_pool"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            create_pool["properties"]["queue_pool"]["maxLength"],
+            json!(128)
+        );
+        assert_eq!(
+            create_pool["properties"]["queue_pool"]["pattern"],
+            json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$")
+        );
         assert!(create_pool["properties"]["name"]["description"]
             .as_str()
             .unwrap()
@@ -2482,6 +2515,17 @@ mod tests {
                     }
                 }
             ])
+        );
+
+        let pool_spec = &spec["components"]["schemas"]["PoolSpec"];
+        assert_eq!(pool_spec["properties"]["queue_pool"]["minLength"], json!(1));
+        assert_eq!(
+            pool_spec["properties"]["queue_pool"]["maxLength"],
+            json!(128)
+        );
+        assert_eq!(
+            pool_spec["properties"]["queue_pool"]["pattern"],
+            json!("^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$")
         );
     }
 

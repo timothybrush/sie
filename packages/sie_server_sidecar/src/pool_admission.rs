@@ -1,12 +1,14 @@
 //! Worker-side pool admission gate.
 //!
-//! The gateway owns pool assignment. Capped pools publish their assigned
-//! workers in `/v1/pools/{name}`; a worker that is not assigned must not pull
-//! from that pool's JetStream consumer, otherwise direct NATS publishes can
-//! bypass the gateway's admission decision.
+//! The gateway owns pool assignment. The sidecar polls `/v1/pools`, opens its
+//! physical JetStream consumer only when the physical pool or at least one
+//! backed logical pool assigns this worker, then checks every work item's
+//! `admission_pool` before Python IPC so direct NATS publishes cannot bypass
+//! the gateway's admission decision.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -41,6 +43,7 @@ pub struct PoolAdmissionGate {
     stale_after: Duration,
     http: reqwest::Client,
     admitted: AtomicBool,
+    assigned_logical_pools: RwLock<HashSet<String>>,
     state: Mutex<GateState>,
 }
 
@@ -72,6 +75,7 @@ impl PoolAdmissionGate {
             stale_after: Duration::from_millis(config.pool_admission_stale_after_ms),
             http,
             admitted: AtomicBool::new(initially_admitted),
+            assigned_logical_pools: RwLock::new(HashSet::new()),
             state: Mutex::new(GateState {
                 last_check_at: None,
                 last_success_at: None,
@@ -111,6 +115,24 @@ impl PoolAdmissionGate {
         self.admitted.load(Ordering::Acquire)
     }
 
+    pub fn pull_admitted(&self) -> bool {
+        self.admitted()
+            || self
+                .assigned_logical_pools
+                .read()
+                .is_ok_and(|pools| !pools.is_empty())
+    }
+
+    pub fn admits_work_item_pool(&self, admission_pool: &str) -> bool {
+        let requested = normalize_pool_name(admission_pool);
+        if requested.is_empty() || requested == normalize_pool_name(&self.pool_name) {
+            return self.admitted();
+        }
+        self.assigned_logical_pools
+            .read()
+            .is_ok_and(|pools| pools.contains(&requested))
+    }
+
     async fn refresh(&self) {
         let now = Instant::now();
         {
@@ -118,13 +140,19 @@ impl PoolAdmissionGate {
             state.last_check_at = Some(now);
         }
 
-        let fetched = self.fetch_pool().await;
+        let fetched = self.fetch_pools().await;
         let mut state = self.state.lock().await;
         match fetched {
-            Ok(pool) => {
+            Ok(pools) => {
                 state.last_success_at = Some(Instant::now());
+                self.set_assigned_logical_pools(assigned_logical_pools_for_worker(
+                    &pools,
+                    &self.worker_id,
+                    &self.pool_name,
+                ));
+                let pool = pool_by_name(&pools, &self.pool_name);
                 let (admitted, reason) = decide_pool_admission(
-                    pool.as_ref(),
+                    pool,
                     &self.pool_name,
                     &self.worker_id,
                     &self.machine_profile,
@@ -132,37 +160,34 @@ impl PoolAdmissionGate {
                 self.set_admitted(&mut state, admitted, reason);
             }
             Err(error) => {
-                self.handle_error(&mut state, Instant::now(), error);
+                if !self.handle_error(&mut state, Instant::now(), error) {
+                    self.set_assigned_logical_pools(HashSet::new());
+                }
             }
         }
     }
 
-    async fn fetch_pool(&self) -> Result<Option<Value>, String> {
-        let url = format!("{}/v1/pools/{}", self.gateway_url, self.pool_name);
+    async fn fetch_pools(&self) -> Result<Vec<Value>, String> {
+        let url = format!("{}/v1/pools", self.gateway_url);
         let mut req = self.http.get(&url).header("accept", "application/json");
         if let Some(token) = self.api_key.as_deref().filter(|token| !token.is_empty()) {
             req = req.bearer_auth(token);
         }
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status();
-        if status.as_u16() == 404 {
-            return Ok(None);
-        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!(
-                "status {} from pool status endpoint: {}",
+                "status {} from pool list endpoint: {}",
                 status.as_u16(),
                 body.chars().take(120).collect::<String>()
             ));
         }
-        resp.json::<Value>()
-            .await
-            .map(Some)
-            .map_err(|e| e.to_string())
+        let body = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        parse_pool_list(&body).ok_or_else(|| "pool list response missing 'pools' array".to_string())
     }
 
-    fn handle_error(&self, state: &mut GateState, now: Instant, error: String) {
+    fn handle_error(&self, state: &mut GateState, now: Instant, error: String) -> bool {
         if state
             .last_success_at
             .is_some_and(|last| now.duration_since(last) <= self.stale_after)
@@ -173,13 +198,14 @@ impl PoolAdmissionGate {
                 error = %error,
                 "pool-admission: keeping cached decision during stale window"
             );
-            return;
+            return true;
         }
 
         // Keep the default pool available during gateway/status glitches.
         // Named pools fail closed because their caps are isolation contracts.
         let fail_open = normalize_pool_name(&self.pool_name) == "default";
         self.set_admitted(state, fail_open, format!("status_error:{error}"));
+        false
     }
 
     fn set_admitted(&self, state: &mut GateState, admitted: bool, reason: String) {
@@ -198,10 +224,78 @@ impl PoolAdmissionGate {
             if admitted { "granted" } else { "paused" }
         );
     }
+
+    fn set_assigned_logical_pools(&self, pools: HashSet<String>) {
+        if let Ok(mut assigned) = self.assigned_logical_pools.write() {
+            *assigned = pools;
+        }
+    }
 }
 
 fn normalize_pool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+fn parse_pool_list(body: &Value) -> Option<Vec<Value>> {
+    body.get("pools")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| body.as_array().cloned())
+}
+
+fn pool_by_name<'a>(pools: &'a [Value], pool_name: &str) -> Option<&'a Value> {
+    let pool_name = normalize_pool_name(pool_name);
+    pools.iter().find(|pool| {
+        pool.get("spec")
+            .and_then(|spec| spec.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| normalize_pool_name(name) == pool_name)
+    })
+}
+
+fn pool_queue_matches(pool: &Value, home_pool: &str) -> bool {
+    let spec = pool.get("spec");
+    let queue_pool = spec
+        .and_then(|spec| spec.get("queue_pool"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            spec.and_then(|spec| spec.get("name"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("default");
+    normalize_pool_name(queue_pool) == normalize_pool_name(home_pool)
+}
+
+fn pool_assigns_worker(pool: &Value, worker_id: &str) -> bool {
+    pool.get("status")
+        .and_then(|status| status.get("assigned_workers"))
+        .and_then(Value::as_array)
+        .is_some_and(|workers| {
+            workers.iter().any(|worker| {
+                worker
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == worker_id)
+            })
+        })
+}
+
+fn assigned_logical_pools_for_worker(
+    pools: &[Value],
+    worker_id: &str,
+    home_pool: &str,
+) -> HashSet<String> {
+    pools
+        .iter()
+        .filter(|pool| pool_queue_matches(pool, home_pool))
+        .filter(|pool| pool_assigns_worker(pool, worker_id))
+        .filter_map(|pool| {
+            pool.get("spec")
+                .and_then(|spec| spec.get("name"))
+                .and_then(Value::as_str)
+                .map(normalize_pool_name)
+        })
+        .collect()
 }
 
 fn object_field<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {
@@ -365,5 +459,85 @@ mod tests {
             decide_pool_admission(Some(&pool), "eval", "w1", "l4"),
             (false, "malformed_assigned_workers".to_string())
         );
+    }
+
+    #[test]
+    fn logical_pool_assignments_follow_home_queue_and_worker() {
+        let pools = vec![
+            json!({
+                "spec": {"name": "tenant-a", "queue_pool": "default"},
+                "status": {"assigned_workers": [{"name": "worker-1"}]}
+            }),
+            json!({
+                "spec": {"name": "tenant-b", "queue_pool": "default"},
+                "status": {"assigned_workers": [{"name": "worker-2"}]}
+            }),
+            json!({
+                "spec": {"name": "dedicated", "queue_pool": "customer-a"},
+                "status": {"assigned_workers": [{"name": "worker-1"}]}
+            }),
+        ];
+
+        let assigned = assigned_logical_pools_for_worker(&pools, "worker-1", "default");
+        assert!(assigned.contains("tenant-a"));
+        assert!(!assigned.contains("tenant-b"));
+        assert!(!assigned.contains("dedicated"));
+    }
+
+    #[test]
+    fn gate_admits_same_physical_pool_or_assigned_logical_pool() {
+        let gate = PoolAdmissionGate {
+            pool_name: "default".to_string(),
+            worker_id: "worker-1".to_string(),
+            machine_profile: "l4".to_string(),
+            gateway_url: "http://gateway".to_string(),
+            api_key: None,
+            check_interval: Duration::from_secs(1),
+            pause: Duration::from_millis(10),
+            stale_after: Duration::from_secs(30),
+            http: reqwest::Client::new(),
+            admitted: AtomicBool::new(true),
+            assigned_logical_pools: RwLock::new(HashSet::from(["tenant-a".to_string()])),
+            state: Mutex::new(GateState {
+                last_check_at: None,
+                last_success_at: None,
+                admitted: true,
+                last_reason: "test".to_string(),
+            }),
+        };
+
+        assert!(gate.admits_work_item_pool(""));
+        assert!(gate.admits_work_item_pool("default"));
+        assert!(gate.admits_work_item_pool("TENANT-A"));
+        assert!(!gate.admits_work_item_pool("tenant-b"));
+    }
+
+    #[test]
+    fn gate_can_pull_for_assigned_logical_pool_without_physical_admission() {
+        let gate = PoolAdmissionGate {
+            pool_name: "customer-queue".to_string(),
+            worker_id: "worker-1".to_string(),
+            machine_profile: "l4".to_string(),
+            gateway_url: "http://gateway".to_string(),
+            api_key: None,
+            check_interval: Duration::from_secs(1),
+            pause: Duration::from_millis(10),
+            stale_after: Duration::from_secs(30),
+            http: reqwest::Client::new(),
+            admitted: AtomicBool::new(false),
+            assigned_logical_pools: RwLock::new(HashSet::from(["tenant-a".to_string()])),
+            state: Mutex::new(GateState {
+                last_check_at: None,
+                last_success_at: None,
+                admitted: false,
+                last_reason: "test".to_string(),
+            }),
+        };
+
+        assert!(gate.pull_admitted());
+        assert!(gate.admits_work_item_pool("tenant-a"));
+        assert!(!gate.admits_work_item_pool(""));
+        assert!(!gate.admits_work_item_pool("customer-queue"));
+        assert!(!gate.admits_work_item_pool("tenant-b"));
     }
 }

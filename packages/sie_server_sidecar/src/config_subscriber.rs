@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use async_nats::Client;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, MutexGuard, Notify};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
@@ -232,7 +232,6 @@ pub fn trusted_producers_from_env() -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct ConfigSubscriberOptions {
     pub trusted_producers: Vec<String>,
-    pub generation_reconcile: Option<Arc<Notify>>,
 }
 
 struct SubscriberRuntime {
@@ -242,7 +241,6 @@ struct SubscriberRuntime {
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
-    generation_reconcile: Option<Arc<Notify>>,
 }
 
 pub fn bundle_subject(bundle: &str) -> Result<String, String> {
@@ -343,7 +341,6 @@ pub fn spawn(
             state,
             metrics,
             shutdown,
-            generation_reconcile: options.generation_reconcile,
         };
 
         if runtime.trusted_producers.is_empty() {
@@ -668,9 +665,6 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
 
     state.mark_applied(notification.epoch, applied_bundle_hash);
     metrics.config_epoch.set(notification.epoch as i64);
-    if let Some(notify) = runtime.generation_reconcile.as_ref() {
-        notify.notify_one();
-    }
 }
 
 #[cfg(test)]

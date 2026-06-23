@@ -302,15 +302,37 @@ export interface CapacityInfo {
 /**
  * Pool specification for creating resource pools.
  */
-export interface PoolSpec {
+export interface PoolCreateSpec {
   /** Pool name (used in GPU param as "poolName/machineProfile") */
   name: string;
+  /** Optional Helm/NATS queue namespace backing this logical pool. Defaults to "default"; non-default values must be declared under queueRouting.staticQueuePools. */
+  queuePool?: string;
   /** Machine profile requirements for pool readiness, e.g., { l4: 2, "a100-40gb": 1 } */
   gpus?: Record<string, number>;
   /** Optional maximum assigned workers per machine profile */
   gpuCaps?: Record<string, number>;
+}
+
+/**
+ * Pool specification returned by the gateway.
+ */
+export interface PoolSpec {
+  /** Pool name (used in GPU param as "poolName/machineProfile") */
+  name: string;
+  /** Helm/NATS queue namespace backing this logical pool */
+  queue_pool?: string;
+  /** Optional bundle constraint for this pool */
+  bundle?: string | null;
+  /** Machine profile requirements for pool readiness, e.g., { l4: 2, "a100-40gb": 1 } */
+  gpus?: Record<string, number>;
   /** Optional maximum assigned workers per machine profile, as returned by the gateway */
   gpu_caps?: Record<string, number>;
+  /** Optional TTL for dynamic pool leases */
+  ttl_seconds?: number | null;
+  /** Minimum workers kept warm for this pool */
+  minimum_worker_count?: number;
+  /** Models pinned for this pool */
+  pinned_models?: string[];
 }
 
 /**
@@ -334,7 +356,7 @@ export interface PoolInfo {
   /** Pool name */
   name: string;
   /** Pool specification */
-  spec: { gpus?: Record<string, number>; gpu_caps?: Record<string, number> };
+  spec: PoolSpec;
   /** Pool status */
   status: PoolStatus;
 }

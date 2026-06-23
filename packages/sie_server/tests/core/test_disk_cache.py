@@ -425,6 +425,46 @@ class TestModelDiskCacheManager:
         assert evicted == []
         assert model_dir.exists()
 
+    def test_ensure_space_excludes_pinned_models(self, cache_dir: Path) -> None:
+        """Pinned models' weights are never evicted from disk, even under sustained pressure."""
+        base = time.time()
+        # The pinned model is the oldest, so it would be the first victim if unprotected.
+        pinned_dir = create_hf_cache_model(cache_dir, "pinned/model", commit_hash="pin", access_time=base - 7200)
+        evictable_dir = create_hf_cache_model(cache_dir, "evictable/model", commit_hash="evi", access_time=base - 3600)
+
+        config = DiskCacheConfig(cache_dir=cache_dir, pressure_threshold=0.85)
+        manager = ModelDiskCacheManager(config, pinned_provider=lambda: {"pinned/model"})
+
+        # Sustained high pressure: the loop evicts the only non-pinned model, then stops
+        # because the pinned model is excluded (no infinite loop, pinned untouched).
+        mock_usage = MagicMock()
+        mock_usage.used = 90 * (1024**3)
+        mock_usage.total = 100 * (1024**3)
+
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            evicted = manager.ensure_space_before_download("new/model")
+
+        assert evicted == ["evictable/model"]
+        assert pinned_dir.exists()
+        assert not evictable_dir.exists()
+
+    def test_ensure_space_all_pinned_returns_empty_without_hanging(self, cache_dir: Path) -> None:
+        """When every cached model is pinned, eviction is a no-op and the loop terminates."""
+        pinned_dir = create_hf_cache_model(cache_dir, "pinned/model", commit_hash="pin", access_time=time.time() - 3600)
+
+        config = DiskCacheConfig(cache_dir=cache_dir, pressure_threshold=0.85)
+        manager = ModelDiskCacheManager(config, pinned_provider=lambda: {"pinned/model"})
+
+        mock_usage = MagicMock()
+        mock_usage.used = 90 * (1024**3)  # Sustained high pressure
+        mock_usage.total = 100 * (1024**3)
+
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            evicted = manager.ensure_space_before_download("new/model")
+
+        assert evicted == []
+        assert pinned_dir.exists()
+
     def test_ensure_space_evicts_multiple_until_below_threshold(
         self, manager: ModelDiskCacheManager, cache_dir: Path
     ) -> None:

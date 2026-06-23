@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -118,15 +119,23 @@ class ModelDiskCacheManager:
         manager.touch("BAAI/bge-m3")
     """
 
-    def __init__(self, config: DiskCacheConfig) -> None:
+    def __init__(
+        self,
+        config: DiskCacheConfig,
+        pinned_provider: Callable[[], set[str]] | None = None,
+    ) -> None:
         """Initialize the disk cache manager.
 
         Args:
             config: Disk cache configuration.
+            pinned_provider: Optional callback returning the HF repo ids whose
+                weights must never be evicted from disk (the pinned set).
+                Evaluated lazily at eviction time so it tracks config changes.
         """
         self._config = config
         self._cache_dir = config.cache_dir
         self._threshold = config.pressure_threshold
+        self._pinned_provider = pinned_provider
 
     @property
     def cache_dir(self) -> Path:
@@ -288,7 +297,11 @@ class ModelDiskCacheManager:
             List of evicted model IDs.
         """
         evicted: list[str] = []
+        # Never evict the model being downloaded, nor any pinned model's weights:
+        # re-downloading a pinned model on reload would reintroduce the cold start.
         exclude = {model_id}
+        if self._pinned_provider is not None:
+            exclude |= self._pinned_provider()
 
         while self.check_pressure():
             lru_model = self.get_lru_model(exclude=exclude)

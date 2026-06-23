@@ -267,6 +267,15 @@ impl GatewayPoolHarness {
         worker_id: &'static str,
         machine_profile: &'static str,
     ) -> Self {
+        Self::start_with_queue_pool(pool, pool, worker_id, machine_profile).await
+    }
+
+    async fn start_with_queue_pool(
+        pool: &'static str,
+        queue_pool: &'static str,
+        worker_id: &'static str,
+        machine_profile: &'static str,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind fake gateway");
@@ -285,9 +294,12 @@ impl GatewayPoolHarness {
                         return;
                     };
                     let request = String::from_utf8_lossy(&buf[..n]);
-                    let expected_path = format!("/v1/pools/{pool}");
                     let ok_path = request.lines().next().is_some_and(|line| {
-                        line.starts_with("GET ") && line.contains(&expected_path)
+                        let mut parts = line.split_whitespace();
+                        matches!(parts.next(), Some("GET"))
+                            && parts.next().is_some_and(|target| {
+                                target == "/v1/pools" || target.starts_with("/v1/pools?")
+                            })
                     });
                     let (status, body) = if ok_path {
                         let assigned_workers = if assigned.load(Ordering::Acquire) {
@@ -300,7 +312,7 @@ impl GatewayPoolHarness {
                         (
                             "200 OK",
                             format!(
-                                r#"{{"spec":{{"gpu_caps":{{"{machine_profile}":1}}}},"status":{{"state":"active","assigned_workers":{assigned_workers}}}}}"#
+                                r#"{{"pools":[{{"spec":{{"name":"{pool}","queue_pool":"{queue_pool}","gpu_caps":{{"{machine_profile}":1}}}},"status":{{"state":"active","assigned_workers":{assigned_workers}}}}}]}}"#
                             ),
                         )
                     } else {
@@ -675,6 +687,7 @@ async fn smoke_encode_request_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: Some(text_item("hello rust worker")),
         payload_ref: None,
@@ -788,6 +801,73 @@ async fn smoke_encode_request_round_trips_through_rust_worker() {
     let _ = Arc::new(());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn smoke_encode_direct_dispatch_round_trips_through_worker_stream() {
+    if skip_unless_tools_available() {
+        return;
+    }
+    let _guard = smoke_test_guard().await;
+
+    let nats = NatsHarness::start().await;
+    eprintln!("nats: {} (port {})", nats.url, nats.port);
+
+    let sock = ShortSocket::new("ipc.sock");
+    let python = PythonHarness::start(sock.path.clone()).await;
+    eprintln!("python harness: socket={}", python.socket_path.display());
+
+    let pool = "smoke-direct";
+    let bundle = "default";
+    let metrics_port = find_free_tcp_port();
+    let _worker = WorkerHarness::spawn(&nats.url, &sock.path, pool, bundle, metrics_port, None);
+    wait_for_tcp(metrics_port, Duration::from_secs(30))
+        .await
+        .expect("worker metrics port");
+    sleep(Duration::from_millis(500)).await;
+
+    let client = async_nats::connect(&nats.url)
+        .await
+        .expect("client connect");
+    let js = async_nats::jetstream::new(client.clone());
+
+    let reply_subject = format!("_INBOX.smoke-direct.{}", uuid::Uuid::new_v4());
+    let mut sub = client
+        .subscribe(reply_subject.clone())
+        .await
+        .expect("subscribe reply");
+
+    let model_id = "BAAI/bge-m3";
+    let subject = worker_work_subject(pool, pool, bundle, model_id, "smoke-worker");
+    publish_work_item(
+        &js,
+        &subject,
+        "smoke-direct-encode-1",
+        model_id,
+        "BAAI__bge-m3",
+        pool,
+        &reply_subject,
+    )
+    .await;
+
+    let reply = timeout(Duration::from_secs(30), sub.next())
+        .await
+        .expect("timed out waiting for direct-dispatch WorkResult")
+        .expect("reply stream closed");
+    let result: WorkResult = rmp_serde::from_slice(&reply.payload).expect("decode WorkResult");
+    assert!(
+        result.success,
+        "expected direct-dispatch success, got error={:?}",
+        result.error
+    );
+    assert_eq!(result.request_id, "smoke-direct-encode-1");
+    assert_eq!(result.worker_id.as_deref(), Some("smoke-worker"));
+
+    drop(_worker);
+    drop(python);
+    drop(nats);
+    let _ = sock;
+    sleep(Duration::from_millis(200)).await;
+}
+
 /// End-to-end smoke test for generation direct-dispatch through the
 /// sidecar. The Python harness exposes one fake generation model and
 /// answers `ProcessGenerate` with the same event sequence a real
@@ -846,6 +926,7 @@ async fn smoke_generate_direct_dispatch_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: None,
         payload_ref: None,
@@ -917,13 +998,11 @@ async fn smoke_generate_direct_dispatch_round_trips_through_rust_worker() {
     sleep(Duration::from_millis(200)).await;
 }
 
-/// Generation direct-dispatch must also come up after a live config change.
-/// The harness hides its generation capability from the startup
-/// WorkerCapabilities probe, then exposes it on the next probe. This exercises
-/// the sidecar's capability reconciler without needing a full sie-config
-/// process in the smoke test.
+/// Worker direct-dispatch is not gated by WorkerCapabilities. The harness hides
+/// generation capability from the first probe, but the worker-specific stream
+/// must still be available for direct generation work immediately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn smoke_generation_direct_dispatch_activates_after_capability_reconcile() {
+async fn smoke_generation_direct_dispatch_is_active_before_capability_reconcile() {
     if skip_unless_tools_available() {
         return;
     }
@@ -945,22 +1024,12 @@ async fn smoke_generation_direct_dispatch_activates_after_capability_reconcile()
     let pool = "smoke-gen-hot-add";
     let bundle = "default";
     let metrics_port = find_free_tcp_port();
-    let _worker = WorkerHarness::spawn_with_env(
-        &nats.url,
-        &sock.path,
-        pool,
-        bundle,
-        metrics_port,
-        None,
-        &[("SIE_GENERATION_CAPABILITY_RECONCILE_INTERVAL_MS", "1000")],
-    );
+    let _worker =
+        WorkerHarness::spawn_with_env(&nats.url, &sock.path, pool, bundle, metrics_port, None, &[]);
     wait_for_tcp(metrics_port, Duration::from_secs(30))
         .await
         .expect("worker metrics port");
-
-    // The binary clamps the reconcile interval to 5s so production cannot
-    // accidentally create a tight IPC polling loop.
-    sleep(Duration::from_millis(6_500)).await;
+    sleep(Duration::from_millis(500)).await;
 
     let client = async_nats::connect(&nats.url)
         .await
@@ -987,6 +1056,7 @@ async fn smoke_generation_direct_dispatch_activates_after_capability_reconcile()
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: None,
         payload_ref: None,
@@ -1140,6 +1210,7 @@ async fn smoke_payload_ref_request_round_trips_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: None,
         payload_ref: Some(payload_ref.clone()),
@@ -1297,6 +1368,7 @@ async fn smoke_extract_payload_ref_preserves_document_bytes_through_ipc() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: None,
         payload_ref: Some(payload_ref.clone()),
@@ -1464,6 +1536,30 @@ async fn publish_work_item(
     pool: &str,
     reply_subject: &str,
 ) {
+    publish_work_item_with_admission_pool(
+        js,
+        subject,
+        request_id,
+        model_id,
+        normalized,
+        pool,
+        "",
+        reply_subject,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_work_item_with_admission_pool(
+    js: &async_nats::jetstream::Context,
+    subject: &str,
+    request_id: &str,
+    model_id: &str,
+    normalized: &str,
+    pool: &str,
+    admission_pool: &str,
+    reply_subject: &str,
+) {
     let _ = normalized; // subject is pre-built by caller
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1479,6 +1575,7 @@ async fn publish_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: admission_pool.into(),
         machine_profile: pool.into(),
         item: Some(text_item(format!("concurrent-{request_id}"))),
         payload_ref: None,
@@ -1534,6 +1631,7 @@ async fn pool_admission_pauses_until_gateway_assigns_worker() {
             ("SIE_POOL_ADMISSION_CHECK_INTERVAL_S", "1"),
             ("SIE_POOL_ADMISSION_PAUSE_S", "0.1"),
             ("SIE_POOL_ADMISSION_STALE_AFTER_S", "0"),
+            ("SIE_NAK_DELAY_S", "0.1"),
         ],
     );
     wait_for_tcp(metrics_port, Duration::from_secs(30))
@@ -1587,6 +1685,98 @@ async fn pool_admission_pauses_until_gateway_assigns_worker() {
         result.error
     );
     assert_eq!(result.request_id, "gated-req-1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logical_pool_admission_naks_until_assigned_worker_serves_item() {
+    if skip_unless_tools_available() {
+        return;
+    }
+    let _guard = smoke_test_guard().await;
+
+    let physical_pool = "default";
+    let logical_pool = "tenant-a";
+    let worker_id = "smoke-worker";
+    let gateway = GatewayPoolHarness::start_with_queue_pool(
+        logical_pool,
+        physical_pool,
+        worker_id,
+        physical_pool,
+    )
+    .await;
+
+    let nats = NatsHarness::start().await;
+    let sock = ShortSocket::new("ipc.sock");
+    let _python = PythonHarness::start(sock.path.clone()).await;
+
+    let bundle = "default";
+    let metrics_port = find_free_tcp_port();
+    let _worker = WorkerHarness::spawn_with_env(
+        &nats.url,
+        &sock.path,
+        physical_pool,
+        bundle,
+        metrics_port,
+        None,
+        &[
+            ("SIE_GATEWAY_URL", gateway.url.as_str()),
+            ("SIE_POOL_ADMISSION_CHECK_INTERVAL_S", "1"),
+            ("SIE_POOL_ADMISSION_PAUSE_S", "0.1"),
+            ("SIE_POOL_ADMISSION_STALE_AFTER_S", "0"),
+            ("SIE_NAK_DELAY_S", "0.1"),
+        ],
+    );
+    wait_for_tcp(metrics_port, Duration::from_secs(30))
+        .await
+        .expect("worker metrics port");
+    sleep(Duration::from_millis(500)).await;
+
+    let client = async_nats::connect(&nats.url)
+        .await
+        .expect("client connect");
+    let js = async_nats::jetstream::new(client.clone());
+    let reply_subject = format!("_INBOX.logical.{}", uuid::Uuid::new_v4());
+    let mut sub = client
+        .subscribe(reply_subject.clone())
+        .await
+        .expect("subscribe reply");
+
+    let model_id = "BAAI/bge-m3";
+    let normalized = "BAAI__bge-m3";
+    let subject = pool_work_subject(physical_pool, physical_pool, bundle, model_id);
+    publish_work_item_with_admission_pool(
+        &js,
+        &subject,
+        "logical-req-1",
+        model_id,
+        normalized,
+        physical_pool,
+        logical_pool,
+        &reply_subject,
+    )
+    .await;
+
+    match timeout(Duration::from_millis(700), sub.next()).await {
+        Err(_) => {}
+        Ok(Some(msg)) => panic!(
+            "worker served logical pool before assignment; payload bytes={}",
+            msg.payload.len()
+        ),
+        Ok(None) => panic!("reply subscription closed before logical assignment"),
+    }
+
+    gateway.set_assigned(true);
+    let reply = timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("timed out waiting for WorkResult after logical assignment")
+        .expect("reply stream closed after logical assignment");
+    let result: WorkResult = rmp_serde::from_slice(&reply.payload).expect("decode WorkResult");
+    assert!(
+        result.success,
+        "expected success after logical assignment, got error={:?}",
+        result.error
+    );
+    assert_eq!(result.request_id, "logical-req-1");
 }
 
 /// Fire N concurrent publishes on distinct reply subjects and assert that
@@ -2179,6 +2369,7 @@ async fn smoke_prepared_tokens_round_trip_through_rust_worker() {
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: Some(text_item("hello world")),
         payload_ref: None,
@@ -2355,6 +2546,7 @@ async fn publish_score_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: None,
         payload_ref: None,
@@ -2405,6 +2597,7 @@ async fn publish_extract_work_item(
         profile_id: String::new(),
         engine: String::new(),
         pool_name: pool.into(),
+        admission_pool: String::new(),
         machine_profile: pool.into(),
         item: Some(text_item("Barack Obama was born in Hawaii.")),
         payload_ref: None,

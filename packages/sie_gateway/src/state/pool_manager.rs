@@ -93,6 +93,23 @@ impl std::fmt::Display for InvalidPoolNameError {
 
 impl std::error::Error for InvalidPoolNameError {}
 
+#[derive(Debug)]
+pub struct UnknownQueuePoolError {
+    pub queue_pool: String,
+}
+
+impl std::fmt::Display for UnknownQueuePoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Unknown backing queue_pool '{}': non-default queue pools must be declared under queueRouting.staticQueuePools",
+            self.queue_pool
+        )
+    }
+}
+
+impl std::error::Error for UnknownQueuePoolError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolAdmissionStatus {
     pub cap: u32,
@@ -146,6 +163,19 @@ impl PoolManager {
                 continue;
             }
             pool.spec.name = normalize_pool_name(&pool.spec.name);
+            pool.spec.queue_pool = normalize_queue_pool(&pool.spec.queue_pool);
+            if let Err(e) = validate_pool_name(&pool.spec.queue_pool) {
+                warn!(pool = %pool.spec.name, queue_pool = %pool.spec.queue_pool, error = %e, "skipping pool with invalid backing queue pool from K8s restore");
+                continue;
+            }
+            if !known_queue_pool_from_names(&static_pool_names, &pool.spec.queue_pool) {
+                warn!(
+                    pool = %pool.spec.name,
+                    queue_pool = %pool.spec.queue_pool,
+                    "skipping pool with unknown backing queue pool from K8s restore"
+                );
+                continue;
+            }
             if static_pool_names.contains(&normalize_pool_name(&pool.spec.name)) {
                 continue;
             }
@@ -230,6 +260,11 @@ impl PoolManager {
             .contains(&normalize_pool_name(name))
     }
 
+    async fn is_known_queue_pool(&self, name: &str) -> bool {
+        let static_pool_names = self.static_pool_names.read().await;
+        known_queue_pool_from_names(&static_pool_names, name)
+    }
+
     pub async fn sync_static_pools(
         &self,
         specs: &[PoolSpec],
@@ -255,6 +290,7 @@ impl PoolManager {
             });
             let static_spec = PoolSpec {
                 name: name.clone(),
+                queue_pool: name.clone(),
                 bundle,
                 gpus,
                 gpu_caps: spec.gpu_caps.clone(),
@@ -419,18 +455,50 @@ impl PoolManager {
         minimum_worker_count: u32,
         pinned_models: Vec<String>,
     ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
+        self.create_pool_with_caps_on_queue(
+            name,
+            DEFAULT_POOL_NAME,
+            gpus,
+            gpu_caps,
+            bundle,
+            ttl_seconds,
+            minimum_worker_count,
+            pinned_models,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pool_with_caps_on_queue(
+        &self,
+        name: &str,
+        queue_pool: &str,
+        gpus: HashMap<String, u32>,
+        gpu_caps: HashMap<String, u32>,
+        bundle: Option<String>,
+        ttl_seconds: Option<u64>,
+        minimum_worker_count: u32,
+        pinned_models: Vec<String>,
+    ) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
         let raw_name = name;
         validate_pool_name(name)?;
         let name = normalize_pool_name(name);
         if name == DEFAULT_POOL_NAME && raw_name != DEFAULT_POOL_NAME {
             return Err(Box::new(DefaultPoolMutationError));
         }
+        validate_pool_name(queue_pool)?;
+        let queue_pool = normalize_queue_pool(queue_pool);
         let gpus = Self::normalize_gpus_and_caps(gpus, &gpu_caps);
         self.validate_pool_profiles(&gpus, &gpu_caps)?;
         let is_static_pool = self.is_static_pool(&name).await;
         if is_static_pool {
             return Err(Box::new(StaticPoolMutationError {
                 name: raw_name.to_string(),
+            }));
+        }
+        if !self.is_known_queue_pool(&queue_pool).await {
+            return Err(Box::new(UnknownQueuePoolError {
+                queue_pool: queue_pool.clone(),
             }));
         }
 
@@ -444,6 +512,7 @@ impl PoolManager {
                 .get_mut(&pool_key)
                 .expect("pool key resolved from the same map");
             let spec_changed = existing.spec.bundle != bundle
+                || existing.spec.queue_pool != queue_pool
                 || existing.spec.gpus != gpus
                 || existing.spec.gpu_caps != gpu_caps
                 || existing.spec.ttl_seconds != ttl_seconds
@@ -457,6 +526,7 @@ impl PoolManager {
             existing.status.last_renewed = now;
             let event = if spec_changed {
                 existing.spec.bundle = bundle;
+                existing.spec.queue_pool = queue_pool.clone();
                 existing.spec.gpus = gpus;
                 existing.spec.gpu_caps = gpu_caps;
                 existing.spec.ttl_seconds = ttl_seconds;
@@ -496,6 +566,7 @@ impl PoolManager {
         let pool = Pool {
             spec: PoolSpec {
                 name: name.clone(),
+                queue_pool,
                 bundle,
                 gpus,
                 gpu_caps,
@@ -638,6 +709,13 @@ impl PoolManager {
         }
     }
 
+    pub async fn queue_pool_for_pool(&self, pool_name: &str) -> Option<String> {
+        let pools = self.pools.read().await;
+        let key = pool_key_for_name(&pools, pool_name)?;
+        let pool = pools.get(&key)?;
+        Some(normalize_queue_pool(&pool.spec.queue_pool))
+    }
+
     pub async fn list_pools(&self) -> Vec<Pool> {
         let pools = self.pools.read().await;
         pools.values().cloned().collect()
@@ -722,10 +800,13 @@ impl PoolManager {
         let pool = pools
             .get_mut(&pool_key)
             .expect("pool key resolved from the same map");
+        let queue_pool = normalize_queue_pool(&pool.spec.queue_pool);
 
         let filtered: Vec<&WorkerAssignment> = available_workers
             .iter()
-            .filter(|(_, _, _, _, queue_pool)| worker_consumes_pool(queue_pool, pool_name))
+            .filter(|(_, _, _, _, worker_queue_pool)| {
+                worker_consumes_pool(worker_queue_pool, &queue_pool)
+            })
             .filter(|(_, _, _, bundle, _)| match pool.spec.bundle.as_ref() {
                 Some(bundle_filter) => bundle == bundle_filter,
                 None => true,
@@ -849,6 +930,19 @@ impl PoolManager {
         }
         let name = normalize_pool_name(&raw_name);
         pool.spec.name = name.clone();
+        pool.spec.queue_pool = normalize_queue_pool(&pool.spec.queue_pool);
+        if let Err(e) = validate_pool_name(&pool.spec.queue_pool) {
+            warn!(pool = %name, queue_pool = %pool.spec.queue_pool, error = %e, "skipping invalid backing queue pool from K8s watch");
+            return;
+        }
+        if !self.is_known_queue_pool(&pool.spec.queue_pool).await {
+            warn!(
+                pool = %name,
+                queue_pool = %pool.spec.queue_pool,
+                "skipping pool with unknown backing queue pool from K8s watch"
+            );
+            return;
+        }
         if self.is_static_pool(&name).await {
             return;
         }
@@ -997,6 +1091,20 @@ pub(crate) fn normalize_pool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+fn normalize_queue_pool(name: &str) -> String {
+    let normalized = normalize_pool_name(name);
+    if normalized.is_empty() {
+        DEFAULT_POOL_NAME.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn known_queue_pool_from_names(static_pool_names: &HashSet<String>, name: &str) -> bool {
+    let queue_pool = normalize_queue_pool(name);
+    queue_pool == DEFAULT_POOL_NAME || static_pool_names.contains(&queue_pool)
+}
+
 /// Deduplicated, lowercased machine-profile set for a pool, taken from the
 /// union of `spec.gpus` (requirements) and `spec.gpu_caps` (admission caps).
 /// This is the same set `single_machine_profile_for_pool` collapses to one;
@@ -1072,6 +1180,21 @@ mod tests {
         )
     }
 
+    fn static_queue_pool(name: &str, profile: &str) -> PoolSpec {
+        let mut gpus = HashMap::new();
+        gpus.insert(profile.to_string(), 0);
+        PoolSpec {
+            name: name.to_string(),
+            queue_pool: name.to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+            pinned_models: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_validate_pool_name_matches_route_contract() {
         for name in ["default", "customer-acme", "bench_1", "A100Pool"] {
@@ -1102,8 +1225,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.spec.name, "test");
+        assert_eq!(pool.spec.queue_pool, DEFAULT_POOL_NAME);
         assert_eq!(pool.status.state, PoolState::Pending);
         assert_eq!(pool.spec.minimum_worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_rejects_unknown_non_default_queue_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        let err = pm
+            .create_pool_with_caps_on_queue(
+                "tenant",
+                "missing-queue",
+                gpus,
+                HashMap::new(),
+                None,
+                None,
+                0,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Unknown backing queue_pool"));
+    }
+
+    #[tokio::test]
+    async fn test_create_pool_accepts_static_non_default_queue_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+        pm.sync_static_pools(&[static_queue_pool("bench", "l4-spot")])
+            .await
+            .unwrap();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        let pool = pm
+            .create_pool_with_caps_on_queue(
+                "tenant",
+                "bench",
+                gpus,
+                HashMap::new(),
+                None,
+                None,
+                0,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pool.spec.name, "tenant");
+        assert_eq!(pool.spec.queue_pool, "bench");
     }
 
     #[tokio::test]
@@ -1301,6 +1475,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let specs = vec![PoolSpec {
             name: "company-a".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus,
             gpu_caps: HashMap::new(),
@@ -1339,6 +1514,7 @@ mod tests {
         gpu_caps.insert("l4-spot".to_string(), 1);
         let specs = vec![PoolSpec {
             name: "bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus: HashMap::new(),
             gpu_caps,
@@ -1373,6 +1549,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let specs = vec![PoolSpec {
             name: "bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus,
             gpu_caps: HashMap::new(),
@@ -1410,6 +1587,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let specs = vec![PoolSpec {
             name: "Bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus,
             gpu_caps: HashMap::new(),
@@ -1447,6 +1625,7 @@ mod tests {
 
         let specs = vec![PoolSpec {
             name: " bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus: HashMap::from([("l4-spot".to_string(), 0)]),
             gpu_caps: HashMap::new(),
@@ -1473,6 +1652,7 @@ mod tests {
         let specs = vec![
             PoolSpec {
                 name: "Bench".to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus: gpus.clone(),
                 gpu_caps: HashMap::new(),
@@ -1482,6 +1662,7 @@ mod tests {
             },
             PoolSpec {
                 name: "bench".to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus,
                 gpu_caps: HashMap::new(),
@@ -1514,6 +1695,7 @@ mod tests {
         static_gpus.insert("l4-spot".to_string(), 0);
         let specs = vec![PoolSpec {
             name: "bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus: static_gpus,
             gpu_caps: HashMap::new(),
@@ -1538,6 +1720,7 @@ mod tests {
         gpus.insert("l4-spot".to_string(), 0);
         let specs = vec![PoolSpec {
             name: "bench".to_string(),
+            queue_pool: DEFAULT_POOL_NAME.to_string(),
             bundle: None,
             gpus,
             gpu_caps: HashMap::new(),
@@ -1552,6 +1735,7 @@ mod tests {
         let remote = Pool {
             spec: PoolSpec {
                 name: "bench".to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: Some("other".to_string()),
                 gpus: remote_gpus,
                 gpu_caps: HashMap::new(),
@@ -1595,9 +1779,9 @@ mod tests {
             .unwrap();
 
         let workers = vec![
-            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w3", "http://w3:8080", "a100", "default", "test"),
+            worker("w1", "http://w1:8080", "l4-spot", "default"),
+            worker("w2", "http://w2:8080", "l4-spot", "default"),
+            worker("w3", "http://w3:8080", "a100", "default"),
         ];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -1625,7 +1809,7 @@ mod tests {
                     &format!("http://w{}:8080", i),
                     "l4-spot",
                     "default",
-                    "test",
+                    DEFAULT_POOL_NAME,
                 )
             })
             .collect();
@@ -1657,7 +1841,7 @@ mod tests {
                     &format!("http://w{}:8080", i),
                     "l4-spot",
                     "default",
-                    "test",
+                    DEFAULT_POOL_NAME,
                 )
             })
             .collect();
@@ -1683,9 +1867,9 @@ mod tests {
             .unwrap();
 
         let workers = vec![
-            worker_in_pool("w3", "http://w3:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+            worker("w3", "http://w3:8080", "l4-spot", "default"),
+            worker("w1", "http://w1:8080", "l4-spot", "default"),
+            worker("w2", "http://w2:8080", "l4-spot", "default"),
         ];
 
         let all_met = pm.assign_workers("test", &workers).await;
@@ -1702,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assign_workers_ignores_other_queue_pools_when_capped() {
+    async fn test_dynamic_pool_assigns_default_backing_queue_when_capped() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
         let mut gpus = HashMap::new();
@@ -1730,11 +1914,11 @@ mod tests {
         let pool = pm.get_pool("bench").await.unwrap();
         assert_eq!(pool.status.state, PoolState::Active);
         assert_eq!(pool.status.assigned_workers.len(), 1);
-        assert_eq!(pool.status.assigned_workers[0].name, "bench-worker");
+        assert_eq!(pool.status.assigned_workers[0].name, "default-worker");
     }
 
     #[tokio::test]
-    async fn test_assign_workers_ignores_other_queue_pools_without_caps() {
+    async fn test_dynamic_pool_assigns_default_backing_queue_without_caps() {
         let pm = PoolManager::new(vec!["l4-spot".to_string()]);
 
         let mut gpus = HashMap::new();
@@ -1751,11 +1935,55 @@ mod tests {
         )];
 
         let all_met = pm.assign_workers("bench", &workers).await;
-        assert!(!all_met);
+        assert!(all_met);
 
         let pool = pm.get_pool("bench").await.unwrap();
-        assert_eq!(pool.status.state, PoolState::Pending);
-        assert!(pool.status.assigned_workers.is_empty());
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 1);
+        assert_eq!(pool.status.assigned_workers[0].name, "default-worker");
+    }
+
+    #[tokio::test]
+    async fn test_assign_workers_honors_custom_backing_queue_pool() {
+        let pm = PoolManager::new(vec!["l4-spot".to_string()]);
+        pm.sync_static_pools(&[static_queue_pool("bench", "l4-spot")])
+            .await
+            .unwrap();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool_with_caps_on_queue(
+            "tenant",
+            "bench",
+            gpus,
+            HashMap::new(),
+            None,
+            None,
+            0,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let workers = vec![
+            worker("default-worker", "http://w1:8080", "l4-spot", "default"),
+            worker_in_pool(
+                "bench-worker",
+                "http://w2:8080",
+                "l4-spot",
+                "default",
+                "bench",
+            ),
+        ];
+
+        let all_met = pm.assign_workers("tenant", &workers).await;
+        assert!(all_met);
+
+        let pool = pm.get_pool("tenant").await.unwrap();
+        assert_eq!(pool.spec.queue_pool, "bench");
+        assert_eq!(pool.status.state, PoolState::Active);
+        assert_eq!(pool.status.assigned_workers.len(), 1);
+        assert_eq!(pool.status.assigned_workers[0].name, "bench-worker");
     }
 
     #[tokio::test]
@@ -1776,7 +2004,7 @@ mod tests {
                     &format!("http://w{}:8080", i),
                     "l4-spot",
                     "default",
-                    "test",
+                    DEFAULT_POOL_NAME,
                 )
             })
             .collect();
@@ -1826,7 +2054,7 @@ mod tests {
             "http://w1:8080",
             "l4-spot",
             "default",
-            "test",
+            DEFAULT_POOL_NAME,
         )];
         pm.assign_workers("test", &workers).await;
 
@@ -1855,8 +2083,8 @@ mod tests {
             .unwrap();
 
         let workers = vec![
-            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w2", "http://w2:8080", "l4-spot", "default", "test"),
+            worker("w1", "http://w1:8080", "l4-spot", "default"),
+            worker("w2", "http://w2:8080", "l4-spot", "default"),
         ];
         pm.assign_workers("test", &workers).await;
 
@@ -1880,8 +2108,8 @@ mod tests {
             .unwrap();
 
         let workers = vec![
-            worker_in_pool("w1", "http://w1:8080", "l4-spot", "default", "test"),
-            worker_in_pool("w2", "http://w2:8080", "l4-spot", "sglang", "test"),
+            worker("w1", "http://w1:8080", "l4-spot", "default"),
+            worker("w2", "http://w2:8080", "l4-spot", "sglang"),
         ];
         pm.assign_workers("test", &workers).await;
 
@@ -2117,6 +2345,7 @@ mod tests {
         let pool = Pool {
             spec: PoolSpec {
                 name: DEFAULT_POOL_NAME.to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
                 gpu_caps: HashMap::new(),
@@ -2155,6 +2384,7 @@ mod tests {
         let pool = Pool {
             spec: PoolSpec {
                 name: DEFAULT_POOL_NAME.to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
                 gpu_caps: HashMap::new(),
@@ -2298,6 +2528,7 @@ mod tests {
         let remote = Pool {
             spec: PoolSpec {
                 name: "bench.l4".to_string(),
+                queue_pool: DEFAULT_POOL_NAME.to_string(),
                 bundle: None,
                 gpus: HashMap::from([("l4-spot".to_string(), 1)]),
                 gpu_caps: HashMap::new(),

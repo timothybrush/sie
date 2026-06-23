@@ -121,6 +121,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: name.to_string(),
+                queue_pool: "default".to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
                 gpu_caps: HashMap::new(),
@@ -169,6 +170,21 @@ mod tests {
         );
         assert_eq!(actions, vec![set_action("tenant", "BAAI/bge-m3", 1.0)]);
         assert_eq!(prev.get("tenant").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_backed_logical_pool_reports_loaded_pinned_model() {
+        let mut prev = PinnedLanes::new();
+        let mut tenant = pool("tenant", &["BAAI/bge-m3"]);
+        tenant.spec.queue_pool = "default".to_string();
+
+        let actions = reconcile_pinned_models(
+            &[tenant],
+            &loaded(&[("tenant", &["BAAI/bge-m3"])]),
+            &mut prev,
+        );
+
+        assert_eq!(actions, vec![set_action("tenant", "BAAI/bge-m3", 1.0)]);
     }
 
     #[test]

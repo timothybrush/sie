@@ -194,6 +194,8 @@ fn parse_engine_pin(headers: &HeaderMap) -> EnginePinParse {
 enum PoolResolution {
     /// A healthy worker is registered and this is the pool to publish to.
     Route(QueueRoute),
+    /// Caller pinned a logical pool that is not present in the pool manager.
+    PoolNotFound(String),
     /// No healthy worker matches the requested `(pool, machine_profile,
     /// bundle)` lane — the caller should emit the surface-specific
     /// provisioning response and record pending demand so KEDA scales up.
@@ -218,6 +220,10 @@ enum ProvisioningSurface {
 #[derive(Debug, PartialEq, Eq)]
 struct PoolLookup {
     resolution: PoolResolution,
+    /// Logical pool whose spec/status should be used for admission decisions.
+    admission_pool: String,
+    /// Physical queue pool label for pending-demand metrics/KEDA.
+    demand_pool: String,
     /// `true` iff a healthy worker with a non-empty pool name and
     /// machine-profile existed for the exact `(bundle, gpu)` tuple at
     /// lookup time.
@@ -258,10 +264,19 @@ fn is_valid_pool_name(pool: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
-fn apply_model_pool_default(
+async fn apply_model_pool_default(
     requested_pool: &mut String,
     model_pool: Option<&str>,
+    pool_manager: Option<&PoolManager>,
 ) -> Result<(), String> {
+    let model_pool = model_pool.and_then(|pool| {
+        let pool = pool.trim();
+        if pool.is_empty() || pool.eq_ignore_ascii_case(DEFAULT_POOL_NAME) {
+            None
+        } else {
+            Some(normalize_pool_name(pool))
+        }
+    });
     let Some(model_pool) = model_pool else {
         if requested_pool.is_empty() {
             *requested_pool = DEFAULT_POOL_NAME.to_string();
@@ -269,11 +284,20 @@ fn apply_model_pool_default(
         return Ok(());
     };
     if requested_pool.is_empty() {
-        *requested_pool = model_pool.to_string();
+        *requested_pool = model_pool.clone();
         return Ok(());
     }
-    if requested_pool == model_pool {
+    if *requested_pool == model_pool {
         return Ok(());
+    }
+    if let Some(manager) = pool_manager {
+        if manager
+            .queue_pool_for_pool(requested_pool)
+            .await
+            .is_some_and(|queue_pool| queue_pool == model_pool)
+        {
+            return Ok(());
+        }
     }
     Err(format!(
         "Model is assigned to pool '{model_pool}', but request targeted pool '{requested_pool}'"
@@ -311,6 +335,16 @@ async fn resolve_effective_pool(
     bundle_config_hash: &str,
 ) -> PoolLookup {
     if !pool_name.is_empty() {
+        let normalized_pool = normalize_pool_name(pool_name);
+        let Some(queue_pool) = queue_pool_for_request(pool_manager, pool_name).await else {
+            return PoolLookup {
+                resolution: PoolResolution::PoolNotFound(normalized_pool.clone()),
+                admission_pool: normalized_pool,
+                demand_pool: DEFAULT_POOL_NAME.to_string(),
+                exact_gpu_match: false,
+                pending_demand_profile: None,
+            };
+        };
         // Caller pinned a pool. With the new subject shape, a pool-only
         // pin is not enough to publish cold unless we can infer a single
         // machine-profile token from the pool spec. A pool+GPU pin names the
@@ -318,11 +352,13 @@ async fn resolve_effective_pool(
         // retryable provisioning error until a healthy worker is present so
         // the gateway does not publish to a stream with no active consumer.
         if gpu.is_empty() {
+            let inferred_profile = infer_single_pool_profile(pool_manager, pool_name).await;
+            let lookup_gpu = inferred_profile.as_deref().unwrap_or("");
             let route = registry
-                .resolve_queue_route_in_pool(bundle, "", pool_name, bundle_config_hash)
+                .resolve_queue_route_in_pool(bundle, lookup_gpu, &queue_pool, bundle_config_hash)
                 .await;
             let pending_demand_profile = if route.is_none() {
-                infer_single_pool_profile(pool_manager, pool_name).await
+                inferred_profile
             } else {
                 None
             };
@@ -331,13 +367,15 @@ async fn resolve_effective_pool(
                     Some(route) => PoolResolution::Route(route),
                     None => PoolResolution::Provisioning,
                 },
+                admission_pool: normalize_pool_name(pool_name),
+                demand_pool: queue_pool,
                 exact_gpu_match: false,
                 pending_demand_profile,
             };
         }
 
         let route = registry
-            .resolve_queue_route_in_pool(bundle, gpu, pool_name, bundle_config_hash)
+            .resolve_queue_route_in_pool(bundle, gpu, &queue_pool, bundle_config_hash)
             .await;
         let exact_gpu_match = route.is_some();
         return PoolLookup {
@@ -345,6 +383,8 @@ async fn resolve_effective_pool(
                 Some(route) => PoolResolution::Route(route),
                 None => PoolResolution::Provisioning,
             },
+            admission_pool: normalize_pool_name(pool_name),
+            demand_pool: queue_pool,
             exact_gpu_match,
             pending_demand_profile: if exact_gpu_match {
                 None
@@ -374,9 +414,25 @@ async fn resolve_effective_pool(
     };
     PoolLookup {
         resolution,
+        admission_pool: DEFAULT_POOL_NAME.to_string(),
+        demand_pool: DEFAULT_POOL_NAME.to_string(),
         exact_gpu_match,
         pending_demand_profile,
     }
+}
+
+async fn queue_pool_for_request(
+    pool_manager: Option<&PoolManager>,
+    pool_name: &str,
+) -> Option<String> {
+    let normalized = normalize_pool_name(pool_name);
+    if normalized.is_empty() {
+        return Some(DEFAULT_POOL_NAME.to_string());
+    }
+    let Some(manager) = pool_manager else {
+        return Some(normalized);
+    };
+    manager.queue_pool_for_pool(&normalized).await
 }
 
 async fn infer_single_pool_profile(
@@ -481,6 +537,31 @@ fn build_openai_provisioning_response(gpu: &str, bundle: &str) -> Response {
     build_provisioning_response_for_surface(gpu, bundle, ProvisioningSurface::OpenAiCompat)
 }
 
+fn pool_not_found_message(pool: &str) -> String {
+    format!("Pool '{}' not found", pool)
+}
+
+fn build_pool_not_found_response_for_surface(pool: &str, surface: ProvisioningSurface) -> Response {
+    let message = pool_not_found_message(pool);
+    match surface {
+        ProvisioningSurface::Native => (
+            StatusCode::NOT_FOUND,
+            Json(json_detail(err_code::POOL_NOT_FOUND, message)),
+        )
+            .into_response(),
+        ProvisioningSurface::OpenAiCompat => (
+            StatusCode::NOT_FOUND,
+            Json(json_openai_error(
+                message,
+                oai_type::INVALID_REQUEST,
+                Some("pool"),
+                oai_code::INVALID_REQUEST,
+            )),
+        )
+            .into_response(),
+    }
+}
+
 fn provisioning_surface_for_endpoint(endpoint: &str) -> ProvisioningSurface {
     if endpoint_uses_openai_envelope(endpoint) {
         ProvisioningSurface::OpenAiCompat
@@ -491,24 +572,30 @@ fn provisioning_surface_for_endpoint(endpoint: &str) -> ProvisioningSurface {
 
 async fn capped_lane_admission_response(
     state: &AppState,
-    pool: &str,
+    admission_pool: &str,
+    demand_pool: &str,
     machine_profile: &str,
     bundle: &str,
     provisioning_surface: ProvisioningSurface,
 ) -> Option<Response> {
     let admission = state
         .pool_manager
-        .capped_lane_status(pool, machine_profile, bundle)
+        .capped_lane_status(admission_pool, machine_profile, bundle)
         .await?;
 
     if admission.cap == 0 {
-        metrics::record_rejected_request_for_pool(pool, machine_profile, bundle, "pool_cap_zero");
+        metrics::record_rejected_request_for_pool(
+            admission_pool,
+            machine_profile,
+            bundle,
+            "pool_cap_zero",
+        );
         let message = format!(
             "Pool '{}' admits zero workers for GPU type '{}' and bundle '{}'.",
-            pool, machine_profile, bundle
+            admission_pool, machine_profile, bundle
         );
         let mut m = Map::new();
-        m.insert("pool".to_string(), json!(pool));
+        m.insert("pool".to_string(), json!(admission_pool));
         m.insert("gpu".to_string(), json!(machine_profile));
         m.insert("bundle".to_string(), json!(bundle));
         m.insert("cap".to_string(), json!(admission.cap));
@@ -549,7 +636,9 @@ async fn capped_lane_admission_response(
     }
 
     if admission.assigned_count == 0 {
-        state.demand_tracker.record(pool, machine_profile, bundle);
+        state
+            .demand_tracker
+            .record(demand_pool, machine_profile, bundle);
         return Some(build_provisioning_response_for_surface(
             machine_profile,
             bundle,
@@ -558,6 +647,60 @@ async fn capped_lane_admission_response(
     }
 
     None
+}
+
+async fn batch_publish_target(
+    state: &AppState,
+    pool: &str,
+    admission_pool: &str,
+    model: &str,
+    machine_profile: &str,
+    bundle: &str,
+    bundle_config_hash: &str,
+) -> Result<publisher::PublishTarget, ()> {
+    let pool_target = publisher::PublishTarget::Pool {
+        pool: pool.to_string(),
+        machine_profile: machine_profile.to_string(),
+        bundle: bundle.to_string(),
+        model: model.to_string(),
+    };
+    let Some(admitted_worker_names) = state
+        .pool_manager
+        .admitted_worker_names_for_capped_lane(admission_pool, machine_profile, bundle)
+        .await
+    else {
+        return Ok(pool_target);
+    };
+    if admitted_worker_names.is_empty() {
+        return Err(());
+    }
+
+    let ring = state.registry.lazy_lane_ring_snapshot_for_admitted(
+        model,
+        pool,
+        machine_profile,
+        bundle,
+        bundle_config_hash,
+        &admitted_worker_names,
+    );
+    let seed = uuid::Uuid::now_v7().to_string();
+    let key = crate::routing::key::RoutingKeyResolved {
+        hash: Some(crate::routing::key::hash_bytes(&seed)),
+        source: crate::routing::key::KeySource::RoutingKey,
+        #[cfg(feature = "raw-routing-logs")]
+        raw_for_debug: None,
+    };
+    let Some(worker_id) = crate::routing::pick_worker(&ring, &key) else {
+        return Err(());
+    };
+
+    Ok(publisher::PublishTarget::Worker {
+        pool: pool.to_string(),
+        machine_profile: machine_profile.to_string(),
+        bundle: bundle.to_string(),
+        model: model.to_string(),
+        worker_id: worker_id.to_string(),
+    })
 }
 
 #[utoipa::path(
@@ -957,7 +1100,13 @@ async fn proxy_request(
         pool_name = normalize_pool_name(&pool_name);
     }
     let model_pool = state.model_registry.get_model_pool_name(&model_name);
-    if let Err(message) = apply_model_pool_default(&mut pool_name, model_pool.as_deref()) {
+    if let Err(message) = apply_model_pool_default(
+        &mut pool_name,
+        model_pool.as_deref(),
+        Some(&state.pool_manager),
+    )
+    .await
+    {
         metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
         return endpoint_error_response(
             endpoint,
@@ -1062,9 +1211,15 @@ async fn proxy_request(
         );
     };
 
+    let Some(hash_pool) = queue_pool_for_request(Some(&state.pool_manager), &pool_name).await
+    else {
+        let requested_pool = normalize_pool_name(&pool_name);
+        metrics::record_rejected_request_for_pool(&requested_pool, &gpu, &bundle, "pool_not_found");
+        return build_pool_not_found_response_for_surface(&requested_pool, provisioning_surface);
+    };
     let bundle_config_hash = state
         .model_registry
-        .compute_bundle_config_hash_for_pool(&bundle, &pool_name);
+        .compute_bundle_config_hash_for_pool(&bundle, &hash_pool);
 
     // Resolve the effective pool in one shot. `resolve_effective_pool`
     // folds the demand-tracking probe ("was there an exact
@@ -1083,25 +1238,26 @@ async fn proxy_request(
         &bundle_config_hash,
     )
     .await;
-    let demand_pool = if pool_name.is_empty() {
-        DEFAULT_POOL_NAME
-    } else {
-        pool_name.as_str()
-    };
+    let demand_pool = lookup.demand_pool.clone();
+    let admission_pool = lookup.admission_pool.clone();
     let pending_demand_profile = lookup.pending_demand_profile.clone();
     if let Some(profile) = pending_demand_profile.as_deref() {
-        state.demand_tracker.record(demand_pool, profile, &bundle);
+        state.demand_tracker.record(&demand_pool, profile, &bundle);
     }
 
     let effective_route = match lookup.resolution {
         PoolResolution::Route(route) => route,
+        PoolResolution::PoolNotFound(pool) => {
+            metrics::record_rejected_request_for_pool(&pool, &gpu, &bundle, "pool_not_found");
+            return build_pool_not_found_response_for_surface(&pool, provisioning_surface);
+        }
         PoolResolution::Provisioning => {
             // If route resolution named a concrete cold lane, demand was
             // recorded above with that machine-profile label. Otherwise keep
             // the legacy empty/unknown-profile series for observability even
             // though KEDA cannot scale a lane without a profile token.
             if pending_demand_profile.is_none() {
-                state.demand_tracker.record(demand_pool, &gpu, &bundle);
+                state.demand_tracker.record(&demand_pool, &gpu, &bundle);
             }
             return build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
         }
@@ -1111,7 +1267,8 @@ async fn proxy_request(
 
     if let Some(resp) = capped_lane_admission_response(
         &state,
-        effective_pool,
+        &admission_pool,
+        &demand_pool,
         effective_machine_profile,
         &bundle,
         provisioning_surface,
@@ -1120,6 +1277,34 @@ async fn proxy_request(
     {
         return resp;
     }
+
+    let batch_target = if endpoint == "generate" {
+        None
+    } else {
+        match batch_publish_target(
+            &state,
+            effective_pool,
+            &admission_pool,
+            &model_name,
+            effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+        )
+        .await
+        {
+            Ok(target) => Some(target),
+            Err(()) => {
+                state
+                    .demand_tracker
+                    .record(&demand_pool, effective_machine_profile, &bundle);
+                return build_provisioning_response_for_surface(
+                    effective_machine_profile,
+                    &bundle,
+                    provisioning_surface,
+                );
+            }
+        }
+    };
 
     let token_id = extract_bearer_token(req.headers())
         .map(|t| mask_token(&t))
@@ -1188,6 +1373,7 @@ async fn proxy_request(
         &engine,
         effective_machine_profile,
         effective_pool,
+        &admission_pool,
         &body_bytes,
         is_msgpack_in,
         use_msgpack_out,
@@ -1195,6 +1381,7 @@ async fn proxy_request(
         content_length,
         Instant::now(),
         &bundle_config_hash,
+        batch_target,
     )
     .await
 }
@@ -1223,6 +1410,7 @@ async fn queue_mode_proxy(
     engine: &str,
     gpu: &str,
     pool: &str,
+    admission_pool: &str,
     body_bytes: &[u8],
     is_msgpack_in: bool,
     use_msgpack_out: bool,
@@ -1230,6 +1418,7 @@ async fn queue_mode_proxy(
     content_length: i64,
     start: Instant,
     bundle_config_hash: &str,
+    batch_target: Option<publisher::PublishTarget>,
 ) -> Response {
     // Parse body once, extract items + params (avoids double parse)
     let (items, params) = match parse_queue_request(body_bytes, is_msgpack_in, endpoint) {
@@ -1444,6 +1633,7 @@ async fn queue_mode_proxy(
                     engine: engine.to_string(),
                     gpu: gpu.to_string(),
                     pool: pool.to_string(),
+                    admission_pool: admission_pool.to_string(),
                     bundle_config_hash: bundle_config_hash.to_string(),
                     work_params: params,
                     endpoint: super::sse::SseEndpoint::Generate,
@@ -1462,6 +1652,7 @@ async fn queue_mode_proxy(
             engine,
             gpu,
             pool,
+            admission_pool,
             bundle_config_hash,
             &params,
             use_msgpack_out,
@@ -1473,14 +1664,21 @@ async fn queue_mode_proxy(
     }
 
     let publish_start = Instant::now();
+    let target = batch_target.unwrap_or_else(|| publisher::PublishTarget::Pool {
+        pool: pool.to_string(),
+        machine_profile: gpu.to_string(),
+        bundle: bundle.to_string(),
+        model: model.to_string(),
+    });
+    let direct_batch_fallback =
+        matches!(target, publisher::PublishTarget::Worker { .. }) && endpoint != "generate";
     let (request_id, rx) = match work_publisher
         .publish_work(
-            pool,
+            target,
+            admission_pool,
             endpoint,
             model,
-            bundle,
             engine,
-            gpu,
             bundle_config_hash,
             items,
             &params,
@@ -1544,6 +1742,14 @@ async fn queue_mode_proxy(
             return response;
         }
     };
+    if direct_batch_fallback {
+        if let Some(work_publisher_arc) = state.work_publisher.clone() {
+            work_publisher_arc.spawn_batch_direct_fallback(
+                request_id.clone(),
+                batch_direct_fallback_delay(state.config.request_timeout),
+            );
+        }
+    }
     let publish_elapsed = publish_start.elapsed();
 
     // Wait for results (use configured request_timeout instead of hardcoded 300s)
@@ -1925,6 +2131,7 @@ pub(crate) async fn run_streaming_generate(
     engine: &str,
     gpu: &str,
     pool: &str,
+    admission_pool: &str,
     bundle_config_hash: &str,
     params: &publisher::WorkParams,
 ) -> Result<StreamingDriverOk, StreamingDriverErr> {
@@ -1981,7 +2188,7 @@ pub(crate) async fn run_streaming_generate(
     } else {
         let admitted_worker_names = state
             .pool_manager
-            .admitted_worker_names_for_capped_lane(pool, gpu, bundle)
+            .admitted_worker_names_for_capped_lane(admission_pool, gpu, bundle)
             .await;
         let fallback_lane_worker_count = state.registry.pool_fallback_lane_worker_count(
             pool,
@@ -2049,7 +2256,14 @@ pub(crate) async fn run_streaming_generate(
     // Capture this before the move into `publish_generate_streaming`.
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
     let (request_id, rx, activity) = match work_publisher
-        .publish_generate_streaming(target, model, engine, bundle_config_hash, params)
+        .publish_generate_streaming(
+            target,
+            model,
+            engine,
+            bundle_config_hash,
+            params,
+            admission_pool,
+        )
         .await
     {
         Ok(r) => r,
@@ -2336,7 +2550,12 @@ pub(crate) async fn run_streaming_generate(
     // If the worker emitted an error terminal, surface it as a typed
     // failure. The caller chooses the HTTP status / wire envelope.
     if let Some(err) = outcome.error.as_ref() {
-        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "generate_worker_error");
+        metrics::record_rejected_request_for_pool(
+            pool,
+            gpu,
+            bundle,
+            generation_worker_error_metric_reason(&err.code),
+        );
         return Err(StreamingDriverErr::WorkerError {
             code: err.code.clone(),
             message: err.message.clone(),
@@ -2362,6 +2581,9 @@ pub(crate) fn worker_error_http_status(code: &str) -> StatusCode {
     match code {
         "invalid_request" | "unsupported_field" => StatusCode::BAD_REQUEST,
         "context_exceeded" => StatusCode::BAD_REQUEST,
+        RESOURCE_EXHAUSTED_ERROR_CODE | MODEL_LOADING_ERROR_CODE | LORA_LOADING_ERROR_CODE => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         "transport_failure" => StatusCode::SERVICE_UNAVAILABLE,
         "cancelled" => StatusCode::REQUEST_TIMEOUT,
         "rate_limit_exceeded" => StatusCode::TOO_MANY_REQUESTS,
@@ -2482,6 +2704,9 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                 "invalid_request" => oai_code::INVALID_REQUEST,
                 "unsupported_field" => oai_code::UNSUPPORTED_FIELD,
                 "context_exceeded" => oai_code::CONTEXT_EXCEEDED,
+                RESOURCE_EXHAUSTED_ERROR_CODE => RESOURCE_EXHAUSTED_ERROR_CODE,
+                MODEL_LOADING_ERROR_CODE => MODEL_LOADING_ERROR_CODE,
+                LORA_LOADING_ERROR_CODE => LORA_LOADING_ERROR_CODE,
                 "transport_failure" => oai_code::TRANSPORT_FAILURE,
                 "cancelled" => oai_code::CANCELLED,
                 "rate_limit_exceeded" => oai_code::RATE_LIMIT_EXCEEDED,
@@ -2510,6 +2735,29 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                 resp.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
                     HeaderValue::from_static("1"),
+                );
+            }
+            let retryable = match code.as_str() {
+                RESOURCE_EXHAUSTED_ERROR_CODE => Some((
+                    RESOURCE_EXHAUSTED_RETRY_AFTER,
+                    RESOURCE_EXHAUSTED_ERROR_CODE,
+                )),
+                MODEL_LOADING_ERROR_CODE => {
+                    Some((MODEL_LOADING_RETRY_AFTER, MODEL_LOADING_ERROR_CODE))
+                }
+                LORA_LOADING_ERROR_CODE => {
+                    Some((LORA_LOADING_RETRY_AFTER, LORA_LOADING_ERROR_CODE))
+                }
+                _ => None,
+            };
+            if let Some((retry_after, error_code)) = retryable {
+                resp.headers_mut().insert(
+                    HeaderName::from_static("retry-after"),
+                    HeaderValue::from_static(retry_after),
+                );
+                resp.headers_mut().insert(
+                    HeaderName::from_static("x-sie-error-code"),
+                    HeaderValue::from_static(error_code),
                 );
             }
             resp
@@ -2579,6 +2827,7 @@ async fn queue_mode_streaming_generate(
     engine: &str,
     gpu: &str,
     pool: &str,
+    admission_pool: &str,
     bundle_config_hash: &str,
     params: &publisher::WorkParams,
     use_msgpack_out: bool,
@@ -2595,6 +2844,7 @@ async fn queue_mode_streaming_generate(
         engine,
         gpu,
         pool,
+        admission_pool,
         bundle_config_hash,
         params,
     )
@@ -4588,6 +4838,7 @@ pub(crate) fn resolve_model_and_bundle(
 struct ResolvedRoute {
     gpu: String,
     engine: String,
+    admission_pool: String,
     effective_pool: String,
     effective_machine_profile: String,
     bundle_config_hash: String,
@@ -4641,7 +4892,13 @@ async fn resolve_generation_route(
         pool_name = normalize_pool_name(&pool_name);
     }
     let model_pool = state.model_registry.get_model_pool_name(model_name);
-    if let Err(message) = apply_model_pool_default(&mut pool_name, model_pool.as_deref()) {
+    if let Err(message) = apply_model_pool_default(
+        &mut pool_name,
+        model_pool.as_deref(),
+        Some(&state.pool_manager),
+    )
+    .await
+    {
         metrics::record_rejected_request_for_pool(&pool_name, &gpu, bundle, "pool_mismatch");
         return Err((
             StatusCode::BAD_REQUEST,
@@ -4709,9 +4966,18 @@ async fn resolve_generation_route(
             .into_response());
     };
 
+    let Some(hash_pool) = queue_pool_for_request(Some(&state.pool_manager), &pool_name).await
+    else {
+        let requested_pool = normalize_pool_name(&pool_name);
+        metrics::record_rejected_request_for_pool(&requested_pool, &gpu, bundle, "pool_not_found");
+        return Err(build_pool_not_found_response_for_surface(
+            &requested_pool,
+            ProvisioningSurface::OpenAiCompat,
+        ));
+    };
     let bundle_config_hash = state
         .model_registry
-        .compute_bundle_config_hash_for_pool(bundle, &pool_name);
+        .compute_bundle_config_hash_for_pool(bundle, &hash_pool);
     let engine = state
         .model_registry
         .get_bundle_info(bundle)
@@ -4726,20 +4992,24 @@ async fn resolve_generation_route(
         &bundle_config_hash,
     )
     .await;
-    let demand_pool = if pool_name.is_empty() {
-        DEFAULT_POOL_NAME
-    } else {
-        pool_name.as_str()
-    };
+    let demand_pool = lookup.demand_pool.clone();
+    let admission_pool = lookup.admission_pool.clone();
     let pending_demand_profile = lookup.pending_demand_profile.clone();
     if let Some(profile) = pending_demand_profile.as_deref() {
-        state.demand_tracker.record(demand_pool, profile, bundle);
+        state.demand_tracker.record(&demand_pool, profile, bundle);
     }
     let effective_route = match lookup.resolution {
         PoolResolution::Route(route) => route,
+        PoolResolution::PoolNotFound(pool) => {
+            metrics::record_rejected_request_for_pool(&pool, &gpu, bundle, "pool_not_found");
+            return Err(build_pool_not_found_response_for_surface(
+                &pool,
+                ProvisioningSurface::OpenAiCompat,
+            ));
+        }
         PoolResolution::Provisioning => {
             if pending_demand_profile.is_none() {
-                state.demand_tracker.record(demand_pool, &gpu, bundle);
+                state.demand_tracker.record(&demand_pool, &gpu, bundle);
             }
             return Err(build_openai_provisioning_response(&gpu, bundle));
         }
@@ -4749,7 +5019,8 @@ async fn resolve_generation_route(
 
     if let Some(resp) = capped_lane_admission_response(
         state,
-        &effective_pool,
+        &admission_pool,
+        &demand_pool,
         &effective_machine_profile,
         bundle,
         ProvisioningSurface::OpenAiCompat,
@@ -4771,6 +5042,7 @@ async fn resolve_generation_route(
     Ok(ResolvedRoute {
         gpu,
         engine,
+        admission_pool,
         effective_pool,
         effective_machine_profile,
         bundle_config_hash,
@@ -5169,6 +5441,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     let ResolvedRoute {
         gpu,
         engine,
+        admission_pool,
         effective_pool,
         effective_machine_profile,
         bundle_config_hash,
@@ -5239,6 +5512,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
             engine: engine.clone(),
             gpu: effective_machine_profile.clone(),
             pool: effective_pool.clone(),
+            admission_pool: admission_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
             work_params,
             endpoint: super::sse::SseEndpoint::Chat {
@@ -5257,6 +5531,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         &engine,
         &effective_machine_profile,
         &effective_pool,
+        &admission_pool,
         &bundle_config_hash,
         &work_params,
     )
@@ -5781,6 +6056,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
     let ResolvedRoute {
         gpu,
         engine,
+        admission_pool,
         effective_pool,
         effective_machine_profile,
         bundle_config_hash,
@@ -5824,6 +6100,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
             engine: engine.clone(),
             gpu: effective_machine_profile.clone(),
             pool: effective_pool.clone(),
+            admission_pool: admission_pool.clone(),
             bundle_config_hash: bundle_config_hash.clone(),
             work_params,
             endpoint: super::sse::SseEndpoint::Completion,
@@ -5840,6 +6117,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         &engine,
         &effective_machine_profile,
         &effective_pool,
+        &admission_pool,
         &bundle_config_hash,
         &work_params,
     )
@@ -6364,6 +6642,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
     let ResolvedRoute {
         gpu,
         engine,
+        admission_pool,
         effective_pool,
         effective_machine_profile,
         bundle_config_hash,
@@ -6399,6 +6678,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         &engine,
         &effective_machine_profile,
         &effective_pool,
+        &admission_pool,
         &bundle_config_hash,
         &work_params,
     )
@@ -6678,6 +6958,24 @@ fn retryable_metric_reason(code: &str) -> &'static str {
         LORA_LOADING_ERROR_CODE => "upstream_lora_loading",
         _ => "all_items_failed",
     }
+}
+
+fn generation_worker_error_metric_reason(code: &str) -> &'static str {
+    match code {
+        RESOURCE_EXHAUSTED_ERROR_CODE | MODEL_LOADING_ERROR_CODE | LORA_LOADING_ERROR_CODE => {
+            retryable_metric_reason(code)
+        }
+        _ => "generate_worker_error",
+    }
+}
+
+fn batch_direct_fallback_delay(request_timeout_s: f64) -> Duration {
+    let timeout_s = if request_timeout_s.is_finite() && request_timeout_s > 0.0 {
+        request_timeout_s
+    } else {
+        30.0
+    };
+    Duration::from_secs_f64((timeout_s / 3.0).clamp(1.0, 10.0))
 }
 
 /// Build a ``503 + <code>`` response that mirrors the worker-side HTTP
@@ -10022,6 +10320,7 @@ mod tests {
         let resp = capped_lane_admission_response(
             &state,
             "tenant",
+            DEFAULT_POOL_NAME,
             "l4",
             "default",
             ProvisioningSurface::Native,
@@ -10049,6 +10348,7 @@ mod tests {
         let resp = capped_lane_admission_response(
             &state,
             "tenant",
+            DEFAULT_POOL_NAME,
             "l4",
             "default",
             ProvisioningSurface::OpenAiCompat,
@@ -10079,12 +10379,15 @@ mod tests {
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
+        let demand_pool = "test-zero-assigned-native";
+        let bundle = "test-zero-assigned-native-bundle";
 
         let resp = capped_lane_admission_response(
             &state,
             "tenant",
+            demand_pool,
             "l4",
-            "default",
+            bundle,
             ProvisioningSurface::Native,
         )
         .await
@@ -10104,12 +10407,12 @@ mod tests {
         assert!(value.get("status").is_none());
 
         let pending_demand = metrics::PENDING_DEMAND
-            .with_label_values(&["tenant", "l4", "default"])
+            .with_label_values(&[demand_pool, "l4", bundle])
             .get();
         assert!((pending_demand - 1.0).abs() < f64::EPSILON);
-        state.demand_tracker.clear("tenant", "l4", "default");
+        state.demand_tracker.clear(demand_pool, "l4", bundle);
         let cleared_demand = metrics::PENDING_DEMAND
-            .with_label_values(&["tenant", "l4", "default"])
+            .with_label_values(&[demand_pool, "l4", bundle])
             .get();
         assert!((cleared_demand - 0.0).abs() < f64::EPSILON);
     }
@@ -10125,12 +10428,15 @@ mod tests {
             .await
             .unwrap();
         let state = admission_test_state(Arc::clone(&pm));
+        let demand_pool = "test-zero-assigned-openai";
+        let bundle = "test-zero-assigned-openai-bundle";
 
         let resp = capped_lane_admission_response(
             &state,
             "tenant",
+            demand_pool,
             "l4",
-            "default",
+            bundle,
             ProvisioningSurface::OpenAiCompat,
         )
         .await
@@ -10154,6 +10460,86 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("Provisioning in progress"));
+        state.demand_tracker.clear(demand_pool, "l4", bundle);
+    }
+
+    #[tokio::test]
+    async fn test_batch_publish_target_directs_capped_logical_pool_to_assigned_cold_worker() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 0);
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("l4".to_string(), 1);
+        pm.create_pool_with_caps("tenant", gpus, caps, None, None, 0, vec![])
+            .await
+            .unwrap();
+        pm.assign_workers(
+            "tenant",
+            &[(
+                "assigned-cold".to_string(),
+                "http://assigned-cold:8080".to_string(),
+                "l4".to_string(),
+                "default".to_string(),
+                DEFAULT_POOL_NAME.to_string(),
+            )],
+        )
+        .await;
+
+        let state = admission_test_state(Arc::clone(&pm));
+        state
+            .registry
+            .update_worker(
+                "http://assigned-cold:8080",
+                crate::types::WorkerStatusMessage {
+                    name: "assigned-cold".to_string(),
+                    ready: true,
+                    gpu_count: 1,
+                    machine_profile: "l4".to_string(),
+                    pool_name: DEFAULT_POOL_NAME.to_string(),
+                    bundle: "default".to_string(),
+                    bundle_config_hash: "h1".to_string(),
+                    loaded_models: Vec::new(),
+                    models: Vec::new(),
+                    gpus: Vec::new(),
+                    queue_depth: None,
+                    memory_used_bytes: None,
+                    memory_total_bytes: None,
+                    saturated: false,
+                    terminated: false,
+                },
+            )
+            .await;
+
+        let target = batch_publish_target(
+            &state,
+            DEFAULT_POOL_NAME,
+            "tenant",
+            "BAAI/bge-m3",
+            "l4",
+            "default",
+            "h1",
+        )
+        .await
+        .expect("assigned capped lane should have a direct target");
+
+        match target {
+            publisher::PublishTarget::Worker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                worker_id,
+            } => {
+                assert_eq!(pool, DEFAULT_POOL_NAME);
+                assert_eq!(machine_profile, "l4");
+                assert_eq!(bundle, "default");
+                assert_eq!(model, "BAAI/bge-m3");
+                assert_eq!(worker_id, "assigned-cold");
+            }
+            publisher::PublishTarget::Pool { .. } => {
+                panic!("capped logical batch work must not publish to the shared pool subject")
+            }
+        }
     }
 
     #[tokio::test]
@@ -10215,26 +10601,87 @@ mod tests {
         assert!(is_valid_pool_name(&"a".repeat(128)));
     }
 
-    #[test]
-    fn test_apply_model_pool_default() {
+    #[tokio::test]
+    async fn test_apply_model_pool_default() {
         let mut omitted = String::new();
-        apply_model_pool_default(&mut omitted, Some("customer-a")).unwrap();
+        apply_model_pool_default(&mut omitted, Some("customer-a"), None)
+            .await
+            .unwrap();
         assert_eq!(omitted, "customer-a");
 
         let mut matching = "customer-a".to_string();
-        apply_model_pool_default(&mut matching, Some("customer-a")).unwrap();
+        apply_model_pool_default(&mut matching, Some("customer-a"), None)
+            .await
+            .unwrap();
         assert_eq!(matching, "customer-a");
 
         let mut mismatched = "default".to_string();
-        assert!(apply_model_pool_default(&mut mismatched, Some("customer-a")).is_err());
+        assert!(
+            apply_model_pool_default(&mut mismatched, Some("customer-a"), None)
+                .await
+                .is_err()
+        );
 
         let mut unknown_omitted = String::new();
-        apply_model_pool_default(&mut unknown_omitted, None).unwrap();
+        apply_model_pool_default(&mut unknown_omitted, None, None)
+            .await
+            .unwrap();
         assert_eq!(unknown_omitted, "default");
 
         let mut unknown_explicit = "customer-a".to_string();
-        apply_model_pool_default(&mut unknown_explicit, None).unwrap();
+        apply_model_pool_default(&mut unknown_explicit, None, None)
+            .await
+            .unwrap();
         assert_eq!(unknown_explicit, "customer-a");
+
+        let mut default_model_explicit_runtime_pool = "customer-a".to_string();
+        apply_model_pool_default(
+            &mut default_model_explicit_runtime_pool,
+            Some("default"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(default_model_explicit_runtime_pool, "customer-a");
+
+        let mut default_model_omitted = String::new();
+        apply_model_pool_default(&mut default_model_omitted, Some("default"), None)
+            .await
+            .unwrap();
+        assert_eq!(default_model_omitted, "default");
+    }
+
+    #[tokio::test]
+    async fn test_apply_model_pool_allows_logical_pool_backed_by_model_pool() {
+        let pm = PoolManager::new(vec!["l4".to_string()]);
+        sync_static_queue_pool(&pm, "customer-queue", "l4").await;
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 1);
+        pm.create_pool_with_caps_on_queue(
+            "tenant-a",
+            "customer-queue",
+            gpus,
+            std::collections::HashMap::new(),
+            None,
+            None,
+            0,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let mut backed_logical_pool = "tenant-a".to_string();
+        apply_model_pool_default(&mut backed_logical_pool, Some("customer-queue"), Some(&pm))
+            .await
+            .unwrap();
+        assert_eq!(backed_logical_pool, "tenant-a");
+
+        let mut unrelated_pool = "tenant-b".to_string();
+        assert!(
+            apply_model_pool_default(&mut unrelated_pool, Some("customer-queue"), Some(&pm))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -11660,6 +12107,37 @@ mod tests {
     }
 
     #[test]
+    fn test_generation_worker_error_metric_reason_keeps_model_loading_retryable() {
+        assert_eq!(
+            generation_worker_error_metric_reason(MODEL_LOADING_ERROR_CODE),
+            "upstream_model_loading"
+        );
+        assert_eq!(
+            generation_worker_error_metric_reason(RESOURCE_EXHAUSTED_ERROR_CODE),
+            "resource_exhausted"
+        );
+        assert_eq!(
+            generation_worker_error_metric_reason(LORA_LOADING_ERROR_CODE),
+            "upstream_lora_loading"
+        );
+        assert_eq!(
+            generation_worker_error_metric_reason("invalid_request"),
+            "generate_worker_error"
+        );
+    }
+
+    #[test]
+    fn test_batch_direct_fallback_delay_leaves_request_budget() {
+        assert_eq!(batch_direct_fallback_delay(0.5), Duration::from_secs(1));
+        assert_eq!(batch_direct_fallback_delay(30.0), Duration::from_secs(10));
+        assert_eq!(batch_direct_fallback_delay(300.0), Duration::from_secs(10));
+        assert_eq!(
+            batch_direct_fallback_delay(f64::NAN),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
     fn test_parse_model_spec_with_bundle() {
         let (bundle, model) = parse_model_spec("premium:/BAAI/bge-m3");
         assert_eq!(bundle, "premium");
@@ -12609,6 +13087,23 @@ mod tests {
         }
     }
 
+    async fn sync_static_queue_pool(pm: &PoolManager, name: &str, profile: &str) {
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert(profile.to_string(), 0);
+        pm.sync_static_pools(&[crate::types::pool::PoolSpec {
+            name: name.to_string(),
+            queue_pool: name.to_string(),
+            bundle: None,
+            gpus,
+            gpu_caps: std::collections::HashMap::new(),
+            ttl_seconds: None,
+            minimum_worker_count: 0,
+            pinned_models: Vec::new(),
+        }])
+        .await
+        .unwrap();
+    }
+
     fn route(pool: &str, gpu: &str) -> PoolResolution {
         PoolResolution::Route(QueueRoute {
             pool_name: pool.to_string(),
@@ -12718,6 +13213,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_effective_pool_unknown_api_pool_fails_closed() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "customer-acme"),
+        )
+        .await;
+        let pm = PoolManager::new(vec!["l4-spot".into()]);
+
+        let out =
+            resolve_effective_pool(&reg, Some(&pm), "default", "l4-spot", "customer-acme", "")
+                .await;
+
+        assert_eq!(
+            out.resolution,
+            PoolResolution::PoolNotFound("customer-acme".to_string())
+        );
+        assert_eq!(out.admission_pool, "customer-acme");
+        assert_eq!(out.demand_pool, DEFAULT_POOL_NAME);
+        assert_eq!(out.pending_demand_profile, None);
+        assert!(!out.exact_gpu_match);
+    }
+
+    #[tokio::test]
     async fn test_resolve_effective_pool_infers_cold_profile_from_single_profile_pool() {
         // A tenant pool with exactly one configured machine profile can scale
         // from a pool-only request: the gateway still returns provisioning, but
@@ -12779,6 +13298,114 @@ mod tests {
         let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "").await;
         assert_eq!(out.resolution, route("my-bench", "l4-spot"));
         assert!(out.exact_gpu_match);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_api_pool_routes_to_default_backing_queue() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", DEFAULT_POOL_NAME),
+        )
+        .await;
+        let pm = PoolManager::new(vec!["l4-spot".into()]);
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool("my-bench", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
+
+        let out =
+            resolve_effective_pool(&reg, Some(&pm), "default", "l4-spot", "my-bench", "").await;
+        assert_eq!(out.resolution, route(DEFAULT_POOL_NAME, "l4-spot"));
+        assert_eq!(out.admission_pool, "my-bench");
+        assert_eq!(out.demand_pool, DEFAULT_POOL_NAME);
+        assert!(out.exact_gpu_match);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_pool_only_respects_single_profile_api_pool() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "a100", DEFAULT_POOL_NAME),
+        )
+        .await;
+        let pm = PoolManager::new(vec!["l4".into(), "a100".into()]);
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4".to_string(), 1);
+        pm.create_pool("tenant-l4", gpus, None, None, 0, vec![])
+            .await
+            .unwrap();
+
+        let out = resolve_effective_pool(&reg, Some(&pm), "default", "", "tenant-l4", "").await;
+
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert_eq!(out.admission_pool, "tenant-l4");
+        assert_eq!(out.demand_pool, DEFAULT_POOL_NAME);
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_api_pool_routes_to_custom_backing_queue() {
+        let reg = pool_registry();
+        reg.update_worker(
+            "http://w1:8080",
+            worker_msg("default", "l4-spot", "customer-queue"),
+        )
+        .await;
+        let pm = PoolManager::new(vec!["l4-spot".into()]);
+        sync_static_queue_pool(&pm, "customer-queue", "l4-spot").await;
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool_with_caps_on_queue(
+            "tenant-a",
+            "customer-queue",
+            gpus,
+            std::collections::HashMap::new(),
+            None,
+            None,
+            0,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let out =
+            resolve_effective_pool(&reg, Some(&pm), "default", "l4-spot", "tenant-a", "").await;
+        assert_eq!(out.resolution, route("customer-queue", "l4-spot"));
+        assert_eq!(out.admission_pool, "tenant-a");
+        assert_eq!(out.demand_pool, "customer-queue");
+        assert!(out.exact_gpu_match);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_api_pool_uses_custom_backing_queue_for_cold_demand() {
+        let reg = pool_registry();
+        let pm = PoolManager::new(vec!["l4-spot".into()]);
+        sync_static_queue_pool(&pm, "customer-queue", "l4-spot").await;
+        let mut gpus = std::collections::HashMap::new();
+        gpus.insert("l4-spot".to_string(), 1);
+        pm.create_pool_with_caps_on_queue(
+            "tenant-a",
+            "customer-queue",
+            gpus,
+            std::collections::HashMap::new(),
+            None,
+            None,
+            0,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let out =
+            resolve_effective_pool(&reg, Some(&pm), "default", "l4-spot", "tenant-a", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert_eq!(out.admission_pool, "tenant-a");
+        assert_eq!(out.demand_pool, "customer-queue");
+        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
+        assert!(!out.exact_gpu_match);
     }
 
     #[tokio::test]
@@ -15574,6 +16201,50 @@ mod tests {
         // SIE-native attempt_id is preserved alongside the envelope so
         // SIE-aware SDKs can correlate retries.
         assert_eq!(err_obj["attempt_id"], "att-rl-1");
+    }
+
+    async fn assert_streaming_worker_error_is_retryable(
+        code: &'static str,
+        retry_after: &'static str,
+    ) {
+        let err = StreamingDriverErr::WorkerError {
+            code: code.to_string(),
+            message: "Retryable worker error; retry later.".to_string(),
+            request_id: "req-retry-1".to_string(),
+            attempt_id: "att-retry-1".to_string(),
+        };
+        let resp = build_streaming_error_response(&err);
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), retry_after);
+        assert_eq!(resp.headers().get("x-sie-error-code").unwrap(), code);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_obj = v.get("error").expect("error envelope");
+        assert_eq!(err_obj["type"], oai_type::SERVER_ERROR);
+        assert_eq!(err_obj["code"], code);
+        assert_eq!(err_obj["attempt_id"], "att-retry-1");
+    }
+
+    #[tokio::test]
+    async fn test_build_streaming_error_response_retryable_worker_errors_return_503() {
+        assert_streaming_worker_error_is_retryable(
+            RESOURCE_EXHAUSTED_ERROR_CODE,
+            RESOURCE_EXHAUSTED_RETRY_AFTER,
+        )
+        .await;
+        assert_streaming_worker_error_is_retryable(
+            MODEL_LOADING_ERROR_CODE,
+            MODEL_LOADING_RETRY_AFTER,
+        )
+        .await;
+        assert_streaming_worker_error_is_retryable(
+            LORA_LOADING_ERROR_CODE,
+            LORA_LOADING_RETRY_AFTER,
+        )
+        .await;
     }
 
     /// HTTP status mapping unit test — guards against an off-by-one

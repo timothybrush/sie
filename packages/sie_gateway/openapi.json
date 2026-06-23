@@ -952,6 +952,16 @@
             },
             "type": "array"
           },
+          "queue_pool": {
+            "description": "Physical Helm/NATS queue namespace to draw workers from. Omit for normal\ndynamic logical pools; they use `default`. Set only to an\noperator-provisioned Helm queue pool declared under\n`queueRouting.staticQueuePools` for dedicated capacity.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttl_seconds": {
             "format": "int64",
             "minimum": 0,
@@ -2442,6 +2452,13 @@
             },
             "type": "array"
           },
+          "queue_pool": {
+            "description": "Physical Helm/NATS queue namespace backing this logical API pool.\n\nAPI-created pools default to the Helm `default` queue pool. Pool `name`\nis user/dynamic; a non-default `queue_pool` is infra/admin and must\nmatch a Helm worker queue declared under `queueRouting.staticQueuePools`.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?!_[dD][eE][fF][aA][uU][lL][tT]$)[A-Za-z0-9_-]+$",
+            "type": "string"
+          },
           "ttl_seconds": {
             "format": "int64",
             "minimum": 0,
@@ -2980,7 +2997,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.10"
+    "version": "0.6.11"
   },
   "openapi": "3.1.0",
   "paths": {

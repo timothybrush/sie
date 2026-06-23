@@ -11,6 +11,13 @@
 {{- $bundle := $bundleName }}
 {{- /* See worker-statefulset.yaml for the imageBundle rationale. */ -}}
 {{- $imageBundle := default $bundle $bundleCfg.imageBundle }}
+{{- /* Mirror the worker-statefulset bundle->platform guard so prepull never
+       references an image the release pipeline does not build. */ -}}
+{{- $bundlePlatforms := $root.Values.workers.common.bundlePlatforms | default dict }}
+{{- $requiredPlatform := index $bundlePlatforms $imageBundle | default "" }}
+{{- if and $requiredPlatform (ne $requiredPlatform $platform) }}
+{{- fail (printf "workers.pools.%s.bundles.%s: image bundle %q is built only for platform %q, but this pool resolves to %q. Set this pool's `platform: %s`." $poolName $bundleName $imageBundle $requiredPlatform $platform $requiredPlatform) }}
+{{- end }}
 {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
 {{- $workerImage := printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
 ---

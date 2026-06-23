@@ -9,6 +9,7 @@ ENV_DEVICE = "SIE_DEVICE"
 ENV_MODELS_DIR = "SIE_MODELS_DIR"
 ENV_MODEL_FILTER = "SIE_MODEL_FILTER"
 ENV_PRELOAD_MODELS = "SIE_PRELOAD_MODELS"
+ENV_PINNED_MODELS = "SIE_PINNED_MODELS"
 ENV_POOL = "SIE_POOL"
 
 
@@ -32,6 +33,9 @@ class AppStateConfig:
     preload_models: list[str] | None = None
     """Optional list of model names to eagerly load at startup. If None, all models are lazy-loaded."""
 
+    pinned_models: list[str] | None = None
+    """Optional list of model names to pin in memory (eager-loaded and never LRU-evicted). If None, no models are pinned."""
+
     pool_name: str | None = None
     """Optional worker pool identity used by ModelRegistry pool-isolation checks."""
 
@@ -54,6 +58,11 @@ class AppStateConfig:
         elif ENV_PRELOAD_MODELS in os.environ:
             del os.environ[ENV_PRELOAD_MODELS]
 
+        if self.pinned_models:
+            os.environ[ENV_PINNED_MODELS] = ",".join(self.pinned_models)
+        elif ENV_PINNED_MODELS in os.environ:
+            del os.environ[ENV_PINNED_MODELS]
+
         if self.pool_name:
             os.environ[ENV_POOL] = self.pool_name
         elif ENV_POOL in os.environ:
@@ -68,6 +77,8 @@ class AppStateConfig:
         model_filter = [m.strip() for m in model_filter_str.split(",") if m.strip()] if model_filter_str else None
         preload_str = os.environ.get(ENV_PRELOAD_MODELS)
         preload_models = [m.strip() for m in preload_str.split(",") if m.strip()] if preload_str else None
+        pinned_str = os.environ.get(ENV_PINNED_MODELS)
+        pinned_models = [m.strip() for m in pinned_str.split(",") if m.strip()] if pinned_str else None
         pool_name = os.environ.get(ENV_POOL) or None
 
         return cls(
@@ -75,5 +86,6 @@ class AppStateConfig:
             device=device,
             model_filter=model_filter,
             preload_models=preload_models,
+            pinned_models=pinned_models,
             pool_name=pool_name,
         )

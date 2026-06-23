@@ -8,8 +8,8 @@ use crate::types::pool::Pool;
 
 /// Tracks the warm-floor lanes the emitter set on the previous tick so it
 /// can clear lanes that disappear (pool deleted, `minimum_worker_count`
-/// dropped to 0, or the profile/bundle set changed). Keyed by pool name; each
-/// value is the set of `(machine_profile, bundle)` lanes that pool emitted
+/// dropped to 0, or the profile/bundle set changed). Keyed by queue pool; each
+/// value is the set of `(machine_profile, bundle)` lanes that queue pool emitted
 /// last tick.
 pub type WarmFloorLanes = HashMap<String, HashSet<(String, String)>>;
 
@@ -45,13 +45,24 @@ fn bundle_label(pool: &Pool) -> String {
         .to_lowercase()
 }
 
+fn queue_pool_label(pool: &Pool) -> String {
+    let queue_pool = pool.spec.queue_pool.trim().to_ascii_lowercase();
+    if queue_pool.is_empty() {
+        "default".to_string()
+    } else {
+        queue_pool
+    }
+}
+
 /// Reconcile the warm-floor gauge for the current set of pools.
 ///
 /// For every pool with `minimum_worker_count > 0` and at least one nameable
-/// machine profile, emit one `Set` per `(machine_profile, bundle)` lane. Any lane
-/// present last tick but absent now is emitted as a `Clear`. `prev` is
-/// updated in place to the lanes emitted this tick so the next call can
-/// detect disappearances.
+/// machine profile, emit one `Set` per `(queue_pool, machine_profile, bundle)`
+/// lane. Multiple logical pools sharing the same backing lane collapse to the
+/// maximum requested floor, not a sum, because KEDA scales physical lanes. Any
+/// lane present last tick but absent now is emitted as a `Clear`. `prev` is
+/// updated in place to the lanes emitted this tick so the next call can detect
+/// disappearances.
 ///
 /// A pool with no nameable machine profile (e.g. the bare `default` pool
 /// with empty `gpus`/`gpu_caps`) cannot name a lane; it emits nothing, and
@@ -64,6 +75,7 @@ fn bundle_label(pool: &Pool) -> String {
 pub fn reconcile_warm_floor(pools: &[Pool], prev: &mut WarmFloorLanes) -> Vec<WarmFloorAction> {
     let mut actions = Vec::new();
     let mut current: WarmFloorLanes = HashMap::new();
+    let mut values: HashMap<(String, String, String), f64> = HashMap::new();
 
     for pool in pools {
         if pool.spec.minimum_worker_count == 0 {
@@ -79,18 +91,52 @@ pub fn reconcile_warm_floor(pools: &[Pool], prev: &mut WarmFloorLanes) -> Vec<Wa
             continue;
         }
         let bundle = bundle_label(pool);
+        let queue_pool = queue_pool_label(pool);
         let value = f64::from(pool.spec.minimum_worker_count);
-        let lanes = current.entry(pool.spec.name.clone()).or_default();
         for profile in profiles {
-            lanes.insert((profile.clone(), bundle.clone()));
-            actions.push(WarmFloorAction::Set {
-                pool: pool.spec.name.clone(),
-                machine_profile: profile,
-                bundle: bundle.clone(),
-                value,
-            });
+            let lane = values
+                .entry((queue_pool.clone(), profile, bundle.clone()))
+                .or_default();
+            *lane = f64::max(*lane, value);
         }
     }
+
+    let mut set_actions: Vec<WarmFloorAction> = values
+        .into_iter()
+        .map(|((pool, machine_profile, bundle), value)| {
+            current
+                .entry(pool.clone())
+                .or_default()
+                .insert((machine_profile.clone(), bundle.clone()));
+            WarmFloorAction::Set {
+                pool,
+                machine_profile,
+                bundle,
+                value,
+            }
+        })
+        .collect();
+    set_actions.sort_by(|a, b| match (a, b) {
+        (
+            WarmFloorAction::Set {
+                pool: a_pool,
+                machine_profile: a_profile,
+                bundle: a_bundle,
+                ..
+            },
+            WarmFloorAction::Set {
+                pool: b_pool,
+                machine_profile: b_profile,
+                bundle: b_bundle,
+                ..
+            },
+        ) => a_pool
+            .cmp(b_pool)
+            .then_with(|| a_profile.cmp(b_profile))
+            .then_with(|| a_bundle.cmp(b_bundle)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    actions.extend(set_actions);
 
     // Clear lanes we set last tick that are no longer present this tick.
     for (pool, lanes) in prev.iter() {
@@ -145,6 +191,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: name.to_string(),
+                queue_pool: name.to_string(),
                 bundle: bundle.map(|b| b.to_string()),
                 gpus,
                 gpu_caps: HashMap::new(),
@@ -171,6 +218,18 @@ mod tests {
             machine_profile: profile.to_string(),
             bundle: bundle.to_string(),
         }
+    }
+
+    fn logical_pool(
+        name: &str,
+        queue_pool: &str,
+        minimum_worker_count: u32,
+        gpus: &[&str],
+        bundle: Option<&str>,
+    ) -> Pool {
+        let mut pool = pool(name, minimum_worker_count, gpus, bundle);
+        pool.spec.queue_pool = queue_pool.to_string();
+        pool
     }
 
     #[test]
@@ -248,5 +307,35 @@ mod tests {
         reconcile_warm_floor(&[pool("tenant", 2, &["l4"], None)], &mut prev);
         let actions = reconcile_warm_floor(&[pool("tenant", 2, &["l4"], None)], &mut prev);
         assert_eq!(actions, vec![set_action("tenant", "l4", "default", 2.0)]);
+    }
+
+    #[test]
+    fn logical_pools_share_backing_queue_floor_without_summing() {
+        let mut prev = WarmFloorLanes::new();
+        let actions = reconcile_warm_floor(
+            &[
+                logical_pool("tenant-a", "default", 2, &["l4"], None),
+                logical_pool("tenant-b", "default", 1, &["l4"], None),
+            ],
+            &mut prev,
+        );
+        assert_eq!(actions, vec![set_action("default", "l4", "default", 2.0)]);
+        assert_eq!(prev.get("default").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn logical_pool_uses_custom_backing_queue_floor() {
+        let mut prev = WarmFloorLanes::new();
+        let actions = reconcile_warm_floor(
+            &[logical_pool("tenant-a", "customer-queue", 2, &["l4"], None)],
+            &mut prev,
+        );
+
+        assert_eq!(
+            actions,
+            vec![set_action("customer-queue", "l4", "default", 2.0)]
+        );
+        assert_eq!(prev.get("customer-queue").unwrap().len(), 1);
+        assert!(!prev.contains_key("tenant-a"));
     }
 }

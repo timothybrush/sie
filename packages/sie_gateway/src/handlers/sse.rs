@@ -88,6 +88,7 @@ pub struct SseParams<'a> {
     pub engine: String,
     pub gpu: String,
     pub pool: String,
+    pub admission_pool: String,
     pub bundle_config_hash: String,
     pub work_params: publisher::WorkParams,
     pub endpoint: SseEndpoint,
@@ -113,6 +114,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
         engine,
         gpu,
         pool,
+        admission_pool,
         bundle_config_hash,
         work_params,
         endpoint,
@@ -161,7 +163,7 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
     } else {
         let admitted_worker_names = state
             .pool_manager
-            .admitted_worker_names_for_capped_lane(&pool, &gpu, &bundle)
+            .admitted_worker_names_for_capped_lane(&admission_pool, &gpu, &bundle)
             .await;
         let fallback_lane_worker_count = state.registry.pool_fallback_lane_worker_count(
             &pool,
@@ -212,7 +214,14 @@ pub async fn build_sse_response(params: SseParams<'_>) -> Response {
     let was_direct_dispatched = matches!(target, publisher::PublishTarget::Worker { .. });
 
     let (request_id, outcome_rx, chunk_rx) = match work_publisher
-        .publish_generate_streaming_sse(target, &model, &engine, &bundle_config_hash, &work_params)
+        .publish_generate_streaming_sse(
+            target,
+            &model,
+            &engine,
+            &bundle_config_hash,
+            &work_params,
+            &admission_pool,
+        )
         .await
     {
         Ok(triple) => triple,

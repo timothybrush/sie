@@ -328,6 +328,17 @@ workers:
     # -- Platform variant for worker images (e.g. "cuda12", "cpu")
     platform: cuda12
 
+    # -- Map of imageBundle -> required platform. Mirrors each bundle's
+    # -- `platform:` field in packages/sie_server/bundles/*.yaml and the
+    # -- `.github/release-matrix.json` `include` pairs (KEEP IN SYNC). The chart
+    # -- fails fast if a pool places a listed bundle on a different platform:
+    # -- the release pipeline only builds the matching `<platform>-<bundle>`
+    # -- image, so a mismatch would otherwise ImagePullBackOff at runtime.
+    # -- Bundles not listed here default to the common `platform` above.
+    bundlePlatforms:
+      # gemma 4 (sglang 0.5.13 / torch 2.11 cu130) ships only as a CUDA 13 image.
+      gemma: cuda13
+
     # -- Image pre-pull DaemonSet (caches worker image on GPU nodes before worker pods schedule)
     imagePrepull:
       # -- Enable image pre-pull DaemonSets for worker pools
@@ -355,16 +366,19 @@ workers:
     # the pod with no batcher at all.
     passthroughMode: true
 
-    # -- Logical queue pool consumed by workers in queue-routing mode.
+    # -- Physical NATS queue pool consumed by workers in queue-routing mode.
     # The default baseline queue pool is `default`, so SDK calls like
     # `gpu="l4"` route to `(pool=default, machineProfile=l4)` without
     # requiring callers to spell the pool as `gpu="default/l4"`.
     # Routing, metrics, and KEDA still stay lane-specific because the
     # NATS subject and Prometheus labels include machineProfile and bundle.
+    # API-created logical pools draw from this `default` queue unless their
+    # PoolSpec sets `queue_pool` to a dedicated Helm queue namespace.
     # Set per-pool `workers.pools.<name>.queuePool` only when a worker group
-    # should consume from a dedicated logical queue namespace / tenant pool
-    # such as `customer-acme`, in which case callers must send that pool
-    # explicitly (SDK `gpu="customer-acme/l4"`).
+    # should consume from a dedicated physical queue namespace such as
+    # `customer-acme`; declare the same name under
+    # `queueRouting.staticQueuePools` before callers create logical pools
+    # backed by it with `queue_pool: "customer-acme"`.
     # Queue pool values are rendered and routed in lowercase so NATS/KEDA
     # labels stay canonical even if an override uses mixed case.
     queuePool: default
@@ -757,6 +771,38 @@ workers:
           minReplicas: 0
           maxReplicas: 3
 
+    # Gemma 4 (CUDA 13 / cu130). NOTE the `platform: cuda13` — the gemma image
+    # is built/tagged cuda13-gemma; omitting this (defaulting to cuda12) makes
+    # the chart fail fast (see workers.common.bundlePlatforms). The 26B-A4B model
+    # needs a 96 GB+ card (H200 / RTX PRO 6000); E2B/E4B fit smaller GPUs.
+    # When productionizing, also add a matching entry under the top-level
+    # `machineProfiles:` map so it surfaces in the machine-profiles ConfigMap,
+    # and set `gpu.product` to your node's actual GPU label.
+    gemma:
+      enabled: false
+      machineProfile: gemma
+      gpuType: h200
+      platform: cuda13
+      nodeSelector: {}
+      gpu:
+        count: 1
+        product: NVIDIA-H200
+      resources:
+        requests:
+          cpu: "8"
+          memory: "128Gi"
+        limits:
+          cpu: "16"
+          memory: "256Gi"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      bundles:
+        gemma:
+          minReplicas: 0
+          maxReplicas: 2
+
     # CPU (local testing with kind, no GPU)
 
     cpu:
@@ -1101,19 +1147,21 @@ clusterRouting: "queue"
 
 # -- Queue routing tuning knobs (only used when clusterRouting=queue).
 queueRouting:
-  # -- NAK delay (seconds) for items targeting unloaded models.
-  # JetStream redelivers after this delay, giving time for model loading.
-  # Effective retry budget = nakDelay * maxDeliver (default: 5 * 20 = 100s).
+  # -- NAK delay (seconds) for retryable queue failures and model-unavailable
+  # states. Workers use JetStream progress ACKs, not NAKs, while a local model
+  # load is actively running so cold starts do not consume maxDeliver budget;
+  # the progress ACK sleep is clamped below the pool consumer ack_wait.
   nakDelaySec: 5
   # -- Maximum delivery attempts before a message is sent to the DLQ.
-  # Must be high enough to cover cold model downloads (10-60s+).
+  # Must be high enough to cover retryable failures; active model loads are
+  # kept alive by progress ACKs instead of redelivery attempts.
   maxDeliver: 20
   # -- Maximum age (seconds) for messages in the pool-level stream.
   # Keep above maxDeliver * 30s so failed work remains fetchable
   # after the retry/DLQ envelope for operator inspection.
   streamMaxAgeSec: 1800
   # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
-  # queue namespaces. Keys are queue pool names; names are normalized to
+  # physical queue namespaces. Keys are queue pool names; names are normalized to
   # lowercase before gateway storage/routing. Use this when
   # poolAdmission.enabled=true and a worker group sets a named non-default
   # workers.pools.<name>.queuePool but the pool is static/deploy-owned rather
@@ -1128,19 +1176,22 @@ queueRouting:
   #     # Per-pool warm floor: minimum machines kept warm via KEDA.
   #     # Default 0 = scale to zero.
   #     minimumWorkerCount: 0
+  #     # Per-pool always-loaded models: kept loaded and never evicted on the
+  #     # pool's workers. Ids may be profile-qualified (model:profile). Default empty.
+  #     pinnedModels: []
   staticQueuePools: {}
   # -- NATS fetch budget: max messages pulled per fetch() call.
   # This is the primary driver of GPU batch size in queue mode; the worker
   # groups fetched messages by model and dispatches them as a single forward pass.
   # Higher values improve GPU utilization under load but increase per-request latency.
   natsFetchBudget: 64
-  # -- Worker admission gate for capped pools. Workers ask the gateway whether
-  # their pod is in the pool's assigned_workers before pulling from NATS.
-  # The baseline `default` pool fails open. Named non-default queue pools are
-  # runtime pool/admission boundaries: if you set `workers.pools.<name>.queuePool`
-  # to a custom value without declaring the matching `staticQueuePools` entry
-  # or creating the matching `/v1/pools/<queuePool>` object, workers will pause
-  # instead of pulling.
+  # -- Worker admission gate for physical queue pools and logical API pools.
+  # Workers poll `GET /v1/pools` before pulling from NATS. The baseline
+  # `default` queue pool fails open during transient gateway/status errors.
+  # For non-default queue pools, workers pull only when their physical queue
+  # pool is admitted directly (usually via `staticQueuePools`) or when at least
+  # one assigned logical pool has `queue_pool` set to that physical queue; each
+  # work item is still checked against its logical `admission_pool`.
   poolAdmission:
     enabled: true
     checkIntervalSec: 10

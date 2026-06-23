@@ -22,6 +22,7 @@ from sie_server.adapters.sglang.generation import (
     SGLangGenerationAdapter,
     _chunk_from_sglang_event,
     _encode_image_data,
+    _mamba_scheduler_strategy_value,
     _p_unsafe_from_verdict_logprobs,
     _parse_sglang_generate_response,
     _thresholded_verdict,
@@ -49,6 +50,33 @@ def test_capabilities_declare_tokens(adapter) -> None:
 def test_load_contract_flags() -> None:
     assert SGLangGenerationAdapter.requires_main_thread is False
     assert SGLangGenerationAdapter.manages_own_load_timeout is True
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        # two-token form (Qwen3.5-4B YAML shape) → exact value
+        (["--mamba-scheduler-strategy", "extra_buffer"], "extra_buffer"),
+        (["--mamba-scheduler-strategy", "default"], "default"),
+        # flag=value form
+        (["--mamba-scheduler-strategy=extra_buffer"], "extra_buffer"),
+        (["--mamba-scheduler-strategy=default"], "default"),
+        # absent → None
+        (["--disable-overlap-schedule"], None),
+        ([], None),
+        # trailing flag with no value → None (no crash)
+        (["--mamba-scheduler-strategy"], None),
+        # a stray ``extra_buffer`` token elsewhere must NOT be read as the value
+        (["--some-other-flag", "extra_buffer", "--mamba-scheduler-strategy", "default"], "default"),
+        # last occurrence wins (argparse semantics)
+        (
+            ["--mamba-scheduler-strategy", "default", "--mamba-scheduler-strategy", "extra_buffer"],
+            "extra_buffer",
+        ),
+    ],
+)
+def test_mamba_scheduler_strategy_value(args: list[str], expected: str | None) -> None:
+    assert _mamba_scheduler_strategy_value(args) == expected
 
 
 def test_unloaded_generate_raises(adapter) -> None:

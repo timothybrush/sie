@@ -495,6 +495,7 @@ mod tests {
         let pool = Pool {
             spec: PoolSpec {
                 name: "test".to_string(),
+                queue_pool: "default".to_string(),
                 bundle: Some("default".to_string()),
                 gpus: {
                     let mut m = HashMap::new();
@@ -587,6 +588,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: name.to_string(),
+                queue_pool: "default".to_string(),
                 bundle: Some("default".to_string()),
                 gpus: {
                     let mut m = HashMap::new();

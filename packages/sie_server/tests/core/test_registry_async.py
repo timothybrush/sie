@@ -36,6 +36,25 @@ def patch_ensure_model_cached():
         yield mock
 
 
+async def _drain_background_tasks(registry: ModelRegistry) -> None:
+    """Await the registry's background tasks (pinned eager-load reconciles and the
+    model-load tasks they spawn), so a test can observe the eventual effect.
+
+    Fails loudly rather than hiding a regression: surfaces any task exception and
+    asserts the set settles within the bounded retries (the spawned tasks are all
+    fast/mocked in these tests, so a non-settling set means a real bug).
+    """
+    for _ in range(10):
+        pending = [task for task in list(registry._background_tasks) if not task.done()]
+        if not pending:
+            return
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert not errors, f"background task(s) failed: {errors!r}"
+    still_pending = [task for task in list(registry._background_tasks) if not task.done()]
+    assert not still_pending, f"background tasks did not settle: {len(still_pending)} pending"
+
+
 class TestAsyncLoading:
     """Tests for async model loading."""
 
@@ -452,3 +471,162 @@ class TestProactiveEviction:
         await registry_with_models.unload_async("model-a")
 
         mock_adapter.unload.assert_called_once()
+
+
+class TestSetPinnedModels:
+    """Tests for the runtime pinned-set mutator (gateway -> worker bridge)."""
+
+    def _registry(self, pinned: list[str] | None = None) -> ModelRegistry:
+        registry = ModelRegistry(pinned_models=pinned)
+        registry.add_config(_make_config(name="model-a", hf_id="org/model-a"))
+        registry.add_config(_make_config(name="model-b", hf_id="org/model-b"))
+        # Spy on eager-load so tests assert intent without driving real loads.
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        return registry
+
+    async def test_sets_pinned_and_eager_loads_new(self) -> None:
+        registry = self._registry()
+        result = await registry.set_pinned_models(["model-a"])
+
+        assert result == frozenset({"model-a"})
+        assert registry._pinned_models == frozenset({"model-a"})
+        registry.start_load_async.assert_awaited_once_with("model-a", "cpu")
+
+    async def test_replaces_set_and_demotes_removed(self) -> None:
+        registry = self._registry(pinned=["model-a"])
+        registry.start_load_async.reset_mock()
+
+        await registry.set_pinned_models(["model-b"])
+
+        # model-a is no longer pinned (demoted to evictable); model-b is now pinned.
+        assert registry._pinned_models == frozenset({"model-b"})
+        assert not registry._is_pinned("model-a")
+        registry.start_load_async.assert_awaited_once_with("model-b", "cpu")
+
+    async def test_empty_set_unpins_all(self) -> None:
+        registry = self._registry(pinned=["model-a"])
+        registry.start_load_async.reset_mock()
+
+        await registry.set_pinned_models([])
+
+        assert registry._pinned_models == frozenset()
+        registry.start_load_async.assert_not_awaited()
+
+    async def test_idempotent_noop_when_unchanged(self) -> None:
+        registry = self._registry(pinned=["model-a"])
+        registry.start_load_async.reset_mock()
+
+        await registry.set_pinned_models(["model-a"])
+
+        # Already loaded-or-pinned: unchanged set must not re-trigger eager-load.
+        registry.start_load_async.assert_not_awaited()
+
+    async def test_profile_variant_pin_loads_and_protects_the_variant(self) -> None:
+        # A non-default profile is a first-class config entry keyed by the full
+        # "base:profile" id; pinning it must load/protect the VARIANT, not the base.
+        registry = ModelRegistry()
+        registry.add_config(_make_config(name="Org/Model-A", hf_id="org/model-a"))
+        registry.add_config(_make_config(name="Org/Model-A:fp8", hf_id="org/model-a"))
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        await registry.set_pinned_models(["Org/Model-A:FP8"])
+
+        # Stored as the lowercased profile-qualified id; eager-load targets the variant.
+        assert registry._pinned_models == frozenset({"org/model-a:fp8"})
+        registry.start_load_async.assert_awaited_once_with("Org/Model-A:fp8", "cpu")
+        # The variant is protected from eviction; the base (never pinned) is not.
+        assert registry._is_pinned("Org/Model-A:fp8")
+        assert not registry._is_pinned("Org/Model-A")
+
+    async def test_default_profile_folds_to_base(self) -> None:
+        registry = ModelRegistry()
+        registry.add_config(_make_config(name="org/model-a", hf_id="org/model-a"))
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        await registry.set_pinned_models(["org/model-a:default"])
+
+        assert registry._pinned_models == frozenset({"org/model-a"})
+        registry.start_load_async.assert_awaited_once_with("org/model-a", "cpu")
+
+    async def test_unknown_config_is_pinned_but_not_loaded(self) -> None:
+        registry = self._registry()
+
+        await registry.set_pinned_models(["missing/model"])
+
+        # Pinned (protected if it ever loads) but not eager-loaded (no local config).
+        assert registry._pinned_models == frozenset({"missing/model"})
+        registry.start_load_async.assert_not_awaited()
+
+    async def test_already_loaded_pinned_not_reloaded(self) -> None:
+        registry = self._registry()
+        registry._loaded["model-a"] = MagicMock()  # simulate already resident
+
+        await registry.set_pinned_models(["model-a"])
+
+        assert registry._pinned_models == frozenset({"model-a"})
+        registry.start_load_async.assert_not_awaited()
+
+    async def test_add_config_eager_loads_already_pinned_model(self) -> None:
+        # P1b: a pin recorded before its config arrives must load once the config
+        # is added at runtime (default Helm workers receive configs via the sidecar).
+        registry = ModelRegistry(pinned_models=["late/model"])
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        # No config yet: nothing to load.
+        await registry._eager_load_pinned()
+        registry.start_load_async.assert_not_awaited()
+
+        # Config arrives -> add_config schedules a background eager-load reconcile.
+        registry.add_config(_make_config(name="late/model", hf_id="late/hf"))
+        await _drain_background_tasks(registry)
+
+        registry.start_load_async.assert_any_await("late/model", "cpu")
+
+    async def test_add_config_ignores_non_pinned_model(self) -> None:
+        registry = ModelRegistry(pinned_models=["pinned/model"])
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        registry.add_config(_make_config(name="other/model", hf_id="other/hf"))
+        await _drain_background_tasks(registry)
+
+        registry.start_load_async.assert_not_awaited()
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_replace_configs_reloads_changed_pinned_model(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        # P1b: replace_configs_async unloads a changed pinned model; it must reload it.
+        mock_load_adapter.side_effect = [mock_adapter_factory(), mock_adapter_factory()]
+        registry = ModelRegistry(pinned_models=["org/model"])
+        registry.add_config(_make_config(name="org/model", hf_id="org/model-hf"))
+        await registry.load_async("org/model", "cpu")
+        assert registry.is_loaded("org/model")
+
+        # Replace with a semantically-changed config (different dim) -> unload + reload.
+        await registry.replace_configs_async([_make_config(name="org/model", hf_id="org/model-hf", dense_dim=512)])
+        await _drain_background_tasks(registry)
+
+        assert registry.is_loaded("org/model")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_replace_configs_loads_newly_known_pinned_model(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        # P1b: a pin whose config first appears via replace_configs must load.
+        mock_load_adapter.return_value = mock_adapter_factory()
+        registry = ModelRegistry(pinned_models=["org/model"])
+
+        await registry.replace_configs_async([_make_config(name="org/model", hf_id="org/model-hf")])
+        await _drain_background_tasks(registry)
+
+        assert registry.is_loaded("org/model")
+
+    @pytest.fixture
+    def mock_adapter_factory(self) -> MagicMock:
+        def make_mock():
+            mock = MagicMock()
+            mock.capabilities.outputs = ["dense"]
+            mock.memory_footprint.return_value = 1_000_000
+            return mock
+
+        return make_mock

@@ -68,6 +68,10 @@ Message settlement:
 - Malformed subjects and bad msgpack payloads are NAKed.
 - Unknown operations publish per-item error outcomes when reply publication
   succeeds.
+- Active local model loads are held with JetStream progress ACKs until
+  `EnsureModelReady` returns ready; this preserves the delivery budget during
+  cold starts. The progress delay is clamped below the pool consumer `ack_wait`
+  even if the retry NAK delay is configured higher.
 - Transient backend, decode, stream, and drain failures are NAKed.
 - Reply publication failure leaves the JetStream message unacked.
 
@@ -107,8 +111,9 @@ subject tokens by the gateway and sidecar helpers.
 The sidecar creates one long-lived async-nats pull stream for pool work. A slow
 reconciler re-ensures stream and durable metadata outside the fetch loop.
 
-When generation direct dispatch is active, the sidecar also creates and polls
-the worker-specific generation stream and subscribes to `cancel.>`.
+The sidecar also creates and polls the worker-specific direct-dispatch stream.
+Generation uses that stream for HRW placement; capped logical batch pools use it
+when the gateway must target one assigned worker on a shared backing queue.
 
 Source: [`nats_consumer.rs`](../src/nats_consumer.rs),
 [`subject.rs`](../src/subject.rs), and the gateway
@@ -117,8 +122,16 @@ Source: [`nats_consumer.rs`](../src/nats_consumer.rs),
 ## Pool Admission
 
 When `SIE_GATEWAY_URL` is configured and pool admission is enabled, the sidecar
-checks gateway pool status before pulling from the pool stream or the
-worker-specific generation stream.
+polls `GET /v1/pools` before pulling from the pool stream or the
+worker-specific direct-dispatch stream. It may pull when its physical `SIE_POOL` is
+admitted directly, or when at least one assigned logical pool is backed by that
+same queue; each work item is then checked against its `admission_pool` before
+Python IPC. The gateway normally direct-dispatches capped logical batch work to
+an assigned worker, so unassigned peers do not spend the item's JetStream
+delivery budget. Work items rejected by this per-item logical gate are still
+NAKed and counted in `sie_worker_pool_admission_naks_total` as a defensive
+backstop for stale assignments, direct NATS publishes, and rolling-version
+mismatches.
 
 Capped named pools require the worker to appear in
 `status.assigned_workers`. The default pool continues pulling during transient
@@ -135,10 +148,6 @@ The gateway streaming path selects either a pool subject or a worker-specific
 subject. Worker-specific routing uses HRW over eligible workers. The gateway
 stores a pool fallback subject for streaming work and uses it for republish
 paths such as NAK handling and first-chunk timeout handling.
-
-The sidecar starts generation direct dispatch after `WorkerCapabilities`
-reports generation models. The generation capability reconciler repeats that
-probe after live config apply when direct dispatch is not active.
 
 The sidecar subscribes to `cancel.>`. Subjects shaped as
 `cancel.{router_id}.{request_id}` are forwarded to Python through
@@ -177,6 +186,9 @@ The Rust and Python protocol copies define the same method names:
 `EnsureModelReady` returns readiness state and an optional `ModelDescriptor`.
 The descriptor carries tokenizer path, tokenizer content hash, maximum sequence
 length, output types, default text templates, and `supports_run_batch`.
+`loading_started` and `loading_in_progress` mean the same worker is actively
+loading the model; the dispatcher progress-ACKs and rechecks instead of NAKing
+those deliveries. `retry_later` remains a NAK path.
 
 Source: [`protocol/ipc_types.rs`](../src/protocol/ipc_types.rs),
 [`ipc_client.rs`](../src/ipc_client.rs), and
@@ -232,7 +244,9 @@ The sidecar HTTP server exposes:
 
 Readiness state is shared with the NATS health publisher. The health publisher
 emits worker identity, bundle, machine profile, readiness, and the current
-bundle config hash.
+bundle config hash. It also mirrors the latest `loaded_models` list reported by
+the Python IPC heartbeat so gateway pool/model gauges reflect live residency in
+NATS health mode.
 
 Source: [`metrics.rs`](../src/metrics.rs),
 [`readiness.rs`](../src/readiness.rs), and

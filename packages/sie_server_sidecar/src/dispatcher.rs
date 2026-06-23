@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_nats::jetstream::Message;
 use futures_util::future::join_all;
@@ -37,6 +37,7 @@ use crate::latency::LatencyTracker;
 use crate::log_util::ErrChain;
 use crate::metrics::MetricsRegistry;
 use crate::payload_store::{PayloadError, PayloadStore};
+use crate::pool_admission::PoolAdmissionGate;
 use crate::publisher::{should_publish, Timings, WorkPublisher};
 use crate::scheduler::{
     lora_from_options, Op as SchedOp, ProductionScheduler, ProductionSchedulerRegistry,
@@ -46,6 +47,26 @@ use crate::shutdown::Shutdown;
 use crate::subject::extract_model_id;
 use crate::tokenize::TokenizerRegistry;
 use crate::work_types::WorkItem;
+
+const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
+
+#[derive(serde::Serialize)]
+struct GenerateTerminalErrorChunk<'a> {
+    kind: &'static str,
+    request_id: &'a str,
+    attempt_id: String,
+    seq: u32,
+    text_delta: &'static str,
+    done: bool,
+    finish_reason: &'static str,
+    error: GenerateTerminalError<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct GenerateTerminalError<'a> {
+    code: &'a str,
+    message: &'a str,
+}
 
 #[derive(Debug, Clone)]
 struct DeliveryContext {
@@ -94,14 +115,14 @@ struct GenerateDeliveryLogContext {
     delivery: DeliveryContext,
 }
 
-/// Base NAK delay in milliseconds. Mirrors Python's `_NAK_DELAY_S`
+/// Base retry delay in milliseconds. Mirrors Python's `_NAK_DELAY_S`
 /// (default 5 000 ms, overridable via `SIE_NAK_DELAY_S`). Used for:
 ///
-/// * `loading_started` readiness (just kicked off a load)
 /// * `retry_later` readiness (unknown error path)
 /// * generic transient IPC / executor failures
 ///
-/// `loading_in_progress` uses `2 × base`.
+/// Local model-loading waits use JetStream progress ACKs instead of NAKs, with
+/// `loading_in_progress` sleeping for `2 × base` between readiness probes.
 pub(crate) fn base_nak_delay_ms() -> u64 {
     std::env::var("SIE_NAK_DELAY_S")
         .ok()
@@ -122,6 +143,7 @@ const NAK_DELAY_OVERFLOW_MS: u64 = 100;
 /// `base_nak_delay_ms` (~5s) that is intended for transient retryable
 /// errors. Holding the message back longer just starves redelivery.
 const NAK_DELAY_DRAINING_MS: u64 = 100;
+const READINESS_PROGRESS_ACK_WAIT_FRACTION: u64 = 2;
 
 /// Pick the right NAK delay for a given backend error — `Draining` is
 /// fast because we want redelivery to another worker, everything else
@@ -130,6 +152,21 @@ pub(crate) fn nak_delay_for_backend_error(err: &BackendError) -> u64 {
     match err {
         BackendError::Draining => NAK_DELAY_DRAINING_MS,
         _ => base_nak_delay_ms(),
+    }
+}
+
+fn readiness_progress_delay_ms(state: &ReadinessState, base_delay_ms: u64) -> Option<u64> {
+    let max_delay_ms = crate::nats_consumer::ACK_WAIT_SECS
+        .saturating_mul(1000)
+        .checked_div(READINESS_PROGRESS_ACK_WAIT_FRACTION)
+        .unwrap_or(1)
+        .max(1);
+    match state {
+        ReadinessState::LoadingStarted => Some(base_delay_ms.min(max_delay_ms)),
+        ReadinessState::LoadingInProgress => {
+            Some(base_delay_ms.saturating_mul(2).min(max_delay_ms))
+        }
+        ReadinessState::Ready | ReadinessState::RetryLater => None,
     }
 }
 
@@ -302,6 +339,9 @@ pub struct Dispatcher {
     /// Current sidecar-applied bundle config state. Shared with the live config
     /// subscriber/reconciler and NATS health publisher.
     pub config_apply_state: Option<Arc<ConfigApplyState>>,
+    /// Optional admission gate for both the physical queue and logical
+    /// `admission_pool` labels carried on default-backed work items.
+    pub pool_admission: Option<Arc<PoolAdmissionGate>>,
     /// Per-model scheduler drain handles, populated lazily when a
     /// new scheduler is materialised on first traffic. The shutdown
     /// path in `lib.rs` drains this map and awaits every handle so
@@ -335,6 +375,7 @@ impl Dispatcher {
         scheduler_registry: Option<Arc<ProductionSchedulerRegistry>>,
         shutdown: Option<Arc<Shutdown>>,
         config_apply_state: Option<Arc<ConfigApplyState>>,
+        pool_admission: Option<Arc<PoolAdmissionGate>>,
     ) -> Self {
         debug_assert_eq!(
             scheduler_registry.is_some(),
@@ -353,6 +394,7 @@ impl Dispatcher {
             scheduler_registry,
             shutdown,
             config_apply_state,
+            pool_admission,
             scheduler_drain_handles: Arc::new(Mutex::new(HashMap::new())),
             generation_handles: Arc::new(Mutex::new(Vec::new())),
         }
@@ -462,6 +504,24 @@ impl Dispatcher {
                             }
                         }
                         continue;
+                    }
+                    if let Some(gate) = self.pool_admission.as_ref() {
+                        let admission_pool = wi.admission_pool.trim();
+                        if !gate.admits_work_item_pool(admission_pool) {
+                            debug!(
+                                work_item_id = %wi.work_item_id,
+                                request_id = %wi.request_id,
+                                admission_pool = %admission_pool,
+                                physical_pool = %wi.pool_name,
+                                "WorkItem admission_pool does not assign this worker — NAKing for redelivery"
+                            );
+                            self.metrics
+                                .pool_admission_naks_total
+                                .with_label_values(&["logical_pool_not_assigned"])
+                                .inc();
+                            nak_one(&msg, base_delay_ms, &self.metrics).await;
+                            continue;
+                        }
                     }
                     if wi.model_id != subject_model {
                         warn!(
@@ -607,7 +667,7 @@ impl Dispatcher {
         };
         match &readiness_resp.state {
             ReadinessState::Ready => {}
-            ReadinessState::LoadingStarted | ReadinessState::RetryLater => {
+            ReadinessState::LoadingStarted => {
                 info!(
                     work_item_id = %wi.work_item_id,
                     request_id = %wi.request_id,
@@ -621,13 +681,78 @@ impl Dispatcher {
                     consumer_seq = delivery.consumer_sequence,
                     delivery_count = delivery.delivered,
                     pending = delivery.pending,
-                    "generate model not ready — NAKing"
+                    "generate model started loading — publishing MODEL_LOADING chunk + ACK"
+                );
+                let message = format!("Model '{model_id}' is loading; retry later.");
+                match self
+                    .publish_generate_terminal_error(&wi, MODEL_LOADING_ERROR_CODE, &message)
+                    .await
+                {
+                    Ok(_) => match ack(&msg).await {
+                        Ok(()) => {
+                            self.metrics.messages_acked_total.inc();
+                            self.metrics
+                                .generate_model_loading_responses_total
+                                .with_label_values(&[
+                                    &model_lbl,
+                                    "loading_started",
+                                    "published_acked",
+                                ])
+                                .inc();
+                        }
+                        Err(e) => {
+                            warn!(
+                                work_item_id = %wi.work_item_id,
+                                request_id = %wi.request_id,
+                                model = %model_id,
+                                stream_seq = delivery.stream_sequence,
+                                delivery_count = delivery.delivered,
+                                error = %e,
+                                "ack after MODEL_LOADING chunk publish failed"
+                            );
+                            self.metrics.jetstream_ack_failures_total.inc();
+                            self.metrics
+                                .generate_model_loading_responses_total
+                                .with_label_values(&[
+                                    &model_lbl,
+                                    "loading_started",
+                                    "published_ack_failed",
+                                ])
+                                .inc();
+                        }
+                    },
+                    Err(_) => {
+                        self.metrics
+                            .generate_model_loading_responses_total
+                            .with_label_values(&[&model_lbl, "loading_started", "publish_failed"])
+                            .inc();
+                        nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    }
+                }
+                return;
+            }
+            ReadinessState::RetryLater => {
+                info!(
+                    work_item_id = %wi.work_item_id,
+                    request_id = %wi.request_id,
+                    model = %model_id,
+                    readiness = ?readiness_resp.state,
+                    delay_ms = base_delay_ms,
+                    subject = %delivery.subject,
+                    stream = %delivery.stream,
+                    consumer = %delivery.consumer,
+                    stream_seq = delivery.stream_sequence,
+                    consumer_seq = delivery.consumer_sequence,
+                    delivery_count = delivery.delivered,
+                    pending = delivery.pending,
+                    "generate model retry requested — NAKing"
                 );
                 nak_one(&msg, base_delay_ms, &self.metrics).await;
                 return;
             }
             ReadinessState::LoadingInProgress => {
-                let delay_ms = base_delay_ms.saturating_mul(2);
+                let delay_ms = readiness_progress_delay_ms(&readiness_resp.state, base_delay_ms)
+                    .unwrap_or_else(|| base_delay_ms.saturating_mul(2));
                 info!(
                     work_item_id = %wi.work_item_id,
                     request_id = %wi.request_id,
@@ -641,9 +766,58 @@ impl Dispatcher {
                     consumer_seq = delivery.consumer_sequence,
                     delivery_count = delivery.delivered,
                     pending = delivery.pending,
-                    "generate model still loading — NAKing"
+                    "generate model still loading — publishing MODEL_LOADING chunk + ACK"
                 );
-                nak_one(&msg, delay_ms, &self.metrics).await;
+                let message = format!("Model '{model_id}' is still loading; retry later.");
+                match self
+                    .publish_generate_terminal_error(&wi, MODEL_LOADING_ERROR_CODE, &message)
+                    .await
+                {
+                    Ok(_) => match ack(&msg).await {
+                        Ok(()) => {
+                            self.metrics.messages_acked_total.inc();
+                            self.metrics
+                                .generate_model_loading_responses_total
+                                .with_label_values(&[
+                                    &model_lbl,
+                                    "loading_in_progress",
+                                    "published_acked",
+                                ])
+                                .inc();
+                        }
+                        Err(e) => {
+                            warn!(
+                                work_item_id = %wi.work_item_id,
+                                request_id = %wi.request_id,
+                                model = %model_id,
+                                stream_seq = delivery.stream_sequence,
+                                delivery_count = delivery.delivered,
+                                error = %e,
+                                "ack after MODEL_LOADING chunk publish failed"
+                            );
+                            self.metrics.jetstream_ack_failures_total.inc();
+                            self.metrics
+                                .generate_model_loading_responses_total
+                                .with_label_values(&[
+                                    &model_lbl,
+                                    "loading_in_progress",
+                                    "published_ack_failed",
+                                ])
+                                .inc();
+                        }
+                    },
+                    Err(_) => {
+                        self.metrics
+                            .generate_model_loading_responses_total
+                            .with_label_values(&[
+                                &model_lbl,
+                                "loading_in_progress",
+                                "publish_failed",
+                            ])
+                            .inc();
+                        nak_one(&msg, delay_ms, &self.metrics).await;
+                    }
+                }
                 return;
             }
         }
@@ -867,72 +1041,85 @@ impl Dispatcher {
             nak_all(&items, base_delay_ms, &self.metrics).await;
             return Ok(());
         }
-        // `ipc_requests_total` / `ipc_failures_total` identify the IPC
-        // transport counters even though the backend trait is generic (see
-        // `crate::backend::InferenceBackend`).
-        self.metrics.ipc_requests_total.inc();
-        let readiness_resp = match self.backend.ensure_model_ready(model_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.metrics.ipc_failures_total.inc();
-                warn!(
+        let readiness_resp = loop {
+            // `ipc_requests_total` / `ipc_failures_total` identify the IPC
+            // transport counters even though the backend trait is generic (see
+            // `crate::backend::InferenceBackend`).
+            self.metrics.ipc_requests_total.inc();
+            let readiness_resp = match self.backend.ensure_model_ready(model_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.metrics.ipc_failures_total.inc();
+                    warn!(
+                        model = %model_id,
+                        group_size,
+                        error = %ErrChain(&e),
+                        "EnsureModelReady failed — NAKing group"
+                    );
+                    nak_all(&items, base_delay_ms, &self.metrics).await;
+                    return Err(e.into());
+                }
+            };
+            if readiness_resp.state == ReadinessState::Ready {
+                break readiness_resp;
+            }
+            if let Some(delay_ms) =
+                readiness_progress_delay_ms(&readiness_resp.state, base_delay_ms)
+            {
+                info!(
                     model = %model_id,
                     group_size,
-                    error = %ErrChain(&e),
-                    "EnsureModelReady failed — NAKing group"
+                    readiness = ?readiness_resp.state,
+                    delay_ms,
+                    "model loading — progress ACKing group before retry"
                 );
-                nak_all(&items, base_delay_ms, &self.metrics).await;
-                return Err(e.into());
-            }
-        };
-        match readiness_resp.state {
-            ReadinessState::Ready => {
-                // Adapter handshake: fold the adapter's `ModelDescriptor`
-                // (if any) into our local registries. Idempotent on
-                // re-handshake — the registry hashes the loaded
-                // tokenizer.json and short-circuits if the declared
-                // `tokenizer_id` already matches what's cached.
-                if let Some(descriptor) = readiness_resp.descriptor.as_ref() {
-                    match self
-                        .tokenizer_registry
-                        .register_from_descriptor(model_id, descriptor)
-                    {
-                        Ok(true) => {
-                            debug!(
-                                model = %model_id,
-                                "rust-tokenize: registered tokeniser from EnsureModelReady descriptor"
-                            );
-                        }
-                        Ok(false) => {} // no path, idempotent, or hash mismatch (warning logged inside)
-                        Err(e) => {
-                            // Non-fatal: model just falls back to Python
-                            // tokenisation, exactly the same as if no
-                            // descriptor had been declared at all.
-                            warn!(
-                                model = %model_id,
-                                error = %e,
-                                "rust-tokenize: descriptor load failed — Python will tokenise this model"
-                            );
-                        }
-                    }
+                if !progress_all(&items, &self.metrics).await {
+                    nak_all(&items, base_delay_ms, &self.metrics).await;
+                    return Ok(());
                 }
+                if self.sleep_or_shutdown(delay_ms).await {
+                    warn!(
+                        model = %model_id,
+                        group_size,
+                        "shutdown while waiting for model load — NAKing group"
+                    );
+                    nak_all(&items, NAK_DELAY_DRAINING_MS, &self.metrics).await;
+                    return Ok(());
+                }
+                continue;
             }
-            ReadinessState::LoadingStarted => {
-                info!(model = %model_id, "model load started — NAKing group for retry");
-                nak_all(&items, base_delay_ms, &self.metrics).await;
-                return Ok(());
-            }
-            ReadinessState::LoadingInProgress => {
-                // 2× base so we don't burn through max_deliver while a slow
-                // model is loading (Python uses the same multiplier).
-                info!(model = %model_id, "model load in progress — NAKing group with 2x delay");
-                nak_all(&items, base_delay_ms.saturating_mul(2), &self.metrics).await;
-                return Ok(());
-            }
-            ReadinessState::RetryLater => {
-                info!(model = %model_id, "model not available — NAKing group");
-                nak_all(&items, base_delay_ms, &self.metrics).await;
-                return Ok(());
+            info!(model = %model_id, "model not available — NAKing group");
+            nak_all(&items, base_delay_ms, &self.metrics).await;
+            return Ok(());
+        };
+
+        // Adapter handshake: fold the adapter's `ModelDescriptor`
+        // (if any) into our local registries. Idempotent on
+        // re-handshake — the registry hashes the loaded
+        // tokenizer.json and short-circuits if the declared
+        // `tokenizer_id` already matches what's cached.
+        if let Some(descriptor) = readiness_resp.descriptor.as_ref() {
+            match self
+                .tokenizer_registry
+                .register_from_descriptor(model_id, descriptor)
+            {
+                Ok(true) => {
+                    debug!(
+                        model = %model_id,
+                        "rust-tokenize: registered tokeniser from EnsureModelReady descriptor"
+                    );
+                }
+                Ok(false) => {} // no path, idempotent, or hash mismatch (warning logged inside)
+                Err(e) => {
+                    // Non-fatal: model just falls back to Python
+                    // tokenisation, exactly the same as if no
+                    // descriptor had been declared at all.
+                    warn!(
+                        model = %model_id,
+                        error = %e,
+                        "rust-tokenize: descriptor load failed — Python will tokenise this model"
+                    );
+                }
             }
         }
 
@@ -1413,6 +1600,18 @@ impl Dispatcher {
         Ok(())
     }
 
+    async fn sleep_or_shutdown(&self, delay_ms: u64) -> bool {
+        let delay = Duration::from_millis(delay_ms);
+        let Some(shutdown) = self.shutdown.as_ref() else {
+            tokio::time::sleep(delay).await;
+            return false;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
+            _ = shutdown.wait() => true,
+        }
+    }
+
     // -- outcome / publish helpers ---------------------------------------
 
     async fn apply_outcomes(&self, outcome: BatchOutcome, resolved: Vec<(WorkItem, Message, f64)>) {
@@ -1663,6 +1862,46 @@ impl Dispatcher {
                     work_item_id = %wi.work_item_id,
                     error = %e,
                     "failed to publish error WorkResult"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Publish a terminal generation chunk error on `wi.reply_subject`.
+    ///
+    /// Generation requests are tracked by the gateway's streaming collector, so
+    /// a one-shot `WorkResult` would not unblock the client. Use the same chunk
+    /// envelope Python's `StreamingProcessor` emits for terminal pre-execution
+    /// errors.
+    async fn publish_generate_terminal_error(
+        &self,
+        wi: &WorkItem,
+        code: &str,
+        message: &str,
+    ) -> Result<bool, crate::publisher::PublishError> {
+        if wi.reply_subject.is_empty() {
+            debug!(
+                work_item_id = %wi.work_item_id,
+                "skipping generate terminal error publish — empty reply_subject"
+            );
+            return Ok(true);
+        }
+        let payload = encode_generate_terminal_error_chunk(wi, code, message)?;
+        match self.publisher.publish_raw(&wi.reply_subject, payload).await {
+            Ok(()) => Ok(true),
+            Err(crate::publisher::PublishError::EmptyReplySubject) => {
+                debug!(
+                    work_item_id = %wi.work_item_id,
+                    "skipping generate terminal error publish — empty reply_subject"
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(
+                    work_item_id = %wi.work_item_id,
+                    error = %e,
+                    "failed to publish generate terminal error chunk"
                 );
                 Err(e)
             }
@@ -2231,6 +2470,24 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
+fn encode_generate_terminal_error_chunk(
+    wi: &WorkItem,
+    code: &str,
+    message: &str,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let chunk = GenerateTerminalErrorChunk {
+        kind: "chunk",
+        request_id: &wi.request_id,
+        attempt_id: format!("{}:model-loading", wi.work_item_id),
+        seq: 0,
+        text_delta: "",
+        done: true,
+        finish_reason: "error",
+        error: GenerateTerminalError { code, message },
+    };
+    rmp_serde::to_vec_named(&chunk)
+}
+
 async fn handle_generate_event(
     event: GenerateEvent,
     publisher: Arc<WorkPublisher>,
@@ -2382,6 +2639,30 @@ async fn nak_one(msg: &Message, delay_ms: u64, metrics: &MetricsRegistry) {
         Err(e) => {
             warn!(error = %e, "nak failed");
             metrics.jetstream_nak_failures_total.inc();
+        }
+    }
+}
+
+async fn progress_all(items: &[(WorkItem, Message)], metrics: &MetricsRegistry) -> bool {
+    let mut all_ok = true;
+    for (_, m) in items {
+        if !progress_one(m, metrics).await {
+            all_ok = false;
+        }
+    }
+    if all_ok {
+        debug!(count = items.len(), "progress ACKed group");
+    }
+    all_ok
+}
+
+async fn progress_one(msg: &Message, metrics: &MetricsRegistry) -> bool {
+    match msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "progress ack failed");
+            metrics.jetstream_ack_failures_total.inc();
+            false
         }
     }
 }
@@ -3004,6 +3285,7 @@ mod tests {
             profile_id: String::new(),
             engine: String::new(),
             pool_name: "l4".into(),
+            admission_pool: String::new(),
             machine_profile: String::new(),
             item: Some(text_item("x")),
             payload_ref: None,
@@ -3026,6 +3308,43 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
         }
+    }
+
+    #[test]
+    fn generate_terminal_error_chunk_uses_streaming_wire_shape() {
+        #[derive(serde::Deserialize)]
+        struct DecodedChunk {
+            kind: String,
+            request_id: String,
+            attempt_id: String,
+            seq: u32,
+            text_delta: String,
+            done: bool,
+            finish_reason: String,
+            error: DecodedError,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct DecodedError {
+            code: String,
+            message: String,
+        }
+
+        let work = wi("req-load", 0, "Qwen/Qwen3-4B-Instruct-2507", "generate");
+        let bytes =
+            encode_generate_terminal_error_chunk(&work, MODEL_LOADING_ERROR_CODE, "loading")
+                .expect("chunk encodes");
+        let decoded: DecodedChunk = rmp_serde::from_slice(&bytes).expect("chunk decodes");
+
+        assert_eq!(decoded.kind, "chunk");
+        assert_eq!(decoded.request_id, "req-load");
+        assert_eq!(decoded.attempt_id, "req-load.0:model-loading");
+        assert_eq!(decoded.seq, 0);
+        assert_eq!(decoded.text_delta, "");
+        assert!(decoded.done);
+        assert_eq!(decoded.finish_reason, "error");
+        assert_eq!(decoded.error.code, MODEL_LOADING_ERROR_CODE);
+        assert_eq!(decoded.error.message, "loading");
     }
 
     #[tokio::test]
@@ -3308,6 +3627,40 @@ mod tests {
         assert_eq!(
             nak_delay_for_backend_error(&BackendError::UnsupportedModel("z".into())),
             base_nak_delay_ms()
+        );
+    }
+
+    #[test]
+    fn readiness_progress_delay_only_covers_local_loading_states() {
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::LoadingStarted, 5_000),
+            Some(5_000)
+        );
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::LoadingInProgress, 5_000),
+            Some(10_000)
+        );
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::Ready, 5_000),
+            None
+        );
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::RetryLater, 5_000),
+            None
+        );
+    }
+
+    #[test]
+    fn readiness_progress_delay_is_clamped_below_pool_ack_wait() {
+        let max_progress_delay_ms =
+            crate::nats_consumer::ACK_WAIT_SECS * 1_000 / READINESS_PROGRESS_ACK_WAIT_FRACTION;
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::LoadingStarted, 20_000),
+            Some(max_progress_delay_ms)
+        );
+        assert_eq!(
+            readiness_progress_delay_ms(&ReadinessState::LoadingInProgress, 20_000),
+            Some(max_progress_delay_ms)
         );
     }
 

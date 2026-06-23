@@ -55,6 +55,49 @@ _ERR_MODEL_NOT_LOADED = "Model '{name}' is not loaded"
 _ERR_MODEL_ALREADY_LOADED = "Model '{name}' is already loaded"
 
 
+def _base_model_id(raw: str) -> str:
+    """Bare ``sie_id`` with any ``:profile`` suffix removed, lowercased.
+
+    HuggingFace org/model ids contain ``/`` but never ``:``, so the part before
+    the first ``:`` is the base model and the rest is a profile name. Used where
+    the base model is what matters (e.g. disk weights, which a profile variant
+    shares with its base).
+    """
+    return raw.split(":", maxsplit=1)[0].strip().lower()
+
+
+def _canonical_pinned_id(raw: str) -> str:
+    """Canonicalise a pinned id, preserving non-default profile variants.
+
+    The worker keys ``_loaded`` / configs / memory by the FULL profile-qualified
+    id for non-default profiles (``loader._expand_profile_variants`` materialises
+    each as its own ``{base}:{profile}`` config), so the pinned set must keep
+    that granularity to load and protect the right unit. Mirrors the gateway's
+    canonicalization (``pools.rs``): the literal ``:default`` folds to the bare
+    base; any other ``:profile`` is preserved. Everything is lowercased for
+    case-insensitive matching against the loaded keys.
+
+    Splits on the first ``:`` (HF ids contain ``/`` but never ``:``, and profile
+    names are single-segment), so a single-colon id is the only valid shape.
+    """
+    base, sep, profile = raw.strip().lower().partition(":")
+    base = base.strip()
+    profile = profile.strip()
+    if not sep or not profile or profile == "default":
+        return base
+    return f"{base}:{profile}"
+
+
+def _normalize_pinned(pinned: Iterable[str] | None) -> frozenset[str]:
+    """Normalise a raw pinned-model list into a lowercase canonical-id frozenset.
+
+    Profile-qualified ids are preserved (only ``:default`` folds to the base).
+    """
+    if not pinned:
+        return frozenset()
+    return frozenset(canonical for raw in pinned if (canonical := _canonical_pinned_id(raw)))
+
+
 def _model_config_semantic_hash(config: ModelConfig) -> str:
     """Stable hash for config equality that ignores Pydantic private attrs."""
     payload = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
@@ -91,6 +134,7 @@ class ModelRegistry:
         engine_config: EngineConfig | None = None,
         enable_hot_reload: bool = True,
         pool_name: str | None = None,
+        pinned_models: Iterable[str] | None = None,
     ) -> None:
         """Initialize the registry.
 
@@ -107,6 +151,11 @@ class ModelRegistry:
                 generation and non-generation models on the same worker. When
                 ``None`` the validator is skipped (e.g. unit tests without a
                 pool context).
+            pinned_models: Optional list of model ids to pin in memory. Pinned models are
+                eager-loaded and never chosen as LRU/idle/OOM eviction victims. Ids may be
+                bare (``org/name``) or profile-qualified (``org/name:profile``); non-default
+                profiles are first-class variants and are preserved, while ``:default`` folds
+                to the base. Matching is case-insensitive against the full canonical id.
         """
         # Store as string to handle cloud URLs
         self._models_dir: str | None = str(models_dir) if models_dir is not None else None
@@ -114,6 +163,8 @@ class ModelRegistry:
         self._device = device
         self._enable_hot_reload = enable_hot_reload
         self._pool_name = pool_name.strip().lower() if pool_name else None
+        # Normalised pinned set: bare lowercase sie_ids, never chosen for eviction.
+        self._pinned_models: frozenset[str] = _normalize_pinned(pinned_models)
         self._configs: dict[str, ModelConfig] = {}
         self._model_dirs: dict[str, Path] = {}
         self._loaded: dict[str, LoadedModel] = {}
@@ -136,7 +187,8 @@ class ModelRegistry:
                 DiskCacheConfig(
                     cache_dir=cache_config.local_cache,
                     pressure_threshold=threshold,
-                )
+                ),
+                pinned_provider=self._pinned_disk_repo_ids,
             )
             logger.info(
                 "Disk cache manager enabled (threshold=%.0f%%, cache_dir=%s)",
@@ -232,6 +284,110 @@ class ModelRegistry:
             oom_recovery=oom_recovery_config,
             registry_callbacks=self,
         )
+
+    def _is_pinned(self, name: str) -> bool:
+        """Return True if ``name`` is in the pinned set (case-insensitive)."""
+        return name.strip().lower() in self._pinned_models
+
+    def _pinned_disk_repo_ids(self) -> set[str]:
+        """HF repo ids of pinned models, for disk-cache eviction protection.
+
+        Matched at BASE-model granularity: a profile variant shares its base
+        model's ``hf_id`` (disk weights), so a pinned ``org/model:fp8`` protects
+        the same repo as ``org/model``. Mapping pinned ids to the configs'
+        ``hf_id`` keeps a long-tail download from evicting a pinned model's
+        weights and reintroducing its cold start.
+
+        The disk cache matches by exact ``hf_id`` (no case-folding, unlike the
+        in-memory sie_id path), which is safe because the cache key also derives
+        from ``config.hf_id`` (model_loader passes it to ``ensure_space_before_download``
+        and ``touch``).
+        """
+        if not self._pinned_models:
+            return set()
+        pinned_bases = {_base_model_id(pinned_id) for pinned_id in self._pinned_models}
+        return {
+            config.hf_id
+            for sie_id, config in self._configs.items()
+            if config.hf_id and _base_model_id(sie_id) in pinned_bases
+        }
+
+    async def _eager_load_pinned(self) -> None:
+        """Eager-load every pinned model that has a config and is not yet resident.
+
+        Idempotent and best-effort (``start_load_async`` skips loaded/loading and
+        failed-in-cooldown models). Called whenever the pinned set or the config
+        set changes, so a pin recorded before its config existed (default Helm
+        workers receive configs at runtime via the sidecar) becomes resident once
+        the config is known, and a pinned model unloaded by a config replacement
+        is reloaded.
+        """
+        for pinned_id in sorted(self._pinned_models):
+            name = self.resolve_model_id(pinned_id)
+            if name is None:
+                logger.debug("Pinned model '%s' has no local config yet; skipping eager-load", pinned_id)
+                continue
+            if self.is_loaded(name):
+                continue
+            try:
+                await self.start_load_async(name, self._device)
+            except Exception:
+                logger.exception("Failed to start eager-load of pinned model '%s'", name)
+
+    def _maybe_schedule_pinned_load(self, name: str) -> None:
+        """Schedule a background pinned-load reconcile if ``name`` is pinned (sync callers).
+
+        Used by the synchronous ``add_config`` to bridge into the async loader
+        when a pinned model's config arrives at runtime, mirroring the
+        ``start_load_async`` / ``_load_lora`` create-task pattern. Schedules the
+        guarded ``_eager_load_pinned`` (so a load-validation error can't surface
+        as an unretrieved task exception). A no-op when ``name`` is not pinned or
+        when there is no running loop (e.g. sync tests / CLI), where the async
+        reconcile paths cover it.
+        """
+        if not self._is_pinned(name):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._eager_load_pinned())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def set_pinned_models(self, raw_ids: Iterable[str]) -> frozenset[str]:
+        """Replace the pinned set at runtime from the gateway's authoritative pool spec.
+
+        ``raw_ids`` are gateway-canonical (bare ``sie_id`` or profile-qualified
+        ``sie_id:profile``); they are normalized to lowercased canonical ids
+        (profile variants preserved, ``:default`` folded to base). The new set
+        fully REPLACES the current one (an empty set un-pins everything), so
+        removing a model from the pool API actually un-pins it on the worker.
+
+        On change: pinned models with a local config are eager-loaded in the
+        background (non-blocking, best-effort) so the first request pays no cold
+        start; un-pinned models are simply demoted to LRU/idle-evictable again
+        (no forced unload). The frozenset is reassigned atomically, so every
+        eviction path and the disk-cache provider see the new protection
+        immediately. Idempotent: an unchanged set is a no-op.
+
+        Returns the normalized pinned set now in effect.
+        """
+        new_pinned = _normalize_pinned(raw_ids)
+        if new_pinned == self._pinned_models:
+            return new_pinned
+
+        newly_pinned = new_pinned - self._pinned_models
+        # Reassign before loading so newly-pinned models are eviction-protected
+        # the instant they are pinned, even before their weights are resident.
+        self._pinned_models = new_pinned
+        logger.info(
+            "Pinned set updated: %d model(s) pinned (%d newly pinned)",
+            len(new_pinned),
+            len(newly_pinned),
+        )
+        await self._eager_load_pinned()
+        return new_pinned
 
     def _load_configs_from_dir(self, models_dir: str) -> None:
         """Load all model configs from a directory (local or cloud)."""
@@ -476,6 +632,25 @@ class ModelRegistry:
             raise KeyError(msg)
         return self._configs[name]
 
+    def resolve_model_id(self, raw_id: str) -> str | None:
+        """Resolve a raw model id to a known config's ``sie_id``.
+
+        Accepts profile-qualified (``sie_id:profile``) and differently-cased ids,
+        which the pinned set may carry per the deployment design. Non-default
+        profiles are first-class config entries keyed by the full ``base:profile``
+        id (``loader._expand_profile_variants``), so this matches the FULL
+        canonical id case-insensitively and returns that variant's original-case
+        ``sie_id`` (not the base). ``:default`` folds to the base. Returns
+        ``None`` when no config matches.
+        """
+        canonical = _canonical_pinned_id(raw_id)
+        if not canonical:
+            return None
+        for sie_id in self._configs:
+            if sie_id.strip().lower() == canonical:
+                return sie_id
+        return None
+
     def get(self, name: str) -> ModelAdapter:
         """Get a loaded model's adapter.
 
@@ -542,10 +717,10 @@ class ModelRegistry:
             if not self._is_oom_error(e):
                 raise
 
-            # OOM - try to evict LRU model and retry
-            lru_model = self._memory_manager.get_lru_model()
+            # OOM - try to evict LRU non-pinned model and retry
+            lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
             if lru_model is None:
-                logger.error("OOM loading '%s' but no models to evict", name)
+                logger.error("OOM loading '%s' but no non-pinned models to evict", name)
                 raise
 
             logger.warning(
@@ -609,11 +784,11 @@ class ModelRegistry:
                 msg = f"Model '{name}' is currently being unloaded"
                 raise RuntimeError(msg)
 
-            # Pre-load eviction: evict LRU models until below pressure threshold
+            # Pre-load eviction: evict LRU non-pinned models until below pressure threshold
             while self._memory_manager.check_pressure():
-                lru_model = self._memory_manager.get_lru_model()
+                lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
                 if lru_model is None:
-                    break  # No models to evict, proceed with load attempt
+                    break  # No non-pinned models to evict, proceed with load attempt
 
                 stats = self._memory_manager.get_stats()
                 logger.info(
@@ -650,10 +825,10 @@ class ModelRegistry:
                     if not self._is_oom_error(e):
                         raise
 
-                    # OOM despite pre-load eviction: evict LRU and retry once
-                    lru_model = self._memory_manager.get_lru_model()
+                    # OOM despite pre-load eviction: evict LRU non-pinned model and retry once
+                    lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
                     if lru_model is None:
-                        logger.error("OOM loading '%s' but no models to evict", name)
+                        logger.error("OOM loading '%s' but no non-pinned models to evict", name)
                         raise
 
                     logger.warning(
@@ -1078,6 +1253,10 @@ class ModelRegistry:
         # request retries with the new config.
         self._failed.pop(config.sie_id, None)
         self._config_version += 1
+        # The config for an already-pinned model may have just arrived at runtime
+        # (default Helm workers receive configs via the sidecar after a pin was
+        # recorded). Eager-load it now so the pin actually keeps it resident.
+        self._maybe_schedule_pinned_load(config.sie_id)
 
     async def replace_configs_async(
         self,
@@ -1143,7 +1322,12 @@ class ModelRegistry:
             for name in invalidated:
                 self._failed.pop(name, None)
             self._config_version += 1
-            return invalidated
+
+        # Outside the load lock (``start_load_async`` acquires it): reload pinned
+        # models that were just unloaded because their config changed, and load
+        # any pinned model whose config arrived in this snapshot.
+        await self._eager_load_pinned()
+        return invalidated
 
     def accepts_config_pool(self, config: ModelConfig) -> bool:
         if self._pool_name is None:
@@ -1324,11 +1508,13 @@ class ModelRegistry:
             return False
 
         try:
-            # Walk LRU order and pick the first that is not ``exclude_name``
-            # and is still loaded (the OrderedDict in the memory manager
-            # may include entries already torn down by another path).
+            # Walk LRU order and pick the first that is not ``exclude_name``,
+            # not pinned, and is still loaded (the OrderedDict in the memory
+            # manager may include entries already torn down by another path).
             for candidate in self._memory_manager.loaded_models:
                 if candidate == exclude_name:
+                    continue
+                if self._is_pinned(candidate):
                     continue
                 if candidate not in self._loaded:
                     continue
@@ -1451,7 +1637,7 @@ class ModelRegistry:
         while self._idle_evict_running:
             try:
                 await asyncio.sleep(interval)
-                stale = self._memory_manager.get_idle_models(idle_threshold_s=threshold)
+                stale = self._memory_manager.get_idle_models(idle_threshold_s=threshold, exclude=self._pinned_models)
                 if not stale:
                     continue
 
@@ -1557,8 +1743,11 @@ class ModelRegistry:
                             )
                             break
 
-                        lru_model = self._memory_manager.get_lru_model()
+                        lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
                         if lru_model is None:
+                            logger.debug(
+                                "Memory pressure detected but no non-pinned models to evict, skipping",
+                            )
                             break
 
                         stats = self._memory_manager.get_stats()

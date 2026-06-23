@@ -159,6 +159,7 @@ class AppFactory:
             device=config.device,
             engine_config=engine_config,
             pool_name=config.pool_name,
+            pinned_models=config.pinned_models,
         )
         try:
             # Start background services (memory monitor, idle evictor, hot reload).
@@ -169,6 +170,8 @@ class AppFactory:
 
             # Preload models (shifts weight download from first-request to startup)
             await cls._preload_models(registry, config)
+            # Eager-load pinned models (models already loaded by preload are skipped)
+            await cls._load_pinned_models(registry, config)
 
             yield registry
         finally:
@@ -282,6 +285,56 @@ class AppFactory:
         elapsed = time.perf_counter() - t0
         logger.info("Preload complete: %d/%d models loaded", succeeded, len(config.preload_models))
         logger.info("lifespan.stage preload_models elapsed_s=%.3f", elapsed)
+
+    @classmethod
+    async def _load_pinned_models(cls, registry: ModelRegistry, config: AppStateConfig) -> None:
+        """Eager-load pinned models at startup (non-fatal on failure).
+
+        Models already loaded by ``_preload_models`` are skipped so a model
+        in both lists is loaded exactly once. Runs inside _model_registry()
+        which enters before _readiness_handling(), keeping the pod NotReady
+        until pinned models are resident.
+        """
+        if not config.pinned_models:
+            logger.info("lifespan.stage load_pinned_models elapsed_s=0.000")
+            return
+
+        t0 = time.perf_counter()
+        logger.info("Loading %d pinned model(s): %s", len(config.pinned_models), ", ".join(config.pinned_models))
+
+        succeeded = 0
+        for raw in config.pinned_models:
+            # Pinned ids may be profile-qualified (``sie_id:profile``) or
+            # differently-cased; resolve to the config's bare sie_id so the
+            # eager-load matches the same set the eviction guard protects.
+            name = registry.resolve_model_id(raw)
+            if name is None:
+                logger.warning(
+                    "Pinned model '%s' has no matching config on this worker, skipping eager-load "
+                    "(it stays eviction-protected if it loads later). "
+                    "Check that the model name matches a config in the models directory.",
+                    raw,
+                )
+                continue
+            if registry.is_loaded(name):
+                logger.info("Pinned model '%s' already loaded (skipping duplicate load)", name)
+                succeeded += 1
+                continue
+            try:
+                await registry.load_async(name, config.device)
+                succeeded += 1
+                logger.info("Pinned model '%s' loaded", name)
+            except Exception:
+                logger.exception(
+                    "Failed to load pinned model '%s', skipping (it will lazy-load on "
+                    "request and stay eviction-protected once resident). "
+                    "Check that the model name matches a config in the models directory.",
+                    name,
+                )
+
+        elapsed = time.perf_counter() - t0
+        logger.info("Pinned model load complete: %d/%d models loaded", succeeded, len(config.pinned_models))
+        logger.info("lifespan.stage load_pinned_models elapsed_s=%.3f", elapsed)
 
     @staticmethod
     def _configure_cuda_defaults() -> None:

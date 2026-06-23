@@ -885,6 +885,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_terminal_model_loading_error_chunk_builds_error_outcome() {
+        let (tx, _rx) = oneshot::channel();
+        let mut c = StreamCollector::new(
+            tx,
+            "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            "default".to_string(),
+        );
+        let mut term = _make_chunk("req-load.0:model-loading", 0, "", true);
+        term.finish_reason = Some("error".to_string());
+        term.usage = None;
+        term.error = Some(ChunkError {
+            code: "MODEL_LOADING".to_string(),
+            message: "Model 'Qwen/Qwen3-4B-Instruct-2507' is loading; retry later.".to_string(),
+        });
+
+        assert_eq!(c.apply(term), ChunkApplied::Terminal);
+        let outcome = c.build_outcome().expect("terminal");
+        let err = outcome.error.expect("terminal error");
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.finish_reason, "error");
+        assert_eq!(outcome.attempt_id, "req-load.0:model-loading");
+        assert_eq!(err.code, "MODEL_LOADING");
+        assert!(err.message.contains("retry later"));
+    }
+
     /// Multi-candidate (`n>1`): the terminal chunk carries a `candidates`
     /// array which the collector passes through verbatim onto the
     /// `StreamOutcome` for the body builder to expand into `choices[]`.

@@ -35,6 +35,8 @@ pub struct WorkItem {
     #[serde(default)]
     pub engine: String,
     pub pool_name: String,
+    #[serde(default)]
+    pub admission_pool: String,
     pub machine_profile: String,
     #[serde(default)]
     pub item: Option<WireValue>,
@@ -129,6 +131,7 @@ mod tests {
             profile_id: String::new(),
             engine: String::new(),
             pool_name: "l4".into(),
+            admission_pool: "l4".into(),
             machine_profile: "l4-spot".into(),
             item: Some(msg_value(serde_json::json!({"text": "hello"}))),
             payload_ref: None,

@@ -200,6 +200,146 @@ class TestRegistryMemoryManagerIntegration:
         adapter_a.unload.assert_not_called()
 
 
+class TestRegistryPinnedModels:
+    """Tests for pinned-model LRU/OOM protection."""
+
+    @pytest.fixture
+    def mock_adapter_factory(self) -> MagicMock:
+        def make_mock():
+            mock = MagicMock()
+            mock.capabilities.outputs = ["dense"]
+            return mock
+
+        return make_mock
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    def test_empty_pinned_set_unchanged(self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock) -> None:
+        """pinned_models=None preserves true LRU behaviour (regression guard)."""
+        mock_load_adapter.side_effect = [mock_adapter_factory(), mock_adapter_factory()]
+
+        registry = ModelRegistry(pinned_models=None)
+        for name in ["model-a", "model-b"]:
+            config = _make_config(name=name, hf_id=f"org/{name}")
+            registry.add_config(config)
+            registry.load(name, device="cpu")
+
+        # model-a loaded first, so it is the LRU
+        assert registry.memory_manager.get_lru_model() == "model-a"
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    def test_oom_evicts_non_pinned_keeps_pinned(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """OOM during load evicts the oldest non-pinned model, never the pinned one."""
+        adapter_pinned = mock_adapter_factory()
+        adapter_nonpinned = mock_adapter_factory()
+
+        # Third adapter fails OOM on first try
+        adapter_c_fail = mock_adapter_factory()
+        adapter_c_fail.load.side_effect = RuntimeError("CUDA out of memory")
+
+        # Retry adapter succeeds
+        adapter_c_success = mock_adapter_factory()
+
+        mock_load_adapter.side_effect = [adapter_pinned, adapter_nonpinned, adapter_c_fail, adapter_c_success]
+
+        # pinned is "model-pinned", loaded first (oldest)
+        registry = ModelRegistry(pinned_models=["model-pinned"])
+        for name in ["model-pinned", "model-non-pinned", "model-c"]:
+            config = _make_config(name=name, hf_id=f"org/{name}")
+            registry.add_config(config)
+
+        registry.load("model-pinned", device="cuda:0")
+        registry.load("model-non-pinned", device="cuda:0")
+
+        # model-pinned is LRU but pinned; OOM must evict model-non-pinned instead
+        assert registry.memory_manager.get_lru_model() == "model-pinned"
+
+        registry.load("model-c", device="cuda:0")
+
+        # Pinned model stays; non-pinned was evicted
+        assert registry.is_loaded("model-pinned")
+        assert not registry.is_loaded("model-non-pinned")
+        assert registry.is_loaded("model-c")
+        adapter_pinned.unload.assert_not_called()
+        adapter_nonpinned.unload.assert_called_once()
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    def test_oom_eviction_skips_pinned(self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock) -> None:
+        """When only pinned models are loaded and OOM occurs, the error propagates."""
+        adapter_pinned = mock_adapter_factory()
+        adapter_fail = mock_adapter_factory()
+        adapter_fail.load.side_effect = RuntimeError("CUDA out of memory")
+
+        mock_load_adapter.side_effect = [adapter_pinned, adapter_fail]
+
+        registry = ModelRegistry(pinned_models=["model-pinned"])
+        for name in ["model-pinned", "model-other"]:
+            config = _make_config(name=name, hf_id=f"org/{name}")
+            registry.add_config(config)
+
+        registry.load("model-pinned", device="cuda:0")
+
+        # Only pinned model loaded; OOM must propagate since there is nothing to evict
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            registry.load("model-other", device="cuda:0")
+
+        # Pinned model must not have been touched
+        assert registry.is_loaded("model-pinned")
+        adapter_pinned.unload.assert_not_called()
+
+    def test_resolve_model_id_preserves_profile_and_case(self) -> None:
+        """resolve_model_id matches the FULL profile-qualified config key; :default folds to base."""
+        registry = ModelRegistry()
+        registry.add_config(_make_config(name="BAAI/bge-m3", hf_id="BAAI/bge-m3"))
+        # Non-default profiles are first-class config entries (loader expands them).
+        registry.add_config(_make_config(name="BAAI/bge-m3:fp8", hf_id="BAAI/bge-m3"))
+
+        # Base id (exact + case-insensitive) -> base config.
+        assert registry.resolve_model_id("BAAI/bge-m3") == "BAAI/bge-m3"
+        assert registry.resolve_model_id("baai/bge-m3") == "BAAI/bge-m3"
+        # ":default" folds to the base config (matches the gateway canonicalization).
+        assert registry.resolve_model_id("baai/bge-m3:default") == "BAAI/bge-m3"
+        # A non-default profile resolves to the VARIANT config, not the base.
+        assert registry.resolve_model_id("baai/bge-m3:fp8") == "BAAI/bge-m3:fp8"
+        # A profile with no variant config must NOT collapse to the base.
+        assert registry.resolve_model_id("baai/bge-m3:missing") is None
+        assert registry.resolve_model_id("org/missing") is None
+
+    def test_pinned_disk_repo_ids_maps_sie_id_to_hf_id(self) -> None:
+        """_pinned_disk_repo_ids resolves pinned sie_ids to their configs' hf_ids (case-insensitive)."""
+        registry = ModelRegistry(pinned_models=["Org/Pinned"])
+        registry.add_config(_make_config(name="Org/Pinned", hf_id="org/pinned-hf"))
+        registry.add_config(_make_config(name="other/model", hf_id="other/hf"))
+
+        # Only the pinned model's hf_id is returned (the disk cache keys by hf repo id).
+        assert registry._pinned_disk_repo_ids() == {"org/pinned-hf"}
+
+    def test_pinned_disk_repo_ids_empty_when_no_pinned_set(self) -> None:
+        """No pinned set means no disk-eviction protection (regression guard)."""
+        registry = ModelRegistry()
+        registry.add_config(_make_config(name="org/model", hf_id="org/model-hf"))
+        assert registry._pinned_disk_repo_ids() == set()
+
+    def test_pinned_disk_repo_ids_profile_pin_protects_base_weights(self) -> None:
+        """A profile-qualified pin protects the base model's disk weights (shared hf_id)."""
+        registry = ModelRegistry(pinned_models=["Org/Model:fp8"])
+        # Only the base config is present (the variant config may not have arrived yet);
+        # the variant shares the base hf_id, so the base weights must be protected.
+        registry.add_config(_make_config(name="Org/Model", hf_id="org/model-hf"))
+        assert registry._pinned_disk_repo_ids() == {"org/model-hf"}
+
+    def test_disk_cache_manager_wired_with_pinned_provider(self) -> None:
+        """The registry feeds its pinned set into the disk cache manager's eviction guard."""
+        registry = ModelRegistry(pinned_models=["org/pinned"])
+        registry.add_config(_make_config(name="org/pinned", hf_id="org/pinned-hf"))
+
+        assert registry._disk_cache_manager is not None
+        # The callback wired at construction resolves to the pinned models' hf_ids.
+        assert registry._disk_cache_manager._pinned_provider is not None
+        assert registry._disk_cache_manager._pinned_provider() == {"org/pinned-hf"}
+
+
 class TestRegistryOOMDetection:
     """Tests for _is_oom_error detection."""
 

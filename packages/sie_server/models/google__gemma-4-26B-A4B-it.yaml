@@ -1,0 +1,132 @@
+sie_id: google/gemma-4-26B-A4B-it
+hf_id: google/gemma-4-26B-A4B-it
+# ── Engine (see issue #1415) ──
+#
+# Served by the dedicated ``gemma`` bundle (packages/sie_server/bundles/
+# gemma.yaml): sglang 0.5.13 + torch 2.11 (cu130) on a CUDA 13 base. 0.5.13 is
+# the validated engine; 0.5.11 (first release with Gemma 4) has a JIT-kernel
+# compile bug. Smoke-validated on a Modal H100-80GB 2026-06-19: the ``default``
+# profile shape (BF16, mem_fraction 0.90, --disable-cuda-graph) loads the MoE
+# and /v1/chat/completions generates correctly. ``kv_budget_tokens`` /
+# ``mem_fraction_static`` / ``context_length`` remain conservative placeholders
+# pending KV calibration. FP8 was dropped: BF16 (~52 GB) already fits the serving
+# cards, and online FP8 quant of this MoE is lossy + runs unoptimized kernels (it
+# does serve on H200, just slower) — so it isn't worth it here.
+#
+# gemma-4-26B-A4B-it is a Mixture-of-Experts model (26B total / ~4B active).
+# BF16 weights (~52 GB) do not fit L4 (24 GB) or A100-40GB; the ``default``
+# profile targets H100-80GB (BF16), and the ``mtp`` variant (BF16 + NEXTN draft
+# + cuda graph) needs a 96 GB+ card (RTX PRO 6000 / H200).
+inputs:
+  # Vision-language; text+image via OpenAI ``image_url`` content parts.
+  # Video is not wired through the SIE gateway.
+  text: true
+  image: true
+  audio: false
+  video: false
+tasks:
+  generate:
+    # Conservative contract pending calibration on a Gemma-4-capable engine.
+    context_length: 8192
+    max_output_tokens: 4096
+    # Grammar (response_format / json_schema / regex) is served by the
+    # non-speculative ``no-spec`` profile — validated with xgrammar. NEXTN/MTP
+    # bypasses SGLang's grammar FSM (leaks/truncates), so grammar must never run
+    # on ``:mtp``. ``grammar_profile`` makes the gateway reroute every grammar
+    # request — INCLUDING an explicit ``…:mtp`` pin — to the named variant (it
+    # strips the pinned suffix and rewrites to the base's grammar_profile). The
+    # validator forbids naming ``default``, so the route is a thin non-spec
+    # ``no-spec`` profile (mirrors Qwen3.5-4B).
+    grammar_profile: no-spec
+    capabilities:
+      # xgrammar supports json_schema/regex/ebnf; advertise the universally
+      # safe subset until a GPU smoke validates ebnf for this model.
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      tools: true
+    # Gemma 4 thinking is off by default; set explicitly so the OpenAI-compat
+    # path returns the answer only. Operators wanting CoT flip this
+    # profile-side or pass chat_template_kwargs.enable_thinking=true per request.
+    chat_template_kwargs:
+      enable_thinking: false
+max_sequence_length: 8192
+profiles:
+  # H100-80GB BF16. ~52 GB weights leave room for KV at the conservative 8K
+  # window; recalibrate ``mem_fraction_static`` / ``kv_budget_tokens`` via a
+  # GPU smoke once SGLang supports Gemma 4.
+  default:
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.gemma:SGLangGemmaAdapter
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.90
+        served_model_name: google/gemma-4-26B-A4B-it
+        disable_cuda_graph: true
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        # Speculative OFF (Gemma 4 MTP needs a separate ``-it-assistant`` draft
+        # model). No ``--mamba-scheduler-strategy`` — Gemma 4 is not the Qwen3.x
+        # Gated-DeltaNet family.
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        # Gemma-family recommended sampling defaults; a request-supplied value
+        # still wins (the adapter merges this dict via setdefault).
+        default_sampling:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 64
+          # Conservative floor against an empty-first-token EOS completion.
+          min_new_tokens: 1
+        stop_tokens:
+          - "<end_of_turn>"
+  # ``no-spec`` — the grammar-safe route (see tasks.generate.grammar_profile).
+  # Identical to ``default`` (non-speculative, H100-80GB BF16); named distinctly
+  # so ``grammar_profile`` can point here (the validator forbids naming
+  # ``default``).
+  no-spec:
+    extends: default
+  # ``mtp`` variant — Gemma 4 MTP for the 26B MoE: NEXTN with the paired draft
+  # ``google/gemma-4-26B-A4B-it-assistant``, BF16 (FP8 dropped — see header).
+  # BF16 weights + the draft + the MTP cuda graph need more headroom than the
+  # 80 GB ``default``, so target a 96 GB+ card (RTX PRO 6000 / H200). VALIDATED
+  # on a Modal H200 2026-06-19: serves as FROZEN_KV_MTP (num_steps 5, eagle_topk
+  # 1, num_draft_tokens 6) with the paired draft loaded and its cuda graph
+  # captured ("Capture Frozen-KV MTP draft cuda graph end"), BF16
+  # (quantization=None, disable_cuda_graph=False); /v1/chat/completions returns
+  # correct output, max_total_num_tokens=444103. (MTP cuda-graph capture JIT-
+  # compiles a fused_rope kernel needing the full CUDA devel toolkit — nvcc, CCCL
+  # headers, lib dev symlinks — all present in this bundle's
+  # ``cuda:13.0.0-...-devel`` base, so no extra wiring is needed in the image.)
+  # ``speculative_needs_extra_buffer: false`` opts out of the Qwen Gated-DeltaNet
+  # mamba-scheduler guard (Gemma 4 is hybrid attention).
+  mtp:
+    extends: default
+    max_batch_tokens: 32768
+    kv_budget_tokens: 16384
+    adapter_options:
+      # loadtime FULL-REPLACED on extend (restated in full); runtime inherited.
+      loadtime:
+        mem_fraction_static: 0.90
+        served_model_name: google/gemma-4-26B-A4B-it
+        # MTP REQUIRES cuda graph ON: the eager path (--disable-cuda-graph)
+        # crashes in sglang's speculative buffer view (validated on E4B, Modal
+        # H100 2026-06-19).
+        disable_cuda_graph: false
+        attention_backend: triton
+        grammar_backend: xgrammar
+        reasoning_parser: gemma4
+        tool_call_parser: gemma4
+        speculative_needs_extra_buffer: false
+        speculative:
+          enabled: true
+          algorithm: nextn
+          num_steps: 5
+          eagle_topk: 1
+          num_draft_tokens: 6
+          draft_model: google/gemma-4-26B-A4B-it-assistant

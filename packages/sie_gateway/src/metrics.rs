@@ -1183,29 +1183,41 @@ pub fn update_pool_metrics(pools: &[crate::types::Pool]) {
     ACTIVE_LEASE_GPUS.reset();
     ACTIVE_LEASE_GPUS.with_label_values(&["", "", ""]).set(0.0);
 
+    let mut active_workers_by_lane: std::collections::HashMap<
+        (String, String, String),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+
     for pool in pools {
         if pool.status.state == PoolState::Active && pool.spec.name != DEFAULT_POOL_NAME {
-            if let Some(bundle) = pool.spec.bundle.as_deref() {
-                for (gpu_type, count) in &pool.spec.gpus {
-                    ACTIVE_LEASE_GPUS
-                        .with_label_values(&[&pool.spec.name, gpu_type, bundle])
-                        .add(*count as f64);
-                }
+            let queue_pool = pool.spec.queue_pool.trim();
+            let metric_pool = if queue_pool.is_empty() {
+                DEFAULT_POOL_NAME
             } else {
-                let mut assigned_by_lane: std::collections::HashMap<(&str, &str), usize> =
-                    std::collections::HashMap::new();
-                for worker in &pool.status.assigned_workers {
-                    *assigned_by_lane
-                        .entry((&worker.gpu, &worker.bundle))
-                        .or_default() += 1;
-                }
-                for ((gpu_type, bundle), count) in assigned_by_lane {
-                    ACTIVE_LEASE_GPUS
-                        .with_label_values(&[&pool.spec.name, gpu_type, bundle])
-                        .add(count as f64);
-                }
+                queue_pool
+            };
+            for worker in &pool.status.assigned_workers {
+                let worker_key = if worker.name.trim().is_empty() {
+                    worker.url.clone()
+                } else {
+                    worker.name.clone()
+                };
+                active_workers_by_lane
+                    .entry((
+                        metric_pool.to_string(),
+                        worker.gpu.clone(),
+                        worker.bundle.clone(),
+                    ))
+                    .or_default()
+                    .insert(worker_key);
             }
         }
+    }
+
+    for ((metric_pool, gpu_type, bundle), workers) in active_workers_by_lane {
+        ACTIVE_LEASE_GPUS
+            .with_label_values(&[&metric_pool, &gpu_type, &bundle])
+            .set(workers.len() as f64);
     }
 }
 
@@ -1236,6 +1248,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: name.to_string(),
+                queue_pool: name.to_string(),
                 bundle,
                 gpus,
                 gpu_caps: HashMap::new(),
@@ -1261,12 +1274,27 @@ mod tests {
 
         let mut gpus = HashMap::new();
         gpus.insert("l4-spot".to_string(), 2);
-        let pools = vec![make_pool(
+        let mut pool = make_pool(
             "eval-pool",
             PoolState::Active,
             gpus,
             Some("premium".to_string()),
-        )];
+        );
+        pool.status.assigned_workers = vec![
+            AssignedWorker {
+                name: "worker-1".to_string(),
+                url: "http://worker-1:8080".to_string(),
+                gpu: "l4-spot".to_string(),
+                bundle: "premium".to_string(),
+            },
+            AssignedWorker {
+                name: "worker-2".to_string(),
+                url: "http://worker-2:8080".to_string(),
+                gpu: "l4-spot".to_string(),
+                bundle: "premium".to_string(),
+            },
+        ];
+        let pools = vec![pool];
 
         update_pool_metrics(&pools);
 
@@ -1310,6 +1338,113 @@ mod tests {
             .get();
         assert!((default_val - 1.0).abs() < f64::EPSILON);
         assert!((sglang_val - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_pool_metrics_logical_pool_uses_backing_queue_pool() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4".to_string(), 1);
+        let mut pool = make_pool(
+            "tenant-a",
+            PoolState::Active,
+            gpus,
+            Some("default".to_string()),
+        );
+        pool.spec.queue_pool = "default".to_string();
+        pool.status.assigned_workers = vec![AssignedWorker {
+            name: "worker-default".to_string(),
+            url: "http://worker-default:8080".to_string(),
+            gpu: "l4".to_string(),
+            bundle: "default".to_string(),
+        }];
+
+        update_pool_metrics(&[pool]);
+
+        let backing_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["default", "l4", "default"])
+            .get();
+        let logical_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["tenant-a", "l4", "default"])
+            .get();
+        assert!((backing_val - 1.0).abs() < f64::EPSILON);
+        assert!((logical_val - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_pool_metrics_logical_pool_uses_custom_backing_queue_pool() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4".to_string(), 1);
+        let mut pool = make_pool(
+            "tenant-a",
+            PoolState::Active,
+            gpus,
+            Some("default".to_string()),
+        );
+        pool.spec.queue_pool = "customer-queue".to_string();
+        pool.status.assigned_workers = vec![AssignedWorker {
+            name: "worker-customer".to_string(),
+            url: "http://worker-customer:8080".to_string(),
+            gpu: "l4".to_string(),
+            bundle: "default".to_string(),
+        }];
+
+        update_pool_metrics(&[pool]);
+
+        let backing_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["customer-queue", "l4", "default"])
+            .get();
+        let logical_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["tenant-a", "l4", "default"])
+            .get();
+        assert!((backing_val - 1.0).abs() < f64::EPSILON);
+        assert!((logical_val - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_pool_metrics_deduplicates_shared_backing_queue_workers() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let _ = &*REGISTRY;
+        reset_test_metrics();
+
+        let mut gpus = HashMap::new();
+        gpus.insert("l4".to_string(), 1);
+        let assigned = AssignedWorker {
+            name: "worker-default".to_string(),
+            url: "http://worker-default:8080".to_string(),
+            gpu: "l4".to_string(),
+            bundle: "default".to_string(),
+        };
+        let mut pool_a = make_pool(
+            "tenant-a",
+            PoolState::Active,
+            gpus.clone(),
+            Some("default".to_string()),
+        );
+        pool_a.spec.queue_pool = "default".to_string();
+        pool_a.status.assigned_workers = vec![assigned.clone()];
+        let mut pool_b = make_pool(
+            "tenant-b",
+            PoolState::Active,
+            gpus,
+            Some("default".to_string()),
+        );
+        pool_b.spec.queue_pool = "default".to_string();
+        pool_b.status.assigned_workers = vec![assigned];
+
+        update_pool_metrics(&[pool_a, pool_b]);
+
+        let backing_val = ACTIVE_LEASE_GPUS
+            .with_label_values(&["default", "l4", "default"])
+            .get();
+        assert!((backing_val - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

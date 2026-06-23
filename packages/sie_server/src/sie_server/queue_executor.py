@@ -36,6 +36,8 @@ from sie_server.ipc_types import (
     ReplaceModelConfigsResponse,
     ScoreBatchItem,
     ScoreOutputRaw,
+    SetPinnedModelsRequest,
+    SetPinnedModelsResponse,
     SparseOutput,
 )
 from sie_server.observability.metrics import record_ipc_batch_shape
@@ -486,6 +488,10 @@ class QueueExecutor:
     def registry(self) -> ModelRegistry:
         return self._registry
 
+    def loaded_model_names(self) -> list[str]:
+        """Return sorted currently loaded model ids for sidecar health heartbeats."""
+        return sorted(self._registry.loaded_model_names)
+
     def invalidate_model_descriptor(self, model_id: str) -> None:
         """Drop the cached descriptor for ``model_id``.
 
@@ -565,6 +571,11 @@ class QueueExecutor:
             applied_models=applied_models,
         )
 
+    async def set_pinned_models(self, req: SetPinnedModelsRequest) -> SetPinnedModelsResponse:
+        """Apply the gateway's authoritative pinned-model set to the local registry."""
+        pinned = await self._registry.set_pinned_models(req.models)
+        return SetPinnedModelsResponse(applied=True, pinned_count=len(pinned))
+
     # -- Readiness ---------------------------------------------------------
 
     async def ensure_model_ready(self, model_id: str) -> ReadinessState:
@@ -572,8 +583,8 @@ class QueueExecutor:
 
         Mapping (for the Rust side):
         - ``ready``: continue processing
-        - ``loading_started``: NAK with base delay (this call triggered a new load)
-        - ``loading_in_progress``: NAK with longer delay (already loading)
+        - ``loading_started``: progress-ACK and recheck (this call triggered a new load)
+        - ``loading_in_progress``: progress-ACK and recheck with a longer delay
         - ``retry_later``: NAK with base delay (unknown error path)
         """
         if not self._registry.has_model(model_id):

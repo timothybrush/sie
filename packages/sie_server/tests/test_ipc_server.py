@@ -25,6 +25,7 @@ from sie_server.ipc_types import (
     ProcessGenerateRequest,
     ReplaceModelConfigEntry,
     ReplaceModelConfigsRequest,
+    SetPinnedModelsRequest,
     SignalGenerateCancelRequest,
 )
 from sie_server.queue_executor import QueueExecutor
@@ -116,6 +117,7 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg = MagicMock()
     reg.model_names = ["test/model"]
     reg.device = "cpu"
+    reg.loaded_model_names = ["test/model"]
     reg.is_loaded.return_value = True
     reg.is_loading.return_value = False
     reg.get_config.return_value = MagicMock()
@@ -153,6 +155,7 @@ class TestFraming:
             assert resp["body"]["timestamp_ms"] == 123.0
             assert resp["body"]["worker_id"] == "worker-test"
             assert resp["body"]["bundle_config_hash"] == ""
+            assert resp["body"]["loaded_models"] == ["test/model"]
             assert srv.is_heartbeat_fresh()
         finally:
             await client.close()
@@ -255,6 +258,7 @@ class TestEnsureModelReady:
         reg.device = "cpu"
         reg.is_loaded.return_value = True
         reg.is_loading.return_value = False
+        reg.loaded_model_names = []
         worker = MagicMock()
         worker._batch_config = MagicMock(max_batch_requests=42)
         reg.get_worker.return_value = worker
@@ -663,6 +667,48 @@ profiles:
         assert resp.applied_models == ["tenant/model"]
         assert not registry.has_model("default/model")
         assert registry.has_model("tenant/model")
+
+
+# -----------------------------------------------------------------------------
+# SetPinnedModels
+# -----------------------------------------------------------------------------
+
+
+class TestSetPinnedModels:
+    @pytest.mark.asyncio
+    async def test_executor_passthrough_returns_count(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        executor = QueueExecutor(registry)
+
+        resp = await executor.set_pinned_models(SetPinnedModelsRequest(models=["org/a", "org/b"]))
+
+        assert resp.applied is True
+        assert resp.pinned_count == 2
+        assert registry._pinned_models == frozenset({"org/a", "org/b"})
+
+    @pytest.mark.asyncio
+    async def test_set_pinned_models_roundtrip_over_ipc(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        executor = QueueExecutor(registry)
+
+        sock = _short_sock_path()
+        srv = IpcServer(sock, executor, worker_id="worker-test", stale_after_ms=10_000)
+        await srv.start()
+        try:
+            client = await _Client.connect(sock)
+            try:
+                resp = await client.rpc("SetPinnedModels", {"models": ["org/a:fast", "Org/B"]})
+                assert resp["ok"] is True
+                assert resp["body"]["applied"] is True
+                assert resp["body"]["pinned_count"] == 2
+                # Lowercased; non-default profile preserved, base kept as-is.
+                assert registry._pinned_models == frozenset({"org/a:fast", "org/b"})
+            finally:
+                await client.close()
+        finally:
+            await srv.stop(drain_timeout_s=1.0)
 
 
 # -----------------------------------------------------------------------------

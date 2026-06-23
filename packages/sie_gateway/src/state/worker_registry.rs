@@ -390,6 +390,33 @@ impl WorkerRegistry {
             .collect()
     }
 
+    fn lazy_lane_workers_for_matching(
+        &self,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> Vec<WorkerState> {
+        let snap = self.snapshot.load();
+        let bundle_lower = bundle.to_lowercase();
+        let Some(candidates) = snap.by_bundle.get(&bundle_lower) else {
+            return Vec::new();
+        };
+        candidates
+            .iter()
+            .filter(|w| {
+                !w.saturated
+                    && worker_allowed_by_admission(w, admitted_worker_names)
+                    && !w.machine_profile.is_empty()
+                    && w.pool_name.eq_ignore_ascii_case(pool)
+                    && w.machine_profile.eq_ignore_ascii_case(machine_profile)
+                    && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Workers that can receive a pool fallback for this concrete lane.
     ///
     /// Unlike [`Self::dispatch_workers_for`], this intentionally does not
@@ -405,22 +432,45 @@ impl WorkerRegistry {
         bundle_config_hash: &str,
         admitted_worker_names: Option<&HashSet<String>>,
     ) -> usize {
-        let snap = self.snapshot.load();
-        let bundle_lower = bundle.to_lowercase();
-        let Some(candidates) = snap.by_bundle.get(&bundle_lower) else {
-            return 0;
-        };
-        candidates
-            .iter()
-            .filter(|w| {
-                !w.saturated
-                    && worker_allowed_by_admission(w, admitted_worker_names)
-                    && !w.machine_profile.is_empty()
-                    && w.pool_name.eq_ignore_ascii_case(pool)
-                    && w.machine_profile.eq_ignore_ascii_case(machine_profile)
-                    && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
-            })
-            .count()
+        self.lazy_lane_workers_for_matching(
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            admitted_worker_names,
+        )
+        .len()
+    }
+
+    /// Build a worker ring for capped logical batch dispatch.
+    ///
+    /// Unlike [`Self::ring_snapshot_for_admitted`], this intentionally does not
+    /// require the target model to already be in `loaded_models`: encode/score/
+    /// extract pool work is allowed to lazy-load the model. The admission filter
+    /// still keeps the ring restricted to workers assigned to the logical pool.
+    pub fn lazy_lane_ring_snapshot_for_admitted(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        bundle_config_hash: &str,
+        admitted_worker_names: &HashSet<String>,
+    ) -> RingSnapshot {
+        let mut workers = self.lazy_lane_workers_for_matching(
+            pool,
+            machine_profile,
+            bundle,
+            bundle_config_hash,
+            Some(admitted_worker_names),
+        );
+        workers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.url.cmp(&b.url)));
+        let before = workers.len();
+        workers.dedup_by(|a, b| a.name == b.name);
+        if workers.len() != before {
+            warn_duplicate_worker_names(model, pool, before - workers.len());
+        }
+        RingSnapshot::new(workers.into_iter().map(|w| w.name))
     }
 
     /// Build a [`RingSnapshot`] for the given concrete queue lane. Uses
@@ -1720,6 +1770,45 @@ mod tests {
         );
         assert_eq!(ring.len(), 1);
         assert_eq!(ring.entries[0].worker_id, "assigned");
+    }
+
+    #[tokio::test]
+    async fn test_lazy_lane_ring_snapshot_for_admitted_includes_cold_assigned_worker() {
+        let reg = registry();
+        let mut assigned = make_dispatch_msg(true, false, "p1", &[]).await;
+        assigned.name = "assigned-cold".into();
+        assigned.bundle_config_hash = "h1".into();
+        reg.update_worker("http://assigned-cold:8080", assigned)
+            .await;
+
+        let mut unassigned = make_dispatch_msg(true, false, "p1", &[]).await;
+        unassigned.name = "unassigned-cold".into();
+        unassigned.bundle_config_hash = "h1".into();
+        reg.update_worker("http://unassigned-cold:8080", unassigned)
+            .await;
+
+        let admitted = HashSet::from(["assigned-cold".to_string()]);
+
+        let loaded_ring = reg.ring_snapshot_for_admitted(
+            "BAAI/bge-m3",
+            "p1",
+            "l4",
+            "default",
+            "h1",
+            Some(&admitted),
+        );
+        assert_eq!(loaded_ring.len(), 0);
+
+        let lazy_ring = reg.lazy_lane_ring_snapshot_for_admitted(
+            "BAAI/bge-m3",
+            "p1",
+            "l4",
+            "default",
+            "h1",
+            &admitted,
+        );
+        assert_eq!(lazy_ring.len(), 1);
+        assert_eq!(lazy_ring.entries[0].worker_id, "assigned-cold");
     }
 
     #[tokio::test]

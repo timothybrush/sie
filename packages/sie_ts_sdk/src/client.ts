@@ -88,6 +88,7 @@ import type {
   Item,
   ModelInfo,
   PoolInfo,
+  PoolSpec,
   SIEClientOptions,
   ScoreOptions,
   ScoreResult,
@@ -180,7 +181,7 @@ function extractGenerateChunkError(chunk: GenerateChunk): SIEStreamError | null 
  * ```typescript
  * const client = new SIEClient("http://gateway:8080");
  *
- * // Create a dedicated pool
+ * // Create a logical pool backed by the cluster's default worker queue
  * await client.createPool("eval-bench", { l4: 2 });
  *
  * // Use pool for requests
@@ -1159,12 +1160,15 @@ export class SIEClient {
   /**
    * Create or update a resource pool for isolated capacity.
    *
-   * Pools provide dedicated worker capacity, isolated from other clients.
-   * Workers are assigned to pools and only serve requests from that pool.
+   * Pools provide logical capacity isolation. By default they draw from the
+   * cluster's `default` Helm/NATS queue; pass `queuePool` only when the cluster
+   * has a dedicated physical worker queue declared under
+   * `queueRouting.staticQueuePools` for this workload.
    *
    * @param name - Pool name (used in GPU param as "poolName/machineProfile")
    * @param gpus - Optional machine profile requirements for pool readiness, e.g., { "l4": 2, "l4-spot": 1 }
    * @param gpuCaps - Optional maximum assigned workers per machine profile
+   * @param queuePool - Optional Helm/NATS queue namespace backing this logical pool. Defaults to "default".
    *
    * @example
    * ```typescript
@@ -1182,6 +1186,7 @@ export class SIEClient {
     name: string,
     gpus?: Record<string, number>,
     gpuCaps?: Record<string, number>,
+    queuePool?: string,
   ): Promise<void> {
     const alreadyTracking = this.pools.has(name);
 
@@ -1190,6 +1195,7 @@ export class SIEClient {
       name: string;
       gpus?: Record<string, number>;
       gpu_caps?: Record<string, number>;
+      queue_pool?: string;
     } = {
       name,
     };
@@ -1198,6 +1204,9 @@ export class SIEClient {
     }
     if (gpuCaps) {
       requestBody.gpu_caps = gpuCaps;
+    }
+    if (queuePool) {
+      requestBody.queue_pool = queuePool;
     }
 
     const url = `${this.baseUrl}/v1/pools`;
@@ -1342,7 +1351,7 @@ export class SIEClient {
       const response = await this.requestJson(`/v1/pools/${encodeURIComponent(name)}`);
       const data = (await response.json()) as {
         name: string;
-        spec: { gpus?: Record<string, number>; gpu_caps?: Record<string, number> };
+        spec: PoolSpec;
         status: {
           state: string;
           assigned_workers: Array<{ name: string; url: string; gpu: string }>;

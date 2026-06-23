@@ -565,6 +565,9 @@ class PoolSpec(TypedDict, total=False):
     Attributes:
         name: Pool name (required). Used in GPU param as "pool_name/machine_profile";
             the gateway stores and routes pool names in lowercase.
+        queue_pool: Optional Helm/NATS queue namespace backing this logical pool.
+            Defaults to "default", so API-created pools can draw from base
+            capacity deployed once by operators.
         gpus: Optional GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
@@ -579,6 +582,7 @@ class PoolSpec(TypedDict, total=False):
     """
 
     name: str
+    queue_pool: str
     gpus: dict[str, int]
     gpu_caps: dict[str, int]
     bundle: str
@@ -625,6 +629,8 @@ class PoolSpecResponse(TypedDict, total=False):
     """Pool specification in API response.
 
     Attributes:
+        name: Pool name.
+        queue_pool: Helm/NATS queue namespace backing this logical pool.
         gpus: GPU requirements for pool readiness, e.g., {"l4": 2, "a100-40gb": 1}.
         gpu_caps: Optional maximum assigned workers per GPU type.
         bundle: Optional bundle filter for worker assignment.
@@ -632,6 +638,8 @@ class PoolSpecResponse(TypedDict, total=False):
         pinned_models: Per-pool set of model ids kept loaded (no cold model-load).
     """
 
+    name: str
+    queue_pool: str
     gpus: dict[str, int]
     gpu_caps: dict[str, int]
     bundle: str | None

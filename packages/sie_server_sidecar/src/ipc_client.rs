@@ -50,11 +50,12 @@ use crate::ipc_types::{
     EnsureModelReadyRequest, EnsureModelReadyResponse, GenerateEvent, PingRequest, PingResponse,
     ProcessEncodeBatchRequest, ProcessExtractBatchRequest, ProcessGenerateRequest,
     ProcessScoreBatchRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
-    RequestEnvelope, ResponseEnvelope, RunBatchRequest, SignalGenerateCancelRequest,
-    SignalGenerateCancelResponse, WorkerCapabilitiesRequest, WorkerCapabilitiesResponse,
-    IPC_VERSION, METHOD_APPLY_MODEL_CONFIG, METHOD_DRAIN, METHOD_ENSURE_MODEL_READY, METHOD_PING,
-    METHOD_PROCESS_ENCODE_BATCH, METHOD_PROCESS_EXTRACT_BATCH, METHOD_PROCESS_GENERATE,
-    METHOD_PROCESS_SCORE_BATCH, METHOD_REPLACE_MODEL_CONFIGS, METHOD_RUN_BATCH,
+    RequestEnvelope, ResponseEnvelope, RunBatchRequest, SetPinnedModelsRequest,
+    SetPinnedModelsResponse, SignalGenerateCancelRequest, SignalGenerateCancelResponse,
+    WorkerCapabilitiesRequest, WorkerCapabilitiesResponse, IPC_VERSION, METHOD_APPLY_MODEL_CONFIG,
+    METHOD_DRAIN, METHOD_ENSURE_MODEL_READY, METHOD_PING, METHOD_PROCESS_ENCODE_BATCH,
+    METHOD_PROCESS_EXTRACT_BATCH, METHOD_PROCESS_GENERATE, METHOD_PROCESS_SCORE_BATCH,
+    METHOD_REPLACE_MODEL_CONFIGS, METHOD_RUN_BATCH, METHOD_SET_PINNED_MODELS,
     METHOD_SIGNAL_GENERATE_CANCEL, METHOD_WORKER_CAPABILITIES,
 };
 use crate::log_util::ErrChain;
@@ -991,6 +992,14 @@ impl IpcClient {
         req: ReplaceModelConfigsRequest,
     ) -> Result<ReplaceModelConfigsResponse, IpcError> {
         self.call(METHOD_REPLACE_MODEL_CONFIGS, req).await
+    }
+
+    pub async fn set_pinned_models(
+        &self,
+        models: Vec<String>,
+    ) -> Result<SetPinnedModelsResponse, IpcError> {
+        self.call(METHOD_SET_PINNED_MODELS, SetPinnedModelsRequest { models })
+            .await
     }
 
     pub async fn drain(&self, deadline_ms: u64) -> Result<DrainResponse, IpcError> {

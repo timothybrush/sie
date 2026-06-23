@@ -79,6 +79,7 @@ pub struct MetricsRegistry {
     pub messages_received_total: IntCounter,
     pub messages_acked_total: IntCounter,
     pub messages_naked_total: IntCounter,
+    pub pool_admission_naks_total: IntCounterVec,
     pub ipc_requests_total: IntCounter,
     pub ipc_failures_total: IntCounter,
     pub inflight_batches: IntGauge,
@@ -87,6 +88,7 @@ pub struct MetricsRegistry {
     pub pull_batch_process_seconds: HistogramVec,
     pub pull_nak_unloaded_total: IntCounterVec,
     pub pull_model_loads_total: IntCounterVec,
+    pub generate_model_loading_responses_total: IntCounterVec,
 
     // Per-backend visibility. These measure what actually landed in
     // each backend after routing, so operators can compare native and
@@ -193,6 +195,13 @@ impl MetricsRegistry {
             IntCounter::new("sie_worker_messages_acked_total", "NATS msgs ACKed")?;
         let messages_naked_total =
             IntCounter::new("sie_worker_messages_naked_total", "NATS msgs NAKed")?;
+        let pool_admission_naks_total = IntCounterVec::new(
+            Opts::new(
+                "sie_worker_pool_admission_naks_total",
+                "Work items NAKed before IPC because this worker is not assigned to the logical admission pool",
+            ),
+            &["reason"],
+        )?;
         let ipc_requests_total = IntCounter::new("sie_worker_ipc_requests_total", "IPC RPCs sent")?;
         let ipc_failures_total = IntCounter::new(
             "sie_worker_ipc_failures_total",
@@ -232,6 +241,13 @@ impl MetricsRegistry {
                 "Background model loads triggered by demand",
             ),
             &["model"],
+        )?;
+        let generate_model_loading_responses_total = IntCounterVec::new(
+            Opts::new(
+                "sie_worker_generate_model_loading_responses_total",
+                "Terminal MODEL_LOADING generation responses emitted by the sidecar before execution",
+            ),
+            &["model", "state", "result"],
         )?;
 
         let backend_process_seconds = HistogramVec::new(
@@ -442,6 +458,7 @@ impl MetricsRegistry {
         registry.register(Box::new(messages_received_total.clone()))?;
         registry.register(Box::new(messages_acked_total.clone()))?;
         registry.register(Box::new(messages_naked_total.clone()))?;
+        registry.register(Box::new(pool_admission_naks_total.clone()))?;
         registry.register(Box::new(ipc_requests_total.clone()))?;
         registry.register(Box::new(ipc_failures_total.clone()))?;
         registry.register(Box::new(inflight_batches.clone()))?;
@@ -449,6 +466,7 @@ impl MetricsRegistry {
         registry.register(Box::new(pull_batch_process_seconds.clone()))?;
         registry.register(Box::new(pull_nak_unloaded_total.clone()))?;
         registry.register(Box::new(pull_model_loads_total.clone()))?;
+        registry.register(Box::new(generate_model_loading_responses_total.clone()))?;
         registry.register(Box::new(backend_process_seconds.clone()))?;
         registry.register(Box::new(backend_batch_items.clone()))?;
         registry.register(Box::new(backend_process_errors_total.clone()))?;
@@ -502,6 +520,7 @@ impl MetricsRegistry {
             messages_received_total,
             messages_acked_total,
             messages_naked_total,
+            pool_admission_naks_total,
             ipc_requests_total,
             ipc_failures_total,
             inflight_batches,
@@ -509,6 +528,7 @@ impl MetricsRegistry {
             pull_batch_process_seconds,
             pull_nak_unloaded_total,
             pull_model_loads_total,
+            generate_model_loading_responses_total,
             backend_process_seconds,
             backend_batch_items,
             backend_process_errors_total,
@@ -722,6 +742,9 @@ mod tests {
             .with_label_values(&["m1"])
             .inc_by(3);
         m.pull_model_loads_total.with_label_values(&["m1"]).inc();
+        m.generate_model_loading_responses_total
+            .with_label_values(&["m1", "loading_started", "published_acked"])
+            .inc();
 
         let families = m.registry.gather();
         let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
@@ -731,6 +754,7 @@ mod tests {
             "sie_pull_loop_batch_process_seconds",
             "sie_pull_loop_nak_unloaded_total",
             "sie_pull_loop_model_loads_total",
+            "sie_worker_generate_model_loading_responses_total",
         ] {
             assert!(names.contains(&expected), "missing metric {expected}");
         }

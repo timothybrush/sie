@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.10"
+version = "0.6.11"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -16,6 +16,10 @@ dependencies = [
     # ML / Inference
     # torch 2.9.x required - flash-attn prebuilt wheels are version-specific
     "torch>=2.9,<2.10",
+    # Bundle-controlled: each bundle overlays its exact transformers into
+    # bundle-libs (bundles/default.yaml >=4.57,<5; transformers5.yaml / gemma via
+    # sglang >=5). The base range is bounded <6 so the >=5 overlays resolve while
+    # the base venv can't silently jump to a transformers 6 major.
     "transformers>=4.57,<6",
     "tokenizers>=0.20,<1",
     "sentence-transformers>=5.0,<6",

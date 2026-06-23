@@ -17,6 +17,12 @@ use crate::state::pool_manager::DEFAULT_POOL_NAME;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePoolRequest {
     pub name: String,
+    /// Physical Helm/NATS queue namespace to draw workers from. Omit for normal
+    /// dynamic logical pools; they use `default`. Set only to an
+    /// operator-provisioned Helm queue pool declared under
+    /// `queueRouting.staticQueuePools` for dedicated capacity.
+    #[serde(default)]
+    pub queue_pool: Option<String>,
     #[serde(default)]
     pub gpus: HashMap<String, u32>,
     #[serde(default)]
@@ -136,8 +142,9 @@ pub async fn create_pool(
 
     match state
         .pool_manager
-        .create_pool_with_caps(
+        .create_pool_with_caps_on_queue(
             &req.name,
+            req.queue_pool.as_deref().unwrap_or(DEFAULT_POOL_NAME),
             req.gpus,
             req.gpu_caps,
             req.bundle,

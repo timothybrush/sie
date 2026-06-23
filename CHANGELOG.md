@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.6.11
+
+- chore(main): release 0.6.11
+- fix: handle sidecar progress ack failures
+- fix: harden worker-direct batch fallback
+- fix: align retryable generation review feedback
+- fix: preserve queue delivery budget
+- fix: return retryable model loading for generation
+- test: cover default-backed pinned pool gauge
+- fix: harden logical pool queue routing
+- docs: clarify logical pool backing queues
+- feat: support logical pools backed by queue pools
+- refactor(bench): re-task Florence-2-base to COCO detection (card metric), keep OCR fallback (#1437)
+- fix(ci): raise uv HTTP timeout for the gemma cu130 wheel downloads
+- docs(deploy): note machineProfiles entry for the gemma example pool
+- feat(deploy): fail fast when a bundle is placed on the wrong platform
+- docs(server): accurately scope what the gemma cuda13 CI smoke covers
+- fix(server): correct stale cuda13/gemma platform references
+- refactor(bench): re-task Florence-2-base to OCR, measure on olmOCR-bench not KIE (#1437)
+- feat(server): first-class cuda13 platform for the gemma bundle
+- fix(server): make transformers version bundle-controlled
+- docs(server): correct the gemma cu130 Docker validation comments
+- fix(server): parse --mamba-scheduler-strategy value exactly in spec guard
+- fix(server): route grammar off :mtp for Gemma 4 via grammar_profile
+- test(server): surface errors and non-settling tasks in pinned-load drain helper
+- fix(worker): make pinned models profile-aware and reconcile on config arrival
+- docs(helm): trim staticQueuePools pinnedModels comment to effect-only
+- feat(worker): bridge gateway pinned-model set to the worker at runtime
+- docs(server): mark gemma-4-26B-A4B mtp profile validated (Modal H200)
+- feat(server): extend pinned-model protection to the disk cache
+- fix(server): gemma Docker builder — effective uv cache, skip bytecode, fix comment
+- fix(server): drop FP8 from gemma-4-26B-A4B (BF16 only)
+- feat(server): keep pinned models loaded and exclude them from LRU eviction
+- fix(server): require extra_buffer value in the speculative mamba-scheduler guard
+- fix(server): wire per-bundle CUDA indexes into the cuda12 Docker builder
+- feat(server): add Gemma 4 generation models (E2B, E4B, 26B-A4B)
+
 ## v0.6.10
 
 - chore(main): release 0.6.10

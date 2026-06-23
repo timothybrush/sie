@@ -23,6 +23,13 @@ impl std::fmt::Display for PoolState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PoolSpec {
     pub name: String,
+    /// Physical Helm/NATS queue namespace backing this logical API pool.
+    ///
+    /// API-created pools default to the Helm `default` queue pool. Pool `name`
+    /// is user/dynamic; a non-default `queue_pool` is infra/admin and must
+    /// match a Helm worker queue declared under `queueRouting.staticQueuePools`.
+    #[serde(default = "default_queue_pool")]
+    pub queue_pool: String,
     #[serde(default)]
     pub bundle: Option<String>,
     #[serde(default)]
@@ -44,6 +51,10 @@ pub struct PoolSpec {
     /// lazy-loading unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_models: Vec<String>,
+}
+
+pub fn default_queue_pool() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -117,6 +128,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: "test".into(),
+                queue_pool: default_queue_pool(),
                 bundle: None,
                 gpus: HashMap::new(),
                 gpu_caps: HashMap::new(),
@@ -235,6 +247,15 @@ mod tests {
         let json = r#"{"name":"test","gpus":{"l4":1}}"#;
         let spec: PoolSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.minimum_worker_count, 0);
+    }
+
+    #[test]
+    fn test_pool_spec_queue_pool_defaults_to_default_when_absent() {
+        // Older persisted ConfigMap state omits `queue_pool`; restore must keep
+        // those logical pools backed by the default physical queue pool.
+        let json = r#"{"name":"test","gpus":{"l4":1}}"#;
+        let spec: PoolSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.queue_pool, default_queue_pool());
     }
 
     #[test]

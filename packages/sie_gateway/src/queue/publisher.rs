@@ -439,6 +439,8 @@ struct WorkItemRef<'a> {
     pub profile_id: &'a str,
     pub engine: &'a str,
     pub pool_name: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub admission_pool: &'a str,
     pub machine_profile: &'a str,
     pub item: Option<&'a rmpv::Value>,
     pub payload_ref: Option<&'a str>,
@@ -479,6 +481,7 @@ struct WorkItemShared<'a> {
     endpoint: &'a str,
     model: &'a str,
     pool: &'a str,
+    admission_pool: &'a str,
     gpu: &'a str,
     engine: &'a str,
     bundle_config_hash: &'a str,
@@ -659,6 +662,43 @@ struct ResultCollector {
     deadline: Instant,
     operation: String,
     published_at: Instant,
+    pool_label: String,
+    model_label: String,
+    pool_fallback_subject: Option<String>,
+    direct_fallback_payloads: Vec<Option<Vec<u8>>>,
+    direct_fallback_republished: bool,
+}
+
+struct PublishedWorkItem {
+    index: usize,
+    ack: jetstream::context::PublishAckFuture,
+    encoded: Vec<u8>,
+}
+
+type DirectFallbackPayload = (usize, Vec<u8>);
+type DirectFallbackPayloads = Vec<DirectFallbackPayload>;
+
+fn take_direct_fallback_payloads(
+    collector: &mut ResultCollector,
+) -> Option<(String, DirectFallbackPayloads)> {
+    if collector.direct_fallback_republished {
+        return None;
+    }
+    let subject = collector.pool_fallback_subject.clone()?;
+    let mut payloads = Vec::new();
+    for (index, payload) in collector.direct_fallback_payloads.iter().enumerate() {
+        let still_missing = collector.results.get(index).is_some_and(Option::is_none);
+        if still_missing {
+            if let Some(bytes) = payload.clone() {
+                payloads.push((index, bytes));
+            }
+        }
+    }
+    if payloads.is_empty() {
+        return None;
+    }
+    collector.direct_fallback_republished = true;
+    Some((subject, payloads))
 }
 
 fn stream_name(pool: &str) -> String {
@@ -1408,23 +1448,24 @@ impl WorkPublisher {
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_work(
         &self,
-        pool: &str,
+        target: PublishTarget,
+        admission_pool: &str,
         endpoint: &str,
         model: &str,
-        bundle: &str,
         engine: &str,
-        gpu: &str,
         bundle_config_hash: &str,
         items: Vec<rmpv::Value>,
         params: &WorkParams,
     ) -> Result<(String, oneshot::Receiver<Vec<WorkResult>>), String> {
         let start = Instant::now();
+        let pool = target.pool().to_string();
+        let gpu = target.machine_profile().to_string();
 
         // Ensure stream exists (cached — first call per pool does admin API, subsequent are free)
-        self.ensure_stream(pool).await?;
+        self.ensure_stream(&pool).await?;
 
         // Check backpressure (lock-free read from background-updated cache)
-        self.check_backpressure(pool)?;
+        self.check_backpressure(&pool)?;
 
         // UUIDv7 keeps the leading 48 bits as a big-endian Unix
         // millisecond timestamp, so lexicographic / B-tree-indexed
@@ -1439,7 +1480,18 @@ impl WorkPublisher {
             items.len() as u32
         };
 
-        let subject = work_subject(pool, gpu, bundle, model);
+        let subject = target.subject();
+        let pool_fallback_subject = match (&target, endpoint) {
+            (PublishTarget::Worker { .. }, "generate") => None,
+            (PublishTarget::Worker { .. }, _) => Some(target.as_pool_fallback().subject()),
+            (PublishTarget::Pool { .. }, _) => None,
+        };
+        let direct_publish_fallback_subject = pool_fallback_subject.clone();
+        let direct_publish_retry_items = if direct_publish_fallback_subject.is_some() {
+            Some(items.clone())
+        } else {
+            None
+        };
 
         // Set up result collector (DashMap — lock-free per-key insert)
         let (tx, rx) = oneshot::channel();
@@ -1452,6 +1504,11 @@ impl WorkPublisher {
                 deadline: Instant::now() + self.result_timeout,
                 operation: endpoint.to_string(),
                 published_at: Instant::now(),
+                pool_label: pool.clone(),
+                model_label: model.to_string(),
+                pool_fallback_subject,
+                direct_fallback_payloads: vec![None; total_items as usize],
+                direct_fallback_republished: false,
             },
         );
 
@@ -1470,12 +1527,13 @@ impl WorkPublisher {
         // params block. `WorkItemRef` borrows these values so we don't
         // pay N × `Option<Vec<String>> / Option<serde_json::Value>`
         // deep clones on the hot path.
-        let shared = WorkItemShared {
+        let shared = Arc::new(WorkItemShared {
             request_id: &request_id,
             endpoint,
             model,
-            pool,
-            gpu,
+            pool: &pool,
+            admission_pool,
+            gpu: &gpu,
             engine,
             bundle_config_hash,
             router_id: &self.router_id,
@@ -1484,7 +1542,7 @@ impl WorkPublisher {
             timestamp,
             traceparent: traceparent.as_deref(),
             tracestate: tracestate.as_deref(),
-        };
+        });
 
         // Running publishes concurrently via `try_join_all` means
         // a late-failing item can race ahead of earlier successes —
@@ -1492,39 +1550,77 @@ impl WorkPublisher {
         // and whatever payloads the successful siblings already
         // wrote to the offload store, otherwise both leak until
         // the result-timeout sweep kicks in.
-        let publish_outcome = if endpoint == "score" {
-            self.publish_score(&shared, items, &subject)
-                .await
-                .map(|ack| vec![ack])
-        } else if endpoint == "generate" {
-            // Discard the cached encoded bytes — this code path is
-            // the batch-style publish used by other callers; the
-            // streaming generate path takes its own dedicated branch
-            // in `publish_generate_streaming` and is the only place
-            // that needs the bytes for direct-dispatch republishing.
-            self.publish_generate(&shared, &subject)
-                .await
-                .map(|(ack, _encoded)| vec![ack])
-        } else {
-            // JetStream publishes issue the send-and-receive-ack cycle
-            // asynchronously per message, so a batch of N items that
-            // used to serialize on `.await` now overlap their network
-            // round trips. Each future in the set borrows `shared` +
-            // owns its per-item `rmpv::Value`.
-            let publishes = items.into_iter().enumerate().map(|(index, item_value)| {
-                self.publish_single(&shared, total_items, index, item_value, &subject)
-            });
-            try_join_all(publishes).await
-        };
-        let ack_futures = match publish_outcome {
-            Ok(acks) => acks,
+        let publish_outcome = self
+            .publish_batch_items(endpoint, Arc::clone(&shared), total_items, items, &subject)
+            .await;
+        let published_items = match publish_outcome {
+            Ok(items) => items,
             Err(e) => {
-                self.pending_results.remove(&request_id);
-                self.cleanup_offloaded_payloads(&request_id, total_items)
-                    .await;
-                return Err(e);
+                if let (Some(fallback_subject), Some(retry_items)) =
+                    (direct_publish_fallback_subject, direct_publish_retry_items)
+                {
+                    warn!(
+                        request_id = %request_id,
+                        subject = %subject,
+                        fallback_subject = %fallback_subject,
+                        error = %e,
+                        "worker-direct publish failed; retrying non-streaming work on pool subject"
+                    );
+                    match self
+                        .publish_batch_items(
+                            endpoint,
+                            Arc::clone(&shared),
+                            total_items,
+                            retry_items,
+                            &fallback_subject,
+                        )
+                        .await
+                    {
+                        Ok(items) => {
+                            metrics::ROUTING_FALLBACK_TOTAL
+                                .with_label_values(&[
+                                    &metrics::sanitize_model_label(model),
+                                    &metrics::sanitize_label(&pool),
+                                    "batch_direct_publish_error",
+                                ])
+                                .inc();
+                            items
+                        }
+                        Err(fallback_err) => {
+                            self.pending_results.remove(&request_id);
+                            self.cleanup_offloaded_payloads(&request_id, total_items)
+                                .await;
+                            return Err(format!(
+                                "{}; pool fallback publish failed: {}",
+                                e, fallback_err
+                            ));
+                        }
+                    }
+                } else {
+                    self.pending_results.remove(&request_id);
+                    self.cleanup_offloaded_payloads(&request_id, total_items)
+                        .await;
+                    return Err(e);
+                }
             }
         };
+        let mut ack_futures = Vec::with_capacity(published_items.len());
+        let should_cache_direct_fallback = self
+            .pending_results
+            .get(&request_id)
+            .is_some_and(|entry| entry.pool_fallback_subject.is_some());
+        if should_cache_direct_fallback {
+            if let Some(mut entry) = self.pending_results.get_mut(&request_id) {
+                for item in &published_items {
+                    if item.index < entry.direct_fallback_payloads.len() {
+                        entry.direct_fallback_payloads[item.index] = Some(item.encoded.clone());
+                    }
+                }
+            }
+        }
+        for item in published_items {
+            ack_futures.push(item.ack);
+        }
 
         // Fire-and-forget: spawn background task to monitor acks.
         // The request handler proceeds immediately to wait for inbox results.
@@ -1553,12 +1649,152 @@ impl WorkPublisher {
             request_id = %request_id,
             items = total_items,
             pool = %pool,
+            target = target.label(),
             endpoint = %endpoint,
             latency_ms = elapsed.as_millis(),
             "published work items"
         );
 
         Ok((request_id, rx))
+    }
+
+    async fn publish_batch_items(
+        &self,
+        endpoint: &str,
+        shared: Arc<WorkItemShared<'_>>,
+        total_items: u32,
+        items: Vec<rmpv::Value>,
+        subject: &str,
+    ) -> Result<Vec<PublishedWorkItem>, String> {
+        if endpoint == "score" {
+            self.publish_score(shared.as_ref(), items, subject)
+                .await
+                .map(|(ack, encoded)| {
+                    vec![PublishedWorkItem {
+                        index: 0,
+                        ack,
+                        encoded,
+                    }]
+                })
+        } else if endpoint == "generate" {
+            self.publish_generate(shared.as_ref(), subject)
+                .await
+                .map(|(ack, encoded)| {
+                    vec![PublishedWorkItem {
+                        index: 0,
+                        ack,
+                        encoded,
+                    }]
+                })
+        } else {
+            // JetStream publishes issue the send-and-receive-ack cycle
+            // asynchronously per message, so a batch of N items that
+            // used to serialize on `.await` now overlap their network
+            // round trips. Each future in the set borrows `shared` +
+            // owns its per-item `rmpv::Value`.
+            let publishes = items.into_iter().enumerate().map(|(index, item_value)| {
+                let subject = subject.to_string();
+                let shared = Arc::clone(&shared);
+                async move {
+                    self.publish_single(shared.as_ref(), total_items, index, item_value, &subject)
+                        .await
+                        .map(|(ack, encoded)| PublishedWorkItem {
+                            index,
+                            ack,
+                            encoded,
+                        })
+                }
+            });
+            try_join_all(publishes).await
+        }
+    }
+
+    /// Arm a one-shot recovery for non-streaming worker-direct batch work.
+    ///
+    /// Capped logical pools direct-dispatch encode/score/extract to one
+    /// admitted worker so unassigned peers do not burn the JetStream
+    /// delivery budget. If that worker or its private consumer disappears
+    /// after the gateway publishes, the worker-specific stream cannot fail
+    /// over by itself. This timer republishes any still-missing items to the
+    /// lane's pool subject once; late duplicate results are harmless because
+    /// the result collector removes itself on first complete response.
+    pub fn spawn_batch_direct_fallback(self: &Arc<Self>, request_id: String, delay: Duration) {
+        let publisher = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(e) = publisher
+                .republish_pending_result_to_pool(&request_id, "batch_direct_timeout")
+                .await
+            {
+                warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "batch direct-dispatch fallback failed"
+                );
+            }
+        });
+    }
+
+    pub async fn republish_pending_result_to_pool(
+        &self,
+        request_id: &str,
+        reason: &'static str,
+    ) -> Result<bool, String> {
+        let (subject, payloads, operation, pool, model) = {
+            let Some(mut entry) = self.pending_results.get_mut(request_id) else {
+                return Ok(false);
+            };
+            let Some((subject, payloads)) = take_direct_fallback_payloads(entry.value_mut()) else {
+                return Ok(false);
+            };
+            let operation = entry.operation.clone();
+            let pool = entry.pool_label.clone();
+            let model = entry.model_label.clone();
+            (subject, payloads, operation, pool, model)
+        };
+
+        let mut acks = Vec::with_capacity(payloads.len());
+        for (index, payload) in payloads {
+            let ack = self
+                .jetstream
+                .publish(subject.clone(), payload.into())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "publish batch fallback item {} for {}: {}",
+                        index, request_id, e
+                    )
+                })?;
+            acks.push(ack);
+        }
+
+        metrics::ROUTING_FALLBACK_TOTAL
+            .with_label_values(&[
+                &metrics::sanitize_model_label(&model),
+                &metrics::sanitize_label(&pool),
+                reason,
+            ])
+            .inc();
+        info!(
+            request_id = %request_id,
+            operation = %operation,
+            subject = %subject,
+            reason,
+            "republished non-streaming direct-dispatch work to pool fallback"
+        );
+
+        for ack in acks {
+            if let Err(e) = ack.await {
+                warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "JetStream ack failed for batch direct fallback"
+                );
+                metrics::QUEUE_ACK_FAILURES.inc();
+            }
+        }
+
+        Ok(true)
     }
 
     fn trace_context_for_endpoint(endpoint: &str) -> (Option<String>, Option<String>) {
@@ -1584,7 +1820,7 @@ impl WorkPublisher {
         shared: &WorkItemShared<'_>,
         score_items: Vec<rmpv::Value>,
         subject: &str,
-    ) -> Result<jetstream::context::PublishAckFuture, String> {
+    ) -> Result<(jetstream::context::PublishAckFuture, Vec<u8>), String> {
         let query_item = shared
             .params
             .query_item
@@ -1602,6 +1838,7 @@ impl WorkPublisher {
             profile_id: "default",
             engine: shared.engine,
             pool_name: shared.pool,
+            admission_pool: shared.admission_pool,
             machine_profile: shared.gpu,
             item: None,
             payload_ref: None,
@@ -1660,10 +1897,12 @@ impl WorkPublisher {
             }
         }
 
-        self.jetstream
-            .publish(subject.to_string(), encoded.into())
+        let ack = self
+            .jetstream
+            .publish(subject.to_string(), encoded.clone().into())
             .await
-            .map_err(|e| format!("publish score work item: {}", e))
+            .map_err(|e| format!("publish score work item: {}", e))?;
+        Ok((ack, encoded))
     }
 
     /// Publish a generation work item and wire up a streaming collector.
@@ -1688,6 +1927,7 @@ impl WorkPublisher {
         engine: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
+        admission_pool: &str,
     ) -> Result<
         (
             String,
@@ -1740,6 +1980,7 @@ impl WorkPublisher {
             endpoint: "generate",
             model: &model,
             pool: &pool,
+            admission_pool,
             gpu: &machine_profile,
             engine,
             bundle_config_hash,
@@ -1802,6 +2043,7 @@ impl WorkPublisher {
         engine: &str,
         bundle_config_hash: &str,
         params: &WorkParams,
+        admission_pool: &str,
     ) -> Result<
         (
             String,
@@ -1849,6 +2091,7 @@ impl WorkPublisher {
             endpoint: "generate",
             model: &model,
             pool: &pool,
+            admission_pool,
             gpu: &machine_profile,
             engine,
             bundle_config_hash,
@@ -2020,6 +2263,7 @@ impl WorkPublisher {
             profile_id: "default",
             engine: shared.engine,
             pool_name: shared.pool,
+            admission_pool: shared.admission_pool,
             machine_profile: shared.gpu,
             item: None,
             payload_ref: None,
@@ -2278,7 +2522,7 @@ impl WorkPublisher {
         index: usize,
         item_value: rmpv::Value,
         subject: &str,
-    ) -> Result<jetstream::context::PublishAckFuture, String> {
+    ) -> Result<(jetstream::context::PublishAckFuture, Vec<u8>), String> {
         let work_item_id = format!("{}.{}", shared.request_id, index);
         let mut ref_item = WorkItemRef {
             work_item_id: &work_item_id,
@@ -2290,6 +2534,7 @@ impl WorkPublisher {
             profile_id: "default",
             engine: shared.engine,
             pool_name: shared.pool,
+            admission_pool: shared.admission_pool,
             machine_profile: shared.gpu,
             item: Some(&item_value),
             payload_ref: None,
@@ -2337,10 +2582,12 @@ impl WorkPublisher {
             }
         }
 
-        self.jetstream
-            .publish(subject.to_string(), encoded.into())
+        let ack = self
+            .jetstream
+            .publish(subject.to_string(), encoded.clone().into())
             .await
-            .map_err(|e| format!("publish work item {}/{}: {}", index, total_items, e))
+            .map_err(|e| format!("publish work item {}/{}: {}", index, total_items, e))?;
+        Ok((ack, encoded))
     }
 
     /// Handle an incoming result message (called from inbox subscription).
@@ -2888,6 +3135,8 @@ mod tests {
         #[serde(default)]
         pub engine: String,
         pub pool_name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub admission_pool: String,
         pub machine_profile: String,
         #[serde(default)]
         pub item: Option<rmpv::Value>,
@@ -2964,6 +3213,50 @@ mod tests {
             canonical_stream_subjects(observed, "sie.work.default.*.*.*"),
             None
         );
+    }
+
+    #[test]
+    fn test_direct_batch_fallback_payloads_only_include_missing_items_once() {
+        let (tx, _rx) = oneshot::channel();
+        let mut collector = ResultCollector {
+            _total_items: 3,
+            results: vec![
+                None,
+                Some(WorkResult {
+                    work_item_id: "req.1".into(),
+                    request_id: "req".into(),
+                    item_index: 1,
+                    success: true,
+                    result_msgpack: Vec::new(),
+                    error: None,
+                    error_code: None,
+                    inference_ms: None,
+                    queue_ms: None,
+                    processing_ms: None,
+                    worker_id: None,
+                    tokenization_ms: None,
+                    postprocessing_ms: None,
+                    payload_fetch_ms: None,
+                }),
+                None,
+            ],
+            sender: Some(tx),
+            deadline: Instant::now() + Duration::from_secs(30),
+            operation: "encode".into(),
+            published_at: Instant::now(),
+            pool_label: "default".into(),
+            model_label: "BAAI/bge-m3".into(),
+            pool_fallback_subject: Some("sie.work.default.l4.default.BAAI__bge-m3".into()),
+            direct_fallback_payloads: vec![Some(vec![0]), Some(vec![1]), Some(vec![2])],
+            direct_fallback_republished: false,
+        };
+
+        let (subject, payloads) =
+            take_direct_fallback_payloads(&mut collector).expect("fallback payloads");
+        assert_eq!(subject, "sie.work.default.l4.default.BAAI__bge-m3");
+        assert_eq!(payloads, vec![(0, vec![0]), (2, vec![2])]);
+        assert!(collector.direct_fallback_republished);
+        assert!(take_direct_fallback_payloads(&mut collector).is_none());
     }
 
     #[test]
@@ -3123,6 +3416,7 @@ mod tests {
             profile_id: String::new(),
             engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
+            admission_pool: "default".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
                 rmpv::Value::from("text"),
@@ -3159,6 +3453,7 @@ mod tests {
         assert_eq!(decoded.operation, "encode");
         assert_eq!(decoded.model_id, "BAAI/bge-m3");
         assert_eq!(decoded.pool_name, "default");
+        assert_eq!(decoded.admission_pool, "default");
         assert_eq!(decoded.machine_profile, "l4-spot");
         assert_eq!(
             decoded.item,
@@ -3210,6 +3505,7 @@ mod tests {
             profile_id: "default".to_string(),
             engine: "pytorch".to_string(),
             pool_name: "default".to_string(),
+            admission_pool: "tenant".to_string(),
             machine_profile: "l4-spot".to_string(),
             item: Some(rmpv::Value::Map(vec![(
                 rmpv::Value::from("text"),
@@ -3252,6 +3548,7 @@ mod tests {
             profile_id: &owned.profile_id,
             engine: &owned.engine,
             pool_name: &owned.pool_name,
+            admission_pool: &owned.admission_pool,
             machine_profile: &owned.machine_profile,
             item: Some(&item_value),
             payload_ref: None,
@@ -3329,6 +3626,7 @@ mod tests {
             profile_id: String::new(),
             engine: String::new(),
             pool_name: "default".to_string(),
+            admission_pool: String::new(),
             machine_profile: String::new(),
             item: None,
             payload_ref: Some("/tmp/payload_req-2_0.bin".to_string()),
@@ -3763,6 +4061,7 @@ mod tests {
             profile_id: "default".to_string(),
             engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
+            admission_pool: String::new(),
             machine_profile: "g".to_string(),
             item: None,
             payload_ref: None,
@@ -3911,6 +4210,7 @@ mod tests {
             profile_id: "default".to_string(),
             engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
+            admission_pool: String::new(),
             machine_profile: "g".to_string(),
             item: None,
             payload_ref: None,
@@ -3954,6 +4254,7 @@ mod tests {
             profile_id: "default".to_string(),
             engine: "pytorch".to_string(),
             pool_name: "p".to_string(),
+            admission_pool: String::new(),
             machine_profile: "g".to_string(),
             item: None,
             payload_ref: None,

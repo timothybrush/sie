@@ -234,6 +234,9 @@ ignore = [
 "tools/sie_dashboard/scripts/*.py" = [
     "INP001",  # JS project subdir; not a Python package
 ]
+"tools/loadtest/*.py" = [
+    "INP001",  # Standalone loadtest CI scripts, not a package
+]
 "**/tests/**/*" = [
     "ANN",     # Type annotations (tests don't need full typing)
     "ARG",     # Unused function arguments (fixtures)

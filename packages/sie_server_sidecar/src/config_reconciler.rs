@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -253,7 +252,6 @@ pub fn spawn(
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
-    generation_reconcile: Option<Arc<Notify>>,
 ) -> Option<JoinHandle<()>> {
     let config = config?;
     if config.base_url.trim().is_empty() {
@@ -304,11 +302,6 @@ pub fn spawn(
                 last_successful_export = Some(Instant::now());
                 if let Some(signature) = outcome.export_signature {
                     last_export_signature = Some(signature);
-                }
-                if outcome.applied > 0 {
-                    if let Some(notify) = generation_reconcile.as_ref() {
-                        notify.notify_one();
-                    }
                 }
                 info!(
                     epoch = outcome.epoch,
@@ -405,11 +398,6 @@ pub fn spawn(
                             if !remote_bundle_config_hashes_hash.is_empty() {
                                 last_bundle_config_hashes_hash =
                                     remote_bundle_config_hashes_hash.clone();
-                            }
-                            if outcome.applied > 0 {
-                                if let Some(notify) = generation_reconcile.as_ref() {
-                                    notify.notify_one();
-                                }
                             }
                             info!(
                                 epoch = outcome.epoch,

@@ -194,6 +194,7 @@ fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
                 }
             });
             Some(PoolSpec {
+                queue_pool: name.clone(),
                 name,
                 bundle,
                 gpus: spec.gpus,

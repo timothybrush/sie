@@ -177,6 +177,7 @@ mod tests {
         Pool {
             spec: PoolSpec {
                 name: name.to_string(),
+                queue_pool: "default".to_string(),
                 bundle: None,
                 gpus: HashMap::new(),
                 gpu_caps: HashMap::new(),

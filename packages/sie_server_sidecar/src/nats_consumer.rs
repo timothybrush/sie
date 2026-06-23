@@ -25,7 +25,7 @@ use crate::subject::subjects_overlap;
 /// and any other worker in the pool — when multiple creators share a
 /// durable consumer by name, the first to create it wins, and subsequent
 /// callers silently inherit whatever was there.
-const ACK_WAIT_SECS: u64 = 30;
+pub(crate) const ACK_WAIT_SECS: u64 = 30;
 const GENERATION_ACK_WAIT_SECS: u64 = 300;
 const DEFAULT_MAX_DELIVER: i64 = 20;
 const DEFAULT_MAX_ACK_PENDING: i64 = 1000;
@@ -393,14 +393,13 @@ pub async fn reconcile_stream_and_consumer(
         .map(|_| ())
 }
 
-/// Ensure the worker-specific stream used by generation direct-dispatch.
+/// Ensure the worker-specific stream used by direct-dispatch.
 ///
-/// The gateway publishes direct generation work to
+/// The gateway publishes worker-directed work to
 /// `sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`. That
 /// subject intentionally does not match the pool stream
 /// (`sie.work.{pool}.*.*.*`), so the sidecar must
-/// bind this second stream for generation to avoid relying solely on
-/// first-chunk fallback republish to the pool.
+/// bind this second stream for generation and capped logical batch dispatch.
 pub async fn ensure_worker_stream_and_consumer(
     js: &JsContext,
     config: &WorkerConfig,
@@ -474,7 +473,7 @@ pub async fn ensure_worker_stream_and_consumer(
         consumer = %consumer_name,
         subject = %subject,
         ack_wait_s = GENERATION_ACK_WAIT_SECS,
-        "ensured generation direct-dispatch stream and pull consumer"
+        "ensured worker direct-dispatch stream and pull consumer"
     );
     Ok(consumer)
 }
