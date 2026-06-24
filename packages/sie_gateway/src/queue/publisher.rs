@@ -636,6 +636,12 @@ pub struct WorkPublisher {
     /// for failure/timeout terminations, reconciled against ``pending_streams``
     /// by the periodic ``cleanup_expired`` sweep.
     offloaded_streams: DashSet<String>,
+    /// Request ids that offloaded at least one ``encode``/``score`` payload to
+    /// the object store (item ``{id}_{i}.bin`` or query ``{id}_score.bin``).
+    /// Lets [`Self::cleanup_offloaded_payloads`] no-op for the common all-inline
+    /// case, so completing a small request issues zero object-store DELETEs
+    /// (issue #1471).
+    offloaded_payloads: DashSet<String>,
     /// Core NATS client (cancel publishes use core NATS, not
     /// JetStream). Populated lazily by
     /// :meth:`start_inbox_subscription`; reads on the cancel path
@@ -1219,6 +1225,7 @@ impl WorkPublisher {
             pending_results: DashMap::new(),
             pending_streams: DashMap::new(),
             offloaded_streams: DashSet::new(),
+            offloaded_payloads: DashSet::new(),
             nats_client: tokio::sync::RwLock::new(None),
             inbox_handle: tokio::sync::Mutex::new(None),
             fallback_buckets: DashMap::new(),
@@ -1882,6 +1889,11 @@ impl WorkPublisher {
             let score_payload = rmp_serde::to_vec_named(&score_payload_value)
                 .map_err(|e| format!("msgpack encode score payload: {}", e))?;
             let ref_key = format!("{}_score.bin", shared.request_id);
+            // Track before the store write (issue #1471 review): a future dropped
+            // mid-`put` may still have landed the blob, so it must stay eligible
+            // for cleanup.
+            self.offloaded_payloads
+                .insert(shared.request_id.to_string());
             if let Err(e) = self.payload_store.put(&ref_key, &score_payload).await {
                 warn!(error = %e, "failed to offload score payload, sending inline");
             } else {
@@ -2571,6 +2583,13 @@ impl WorkPublisher {
             let item_msgpack = rmp_serde::to_vec_named(&item_value)
                 .map_err(|e| format!("msgpack encode offloaded item: {}", e))?;
             offload_key = format!("{}_{}.bin", shared.request_id, index);
+            // Track the request as offloaded BEFORE the store write: this future
+            // can be dropped mid-`put` when a sibling item's publish fails under
+            // `try_join_all`, yet the object-store write may still have landed.
+            // Recording the id first keeps the blob eligible for cleanup on the
+            // error/timeout unwind (issue #1471 review).
+            self.offloaded_payloads
+                .insert(shared.request_id.to_string());
             if let Err(e) = self.payload_store.put(&offload_key, &item_msgpack).await {
                 warn!(error = %e, "failed to offload payload, sending inline");
             } else {
@@ -3074,20 +3093,49 @@ impl WorkPublisher {
         }
     }
 
-    /// Remove offloaded payloads for a completed/expired request.
+    /// Remove offloaded payloads for a completed/expired request. No-op when the
+    /// request offloaded nothing (every item was inline) — otherwise this issued
+    /// an object-store DELETE per item index plus a score key on *every* request,
+    /// i.e. wasted network round-trips for keys that were never written, which
+    /// serialized the inbox handler and capped throughput (issue #1471).
     async fn cleanup_offloaded_payloads(&self, request_id: &str, total_items: u32) {
-        for index in 0..total_items {
-            let key = format!("{}_{}.bin", request_id, index);
-            if let Err(e) = self.payload_store.delete(&key).await {
-                warn!(key = %key, error = %e, "failed to remove offloaded payload");
-            }
-        }
+        cleanup_offloaded_payloads_inner(
+            self.payload_store.as_ref(),
+            &self.offloaded_payloads,
+            request_id,
+            total_items,
+        )
+        .await;
+    }
+}
 
-        let score_key = format!("{}_score.bin", request_id);
-        if let Err(e) = self.payload_store.delete(&score_key).await {
-            warn!(key = %score_key, error = %e, "failed to remove offloaded score payload");
+/// Delete the object-store blobs an offloaded request wrote (``{id}_{i}.bin``
+/// per item + ``{id}_score.bin``) and drop its tracking entry. **No-op when the
+/// request offloaded nothing** (`offloaded` does not contain it) — the common
+/// all-inline case — so it issues zero object-store DELETEs. Extracted from
+/// [`WorkPublisher::cleanup_offloaded_payloads`] so the guard is unit-testable
+/// without a live JetStream context (issue #1471).
+async fn cleanup_offloaded_payloads_inner(
+    payload_store: &dyn PayloadStore,
+    offloaded: &DashSet<String>,
+    request_id: &str,
+    total_items: u32,
+) {
+    if !offloaded.contains(request_id) {
+        return;
+    }
+    for index in 0..total_items {
+        let key = format!("{}_{}.bin", request_id, index);
+        if let Err(e) = payload_store.delete(&key).await {
+            warn!(key = %key, error = %e, "failed to remove offloaded payload");
         }
     }
+
+    let score_key = format!("{}_score.bin", request_id);
+    if let Err(e) = payload_store.delete(&score_key).await {
+        warn!(key = %score_key, error = %e, "failed to remove offloaded score payload");
+    }
+    offloaded.remove(request_id);
 }
 
 /// Content negotiation: determine if client wants msgpack or JSON.
@@ -3121,6 +3169,134 @@ pub fn encode_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- issue #1471: payload-store cleanup guard ---
+    use async_trait::async_trait;
+
+    /// Records every `delete` so tests can assert the cleanup guard issues no
+    /// object-store DELETEs for inline (non-offloaded) requests.
+    #[derive(Default)]
+    struct CountingPayloadStore {
+        deleted: std::sync::Mutex<Vec<String>>,
+        fail_delete: bool,
+    }
+
+    #[async_trait]
+    impl PayloadStore for CountingPayloadStore {
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<String, String> {
+            Ok(String::new())
+        }
+        async fn delete(&self, key: &str) -> Result<(), String> {
+            self.deleted.lock().unwrap().push(key.to_string());
+            if self.fail_delete {
+                Err("simulated object-store delete failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Common case (issue #1471): a small/inline request that never offloaded a
+    // payload must issue ZERO object-store DELETEs — the unconditional
+    // per-request DELETE storm is exactly what capped throughput.
+    #[tokio::test]
+    async fn cleanup_offloaded_payloads_noop_when_nothing_offloaded() {
+        let store = CountingPayloadStore::default();
+        let offloaded: DashSet<String> = DashSet::new(); // request NOT tracked
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-inline", 4).await;
+        let deleted = store.deleted.lock().unwrap();
+        assert!(
+            deleted.is_empty(),
+            "inline request must not trigger payload-store deletes, got {:?}",
+            *deleted,
+        );
+    }
+
+    // A request that actually offloaded gets its blobs deleted (one per item
+    // index + the score key) and is dropped from the tracking set.
+    #[tokio::test]
+    async fn cleanup_offloaded_payloads_deletes_when_offloaded() {
+        let store = CountingPayloadStore::default();
+        let offloaded: DashSet<String> = DashSet::new();
+        offloaded.insert("req-big".to_string());
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-big", 2).await;
+        let mut got = store.deleted.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "req-big_0.bin".to_string(),
+                "req-big_1.bin".to_string(),
+                "req-big_score.bin".to_string(),
+            ],
+            "offloaded request must delete each item blob + the score key",
+        );
+        assert!(
+            !offloaded.contains("req-big"),
+            "tracking entry must be dropped after cleanup",
+        );
+    }
+
+    // A tracked request with zero items deletes ONLY the score key (no item
+    // blobs): pins the loop bound + the always-issued score delete.
+    #[tokio::test]
+    async fn cleanup_offloaded_payloads_total_items_zero_deletes_only_score() {
+        let store = CountingPayloadStore::default();
+        let offloaded: DashSet<String> = DashSet::new();
+        offloaded.insert("req-score".to_string());
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-score", 0).await;
+        let got = store.deleted.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["req-score_score.bin".to_string()],
+            "total_items=0 must delete only the score key, no item blobs",
+        );
+        assert!(!offloaded.contains("req-score"));
+    }
+
+    // Cleanup is idempotent: a second call (both terminal cleanup paths can
+    // fire) is a no-op once the first dropped the tracking entry.
+    #[tokio::test]
+    async fn cleanup_offloaded_payloads_second_call_is_noop() {
+        let store = CountingPayloadStore::default();
+        let offloaded: DashSet<String> = DashSet::new();
+        offloaded.insert("req-twice".to_string());
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-twice", 1).await;
+        let after_first = store.deleted.lock().unwrap().len();
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-twice", 1).await;
+        let after_second = store.deleted.lock().unwrap().len();
+        assert_eq!(
+            after_first, after_second,
+            "second cleanup must issue no further deletes (entry already removed)",
+        );
+    }
+
+    // A failing object store must not break cleanup: every delete is still
+    // attempted (errors are logged best-effort). NOTE: a transient delete
+    // failure currently drops the tracking entry without retry, so the blob
+    // leaks — retain-on-failure + a reconcile sweep (mirroring
+    // cleanup_offloaded_generate) is the #1471 follow-up.
+    #[tokio::test]
+    async fn cleanup_offloaded_payloads_best_effort_on_delete_failure() {
+        let store = CountingPayloadStore {
+            fail_delete: true,
+            ..Default::default()
+        };
+        let offloaded: DashSet<String> = DashSet::new();
+        offloaded.insert("req-fail".to_string());
+        cleanup_offloaded_payloads_inner(&store, &offloaded, "req-fail", 2).await;
+        let mut attempted = store.deleted.lock().unwrap().clone();
+        attempted.sort();
+        assert_eq!(
+            attempted,
+            vec![
+                "req-fail_0.bin".to_string(),
+                "req-fail_1.bin".to_string(),
+                "req-fail_score.bin".to_string(),
+            ],
+            "all deletes must be attempted even when the store errors",
+        );
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct WorkItem {

@@ -35,15 +35,17 @@ if TYPE_CHECKING:
 
 _ERR_REQUIRES_LABELS = "Zero-shot classification requires labels parameter."
 _ERR_INPUT_TOO_LONG = (
-    "Input produced an empty tensor inside the gliclass pipeline; "
-    "this typically indicates the input exceeds the model's max sequence length "
-    "even after truncation. Reduce input length or split into chunks."
+    "Input overflowed the gliclass model's max sequence length (the label/text "
+    "window could not fit after truncation). Reduce the number of labels or the "
+    "input length, or split into chunks."
 )
-# Matches the torch IndexError shape "index N is out of bounds for dimension D
-# with size 0" emitted when gliclass indexes into an empty post-processing
-# tensor on overflowing inputs. ``\b`` anchors the size to a word boundary so a
-# hypothetical "with size 02" cannot falsely match.
-_INDEX_OOB_EMPTY_TENSOR_RE = re.compile(r"out of bounds for dimension \d+ with size 0\b")
+# Captures the index and size from the torch IndexError shape "index N is out of
+# bounds for dimension D with size M". The dispatch below only treats it as an
+# overflow when N == M (the off-by-one / exhausted-dimension shape); a generic
+# out-of-range bug (N > M) keeps propagating. Anchored to the "out of bounds for
+# dimension" shape so an unrelated IndexError such as "list index out of range"
+# never matches at all.
+_INDEX_OOB_RE = re.compile(r"index (\d+) is out of bounds for dimension \d+ with size (\d+)")
 ClassificationType = Literal["single-label", "multi-label"]
 
 
@@ -294,12 +296,25 @@ class GLiClassAdapter(BaseAdapter):
             # unrelated errors. Catalog of caught signatures:
             #   - RuntimeError "argmax(): ... numel() == 0"  (sie-test#89 / #848)
             #     torch.argmax on an empty tensor inside the classification head.
-            #   - IndexError  "index N is out of bounds for dimension D with size 0" (#860)
-            #     indexing an empty tensor in the gliclass post-processing path.
+            #   - IndexError  "index N is out of bounds for dimension D with size N"
+            #     (index == size: off-by-one / exhausted dimension). Covers both the
+            #     empty-tensor case (#860, index 0 / size 0) and the label-window
+            #     overflow (#1434, e.g. index 79 / size 79): when too many labels
+            #     overflow the shared 512-token window only some survive truncation
+            #     and the single-label hierarchical decode then indexes exactly one
+            #     past the shrunk label window.
             msg = str(exc)
             if isinstance(exc, RuntimeError) and "numel() == 0" in msg and "argmax" in msg:
                 raise InputTooLongError(_ERR_INPUT_TOO_LONG) from exc
-            if isinstance(exc, IndexError) and _INDEX_OOB_EMPTY_TENSOR_RE.search(msg):
+            oob = _INDEX_OOB_RE.search(msg)
+            if isinstance(exc, IndexError) and oob is not None and oob.group(1) == oob.group(2):
+                # Off-by-one: the gliclass single-label hierarchical decode indexes
+                # exactly one past an exhausted dimension (index == size) when the
+                # label/text window overflows max_sequence_length. Covers both the
+                # empty-tensor case (#860, index 0 / size 0) and the label-window
+                # overflow (#1434, e.g. index 79 / size 79). A generic out-of-range
+                # bug (index > size, e.g. index 5 / size 3) is NOT this and must keep
+                # propagating via the bare ``raise`` below.
                 raise InputTooLongError(_ERR_INPUT_TOO_LONG) from exc
             raise
 

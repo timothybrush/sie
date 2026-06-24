@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from sie_server.adapters.errors import InputTooLongError
 from sie_server.adapters.gliclass import GLiClassAdapter
@@ -100,3 +102,80 @@ class TestApplyOverflowPolicy:
         texts = ["a b c"]
 
         assert adapter._apply_overflow_policy(texts, _LABELS, "default") == texts
+
+
+class _RaisingPipeline:
+    """Fake gliclass pipeline whose __call__ raises a chosen exception.
+
+    Exercises the except-block crash-signature mapping in
+    ``GLiClassAdapter.extract`` end-to-end (not just ``_apply_overflow_policy``).
+    The default overflow policy returns texts without touching ``.pipe``, so the
+    pipeline only needs to be callable.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise self._exc
+
+
+def _make_raising_adapter(exc: BaseException) -> GLiClassAdapter:
+    adapter = GLiClassAdapter("test-model")
+    adapter._pipeline = _RaisingPipeline(exc)  # ty:ignore[invalid-assignment]
+    return adapter
+
+
+class TestExtractOverflowGuard:
+    """The ``extract`` except block maps known crash signatures to
+    ``InputTooLongError`` and lets unrelated errors propagate unchanged.
+    """
+
+    def test_label_window_off_by_one_maps_to_input_too_long(self) -> None:
+        # The new #1434 case: too many labels overflow the shared window, only
+        # ~79 of 100 survive, and the single-label decode indexes past the
+        # shrunk window (size > 0).
+        adapter = _make_raising_adapter(IndexError("index 79 is out of bounds for dimension 0 with size 79"))
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(InputTooLongError):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]
+
+    def test_empty_tensor_index_maps_to_input_too_long(self) -> None:
+        adapter = _make_raising_adapter(IndexError("index 0 is out of bounds for dimension 0 with size 0"))
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(InputTooLongError):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]
+
+    def test_argmax_empty_tensor_maps_to_input_too_long(self) -> None:
+        adapter = _make_raising_adapter(
+            RuntimeError("argmax(): Expected reduction dim to be specified for input.numel() == 0.")
+        )
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(InputTooLongError):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]
+
+    def test_unrelated_index_error_propagates(self) -> None:
+        adapter = _make_raising_adapter(IndexError("list index out of range"))
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(IndexError, match="list index out of range"):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]
+
+    def test_generic_out_of_range_index_error_propagates(self) -> None:
+        # index > size: a genuine out-of-range bug against a non-empty tensor,
+        # NOT the #1434 off-by-one (index == size), so it must propagate.
+        adapter = _make_raising_adapter(IndexError("index 5 is out of bounds for dimension 0 with size 3"))
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(IndexError, match="size 3"):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]
+
+    def test_unrelated_runtime_error_propagates(self) -> None:
+        adapter = _make_raising_adapter(RuntimeError("CUDA out of memory"))
+        items = [SimpleNamespace(text="hello world")]
+
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            adapter.extract(items, labels=_LABELS)  # ty:ignore[invalid-argument-type]

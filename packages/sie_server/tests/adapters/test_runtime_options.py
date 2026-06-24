@@ -929,7 +929,7 @@ class TestExtractRuntimeOptions:
         adapter._pipeline = mock_pipeline
         adapter._device = "cpu"
 
-        with pytest.raises(ValueError, match="empty tensor"):
+        with pytest.raises(ValueError, match="max sequence length"):
             adapter.extract([Item(text="x" * 6000)], labels=["Electronics"])
 
     def test_gliclass_translates_index_oob_crash_to_validation_error(self) -> None:
@@ -950,7 +950,7 @@ class TestExtractRuntimeOptions:
         adapter._pipeline = mock_pipeline
         adapter._device = "cpu"
 
-        with pytest.raises(ValueError, match="empty tensor"):
+        with pytest.raises(ValueError, match="max sequence length"):
             adapter.extract([Item(text="x" * 6000)], labels=["Electronics"])
 
     def test_gliclass_unrelated_runtime_error_propagates(self) -> None:
@@ -976,15 +976,38 @@ class TestExtractRuntimeOptions:
         with pytest.raises(RuntimeError, match="argmax"):
             adapter.extract([Item(text="hello")], labels=["a", "b"])
 
-        # Also: an IndexError with "out of bounds" but NOT "size 0" must propagate
-        # (e.g. a real out-of-range index against a non-empty tensor).
+        # Also: an IndexError of the "index N out of bounds for dimension D with
+        # size N" shape where index == size is the #1434 label-window off-by-one
+        # and IS mapped to validation (InputTooLongError), not propagated, because
+        # too many labels overflowed the shared window and the single-label decode
+        # indexed exactly one past the shrunk label window.
+        mock_pipeline.side_effect = IndexError("index 79 is out of bounds for dimension 0 with size 79")
+        with pytest.raises(ValueError, match="max sequence length"):
+            adapter.extract([Item(text="hello")], labels=["a", "b"])
+
+        # Also: the empty-tensor case (index 0 / size 0, #860) is the same
+        # exhausted-dimension shape (index == size) and is mapped to validation.
+        mock_pipeline.side_effect = IndexError("index 0 is out of bounds for dimension 0 with size 0")
+        with pytest.raises(ValueError, match="max sequence length"):
+            adapter.extract([Item(text="hello")], labels=["a", "b"])
+
+        # Also: an IndexError with "out of bounds" but index > size (NOT the
+        # off-by-one shape) is a genuine out-of-range bug and must propagate —
+        # e.g. a real out-of-range index against a non-empty tensor.
         mock_pipeline.side_effect = IndexError("index 5 is out of bounds for dimension 0 with size 3")
         with pytest.raises(IndexError, match="size 3"):
             adapter.extract([Item(text="hello")], labels=["a", "b"])
 
-        # Also: an IndexError mentioning "size 0" but NOT "out of bounds for
-        # dimension ... with size 0" must propagate — locks in the full
-        # "out of bounds for dimension D with size 0" discriminator.
+        # Also: a genuinely-unrelated IndexError NOT matching the "out of bounds
+        # for dimension" shape (e.g. "list index out of range") must propagate —
+        # locks in that the guard stays anchored to the torch-tensor shape.
+        mock_pipeline.side_effect = IndexError("list index out of range")
+        with pytest.raises(IndexError, match="list index out of range"):
+            adapter.extract([Item(text="hello")], labels=["a", "b"])
+
+        # Also: an IndexError mentioning "size 0" but NOT the full "index N is out
+        # of bounds for dimension D with size M" shape must propagate — locks in
+        # that the guard is anchored to the torch-tensor index/size shape.
         mock_pipeline.side_effect = IndexError("some unrelated error with size 0 buried in the message")
         with pytest.raises(IndexError, match="unrelated"):
             adapter.extract([Item(text="hello")], labels=["a", "b"])

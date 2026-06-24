@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.12
+
+- chore(main): release 0.6.12
+- fix(gateway): record offload before the store write (PR review)
+- test(gateway): cover payload-store cleanup guard
+- fix(gateway): skip payload-store cleanup DELETEs for inline requests
+- fix(gliclass): guard label-window overflow + defer LEDGAR for v1.0 uni-encoders
+
 ## v0.6.11
 
 - chore(main): release 0.6.11
