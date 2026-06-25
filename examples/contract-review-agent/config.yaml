@@ -12,13 +12,16 @@ cluster:
 # Every value is a real model in the SIE catalog (https://superlinked.com/models).
 # Swap any line to try a different model; no other code changes.
 models:
-  # Generative LLMs — the agent "brains" (chat / tools / structured output):
-  triage: "Qwen/Qwen3-0.6B"                          # fast, cheap doc-type classifier (no tools)
-  orchestrator: "Qwen/Qwen3-4B-Instruct-2507"        # plans, calls tools, assembles output (alias: code)
+  # Generative LLMs — the agent "brains" (chat / tools / structured output).
+  # Consolidated onto Qwen/Qwen3.5-4B for now: one warm 4B vision+text model
+  # does the planning, vision, reasoning, and SQL jobs. Branch out per role
+  # from there (see the ↑ hints) as the cluster grows.
+  triage: "Qwen/Qwen3-0.6B"                          # fast, cheap doc-type classifier (kept tiny on purpose; no tools)
+  orchestrator: "Qwen/Qwen3.5-4B"                    # plans, calls tools, assembles output (chat + tools + JSON schema)
   vision: "Qwen/Qwen3.5-4B"                          # reads scanned / signature pages (text + image)
-  reasoning: "Qwen/Qwen3-4B-Instruct-2507"           # clause-risk analysis (reliable, fast); swap to newer Qwen/Qwen3.5-4B or stronger Qwen/Qwen3.6-27B where the cluster serves them
-  sql: "defog/sqlcoder-7b-2"                         # text-to-SQL specialist (completions + native template)
-  guard: "ibm-granite/granite-guardian-3.0-2b"       # safety / prompt-injection guardrail (alias: guard)
+  reasoning: "Qwen/Qwen3.5-4B"                       # clause-risk analysis; ↑ Qwen/Qwen3.6-27B on an H100-class cluster
+  sql: "Qwen/Qwen3.5-4B"                             # text-to-SQL via chat (see sql.mode); ↑ Qwen/Qwen3-4B-Instruct-2507 for stronger SQL, or defog/sqlcoder-7b-2 with sql.mode=completions
+  guard: "ibm-granite/granite-guardian-3.0-2b"       # safety / prompt-injection guardrail (specialist; alias: guard)
   # Retrieval + extraction tools (encode / score / extract):
   ocr: "lightonai/LightOnOCR-2-1B"                   # scanned PDF / image -> markdown (latest OCR model)
   embed: "BAAI/bge-m3"                               # dense embeddings for clause search
@@ -34,3 +37,10 @@ guard:
   # granite-guardian emits a "yes" (unsafe) / "no" (safe) verdict. Trip the
   # guardrail when P(unsafe) clears this threshold. 0.5 is recall-biased.
   threshold: 0.5
+
+# Text-to-SQL calling convention. Chat/instruct models (Qwen3.5-4B,
+# Qwen3-4B-Instruct) take a chat prompt; completion-only specialists like
+# defog/sqlcoder-7b-2 need their native template over /v1/completions — set
+# mode: completions when you point `sql` at one of those.
+sql:
+  mode: "chat"   # "chat" | "completions"

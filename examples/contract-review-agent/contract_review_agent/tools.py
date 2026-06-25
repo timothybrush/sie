@@ -243,7 +243,7 @@ async def search_clauses(ctx: RunContextWrapper[AppContext], query: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Text-to-SQL tool (completion-only specialist model)
+# Text-to-SQL tool (chat by default; completion-template mode for specialists)
 # ──────────────────────────────────────────────────────────────────────────
 _SQLCODER_PROMPT = """### Task
 Generate a SQLite SQL query to answer [QUESTION]{question}[/QUESTION]
@@ -259,6 +259,21 @@ The query will run on a database with this schema:
 ### Answer
 Given the database schema, here is the SQLite query that answers [QUESTION]{question}[/QUESTION]:
 """
+
+# Chat-mode SQL prompt for instruct/chat models (Qwen3.5-4B, Qwen3-4B-Instruct).
+_SQL_CHAT_SYSTEM = (
+    "You are a text-to-SQL engine for SQLite. Given the schema and a question, "
+    "reply with ONE SQLite SELECT statement and nothing else — no prose, no "
+    "explanation, no markdown fences. Today's date is {today}. Dates are stored "
+    "as ISO-8601 text; use SQLite date functions (e.g. date('now'), date(due_date))."
+)
+
+_SQL_CHAT_USER = """Database schema:
+{schema}
+
+Question: {question}
+
+SQLite query:"""
 
 
 def _clean_sql(raw: str) -> str:
@@ -290,9 +305,23 @@ async def query_obligations_db(ctx: RunContextWrapper[AppContext], question: str
     outstanding payments by counterparty'."""
     app = ctx.context
     model = app.cfg["models"]["sql"]
-    prompt = _SQLCODER_PROMPT.format(question=question, schema=SCHEMA_DDL, today=TODAY)
-    res = await complete_once(app, model, prompt, max_tokens=256, stop=[";", "```", "\n\n\n"])
-    app.ledger.record("Text-to-SQL", model, "completions",
+    # Chat/instruct models take a chat prompt; completion-only specialists (e.g.
+    # defog/sqlcoder-7b-2) use their native template over /v1/completions. Default
+    # is chat — set sql.mode=completions in config.yaml to use a completion model.
+    mode = (app.cfg.get("sql") or {}).get("mode", "chat")
+    if mode == "completions":
+        prompt = _SQLCODER_PROMPT.format(question=question, schema=SCHEMA_DDL, today=TODAY)
+        res = await complete_once(app, model, prompt, max_tokens=256, stop=[";", "```", "\n\n\n"])
+    else:
+        res = await chat_once(
+            app, model,
+            [
+                {"role": "system", "content": _SQL_CHAT_SYSTEM.format(today=TODAY)},
+                {"role": "user", "content": _SQL_CHAT_USER.format(schema=SCHEMA_DDL, question=question)},
+            ],
+            max_tokens=256,
+        )
+    app.ledger.record("Text-to-SQL", model, mode,
                       warmup_s=res.provision_s, latency_s=res.gen_s,
                       sent=_tok(res.prompt_tokens), got=_tok(res.completion_tokens), throughput=_tps(res))
 

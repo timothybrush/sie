@@ -27,7 +27,7 @@ ROLE_INFO = [
     ("triage", "Classify the document type (fast)", "chat"),
     ("vision", "Read the scanned signature page", "chat + image"),
     ("reasoning", "Clause-risk specialist (sub-agent)", "chat"),
-    ("sql", "Text-to-SQL over the obligations DB", "completions"),
+    ("sql", "Text-to-SQL over the obligations DB", "chat"),
     ("guard", "Safety / prompt-injection guardrail", "chat"),
     ("ocr", "Scanned page → markdown", "extract"),
     ("embed", "Clause search (embeddings)", "encode"),
@@ -43,6 +43,8 @@ def _print_catalog(cfg: dict) -> None:
     table.add_column("SIE function", style="magenta")
     table.add_column("Job")
     for role, job, fn in ROLE_INFO:
+        if role == "sql":  # the SQL tool's wire path follows sql.mode (chat | completions)
+            fn = (cfg.get("sql") or {}).get("mode", "chat")
         table.add_row(role, cfg["models"][role], fn, job)
     console.print(table)
 

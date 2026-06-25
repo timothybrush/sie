@@ -11,10 +11,10 @@ Every value below is a real model in the [SIE catalog](https://superlinked.com/m
 | Role in the agent | SIE model | SIE function |
 |---|---|---|
 | Triage — classify the document type | `Qwen/Qwen3-0.6B` | chat |
-| **Orchestrator** — plan, call tools, assemble the review | `Qwen/Qwen3-4B-Instruct-2507` (alias `code`) | chat + tools + JSON schema |
+| **Orchestrator** — plan, call tools, assemble the review | `Qwen/Qwen3.5-4B` | chat + tools + JSON schema |
 | Vision — read the scanned signature page | `Qwen/Qwen3.5-4B` | chat + image |
-| Reasoning sub-agent — clause-risk analysis | `Qwen/Qwen3-4B-Instruct-2507` (↑ `Qwen3.5-4B` / `Qwen3.6-27B` where served) | chat |
-| Text-to-SQL — query the obligations DB | `defog/sqlcoder-7b-2` | completions |
+| Reasoning sub-agent — clause-risk analysis | `Qwen/Qwen3.5-4B` (↑ `Qwen3.6-27B` where served) | chat |
+| Text-to-SQL — query the obligations DB | `Qwen/Qwen3.5-4B` (↑ `Qwen3-4B-Instruct-2507`; or `defog/sqlcoder-7b-2` with `sql.mode: completions`) | chat |
 | Guardrail — safety / prompt-injection | `ibm-granite/granite-guardian-3.0-2b` (alias `guard`) | chat |
 | OCR — scanned page → markdown | `lightonai/LightOnOCR-2-1B` | extract |
 | Clause search — dense embeddings | `BAAI/bge-m3` | encode |
@@ -35,12 +35,12 @@ set_tracing_disabled(True)               # ...and we never phone home with trace
 After that, each `Agent` just names the SIE model it should run on:
 
 ```python
-Agent(name="Risk Analyst", model=OpenAIChatCompletionsModel("Qwen/Qwen3-4B-Instruct-2507", openai_client=client), ...)
+Agent(name="Risk Analyst", model=OpenAIChatCompletionsModel("Qwen/Qwen3.5-4B", openai_client=client), ...)
 ```
 
 The flow is **two agents** (which is what keeps a small open model reliable):
 
-1. An **investigator** (on `Qwen3-4B-Instruct`) with seven tools and **no** structured `output_type` — so it can't short-circuit to a hallucinated answer and instead must call tools to learn anything about the contract:
+1. An **investigator** (on `Qwen3.5-4B`) with seven tools and **no** structured `output_type` — so it can't short-circuit to a hallucinated answer and instead must call tools to learn anything about the contract:
    - `classify_document` (triage) · `read_signature_page` (vision) · `analyze_clause_risks` (delegates to the reasoning **sub-agent**) — generative LLMs
    - `ocr_signature_page` · `extract_entities` (`extract`), `search_clauses` (`encode` + `score`), `query_obligations_db` (`completions`) — retrieval & extraction
    - a `granite-guardian` **input guardrail** screens the request first (and fails open, logged, if the guard model is unavailable).
@@ -69,8 +69,9 @@ uv run review                          # uv run review --list   to see available
 uv run review --contract <slug>        # review a specific one
 ```
 
-> **GPU sizing.** `reasoning` defaults to `Qwen/Qwen3-4B-Instruct-2507` (reliable, fast) so the demo
-> runs on a single mid-size GPU; swap in the newer `Qwen/Qwen3.5-4B` or the stronger `Qwen/Qwen3.6-27B` (H100/RTX PRO 6000) where the cluster serves them. A cold
+> **GPU sizing.** The generative roles (`orchestrator`, `vision`, `reasoning`, `sql`) are consolidated on
+> `Qwen/Qwen3.5-4B`, so one warm 4B vision+text model runs the demo on a single mid-size GPU; bump
+> `reasoning`/`sql` to the stronger `Qwen/Qwen3.6-27B` (H100/RTX PRO 6000) where the cluster serves it. A cold
 > cluster pays a one-time load per model on first use; the agent retries the "still
 > provisioning" responses under `cluster.provision_timeout_s`. Keep bundles warm
 > (`minReplicas: 1`) to skip the wait — and any model the cluster can't serve degrades
@@ -104,8 +105,8 @@ The default corpus is **[CUAD](https://www.atticusprojectai.org/cuad/)** (Contra
 
 ## Notes
 
-- Chat completions, tool calling, JSON-schema structured output, vision, and `/v1/completions` (for `sqlcoder`) are all served over SIE's OpenAI-compatible API.
-- `sqlcoder-7b-2` is a completion model used with its native text-to-SQL template; for higher accuracy you can instead point `sql` at the `code`-aliased instruct model.
+- Chat completions, tool calling, JSON-schema structured output, vision, and `/v1/completions` (set `sql.mode: completions` to route SQL through a completion-only model like `sqlcoder`) are all served over SIE's OpenAI-compatible API.
+- Text-to-SQL runs on `Qwen/Qwen3.5-4B` over chat by default. For stronger SQL, point `sql` at `Qwen/Qwen3-4B-Instruct-2507` (SIE's measured-best 4B text-to-SQL, Spider ≈0.70); to demo the completion path, set `sql: "defog/sqlcoder-7b-2"` with `sql.mode: completions`.
 - This is a demo of inference orchestration, **not legal advice**.
 
 Apache-2.0, like the rest of SIE.
