@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import threading
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -90,8 +91,22 @@ def _load_configs_from_local(models_dir: Path) -> dict[str, ModelConfig]:
             logger.exception("Failed to load config from %s", config_path)
             raise
 
-    _expand_profile_variants(configs)
-    return configs
+    return expand_profile_variants(configs)
+
+
+def expand_profile_variants(configs: Iterable[ModelConfig] | Mapping[str, ModelConfig]) -> dict[str, ModelConfig]:
+    """Return configs plus generated entries for non-default profiles."""
+    if isinstance(configs, Mapping):
+        expanded = dict(configs)
+    else:
+        expanded = {}
+        for config in configs:
+            if config.sie_id in expanded:
+                msg = f"duplicate model config: {config.sie_id}"
+                raise ValueError(msg)
+            expanded[config.sie_id] = config
+    _expand_profile_variants(expanded)
+    return expanded
 
 
 def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
@@ -157,6 +172,7 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
             # with the base config or sibling variants.
             variant_config._resolved_cache = {}
             variant_config._resolved_lock = threading.Lock()
+            variant_config._synthetic_profile_variant_source = (base_name, profile_name)
             variants[variant_id] = variant_config
             logger.info("Expanded profile '%s' as variant: %s", profile_name, variant_id)
 
@@ -196,8 +212,7 @@ def _load_configs_from_cloud(models_dir: str) -> dict[str, ModelConfig]:
             logger.exception("Failed to load config from %s", config_url)
             raise
 
-    _expand_profile_variants(configs)
-    return configs
+    return expand_profile_variants(configs)
 
 
 def load_model_config(config_path: Path) -> ModelConfig:

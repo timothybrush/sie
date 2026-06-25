@@ -436,6 +436,7 @@ class ModelConfig(BaseModel):
     # Intentionally non-serializable; rebuilt on demand after deserialization.
     _resolved_cache: dict[str, ResolvedProfile] = PrivateAttr(default_factory=dict)
     _resolved_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+    _synthetic_profile_variant_source: tuple[str, str] | None = PrivateAttr(default=None)
 
     sie_id: str
     hf_id: str | None = None
@@ -447,6 +448,10 @@ class ModelConfig(BaseModel):
     tasks: Tasks
     max_sequence_length: int | None = None
     profiles: dict[str, ProfileConfig]
+
+    @property
+    def synthetic_profile_variant_source(self) -> tuple[str, str] | None:
+        return self._synthetic_profile_variant_source
 
     @model_validator(mode="after")
     def validate_pool_name(self) -> "ModelConfig":

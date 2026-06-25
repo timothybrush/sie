@@ -97,6 +97,7 @@ class TestHotReloader:
         registry.get_worker.return_value = None
         registry._configs = {}
         registry._model_dirs = {}
+        registry.add_config_async = AsyncMock()  # type: ignore[method-assign]
         return registry
 
     @pytest.fixture
@@ -188,6 +189,7 @@ class TestHotReloaderHandlers:
         registry.get_worker.return_value = None
         registry._configs = {}
         registry._model_dirs = {}
+        registry.add_config_async = AsyncMock()  # type: ignore[method-assign]
         return registry
 
     @pytest.mark.asyncio
@@ -227,8 +229,8 @@ class TestHotReloaderHandlers:
         result = await reloader._handle_model_added(change)
 
         assert result.status == ReloadStatus.SUCCESS
-        mock_registry.add_config.assert_called_once()
-        call_args = mock_registry.add_config.call_args
+        mock_registry.add_config_async.assert_awaited_once()
+        call_args = mock_registry.add_config_async.call_args
         assert call_args[0][0].name == "new-model"
 
     @pytest.mark.asyncio

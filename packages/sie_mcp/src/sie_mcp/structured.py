@@ -83,9 +83,15 @@ _MAX_EBNF_LEN = 8 * 1024
 
 # Models whose generation profile is Outlines-backed and therefore advertise
 # only ``json_schema`` + ``regex`` (EBNF/grammar is an upstream SGLang/Outlines
-# limitation). An EBNF request to one of these is rejected up front. The
-# production Qwen3.5 profile (``grammar_backend: outlines``) seeds the set.
-_OUTLINES_BACKED_MODELS = frozenset({"Qwen/Qwen3.5-4B"})
+# limitation). An EBNF request to one of these is rejected up front. Both 4B
+# generation profiles served on the test cluster (``grammar_backend: outlines``)
+# seed the set.
+_OUTLINES_BACKED_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3-4B-Instruct-2507",
+    }
+)
 
 _EXTRACT_SYSTEM = (
     "You extract structured data from the supplied document content. Use only "

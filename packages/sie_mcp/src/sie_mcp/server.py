@@ -4,6 +4,8 @@ Tracer bullet (#1306): a single ``docs_to_markdown`` tool. The cluster client is
 created once per process in the lifespan and reused across requests.
 """
 
+import base64
+import binascii
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,10 +15,59 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from sie_sdk import SIEAsyncClient
 
-from sie_mcp import describe, jobs, qa, structured
+from sie_mcp import describe, jobs, offload, qa, structured
 from sie_mcp.config import MCPConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_base64_text(content_base64: str, max_bytes: int) -> str:
+    try:
+        raw = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("content_base64 must be valid base64") from exc
+    if len(raw) > max_bytes:
+        raise ValueError(f"decoded content exceeds {max_bytes} bytes")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _validate_plain_text_size(content: str, max_bytes: int) -> str:
+    if len(content.encode("utf-8")) > max_bytes:
+        raise ValueError(f"content exceeds {max_bytes} bytes")
+    return content
+
+
+async def _resolve_text_input(
+    client: Any,
+    config: MCPConfig,
+    *,
+    content: str | None,
+    content_base64: str | None,
+    document_base64: str | None,
+    filename: str | None,
+    engine: jobs.EngineName,
+) -> tuple[str, dict[str, Any]]:
+    provided = [content is not None, content_base64 is not None, document_base64 is not None]
+    if sum(provided) != 1:
+        raise ValueError("provide exactly one of content, content_base64, or document_base64")
+    if content is not None:
+        return _validate_plain_text_size(content, config.max_document_bytes), {"input_type": "content"}
+    if content_base64 is not None:
+        return _decode_base64_text(content_base64, config.max_document_bytes), {"input_type": "content_base64"}
+
+    assert document_base64 is not None
+    result = await jobs.docs_to_markdown(
+        client,
+        document_base64=document_base64,
+        filename=filename,
+        ocr=False,
+        engine=engine,
+        model=config.docling_model,
+        vlocr_model=config.vlocr_model,
+        gpu=config.docs_gpu,
+        max_document_bytes=config.max_document_bytes,
+    )
+    return result["markdown"], {"input_type": "document_base64", "document_metadata": result["metadata"]}
 
 
 @asynccontextmanager
@@ -99,7 +150,7 @@ def build_server(config: MCPConfig) -> FastMCP:
             engine=engine,
             model=config.docling_model,
             vlocr_model=config.vlocr_model,
-            gpu=config.gpu,
+            gpu=config.docs_gpu,
             max_document_bytes=config.max_document_bytes,
         )
         return {"markdown": result["markdown"], "metadata": result["metadata"]}
@@ -144,9 +195,138 @@ def build_server(config: MCPConfig) -> FastMCP:
             max_document_chars=config.qa_max_document_chars,
             max_questions=config.qa_max_questions,
             max_chunks=config.qa_max_chunks,
-            gpu=config.gpu,
+            gpu=config.qa_gpu,
         )
         return {"answers": result["answers"]}
+
+    @server.tool()
+    async def summarize_document(
+        ctx: Context,
+        content: str | None = None,
+        content_base64: str | None = None,
+        document_base64: str | None = None,
+        filename: str | None = None,
+        engine: jobs.EngineName = "auto",
+        model: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Summarize a document/text input on the SIE cluster.
+
+        Provide exactly one of ``content``, ``content_base64``, or ``document_base64``.
+        For source documents, pass raw file bytes as ``document_base64``; the edge first
+        converts them through ``docs_to_markdown`` and then summarizes the markdown. This
+        mirrors the PR #1336 summarize-document skill without routing through the
+        gateway-backed ``sie_tools`` CLI.
+
+        Args:
+            content: Plain text/markdown content. Prefer ``content_base64`` for large files
+                so the calling model does not read the content directly.
+            content_base64: UTF-8 text/markdown bytes, base64-encoded.
+            document_base64: Source document bytes, base64-encoded.
+            filename: Optional source filename; used when ``document_base64`` is set.
+            engine: Document conversion engine for ``document_base64`` inputs.
+            model: Optional generation model override.
+            max_output_tokens: Optional summary token ceiling.
+        """
+        lifespan_ctx = ctx.request_context.lifespan_context
+        client = lifespan_ctx["client"]
+        config: MCPConfig = lifespan_ctx["config"]
+        text, input_metadata = await _resolve_text_input(
+            client,
+            config,
+            content=content,
+            content_base64=content_base64,
+            document_base64=document_base64,
+            filename=filename,
+            engine=engine,
+        )
+        result = await offload.summarize_document(
+            client,
+            content=text,
+            model=model or config.generate_model,
+            gpu=config.generate_gpu,
+            max_output_tokens=max_output_tokens or offload.SUMMARY_REDUCE_MAX_TOKENS,
+        )
+        result["metadata"] = {**input_metadata, **result["metadata"]}
+        return result
+
+    @server.tool()
+    async def extract_entities(
+        ctx: Context,
+        labels: list[str],
+        content: str | None = None,
+        content_base64: str | None = None,
+        document_base64: str | None = None,
+        filename: str | None = None,
+        engine: jobs.EngineName = "auto",
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Extract zero-shot entities from a document/text input on the SIE cluster.
+
+        Provide labels such as ``["person", "organization", "date", "amount"]`` and
+        exactly one of ``content``, ``content_base64``, or ``document_base64``. Document
+        inputs are converted to markdown first, matching the PR #1336 flow.
+        """
+        lifespan_ctx = ctx.request_context.lifespan_context
+        client = lifespan_ctx["client"]
+        config: MCPConfig = lifespan_ctx["config"]
+        text, input_metadata = await _resolve_text_input(
+            client,
+            config,
+            content=content,
+            content_base64=content_base64,
+            document_base64=document_base64,
+            filename=filename,
+            engine=engine,
+        )
+        result = await offload.extract_entities(
+            client,
+            content=text,
+            labels=labels,
+            model=model or config.extract_model,
+            gpu=config.extract_gpu,
+        )
+        result["metadata"] = {**input_metadata, **result["metadata"]}
+        return result
+
+    @server.tool()
+    async def redact_pii(
+        ctx: Context,
+        content: str | None = None,
+        content_base64: str | None = None,
+        document_base64: str | None = None,
+        filename: str | None = None,
+        engine: jobs.EngineName = "auto",
+        labels: list[str] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Redact PII from a document/text input on the SIE cluster.
+
+        The tool returns redacted text and counts, but intentionally does not return the
+        placeholder-to-original map. That preserves the MCP privacy contract: original PII
+        is not handed back to the calling model.
+        """
+        lifespan_ctx = ctx.request_context.lifespan_context
+        client = lifespan_ctx["client"]
+        config: MCPConfig = lifespan_ctx["config"]
+        text, input_metadata = await _resolve_text_input(
+            client,
+            config,
+            content=content,
+            content_base64=content_base64,
+            document_base64=document_base64,
+            filename=filename,
+            engine=engine,
+        )
+        result = await offload.redact_pii(
+            client,
+            content=text,
+            labels=labels,
+            model=model or config.pii_model,
+            gpu=config.extract_gpu,
+        )
+        result["metadata"] = {**input_metadata, **result["metadata"]}
+        return result
 
     @server.tool()
     async def describe_image(
@@ -182,7 +362,7 @@ def build_server(config: MCPConfig) -> FastMCP:
             embed_model=config.embed_model,
             detailed=detailed,
             top_k=top_k if top_k is not None else config.image_top_k,
-            gpu=config.gpu,
+            gpu=config.image_gpu,
             max_image_bytes=config.max_image_bytes,
         )
         return {"caption": result["caption"], "tags": result["tags"]}
@@ -228,7 +408,7 @@ def build_server(config: MCPConfig) -> FastMCP:
             output_schema=output_schema,
             instruction=instruction,
             model=model or config.generate_model,
-            gpu=config.gpu,
+            gpu=config.generate_gpu,
             max_completion_tokens=max_output_tokens or config.max_output_tokens,
         )
         return {"data": data}
@@ -271,7 +451,7 @@ def build_server(config: MCPConfig) -> FastMCP:
             prompt=prompt,
             response_format=response_format,
             model=model or config.generate_model,
-            gpu=config.gpu,
+            gpu=config.generate_gpu,
             max_completion_tokens=max_output_tokens or config.max_output_tokens,
         )
         return {"content": content}

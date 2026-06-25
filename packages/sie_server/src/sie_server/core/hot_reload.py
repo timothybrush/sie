@@ -335,7 +335,7 @@ class HotReloader:
             )
 
         # Register with registry (config_path for flat YAML)
-        self._registry.add_config(config, config_path)
+        await self._registry.add_config_async(config, config_path)
 
         logger.info("Added new model: %s", model_name)
         return ReloadResult(
@@ -413,7 +413,7 @@ class HotReloader:
 
         # Update registry with new config
         if model_name in new_configs:
-            self._registry.add_config(new_configs[model_name], config_path)
+            await self._registry.add_config_async(new_configs[model_name], config_path)
 
         # Reload model if it was loaded before
         if was_loaded and model_name in new_configs:

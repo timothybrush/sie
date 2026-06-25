@@ -3,6 +3,38 @@
 `superlinked.md` is a router to each surface's **native** install path. There is no
 drop-a-file auto-install — pick your surface below.
 
+## Managed sie-test quick install
+
+If a Superlinked operator gives you a hosted MCP endpoint for `sie-test` plus a connector
+secret, you can use the MCP-based document offload flow without deploying a self-hosted AWS
+cluster. Build a small install pack from this repo:
+
+```bash
+mise run mcp-plugin-pack -- \
+  --cluster-label sie-test \
+  --mcp-url https://<sie-test-mcp-host>/mcp
+```
+
+Add `SIE_MCP_CONNECTOR_SECRET=<secret>` or `--connector-secret <secret>` if you want the
+generated `INSTALL.md` to include the exact connector command. The command writes:
+
+- `dist/superlinked-docs-plugin/INSTALL.md` — endpoint-specific install steps for Claude
+  Code, claude.ai / desktop, and Cowork.
+- `dist/superlinked-docs-plugin/superlinked-docs-skill.zip` — the claude.ai skill ZIP.
+- `dist/superlinked-docs-plugin/claude-code/*/SKILL.md` — Claude Code skills in the
+  local skill layout, including PR #1336-style `parse-document`, `summarize-document`,
+  `extract-entities`, and `redact-pii` skills backed by MCP tools.
+
+The connector secret is printed only in `INSTALL.md` when you pass it; it is not embedded
+in the skill ZIP or skill file.
+
+The MCP redaction flow returns redacted text and counts, but not a local
+placeholder-to-original map; do not use it when de-redaction is required.
+
+For the full operator and user onboarding flow, including running a local edge,
+smoke testing it, deploying it with Helm, and generating endpoint-specific install packs,
+see `packages/sie_mcp/README.md`.
+
 ## Cowork (lead surface)
 
 Install the **Superlinked plugin**, which provides this skill together with the remote MCP

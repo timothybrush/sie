@@ -257,6 +257,14 @@ def _resolved_profile_for_hash(config: ServerModelConfig, profile_name: str) -> 
     return resolve(profile_name, set())
 
 
+def _is_synthetic_profile_variant(config: ServerModelConfig, configs: dict[str, ServerModelConfig]) -> bool:
+    source = config.synthetic_profile_variant_source
+    if source is None:
+        return False
+    base_model, profile = source
+    return bool(base_model in configs and profile and config.sie_id == f"{base_model}:{profile}")
+
+
 def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
     """Compute SHA-256 hash of model configs assigned to this worker's bundle.
 
@@ -282,6 +290,9 @@ def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
     items = []
     bundle_adapter_set = _bundle_adapter_modules(bundle_id)
     for config in sorted(configs.values(), key=lambda c: c.sie_id):
+        if _is_synthetic_profile_variant(config, configs):
+            continue
+
         profiles_for_hash = []
         for pname in sorted(config.profiles.keys()):
             profile_dict = _resolved_profile_for_hash(config, pname)

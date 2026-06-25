@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SIE Document Offload - what you just saved</title>
+<style>
+  :root{
+    --bg:#15151c; --panel:#1f1f2b; --line:#33333f; --txt:#f2f2f5; --muted:#9a9aa7;
+    --accent:#f7451d; --good:#34d399; --before:#5b5b6b;
+    --font:"DM Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:var(--font);
+    -webkit-font-smoothing:antialiased;line-height:1.5;padding:40px 20px;}
+  .wrap{max-width:760px;margin:0 auto;}
+  h1{font-size:20px;font-weight:600;margin:0 0 4px;letter-spacing:.02em;}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:28px;}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px 24px;margin-bottom:18px;}
+  .controls{display:flex;flex-wrap:wrap;gap:18px;}
+  .ctrl{flex:1;min-width:150px;}
+  label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px;}
+  input[type=number],select{width:100%;background:var(--bg);color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:8px 10px;font-family:var(--font);font-size:14px;}
+  .hero{display:flex;align-items:baseline;gap:14px;margin:6px 0 18px;}
+  .hero .pct{font-size:64px;font-weight:700;color:var(--good);line-height:1;}
+  .hero .lab{font-size:14px;color:var(--muted);}
+  .bars{margin-top:6px;}
+  .barrow{margin:14px 0;}
+  .barrow .top{display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;}
+  .barrow .top .n{color:var(--muted);}
+  .track{height:26px;background:#000;border-radius:6px;overflow:hidden;}
+  .fill{height:100%;border-radius:6px;transition:width .6s cubic-bezier(.2,.8,.2,1);}
+  .fill.before{background:var(--before);}
+  .fill.after{background:linear-gradient(90deg,var(--accent),#ff7a52);}
+  .grid{display:flex;gap:18px;flex-wrap:wrap;margin-top:4px;}
+  .stat{flex:1;min-width:150px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:14px 16px;}
+  .stat .k{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);}
+  .stat .v{font-size:22px;font-weight:600;margin-top:4px;}
+  .foot{color:var(--muted);font-size:12px;margin-top:8px;}
+  a{color:var(--accent);}
+  .tag{display:inline-block;background:#2a2a36;border:1px solid var(--line);border-radius:999px;
+    padding:2px 10px;font-size:11px;color:var(--muted);margin-left:8px;vertical-align:middle;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SIE Document Offload <span class="tag">what you just saved</span></h1>
+  <div class="sub">Offload a document to your SIE cluster, get clean markdown back, and the model reads the small artifact instead of the whole file.</div>
+
+  <div class="panel">
+    <div class="controls">
+      <div class="ctrl">
+        <label>Document</label>
+        <select id="ftype">
+          <option value="0.829">PDF report (blended, Opus 4.8)</option>
+          <option value="0.865">PDF report (blended, Sonnet 4.6)</option>
+          <option value="0.633">HTML page (benchmark floor)</option>
+          <option value="0.90">Scanned document</option>
+          <option value="0.948">Slide deck / PPTX (benchmark ceiling)</option>
+          <option value="0.85">Spreadsheet</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label>Pages</label>
+        <input id="pages" type="number" min="1" max="2000" value="40" />
+      </div>
+      <div class="ctrl">
+        <label>Follow-up turns</label>
+        <input id="turns" type="number" min="1" max="200" value="10" />
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="hero"><div class="pct" id="pct">85%</div><div class="lab">fewer document tokens<br/>every turn the doc is in context</div></div>
+    <div class="bars">
+      <div class="barrow">
+        <div class="top"><span>Upload the file to the model</span><span class="n" id="beforeN">80,000 tokens</span></div>
+        <div class="track"><div class="fill before" id="beforeBar" style="width:100%"></div></div>
+      </div>
+      <div class="barrow">
+        <div class="top"><span>Read the SIE markdown instead</span><span class="n" id="afterN">12,000 tokens</span></div>
+        <div class="track"><div class="fill after" id="afterBar" style="width:15%"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Saved per turn</div><div class="v" id="savedTurn">68,000</div></div>
+    <div class="stat"><div class="k">Saved over session (uncached)</div><div class="v" id="savedSession">680,000</div></div>
+    <div class="stat"><div class="k">Stayed in your cloud</div><div class="v">100%</div></div>
+  </div>
+
+  <div class="foot">
+    Percentages are the committed token-reduction benchmark (text + one page-image per page, as a document upload is billed, vs the SIE markdown): blended 82.9% on Opus 4.8 and 86.5% on Sonnet 4.6; 63-95% across file types. Per-document token counts here are an estimate (~2,200 tokens/page: a ~1,600-token page image plus text) for illustration; the reduction percentage is measured. "Saved over the session" is the no-caching upper bound; with prompt caching the document is re-read on later turns at ~10% of input price, so the recurring saving is ~85% of that smaller cache-read cost. The reduction percentage holds either way.
+  </div>
+</div>
+
+<script>
+  var perPage = 2200;
+  function fmt(n){ return Math.round(n).toLocaleString(); }
+  function render(){
+    var red = parseFloat(document.getElementById('ftype').value);
+    var pages = Math.max(1, parseInt(document.getElementById('pages').value||'1',10));
+    var turns = Math.max(1, parseInt(document.getElementById('turns').value||'1',10));
+    var before = pages * perPage;
+    var after = before * (1 - red);
+    var saved = before - after;
+    document.getElementById('pct').textContent = Math.round(red*100) + '%';
+    document.getElementById('beforeN').textContent = fmt(before) + ' tokens';
+    document.getElementById('afterN').textContent = fmt(after) + ' tokens';
+    document.getElementById('afterBar').style.width = Math.max(2, (after/before)*100) + '%';
+    document.getElementById('savedTurn').textContent = fmt(saved);
+    document.getElementById('savedSession').textContent = fmt(saved*turns);
+  }
+  ['ftype','pages','turns'].forEach(function(id){
+    document.getElementById(id).addEventListener('input', render);
+  });
+  render();
+</script>
+</body>
+</html>

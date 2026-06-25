@@ -502,7 +502,7 @@ class QueueExecutor:
         """
         self._descriptor_cache.pop(model_id, None)
 
-    def apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
+    async def apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
         """Validate and add a bundle-scoped config delta to the local registry."""
         if not req.bundle_id:
             msg = "bundle_id is required"
@@ -521,8 +521,9 @@ class QueueExecutor:
             msg = f"model_id mismatch: notification={req.model_id!r} config={model_config.sie_id!r}"
             raise ValueError(msg)
 
-        self._registry.add_config(model_config)
-        self.invalidate_model_descriptor(model_config.sie_id)
+        updated_model_ids = await self._registry.add_config_async(model_config)
+        for model_id in updated_model_ids:
+            self.invalidate_model_descriptor(model_id)
         bundle_hash = compute_bundle_config_hash_cached(self._registry, req.bundle_id)
         return ApplyModelConfigResponse(
             applied=True,

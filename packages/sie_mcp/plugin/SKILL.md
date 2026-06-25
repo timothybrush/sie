@@ -46,6 +46,46 @@ estimate, not a billed figure) and `token_reduction`, the committed #1311 benchm
 measurement of markdown vs direct document ingestion. Surface these if the user asks how
 much was saved; the exact percentages and the benchmark path are in the metadata.
 
+## summarize document
+
+When the user asks for a summary, overview, or digest of a long document, do **not** read
+the source into context. Call the `summarize_document` MCP tool instead.
+
+- For PDF/DOCX/PPTX/XLSX/HTML/scans, read raw bytes only and pass `document_base64` plus
+  `filename`.
+- For text or markdown files, read raw bytes only and pass `content_base64`.
+- Leave `engine` as `auto` unless the user asks to force a conversion engine.
+
+Write the returned `summary` to a summary artifact, read that artifact, and present it.
+Surface `metadata.token_savings_estimate` as an estimate when present.
+
+## extract entities
+
+When the user asks to list or tabulate entities, names, parties, dates, amounts, or custom
+labels, call the `extract_entities` MCP tool instead of reading the whole document.
+
+- Pick concise lowercase labels from the request, e.g. `person`, `organization`, `date`,
+  `amount`, `contract term`.
+- For source documents, pass `document_base64` plus `filename`.
+- For text/markdown, pass `content_base64`.
+
+Write the returned `markdown_table` to an entities artifact, then answer from the table.
+
+## redact PII
+
+When the user asks to redact, anonymize, scrub, or de-identify a document, call the
+`redact_pii` MCP tool before working with the content.
+
+- Do not read the source document into context before redaction.
+- Pass source documents as `document_base64` plus `filename`; pass text/markdown as
+  `content_base64`.
+- Pass `labels` only if the user asks for a custom sensitive-data set.
+- The MCP tool intentionally returns redacted text and counts, not a placeholder-to-original
+  map. Do not promise de-redaction from this MCP flow.
+
+Write `redacted_text` to a redacted artifact and continue the task using only that artifact.
+Mention that detection is model-based and best-effort, not a certified scrubber.
+
 ## Structured output (schema-valid JSON / constrained generation)
 
 Two tools constrain the cluster's output at decode time, so the result is a reliable,
@@ -117,7 +157,8 @@ pixels reach the calling model.
 
 ## Authentication
 
-`docs_to_markdown`, `describe_image`, `extract_structured`, and `generate_structured` are all
-served by the Superlinked MCP connector. Configure the connector with your **connector
-secret** — credentials are never pasted into the chat. For this POC the connector secret is
-provided by your cluster operator; self-serve issuance arrives with the managed service.
+`docs_to_markdown`, `summarize_document`, `extract_entities`, `redact_pii`,
+`describe_image`, `extract_structured`, and `generate_structured` are all served by the
+Superlinked MCP connector. Configure the connector with your **connector secret** —
+credentials are never pasted into the chat. For this POC the connector secret is provided
+by your cluster operator; self-serve issuance arrives with the managed service.

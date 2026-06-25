@@ -260,7 +260,10 @@ profiles:
           - "--mamba-scheduler-strategy"
           - "extra_buffer"
       runtime:
-        first_chunk_timeout_s: 60
+        # Outlines can spend more than 60s compiling/decoding larger
+        # json_schema requests before the first visible token. Keep this below
+        # overall_timeout_s so genuinely stuck requests still fail within 5 min.
+        first_chunk_timeout_s: 180
         inter_chunk_timeout_s: 10
         overall_timeout_s: 300
         default_sampling:

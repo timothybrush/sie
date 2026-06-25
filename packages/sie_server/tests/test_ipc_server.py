@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import msgpack
 import numpy as np
 import pytest
+import yaml
 from sie_server.api.ws import compute_bundle_config_hash_cached
+from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
@@ -123,6 +125,87 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg.get_config.return_value = MagicMock()
     reg.get_configs_snapshot.return_value = {}
     return QueueExecutor(reg), reg
+
+
+def _qwen_profile_variant_yaml() -> str:
+    return """
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+tasks:
+  generate:
+    context_length: 4096
+    max_output_tokens: 4096
+max_sequence_length: 4096
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+  rtx-pro-6000:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 32768
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+"""
+
+
+def _qwen_default_only_yaml() -> str:
+    return """
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+tasks:
+  generate:
+    context_length: 4096
+    max_output_tokens: 4096
+max_sequence_length: 4096
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+"""
+
+
+def _qwen_real_colon_config_yaml() -> str:
+    return """
+sie_id: Qwen/Qwen3.6-27B:rtx-pro-6000
+hf_id: Qwen/Qwen3.6-27B
+tasks:
+  generate:
+    context_length: 32768
+    max_output_tokens: 4096
+max_sequence_length: 32768
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 32768
+    kv_budget_tokens: 65536
+    adapter_options:
+      loadtime:
+        max_seq_length: 32768
+"""
+
+
+def _qwen_invalid_legacy_lora_yaml() -> str:
+    return """
+sie_id: Qwen/Qwen3.6-27B
+hf_id: Qwen/Qwen3.6-27B
+tasks:
+  generate:
+    context_length: 4096
+    max_output_tokens: 4096
+max_sequence_length: 4096
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    max_batch_tokens: 16384
+    kv_budget_tokens: 8192
+    adapter_options:
+      runtime:
+        lora_id: legacy-lora
+"""
 
 
 @pytest.fixture
@@ -285,7 +368,8 @@ class TestEnsureModelReady:
 
 
 class TestApplyModelConfig:
-    def test_apply_model_config_hash_cache_is_per_registry(self) -> None:
+    @pytest.mark.asyncio
+    async def test_apply_model_config_hash_cache_is_per_registry(self) -> None:
         stale_registry = ModelRegistry(models_dir=None)
         stale_registry._config_version = 1
         assert compute_bundle_config_hash_cached(stale_registry, "default") == ""
@@ -293,7 +377,7 @@ class TestApplyModelConfig:
         registry = ModelRegistry(models_dir=None, model_filter=["existing/model"])
         executor = QueueExecutor(registry)
 
-        resp = executor.apply_model_config(
+        resp = await executor.apply_model_config(
             ApplyModelConfigRequest(
                 bundle_id="default",
                 model_id="test/model",
@@ -360,6 +444,218 @@ profiles:
                 await client.close()
         finally:
             await srv.stop(drain_timeout_s=1.0)
+
+    @pytest.mark.asyncio
+    async def test_apply_model_config_expands_profile_variants(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(registry)
+        executor._descriptor_cache["Qwen/Qwen3.6-27B:rtx-pro-6000"] = MagicMock()
+
+        resp = await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id="Qwen/Qwen3.6-27B",
+                epoch=7,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default", "rtx-pro-6000"],
+                model_config=_qwen_profile_variant_yaml(),
+            )
+        )
+
+        assert resp.applied is True
+        assert registry.has_model("Qwen/Qwen3.6-27B")
+        assert registry.has_model("Qwen/Qwen3.6-27B:rtx-pro-6000")
+        variant = registry.get_config("Qwen/Qwen3.6-27B:rtx-pro-6000")
+        assert variant.tasks.generate is not None
+        assert variant.tasks.generate.context_length == 32768
+        assert variant.max_sequence_length == 32768
+        assert "Qwen/Qwen3.6-27B:rtx-pro-6000" not in executor._descriptor_cache
+
+    @pytest.mark.asyncio
+    async def test_bundle_hash_ignores_expanded_profile_variant_aliases(self) -> None:
+        base_config = ModelConfig(**yaml.safe_load(_qwen_profile_variant_yaml()))
+        base_registry = ModelRegistry(models_dir=None, model_filter=["Qwen/Qwen3.6-27B"])
+        base_registry._configs[base_config.sie_id] = base_config
+        base_registry._config_version += 1
+        base_hash = compute_bundle_config_hash_cached(base_registry, "sglang")
+        assert base_hash
+
+        expanded_registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(expanded_registry)
+        await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id="Qwen/Qwen3.6-27B",
+                epoch=7,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default", "rtx-pro-6000"],
+                model_config=_qwen_profile_variant_yaml(),
+            )
+        )
+
+        assert expanded_registry.has_model("Qwen/Qwen3.6-27B:rtx-pro-6000")
+        assert compute_bundle_config_hash_cached(expanded_registry, "sglang") == base_hash
+
+    def test_bundle_hash_keeps_real_colon_config(self) -> None:
+        base_config = ModelConfig(**yaml.safe_load(_qwen_default_only_yaml()))
+        real_colon_config = ModelConfig(**yaml.safe_load(_qwen_real_colon_config_yaml()))
+        base_registry = ModelRegistry(models_dir=None)
+        base_registry.add_config(base_config)
+        base_hash = compute_bundle_config_hash_cached(base_registry, "sglang")
+        assert base_hash
+
+        real_colon_registry = ModelRegistry(models_dir=None)
+        real_colon_registry.add_config(base_config)
+        real_colon_registry.add_config(real_colon_config)
+
+        assert real_colon_config.synthetic_profile_variant_source is None
+        assert real_colon_registry.has_model("Qwen/Qwen3.6-27B:rtx-pro-6000")
+        assert compute_bundle_config_hash_cached(real_colon_registry, "sglang") != base_hash
+
+    @pytest.mark.asyncio
+    async def test_apply_model_config_removes_dropped_profile_variant(self) -> None:
+        base_id = "Qwen/Qwen3.6-27B"
+        variant_id = "Qwen/Qwen3.6-27B:rtx-pro-6000"
+        registry = ModelRegistry(models_dir=None, model_filter=[base_id, variant_id])
+        executor = QueueExecutor(registry)
+
+        await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id=base_id,
+                epoch=7,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default", "rtx-pro-6000"],
+                model_config=_qwen_profile_variant_yaml(),
+            )
+        )
+        assert registry.has_model(variant_id)
+
+        executor._descriptor_cache[variant_id] = MagicMock()
+        loaded = MagicMock()
+        loaded.worker = None
+        loaded.device = "cpu"
+        registry._loaded[variant_id] = loaded
+
+        resp = await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id=base_id,
+                epoch=8,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default"],
+                model_config=_qwen_default_only_yaml(),
+            )
+        )
+
+        assert resp.applied is True
+        assert registry.has_model(base_id)
+        assert not registry.has_model(variant_id)
+        assert variant_id not in registry._loaded
+        assert registry._model_filter == {base_id}
+        loaded.adapter.unload.assert_called_once()
+        assert variant_id not in executor._descriptor_cache
+
+    @pytest.mark.asyncio
+    async def test_apply_model_config_invalid_replacement_keeps_dropped_profile_variant(self) -> None:
+        base_id = "Qwen/Qwen3.6-27B"
+        variant_id = "Qwen/Qwen3.6-27B:rtx-pro-6000"
+        registry = ModelRegistry(models_dir=None, model_filter=[base_id, variant_id])
+        executor = QueueExecutor(registry)
+
+        await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id=base_id,
+                epoch=7,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default", "rtx-pro-6000"],
+                model_config=_qwen_profile_variant_yaml(),
+            )
+        )
+        assert registry.has_model(variant_id)
+        executor._descriptor_cache[variant_id] = MagicMock()
+
+        with pytest.raises(ValueError, match="legacy scalar"):
+            await executor.apply_model_config(
+                ApplyModelConfigRequest(
+                    bundle_id="sglang",
+                    model_id=base_id,
+                    epoch=8,
+                    bundle_config_hash="from-sie-config",
+                    profiles_added=["default"],
+                    model_config=_qwen_invalid_legacy_lora_yaml(),
+                )
+            )
+
+        assert registry.has_model(base_id)
+        assert registry.has_model(variant_id)
+        assert registry._model_filter == {base_id, variant_id}
+        assert variant_id in executor._descriptor_cache
+
+    @pytest.mark.asyncio
+    async def test_apply_model_config_serializes_stale_variant_removal(self) -> None:
+        base_id = "Qwen/Qwen3.6-27B"
+        variant_id = "Qwen/Qwen3.6-27B:rtx-pro-6000"
+        registry = ModelRegistry(models_dir=None, model_filter=[base_id, variant_id])
+        executor = QueueExecutor(registry)
+
+        await executor.apply_model_config(
+            ApplyModelConfigRequest(
+                bundle_id="sglang",
+                model_id=base_id,
+                epoch=7,
+                bundle_config_hash="from-sie-config",
+                profiles_added=["default", "rtx-pro-6000"],
+                model_config=_qwen_profile_variant_yaml(),
+            )
+        )
+        assert registry.has_model(variant_id)
+
+        load_lock = registry._get_load_lock()
+        await load_lock.acquire()
+        remove_task = asyncio.create_task(
+            executor.apply_model_config(
+                ApplyModelConfigRequest(
+                    bundle_id="sglang",
+                    model_id=base_id,
+                    epoch=8,
+                    bundle_config_hash="from-sie-config",
+                    profiles_added=["default"],
+                    model_config=_qwen_default_only_yaml(),
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not remove_task.done()
+
+        readd_task = asyncio.create_task(
+            executor.apply_model_config(
+                ApplyModelConfigRequest(
+                    bundle_id="sglang",
+                    model_id=base_id,
+                    epoch=9,
+                    bundle_config_hash="from-sie-config",
+                    profiles_added=["default", "rtx-pro-6000"],
+                    model_config=_qwen_profile_variant_yaml(),
+                )
+            )
+        )
+
+        try:
+            await asyncio.sleep(0)
+            load_lock.release()
+            await asyncio.gather(remove_task, readd_task)
+        finally:
+            if load_lock.locked():
+                load_lock.release()
+            for task in (remove_task, readd_task):
+                if not task.done():
+                    task.cancel()
+
+        assert registry.has_model(base_id)
+        assert registry.has_model(variant_id)
+        assert registry._model_filter == {base_id, variant_id}
 
     @pytest.mark.asyncio
     async def test_apply_model_config_rejects_model_id_mismatch(self) -> None:
@@ -514,6 +810,55 @@ profiles:
         registry._do_unload.assert_awaited_once_with("stale/model")
         assert not registry.has_model("stale/model")
         assert registry.has_model("kept/model")
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_expands_profile_variants_from_export(self) -> None:
+        registry = ModelRegistry(models_dir=None, model_filter=["Qwen/Qwen3.6-27B:rtx-pro-6000"])
+        executor = QueueExecutor(registry)
+
+        resp = await executor.replace_model_configs(
+            ReplaceModelConfigsRequest(
+                bundle_id="sglang",
+                epoch=8,
+                bundle_config_hash="from-sie-config",
+                models=[
+                    ReplaceModelConfigEntry(
+                        model_id="Qwen/Qwen3.6-27B",
+                        model_config=_qwen_profile_variant_yaml(),
+                    )
+                ],
+            )
+        )
+
+        assert resp.applied is True
+        assert resp.applied_models == ["Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-27B:rtx-pro-6000"]
+        assert registry.has_model("Qwen/Qwen3.6-27B")
+        assert registry.has_model("Qwen/Qwen3.6-27B:rtx-pro-6000")
+        assert registry._model_filter == {"Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-27B:rtx-pro-6000"}
+
+    @pytest.mark.asyncio
+    async def test_replace_model_configs_rejects_duplicate_export_entries(self) -> None:
+        registry = ModelRegistry(models_dir=None)
+        executor = QueueExecutor(registry)
+
+        with pytest.raises(ValueError, match="duplicate model config"):
+            await executor.replace_model_configs(
+                ReplaceModelConfigsRequest(
+                    bundle_id="sglang",
+                    epoch=8,
+                    bundle_config_hash="from-sie-config",
+                    models=[
+                        ReplaceModelConfigEntry(
+                            model_id="Qwen/Qwen3.6-27B",
+                            model_config=_qwen_profile_variant_yaml(),
+                        ),
+                        ReplaceModelConfigEntry(
+                            model_id="Qwen/Qwen3.6-27B",
+                            model_config=_qwen_profile_variant_yaml(),
+                        ),
+                    ],
+                )
+            )
 
     @pytest.mark.asyncio
     async def test_replace_model_configs_keeps_loaded_model_for_identical_config(self) -> None:

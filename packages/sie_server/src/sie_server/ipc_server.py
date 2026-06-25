@@ -458,7 +458,7 @@ class IpcServer:
                 # full fallback matrix.
                 resp_body = await self._handle_run_batch(msgspec.convert(body, RunBatchRequest))
             elif method == METHOD_APPLY_MODEL_CONFIG:
-                resp_body = self._handle_apply_model_config(msgspec.convert(body, ApplyModelConfigRequest))
+                resp_body = await self._handle_apply_model_config(msgspec.convert(body, ApplyModelConfigRequest))
             elif method == METHOD_REPLACE_MODEL_CONFIGS:
                 resp_body = await self._handle_replace_model_configs(msgspec.convert(body, ReplaceModelConfigsRequest))
             elif method == METHOD_SET_PINNED_MODELS:
@@ -558,8 +558,8 @@ class IpcServer:
     async def _handle_run_batch(self, req: RunBatchRequest) -> BatchOutcome:
         return await handle_run_batch(self._executor, req)
 
-    def _handle_apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
-        return self._executor.apply_model_config(req)
+    async def _handle_apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
+        return await self._executor.apply_model_config(req)
 
     async def _handle_replace_model_configs(
         self,

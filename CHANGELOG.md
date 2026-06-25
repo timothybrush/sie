@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.13
+
+- chore(main): release 0.6.13
+- fix: extend tester structured generation timeouts
+- fix(server): serialize async config registry updates
+- fix(server): preflight profile variant config updates
+- fix(server): drain removed profile variants during config apply
+- fix(sie-mcp): chunk GLiNER extract/redact for large docs; flag the other 4B
+- feat(sie-mcp): per-tool GPU routing and env-overridable GLiNER models
+- docs(sie-mcp): add the Obsidian contract-graph example
+- fix(server): tighten profile variant reconciliation
+- fix(server): preserve profile variants during config reconcile
+- fix(gateway): retry failed payload cleanup deletes
+- fix(gateway): dedupe offloaded payload cleanup keys
+- fix(gateway): track exact offloaded payload keys
+- docs(sie-mcp): use the rendered Excalidraw PNG for the architecture diagram
+- docs(sie-mcp): replace the ASCII architecture sketch with an Excalidraw diagram
+- docs(sie-mcp): accessible README intro; drop the redundant product page
+- fix(sie-mcp): bound text offload inputs
+- feat(sie-mcp): integrate managed plugin skills
+
 ## v0.6.12
 
 - chore(main): release 0.6.12

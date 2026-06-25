@@ -33,7 +33,7 @@ from sie_server.core.load_errors import (
     LoadFailure,
     classify_load_error,
 )
-from sie_server.core.loader import load_model_configs
+from sie_server.core.loader import expand_profile_variants, load_model_configs
 from sie_server.core.memory import MemoryConfig, MemoryManager
 from sie_server.core.model_loader import DEFAULT_MAX_LORAS, LoadedModel, ModelLoader
 from sie_server.core.oom import is_oom_error
@@ -198,6 +198,7 @@ class ModelRegistry:
 
         # Concurrency-safe loading
         self._load_lock: asyncio.Lock | None = None  # Created lazily on first use
+        self._config_update_lock: asyncio.Lock | None = None
         self._loading: set[str] = set()  # Models currently being loaded
         self._unloading: set[str] = set()  # Models currently being unloaded
         # Terminal-failed state. Populated by ``_load_model_background`` when a
@@ -584,6 +585,12 @@ class ModelRegistry:
         if self._load_lock is None:
             self._load_lock = asyncio.Lock()
         return self._load_lock
+
+    def _get_config_update_lock(self) -> asyncio.Lock:
+        """Serialize async config mutations across IPC/hot-reload entrypoints."""
+        if self._config_update_lock is None:
+            self._config_update_lock = asyncio.Lock()
+        return self._config_update_lock
 
     def _check_model_loadable(self, name: str) -> tuple[ModelConfig, Path]:
         """Check if a model can be loaded (exists in registry).
@@ -1210,7 +1217,7 @@ class ModelRegistry:
                 pool_name=self._pool_name,
             )
 
-    def add_config(self, config: ModelConfig, model_dir: Path | None = None) -> None:
+    def add_config(self, config: ModelConfig, model_dir: Path | None = None) -> set[str]:
         """Add a model config to the registry.
 
         Useful for programmatic config creation without files.
@@ -1218,7 +1225,81 @@ class ModelRegistry:
         Args:
             config: The model configuration.
             model_dir: Optional directory for custom adapter resolution.
+
+        Returns:
+            Concrete config ids considered by this update, including generated
+            profile variants.
         """
+        expanded, updated_ids, removed_ids = self._prepare_config_update(config)
+        self._preflight_config_update(expanded, updated_ids, removed_ids)
+        if removed_ids:
+            removed = ", ".join(sorted(removed_ids))
+            msg = f"cannot synchronously remove model config(s): {removed}; use add_config_async"
+            raise RuntimeError(msg)
+        for expanded_config in expanded.values():
+            self._apply_config_entry(expanded_config, model_dir)
+        self._loader.update_configs(self._configs)
+        return updated_ids | removed_ids
+
+    async def add_config_async(self, config: ModelConfig, model_dir: Path | None = None) -> set[str]:
+        """Add a model config, draining removed loaded variants under the load lock."""
+        update_lock = self._get_config_update_lock()
+        async with update_lock:
+            expanded, updated_ids, removed_ids = self._prepare_config_update(config)
+            self._preflight_config_update(expanded, updated_ids, removed_ids)
+            if removed_ids:
+                lock = self._get_load_lock()
+                async with lock:
+                    for model_id in sorted(removed_ids):
+                        if model_id in self._loaded:
+                            await self._do_unload(model_id)
+                        self._drop_config_entry(model_id)
+            for expanded_config in expanded.values():
+                self._apply_config_entry(expanded_config, model_dir)
+            self._loader.update_configs(self._configs)
+            return updated_ids | removed_ids
+
+    def _prepare_config_update(self, config: ModelConfig) -> tuple[dict[str, ModelConfig], set[str], set[str]]:
+        expanded = expand_profile_variants([config])
+        updated_ids = set(expanded)
+        removed_ids = self._synthetic_profile_variant_ids_for_base(config.sie_id) - updated_ids
+        return expanded, updated_ids, removed_ids
+
+    def _preflight_config_update(
+        self,
+        expanded: dict[str, ModelConfig],
+        updated_ids: set[str],
+        removed_ids: set[str],
+    ) -> None:
+        post_update = {
+            name: existing_config
+            for name, existing_config in self._configs.items()
+            if name not in updated_ids and name not in removed_ids
+        }
+        for expanded_config in expanded.values():
+            if not self.accepts_config_pool(expanded_config):
+                post_update.pop(expanded_config.sie_id, None)
+                continue
+            self._validate_config_entry(expanded_config, post_update)
+            post_update[expanded_config.sie_id] = expanded_config
+
+    def _synthetic_profile_variant_ids_for_base(self, base_model_id: str) -> set[str]:
+        return {
+            name
+            for name, existing_config in self._configs.items()
+            if existing_config.synthetic_profile_variant_source is not None
+            and existing_config.synthetic_profile_variant_source[0] == base_model_id
+        }
+
+    def _drop_config_entry(self, model_id: str) -> None:
+        self._configs.pop(model_id, None)
+        if self._model_filter is not None:
+            self._model_filter.discard(model_id)
+        self._model_dirs.pop(model_id, None)
+        self._failed.pop(model_id, None)
+        self._config_version += 1
+
+    def _add_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
         if not self.accepts_config_pool(config):
             if config.sie_id in self._configs:
                 del self._configs[config.sie_id]
@@ -1226,6 +1307,10 @@ class ModelRegistry:
                 self._failed.pop(config.sie_id, None)
                 self._config_version += 1
             return
+        self._validate_config_entry(config, self._configs)
+        self._apply_config_entry(config, model_dir)
+
+    def _validate_config_entry(self, config: ModelConfig, existing_configs: dict[str, ModelConfig]) -> None:
         # Pool isolation. Validate before mutating
         # ``self._configs`` so a rejected add does not leave the
         # registry in a half-mutated state. ``None`` pool skips the
@@ -1235,13 +1320,19 @@ class ModelRegistry:
             validate_pool_isolation(
                 candidate_name=config.sie_id,
                 candidate_config=config,
-                existing_configs=self._configs,
+                existing_configs=existing_configs,
                 pool_name=self._pool_name,
             )
         # Legacy scalar ``lora_id`` exclusion is *not* pool-scoped (it is a
         # hard invariant) so it fires regardless of ``self._pool_name``.
         # Multi-LoRA generation (``loadtime.lora_paths``) is unaffected.
         validate_no_legacy_scalar_lora_id(name=config.sie_id, config=config)
+
+    def _apply_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
+        if not self.accepts_config_pool(config):
+            if config.sie_id in self._configs:
+                self._drop_config_entry(config.sie_id)
+            return
         self._configs[config.sie_id] = config
         if self._model_filter is not None:
             self._model_filter.add(config.sie_id)
@@ -1271,7 +1362,7 @@ class ModelRegistry:
         disappeared from the authoritative bundle export.
         """
         new_configs: dict[str, ModelConfig] = {}
-        for config in configs:
+        for config in expand_profile_variants(configs).values():
             if not self.accepts_config_pool(config):
                 continue
             if config.sie_id in new_configs:
@@ -1292,36 +1383,38 @@ class ModelRegistry:
         for name, config in new_configs.items():
             validate_no_legacy_scalar_lora_id(name=name, config=config)
 
-        lock = self._get_load_lock()
-        async with lock:
-            removed = set(self._configs) - set(new_configs)
-            changed = {
-                name
-                for name, config in new_configs.items()
-                if not _model_configs_semantically_equal(self._configs.get(name), config)
-            }
-            if model_dir is not None:
-                changed.update(name for name in new_configs if self._model_dirs.get(name) != model_dir)
-            invalidated = removed | changed
+        update_lock = self._get_config_update_lock()
+        async with update_lock:
+            lock = self._get_load_lock()
+            async with lock:
+                removed = set(self._configs) - set(new_configs)
+                changed = {
+                    name
+                    for name, config in new_configs.items()
+                    if not _model_configs_semantically_equal(self._configs.get(name), config)
+                }
+                if model_dir is not None:
+                    changed.update(name for name in new_configs if self._model_dirs.get(name) != model_dir)
+                invalidated = removed | changed
 
-            if not invalidated:
-                return set()
+                if not invalidated:
+                    return set()
 
-            for name in sorted(invalidated):
-                if name in self._loaded:
-                    await self._do_unload(name)
+                for name in sorted(invalidated):
+                    if name in self._loaded:
+                        await self._do_unload(name)
 
-            self._configs = dict(new_configs)
-            self._loader.update_configs(self._configs)
-            if self._model_filter is not None:
-                self._model_filter = set(new_configs)
-            self._model_dirs = {name: path for name, path in self._model_dirs.items() if name in new_configs}
-            if model_dir is not None:
-                for name in new_configs:
-                    self._model_dirs[name] = model_dir
-            for name in invalidated:
-                self._failed.pop(name, None)
-            self._config_version += 1
+                self._configs = dict(new_configs)
+                self._loader.update_configs(self._configs)
+                if self._model_filter is not None:
+                    self._model_filter = set(new_configs)
+                self._model_dirs = {name: path for name, path in self._model_dirs.items() if name in new_configs}
+                if model_dir is not None:
+                    for name in new_configs:
+                        self._model_dirs[name] = model_dir
+                for name in invalidated:
+                    self._failed.pop(name, None)
+                self._config_version += 1
 
         # Outside the load lock (``start_load_async`` acquires it): reload pinned
         # models that were just unloaded because their config changed, and load

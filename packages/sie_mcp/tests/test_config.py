@@ -1,8 +1,10 @@
 import pytest
 from sie_mcp.config import (
     _DEFAULT_IMAGE_TOP_K,
+    DEFAULT_EXTRACT_MODEL,
     DEFAULT_MAX_DOCUMENT_BYTES,
     DEFAULT_MAX_IMAGE_BYTES,
+    DEFAULT_PII_MODEL,
     DEFAULT_VLOCR_MODEL,
     MCPConfig,
 )
@@ -79,3 +81,67 @@ def test_image_top_k_zero_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_image_top_k_falls_back_on_bad_value(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     monkeypatch.setenv("SIE_MCP_IMAGE_TOP_K", bad)
     assert MCPConfig.from_env().image_top_k == _DEFAULT_IMAGE_TOP_K
+
+
+def test_gliner_models_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SIE_MCP_EXTRACT_MODEL", raising=False)
+    monkeypatch.delenv("SIE_MCP_PII_MODEL", raising=False)
+    cfg = MCPConfig.from_env()
+    assert cfg.extract_model == DEFAULT_EXTRACT_MODEL
+    assert cfg.pii_model == DEFAULT_PII_MODEL
+
+
+def test_gliner_models_honor_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIE_MCP_EXTRACT_MODEL", "some/other-gliner")
+    monkeypatch.setenv("SIE_MCP_PII_MODEL", "some/other-pii")
+    cfg = MCPConfig.from_env()
+    assert cfg.extract_model == "some/other-gliner"
+    assert cfg.pii_model == "some/other-pii"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_gliner_models_fall_back(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
+    monkeypatch.setenv("SIE_MCP_EXTRACT_MODEL", blank)
+    monkeypatch.setenv("SIE_MCP_PII_MODEL", blank)
+    cfg = MCPConfig.from_env()
+    assert cfg.extract_model == DEFAULT_EXTRACT_MODEL
+    assert cfg.pii_model == DEFAULT_PII_MODEL
+
+
+_PER_TOOL_GPU_VARS = (
+    "SIE_MCP_DOCS_GPU",
+    "SIE_MCP_EXTRACT_GPU",
+    "SIE_MCP_GENERATE_GPU",
+    "SIE_MCP_IMAGE_GPU",
+    "SIE_MCP_QA_GPU",
+)
+
+
+def test_per_tool_gpu_defaults_to_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in _PER_TOOL_GPU_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SIE_MCP_GPU", "rtx6000")
+    cfg = MCPConfig.from_env()
+    assert cfg.gpu == "rtx6000"
+    assert (cfg.docs_gpu, cfg.extract_gpu, cfg.generate_gpu, cfg.image_gpu, cfg.qa_gpu) == (("rtx6000",) * 5)
+
+
+def test_per_tool_gpu_overrides_win(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIE_MCP_GPU", "l4")
+    monkeypatch.setenv("SIE_MCP_GENERATE_GPU", "rtx6000")
+    monkeypatch.setenv("SIE_MCP_EXTRACT_GPU", "rtx6000")
+    cfg = MCPConfig.from_env()
+    assert cfg.generate_gpu == "rtx6000"
+    assert cfg.extract_gpu == "rtx6000"
+    # untouched lanes fall back to the global SIE_MCP_GPU
+    assert cfg.docs_gpu == "l4"
+    assert cfg.image_gpu == "l4"
+    assert cfg.qa_gpu == "l4"
+
+
+def test_gpu_is_none_when_nothing_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in ("SIE_MCP_GPU", *_PER_TOOL_GPU_VARS):
+        monkeypatch.delenv(var, raising=False)
+    cfg = MCPConfig.from_env()
+    assert cfg.gpu is None
+    assert cfg.generate_gpu is None

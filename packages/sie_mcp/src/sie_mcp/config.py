@@ -79,6 +79,12 @@ DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # here as the demo default and re-source from #955 once that decision lands.
 DEFAULT_VLOCR_MODEL = "opendatalab/MinerU2.5-Pro-2604-1.2B"
 
+# GLiNER models for extract_entities / redact_pii. Env-overridable (SIE_MCP_EXTRACT_MODEL
+# / SIE_MCP_PII_MODEL) for parity with the docling/generation model knobs, so a cluster
+# that advertises different GLiNER ids can be targeted without a code change.
+DEFAULT_EXTRACT_MODEL = "urchade/gliner_multi-v2.1"
+DEFAULT_PII_MODEL = "urchade/gliner_multi_pii-v1"
+
 
 def _parse_connector_secrets(raw: str) -> dict[str, str]:
     """Parse ``SIE_MCP_CONNECTOR_SECRETS`` into a ``{secret: user_id}`` map.
@@ -168,6 +174,8 @@ class MCPConfig:
     max_image_bytes: int
     docling_model: str
     generate_model: str
+    extract_model: str
+    pii_model: str
     max_output_tokens: int
     vlocr_model: str
     encode_model: str
@@ -177,6 +185,11 @@ class MCPConfig:
     image_labels: list[str]
     image_top_k: int
     gpu: str | None
+    docs_gpu: str | None
+    extract_gpu: str | None
+    generate_gpu: str | None
+    image_gpu: str | None
+    qa_gpu: str | None
     timeout_s: float
     qa_top_k: int
     qa_rerank_candidates: int
@@ -204,6 +217,10 @@ class MCPConfig:
         chunk_overlap = min(
             max(0, _env_int("SIE_MCP_QA_CHUNK_OVERLAP_CHARS", default=_DEFAULT_QA_CHUNK_OVERLAP_CHARS)), chunk_chars - 1
         )
+        # One global GPU lane (SIE_MCP_GPU); each per-tool override below falls back
+        # to it, so a single-knob setup keeps working while a multi-lane cluster can
+        # route each tool to its own lane (docling on l4, generation on rtx6000, ...).
+        gpu = os.getenv("SIE_MCP_GPU") or None
         return cls(
             sie_base_url=os.getenv("SIE_BASE_URL", _DEFAULT_BASE_URL),
             sie_api_key=os.getenv("SIE_API_KEY") or None,
@@ -218,6 +235,8 @@ class MCPConfig:
             max_image_bytes=_env_int("SIE_MCP_MAX_IMAGE_BYTES", default=DEFAULT_MAX_IMAGE_BYTES),
             docling_model=os.getenv("SIE_MCP_DOCLING_MODEL", _DEFAULT_MODEL),
             generate_model=os.getenv("SIE_MCP_GENERATE_MODEL", _DEFAULT_GENERATE_MODEL),
+            extract_model=(os.getenv("SIE_MCP_EXTRACT_MODEL") or "").strip() or DEFAULT_EXTRACT_MODEL,
+            pii_model=(os.getenv("SIE_MCP_PII_MODEL") or "").strip() or DEFAULT_PII_MODEL,
             max_output_tokens=_env_int("SIE_MCP_MAX_OUTPUT_TOKENS", default=_DEFAULT_MAX_OUTPUT_TOKENS),
             # Treat an empty/whitespace override as unset so OCR routing keeps a real model id.
             vlocr_model=(os.getenv("SIE_MCP_VLOCR_MODEL") or "").strip() or DEFAULT_VLOCR_MODEL,
@@ -229,7 +248,12 @@ class MCPConfig:
             image_labels=_parse_labels(os.getenv("SIE_MCP_IMAGE_LABELS", ""), default=_DEFAULT_IMAGE_LABELS),
             # min_value=0 so a caption-only request (SIE_MCP_IMAGE_TOP_K=0) is honored.
             image_top_k=_env_int("SIE_MCP_IMAGE_TOP_K", default=_DEFAULT_IMAGE_TOP_K, min_value=0),
-            gpu=os.getenv("SIE_MCP_GPU") or None,
+            gpu=gpu,
+            docs_gpu=os.getenv("SIE_MCP_DOCS_GPU") or gpu,
+            extract_gpu=os.getenv("SIE_MCP_EXTRACT_GPU") or gpu,
+            generate_gpu=os.getenv("SIE_MCP_GENERATE_GPU") or gpu,
+            image_gpu=os.getenv("SIE_MCP_IMAGE_GPU") or gpu,
+            qa_gpu=os.getenv("SIE_MCP_QA_GPU") or gpu,
             # Document conversion can be slow on a cold model load; default generous.
             timeout_s=_env_float("SIE_MCP_TIMEOUT_S", default=300.0),
             qa_top_k=max(1, _env_int("SIE_MCP_QA_TOP_K", default=_DEFAULT_QA_TOP_K)),

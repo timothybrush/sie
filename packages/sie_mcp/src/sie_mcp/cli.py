@@ -9,12 +9,15 @@ from typing import Annotated
 import typer
 import uvicorn
 
+from sie_mcp.plugin_pack import build_plugin_pack
 from sie_mcp.skill_zip import build_skill_zip, skill_name
 
 app = typer.Typer(name="sie-mcp", help="SIE MCP edge service (Req 12).", no_args_is_help=True)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SKILL_MD = _PACKAGE_ROOT / "plugin" / "SKILL.md"
+_DEFAULT_COWORK_GUIDE = _PACKAGE_ROOT / "plugin" / "superlinked.md"
+_DEFAULT_CLAUDE_CODE_SKILLS_DIR = _PACKAGE_ROOT / "plugin" / "claude-code"
 
 
 def _setup_logging(level: str) -> None:
@@ -71,6 +74,83 @@ def skill_zip(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     typer.echo(f"wrote {target} ({len(data)} bytes)")
+
+
+@app.command("plugin-pack")
+def plugin_pack(
+    mcp_url: Annotated[
+        str,
+        typer.Option(
+            "--mcp-url",
+            envvar="SIE_MCP_URL",
+            help="Hosted MCP endpoint to install, e.g. https://mcp.sie-test.example/mcp.",
+        ),
+    ],
+    connector_secret: Annotated[
+        str | None,
+        typer.Option(
+            "--connector-secret",
+            envvar="SIE_MCP_CONNECTOR_SECRET",
+            help="Optional connector secret to print in INSTALL.md; prefer the env var to avoid shell history.",
+        ),
+    ] = None,
+    cluster_label: Annotated[
+        str,
+        typer.Option("--cluster-label", help="Human-readable cluster label for the generated install guide."),
+    ] = "sie-test",
+    skill: Annotated[
+        Path,
+        typer.Option("--skill", "-s", help="Path to the surface-agnostic Superlinked SKILL.md to package."),
+    ] = _DEFAULT_SKILL_MD,
+    cowork_guide: Annotated[
+        Path | None,
+        typer.Option("--cowork-guide", help="Optional Cowork install guide to include in the pack."),
+    ] = _DEFAULT_COWORK_GUIDE,
+    claude_code_skills_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--claude-code-skills-dir",
+            help="Optional directory of Claude Code skill folders to include in the pack.",
+        ),
+    ] = _DEFAULT_CLAUDE_CODE_SKILLS_DIR,
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out-dir", "-o", help="Output directory for the plugin pack."),
+    ] = _PACKAGE_ROOT / "dist" / "superlinked-docs-plugin",
+) -> None:
+    """Build a quick install pack for a hosted/test-cluster Superlinked MCP edge."""
+    if not skill.is_file():
+        raise typer.BadParameter(f"SKILL.md not found at {skill}")
+    cowork_text = None
+    if cowork_guide is not None:
+        if not cowork_guide.is_file():
+            raise typer.BadParameter(f"Cowork guide not found at {cowork_guide}")
+        cowork_text = cowork_guide.read_text(encoding="utf-8")
+    claude_code_skill_mds = []
+    if claude_code_skills_dir is not None:
+        if not claude_code_skills_dir.is_dir():
+            raise typer.BadParameter(f"Claude Code skills directory not found at {claude_code_skills_dir}")
+        claude_code_skill_mds = [
+            skill_file.read_text(encoding="utf-8") for skill_file in sorted(claude_code_skills_dir.glob("*/SKILL.md"))
+        ]
+    try:
+        report = build_plugin_pack(
+            skill.read_text(encoding="utf-8"),
+            mcp_url=mcp_url,
+            connector_secret=connector_secret,
+            cluster_label=cluster_label,
+            claude_code_skill_mds=claude_code_skill_mds,
+            cowork_guide_md=cowork_text,
+            out_dir=out_dir,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    typer.echo(f"wrote plugin pack to {report.out_dir}")
+    typer.echo(f"- install guide: {report.install_guide}")
+    typer.echo(f"- claude.ai skill ZIP: {report.skill_zip}")
+    for skill_path in report.claude_code_skills:
+        typer.echo(f"- Claude Code skill: {skill_path}")
 
 
 @app.command()

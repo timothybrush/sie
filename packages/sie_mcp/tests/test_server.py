@@ -12,7 +12,7 @@ from sie_mcp.config import (
     DEFAULT_VLOCR_MODEL,
     MCPConfig,
 )
-from sie_mcp.server import _transport_security
+from sie_mcp.server import _resolve_text_input, _transport_security
 
 
 def _cfg(**overrides: object) -> MCPConfig:
@@ -26,6 +26,8 @@ def _cfg(**overrides: object) -> MCPConfig:
         "max_image_bytes": DEFAULT_MAX_IMAGE_BYTES,
         "docling_model": "docling",
         "generate_model": "Qwen/Qwen3.5-4B",
+        "extract_model": "urchade/gliner_multi-v2.1",
+        "pii_model": "urchade/gliner_multi_pii-v1",
         "max_output_tokens": 4096,
         "vlocr_model": DEFAULT_VLOCR_MODEL,
         "encode_model": "BAAI/bge-m3",
@@ -35,6 +37,11 @@ def _cfg(**overrides: object) -> MCPConfig:
         "image_labels": [],
         "image_top_k": 5,
         "gpu": None,
+        "docs_gpu": None,
+        "extract_gpu": None,
+        "generate_gpu": None,
+        "image_gpu": None,
+        "qa_gpu": None,
         "timeout_s": 300.0,
         "qa_top_k": 5,
         "qa_rerank_candidates": 20,
@@ -70,3 +77,31 @@ def test_transport_security_scopes_to_allowed_hosts() -> None:
     }
     assert ("https", "mcp.example.com") in parsed_origins
     assert ("http", "mcp.example.com") in parsed_origins
+
+
+async def test_resolve_text_input_rejects_plain_content_over_payload_cap() -> None:
+    with pytest.raises(ValueError, match="content exceeds 4 bytes"):
+        await _resolve_text_input(
+            object(),
+            _cfg(max_document_bytes=4),
+            content="abcde",
+            content_base64=None,
+            document_base64=None,
+            filename=None,
+            engine="auto",
+        )
+
+
+async def test_resolve_text_input_counts_plain_content_as_utf8_bytes() -> None:
+    text, metadata = await _resolve_text_input(
+        object(),
+        _cfg(max_document_bytes=4),
+        content="éé",
+        content_base64=None,
+        document_base64=None,
+        filename=None,
+        engine="auto",
+    )
+
+    assert text == "éé"
+    assert metadata == {"input_type": "content"}

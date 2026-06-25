@@ -233,6 +233,17 @@ async def test_generate_rejects_ebnf_on_outlines_model() -> None:
     assert client.calls == []
 
 
+async def test_generate_rejects_ebnf_on_instruct_4b_outlines_model() -> None:
+    # The other 4B generation profile on the test cluster is Outlines-backed too.
+    client = _FakeChatClient("x")
+    rf = {"type": "grammar", "grammar": 'root ::= "yes" | "no"', "syntax": "ebnf"}
+    with pytest.raises(StructuredOutputError, match="EBNF"):
+        await structured.generate_structured(
+            client, prompt="p", response_format=rf, model="Qwen/Qwen3-4B-Instruct-2507"
+        )
+    assert client.calls == []
+
+
 async def test_generate_allows_grammar_on_non_outlines_model() -> None:
     client = _FakeChatClient("yes")
     rf = {"type": "grammar", "grammar": 'root ::= "yes"', "syntax": "ebnf"}
