@@ -29,6 +29,7 @@ class EncodePipeline:
         is_query: bool,
         options: dict[str, Any],
         prepared_tokens_per_item: list[PreparedTokens | None] | None = None,
+        response_output_types: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], RequestTiming]:
         """Main entry point: preprocess then execute encoding.
 
@@ -39,6 +40,12 @@ class EncodePipeline:
         the text preprocessor skips its own tokenisation iff the
         tokenizer_id matches (see ``TextPreprocessor.try_prepare_from_prepared_tokens``).
         Absent / mismatched → Python tokenises exactly like today.
+
+        ``response_output_types`` filters the final response. It differs from
+        ``output_types`` only when the caller translated the adapter request
+        (e.g. muvera asks the adapter for ``multivector`` while the postprocessor
+        adds ``dense``); the response must then be filtered by the user-requested
+        types, not the translated adapter types. Defaults to ``output_types``.
         """
         timing = RequestTiming()
 
@@ -87,7 +94,10 @@ class EncodePipeline:
             )
             timing.add_postprocessing_ms(postprocess_ms)
 
-        formatted_output = EncodeHandler.format_output(encode_output, output_types=output_types)
+        formatted_output = EncodeHandler.format_output(
+            encode_output,
+            output_types=response_output_types if response_output_types is not None else output_types,
+        )
         return formatted_output, timing
 
     @classmethod

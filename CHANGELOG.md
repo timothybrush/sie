@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.14
+
+- chore(main): release 0.6.14
+- test(encode): cover dual-type muvera filter; harden response_output_types fallback (#1430)
+- fix(encode): preserve postprocessor dense output for muvera profile (#1430)
+- fix(colbert): patch ColBERTRotaryFlashAdapter score_pairs too (#1430)
+- fix(colbert): override score_pairs to ignore encode-time options (#1430)
+
 ## v0.6.13
 
 - chore(main): release 0.6.13

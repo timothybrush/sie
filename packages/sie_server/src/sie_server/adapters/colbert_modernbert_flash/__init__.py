@@ -9,9 +9,9 @@ from torch.nn import functional
 from sie_server.adapters._flash_base import FlashBaseAdapter
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
-from sie_server.adapters._utils import apply_rotary_pos_emb, validate_output_types
+from sie_server.adapters._utils import apply_rotary_pos_emb, grouped_score_pairs, validate_output_types
 from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
-from sie_server.core.inference_output import EncodeOutput
+from sie_server.core.inference_output import EncodeOutput, ScoreOutput
 from sie_server.types.inputs import Item
 
 if TYPE_CHECKING:
@@ -293,6 +293,24 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         sim.masked_fill_(~mask.unsqueeze(1), float("-inf"))
 
         return sim.max(dim=-1).values.sum(dim=-1).tolist()
+
+    def score_pairs(
+        self,
+        queries: list[Item],
+        docs: list[Item],
+        *,
+        instruction: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ScoreOutput:
+        """Score parallel (query, doc) pairs via per-query MaxSim grouping.
+
+        Encode-time runtime ``options`` (e.g. ``muvera``/``output_types``) are
+        irrelevant to ColBERT MaxSim and are accepted and ignored. ``score()`` on
+        this adapter does not take ``options``; ``grouped_score_pairs`` never threads
+        options into the score callable, so delegation is unaffected.
+        """
+        _ = options  # Encode-time options are irrelevant to MaxSim scoring.
+        return grouped_score_pairs(self.score, queries, docs, instruction=instruction)
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences."""

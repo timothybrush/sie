@@ -386,6 +386,39 @@ class TestErrorHandling:
             assert exc_info.value.status_code == 404
             client.close()
 
+    def test_score_server_error_surfaces_structured_detail(self) -> None:
+        """score() surfaces a structured 500 detail.message into ServerError (#1430).
+
+        The colbert score_pairs fix makes the server return its structured
+        ``detail`` (``{"message": "score error: ..."}``); this pins that the
+        score path threads that message + code through ``handle_error``.
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.json.return_value = {
+            "detail": {
+                "code": "INFERENCE_ERROR",
+                "message": "score error: NotImplementedError: per-call options not supported",
+            }
+        }
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+
+            with pytest.raises(ServerError) as exc_info:
+                client.score(
+                    "colbertv2.0",
+                    query={"text": "query"},
+                    items=[{"text": "doc"}],
+                )
+
+            assert exc_info.value.status_code == 500
+            assert exc_info.value.code == "INFERENCE_ERROR"
+            assert "score error: NotImplementedError" in str(exc_info.value)
+            client.close()
+
 
 class TestListModels:
     """Tests for list_models() method."""

@@ -377,6 +377,7 @@ async def encode(
                 config=config,
                 is_query=is_query,
                 options=options,
+                response_output_types=output_types,
             )
         except QueueFullError as e:
             raise error_handler.handle_queue_full(e) from e

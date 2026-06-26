@@ -5,6 +5,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from sie_server.adapters.colbert import ColBERTAdapter
+from sie_server.adapters.colbert_modernbert_flash import ColBERTModernBERTFlashAdapter
+from sie_server.adapters.colbert_rotary_flash import ColBERTRotaryFlashAdapter
+from sie_server.core.inference_output import ScoreOutput
 from sie_server.types.inputs import Item
 
 # Create a random generator for tests
@@ -329,3 +332,88 @@ class TestColBERTScoreMethod:
 
         # Doc 1 (similar) should have higher score than Doc 2 (orthogonal)
         assert scores[0] > scores[1]
+
+
+# Encode-time runtime options resolved from the colbert/muvera profiles. These
+# are irrelevant to MaxSim scoring; score_pairs() must accept-and-ignore them
+# instead of inheriting BaseAdapter.score_pairs()'s NotImplementedError guard.
+_ENCODE_OPTIONS = {
+    "muvera": {},
+    "output_types": ["dense"],
+    "output_similarity": {"dense": "dot"},
+}
+
+
+class TestColBERTScorePairsOptions:
+    """score_pairs() ignores encode-time options instead of raising (#1430)."""
+
+    def test_score_pairs_with_nonempty_options_does_not_raise(self) -> None:
+        """Non-empty encode-time options are accepted and ignored."""
+        adapter = ColBERTAdapter("test-model")
+        adapter._model = MagicMock()
+        adapter._device = "cpu"
+
+        # Both queries share text="q" -> grouped into one score() call over both
+        # docs, so the patched return must cover both grouped docs.
+        with patch.object(adapter, "score", return_value=[0.5, 0.3]) as mock_score:
+            out = adapter.score_pairs(
+                queries=[Item(text="q"), Item(text="q")],
+                docs=[Item(text="d1"), Item(text="d2")],
+                options=_ENCODE_OPTIONS,
+            )
+
+        assert isinstance(out, ScoreOutput)
+        assert out.scores.shape == (2,)
+        # Options must NOT be threaded into score().
+        assert "options" not in mock_score.call_args.kwargs
+
+    @pytest.mark.parametrize("options", [None, {}])
+    def test_score_pairs_with_empty_options_returns_score_output(self, options: dict[str, object] | None) -> None:
+        """options=None/{} behaves identically (parity with non-empty path)."""
+        adapter = ColBERTAdapter("test-model")
+        adapter._model = MagicMock()
+        adapter._device = "cpu"
+
+        with patch.object(adapter, "score", return_value=[0.5, 0.3]):
+            out = adapter.score_pairs(
+                queries=[Item(text="q"), Item(text="q")],
+                docs=[Item(text="d1"), Item(text="d2")],
+                options=options,
+            )
+
+        assert isinstance(out, ScoreOutput)
+        assert out.scores.shape == (2,)
+
+    def test_modernbert_flash_score_pairs_with_nonempty_options_does_not_raise(self) -> None:
+        """Flash ColBERT adapter accepts-and-ignores encode-time options."""
+        adapter = ColBERTModernBERTFlashAdapter("test-model")
+        adapter._model = MagicMock()
+        adapter._device = "cpu"
+
+        with patch.object(adapter, "score", return_value=[0.5, 0.3]):
+            out = adapter.score_pairs(
+                queries=[Item(text="q"), Item(text="q")],
+                docs=[Item(text="d1"), Item(text="d2")],
+                options=_ENCODE_OPTIONS,
+            )
+
+        assert isinstance(out, ScoreOutput)
+        assert out.scores.shape == (2,)
+
+    def test_rotary_flash_score_pairs_with_nonempty_options_does_not_raise(self) -> None:
+        """Rotary-flash ColBERT adapter (jina-colbert-v2) accepts-and-ignores options."""
+        adapter = ColBERTRotaryFlashAdapter("test-model")
+        adapter._model = MagicMock()
+        adapter._device = "cpu"
+
+        with patch.object(adapter, "score", return_value=[0.5, 0.3]) as mock_score:
+            out = adapter.score_pairs(
+                queries=[Item(text="q"), Item(text="q")],
+                docs=[Item(text="d1"), Item(text="d2")],
+                options=_ENCODE_OPTIONS,
+            )
+
+        assert isinstance(out, ScoreOutput)
+        assert out.scores.shape == (2,)
+        # Options must NOT be threaded into score().
+        assert "options" not in mock_score.call_args.kwargs

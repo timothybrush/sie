@@ -50,13 +50,18 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 
 ## Quickstart
 
-SIE is a Docker container; your code calls it over HTTP. Start the container, install the SDK, run the example.
+SIE runs as a server you call over HTTP — a Docker container today, with a native macOS pip install coming in the Apple-Silicon release. Start it, install the SDK, run the example.
 
 **1. Run the engine**
 
 ```bash
-# macOS (Apple Silicon)
+# macOS (Apple Silicon) — today, run the Linux CPU image under emulation:
 docker run --platform linux/amd64 -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
+# Coming in the Apple-Silicon release (NOT yet on PyPI) — a native pip install served on Metal
+# (requires Python 3.12). Embeddings + reranking:
+#   pip install "sie-server[local]" && sie-server serve
+# Generation (Apple MLX), in its own env (uv one-liner, or pip install into a fresh venv):
+#   uvx --with "mlx-lm>=0.30.7" --from sie-server sie-server serve -b sglang -p 8081
 
 # Linux, CPU
 docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
