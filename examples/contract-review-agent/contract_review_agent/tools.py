@@ -260,7 +260,7 @@ The query will run on a database with this schema:
 Given the database schema, here is the SQLite query that answers [QUESTION]{question}[/QUESTION]:
 """
 
-# Chat-mode SQL prompt for instruct/chat models (Qwen3.5-4B, Qwen3-4B-Instruct).
+# Chat-mode SQL prompt for chat/instruct models (e.g. Qwen3.5-4B).
 _SQL_CHAT_SYSTEM = (
     "You are a text-to-SQL engine for SQLite. Given the schema and a question, "
     "reply with ONE SQLite SELECT statement and nothing else — no prose, no "

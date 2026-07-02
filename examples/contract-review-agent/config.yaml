@@ -12,15 +12,14 @@ cluster:
 # Every value is a real model in the SIE catalog (https://superlinked.com/models).
 # Swap any line to try a different model; no other code changes.
 models:
-  # Generative LLMs — the agent "brains" (chat / tools / structured output).
-  # Consolidated onto Qwen/Qwen3.5-4B for now: one warm 4B vision+text model
-  # does the planning, vision, reasoning, and SQL jobs. Branch out per role
-  # from there (see the ↑ hints) as the cluster grows.
-  triage: "Qwen/Qwen3-0.6B"                          # fast, cheap doc-type classifier (kept tiny on purpose; no tools)
-  orchestrator: "Qwen/Qwen3.5-4B"                    # plans, calls tools, assembles output (chat + tools + JSON schema)
-  vision: "Qwen/Qwen3.5-4B"                          # reads scanned / signature pages (text + image)
-  reasoning: "Qwen/Qwen3.5-4B"                       # clause-risk analysis; ↑ Qwen/Qwen3.6-27B on an H100-class cluster
-  sql: "Qwen/Qwen3.5-4B"                             # text-to-SQL via chat (see sql.mode); ↑ Qwen/Qwen3-4B-Instruct-2507 for stronger SQL, or defog/sqlcoder-7b-2 with sql.mode=completions
+  # Generative LLMs — the agent "brains". Two Qwen models, both non-thinking:
+  # Qwen3.6-27B (64K ctx) is the brain — plans, reasons over long context, and
+  # synthesizes; Qwen3.5-4B (8K, vision LLM) handles the shorter-context tasks.
+  triage: "Qwen/Qwen3.5-4B"                          # fast doc-type classifier
+  orchestrator: "Qwen/Qwen3.6-27B"                   # the brain: plans, calls tools, synthesizes (chat + tools + JSON schema; 64K ctx)
+  vision: "Qwen/Qwen3.5-4B"                          # reads scanned / signature pages (text + image) — the vision LLM
+  reasoning: "Qwen/Qwen3.5-4B"                       # clause-risk analysis (short context)
+  sql: "Qwen/Qwen3.5-4B"                             # text-to-SQL via chat (see sql.mode); or defog/sqlcoder-7b-2 with sql.mode=completions
   guard: "ibm-granite/granite-guardian-3.0-2b"       # safety / prompt-injection guardrail (specialist; alias: guard)
   # Retrieval + extraction tools (encode / score / extract):
   ocr: "lightonai/LightOnOCR-2-1B"                   # scanned PDF / image -> markdown (latest OCR model)
@@ -39,7 +38,7 @@ guard:
   threshold: 0.5
 
 # Text-to-SQL calling convention. Chat/instruct models (Qwen3.5-4B,
-# Qwen3-4B-Instruct) take a chat prompt; completion-only specialists like
+# Qwen3.6-27B) take a chat prompt; completion-only specialists like
 # defog/sqlcoder-7b-2 need their native template over /v1/completions — set
 # mode: completions when you point `sql` at one of those.
 sql:
