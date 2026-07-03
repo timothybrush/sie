@@ -6,18 +6,18 @@ cluster:
   url: "http://localhost:8080"
   api_key: ""
   gpu: ""                  # only set for managed multi-GPU clusters (e.g. "l4-spot"); ignored locally
-  provision_timeout_s: 900 # cold clusters scale from zero — first call to each model pays a load
+  provision_timeout_s: 900 # cold clusters scale from zero; first call to each model pays a load
 
-# ── The heart of the demo: one cluster, many models — the right one for each job. ──
+# The heart of the demo: one cluster, many models, the right one for each job.
 # Every value is a real model in the SIE catalog (https://superlinked.com/models).
 # Swap any line to try a different model; no other code changes.
 models:
-  # Generative LLMs — the agent "brains". Two Qwen models, both non-thinking:
-  # Qwen3.6-27B (64K ctx) is the brain — plans, reasons over long context, and
+  # Generative LLMs, the agent "brains". Two Qwen models, both non-thinking:
+  # Qwen3.6-27B (64K ctx) is the brain: plans, reasons over long context, and
   # synthesizes; Qwen3.5-4B (8K, vision LLM) handles the shorter-context tasks.
   triage: "Qwen/Qwen3.5-4B"                          # fast doc-type classifier
   orchestrator: "Qwen/Qwen3.6-27B"                   # the brain: plans, calls tools, synthesizes (chat + tools + JSON schema; 64K ctx)
-  vision: "Qwen/Qwen3.5-4B"                          # reads scanned / signature pages (text + image) — the vision LLM
+  vision: "Qwen/Qwen3.5-4B"                          # reads scanned / signature pages (text + image); the vision LLM
   reasoning: "Qwen/Qwen3.5-4B"                       # clause-risk analysis (short context)
   sql: "Qwen/Qwen3.5-4B"                             # text-to-SQL via chat (see sql.mode); or defog/sqlcoder-7b-2 with sql.mode=completions
   guard: "ibm-granite/granite-guardian-3.0-2b"       # safety / prompt-injection guardrail (specialist; alias: guard)
@@ -39,7 +39,7 @@ guard:
 
 # Text-to-SQL calling convention. Chat/instruct models (Qwen3.5-4B,
 # Qwen3.6-27B) take a chat prompt; completion-only specialists like
-# defog/sqlcoder-7b-2 need their native template over /v1/completions — set
+# defog/sqlcoder-7b-2 need their native template over /v1/completions; set
 # mode: completions when you point `sql` at one of those.
 sql:
   mode: "chat"   # "chat" | "completions"
