@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.6.15
+
+- chore(main): release 0.6.15
+- fix(playground): keyboard-accessible tabs + associated form labels
+- fix(server): address CI + review comments on the Apple Silicon re-land
+- feat(server): land Apple Silicon as a primary device onto main
+- fix(sidecar): start batch cancel before direct pulls
+- fix(tilt): wait for complete trace before asserting span chain
+- fix(gateway): harden batch direct fallback cancellation
+- fix(gateway): cancel abandoned direct batch fallback work
+- test(tracing): assert run_batch metadata and malformed traceparent
+- fix(gateway): ignore pre-latch stale NAKs after republish
+- fix(docs): drop otel.name from span-attribute table; tighten tracing dashboard test
+- feat(helm): add SIE tracing dashboard and tempo datasource uid
+- docs(gateway): document distributed tracing span chain and enable switch
+- refactor(helm): migrate bundled Tempo to grafana-community chart 2.2.3
+- refactor(helm): gate tempo datasource on grafana
+- fix(gateway): use real RUSTSEC id for second quick-xml advisory
+- feat(helm): add optional bundled Tempo tracing backend
+- fix(gateway): ignore quick-xml <0.41 RustSec advisories in cargo-deny
+- refactor(sie_gateway): clarify publish-seam comment, drop redundant otel.name
+- feat(sie_gateway): emit gateway.publish span on non-streaming queue-publish path (#1596)
+- feat(gateway): count dropped stale NAKs from abandoned attempts
+- test(observability): use single import style in shutdown_tracing test
+- feat(observability): bound tracing shutdown and trim env inputs across all four runtimes
+- fix(models): serve gte-Qwen2-1.5B via sentence_transformer adapter (#1593)
+- feat(observability): gate Rust tracing on SIE_TRACING_ENABLED
+- test: update queue executor batch mocks
+- test: cover queue runtime app wiring
+- fix: complete empty preformed worker requests
+- fix: address sidecar PR review feedback
+- fix: clean stale Python queue ownership drift
+- docs: clarify sidecar queue batching ownership
+- fix: remove Python worker pull-loop path
+- fix(server): serialize hot reload registry mutations
+- fix(server): move load headroom behind adapter contract
+- fix(server): make SGLang load eviction headroom-aware
+- test(config): time-box idempotency mismatch request
+- fix(config): shield idempotency failure cleanup
+- fix(config): defer cancellation after config commit starts
+- fix(config): handle idempotency in-flight races
+- fix(server): cap LoRA drain to snapshot backlog so post-snapshot arrivals don't overshoot
+- fix(gateway): keep signalling SSE incompleteness on lag; only skip cancel when done (#1602)
+- perf(gateway): build the HRW ring from the by_bundle index, not a whole-cluster scan (#1607)
+- fix(gateway): don't report a succeeded SSE generation as inter_chunk_timeout on consumer lag (#1602)
+- fix(gateway): drop stale NAKs from abandoned attempts in handle_nak (#1601)
+- perf(server): vectorize bge_m3_flash CLS gather to drop N per-encode GPU syncs (#1605)
+- fix(server): bound the continuous-batching drain so a busy LoRA can't starve siblings (#1606)
+- fix(server): stop mislabelling uint8 embeddings as "binary" on the queue path (#1603)
+- fix(server): /v1/embeddings maps OOM to 503 RESOURCE_EXHAUSTED, not 500 (#1604)
+- fix(server): unregister model from MemoryManager even if adapter.unload() raises (#1600)
+- fix: select rustls provider at binary startup
+- revert: restore gateway sidecar rustls defaults
+- fix: select rustls provider for rust services
+- fix(gateway): append forwarded embeddings headers to preserve multi-value tracestate
+- fix(gateway): forward traceparent/tracestate through /v1/embeddings rewrite
+- test(gateway): pin RetryAfter aliases to wire literals, not tautologies (#1574)
+- fix(tracing): parent sidecar.dispatch on first valid inbound context
+- refactor(gateway): injectable clock for TokenBucket (#1575, publisher PR 1/n)
+- refactor(gateway): one typed RetryAfter home for cold-load retry hints (#1574)
+- refactor(gateway): normalize rejected-request labels via sanitize_label (#1573)
+- docs(server): ADR-0004 — cost is modality-native, not commensurable (#1571)
+- refactor(server): controller owns its config write-back via apply_step (#1570, BatchPolicy PR 1/n)
+- feat(tracing): emit sidecar.dispatch span from sie_server_sidecar (#1550)
+- refactor(server): typed EvictionResult for evict_lru_excluding (#1569, ResidencyPolicy PR 1/n)
+- fix(gateway): record demand on backpressure so KEDA scales the lane (#1568)
+- refactor(server): single typed definition for the queue-path inference_error code (#1572)
+- fix(gateway): route engine-pin errors through endpoint_error_response (#1567)
+- chore(deps): refresh gateway Rust lockfile
+- docs(gateway): use 'gateway' terminology in resolve_routing pool comment (#1543)
+- refactor(gateway): fold pool + GPU resolution into resolve_routing (#1543, PR 3/3)
+- refactor(gateway): wrap routing decision in resolve_routing (#1543, PR 2/3)
+- refactor(gateway): extract resolve_bundle_for_request from proxy_request (#1543)
+- test(gateway/config/server): shared conformance vectors for bundle_config_hash (#1542)
+- refactor(server): make ModelRegistry.get() a pure read; add touch_lru() (#1541)
+- refactor(tracing): use is_some() borrow check for inbound ctx branch
+- test(tracing): bind a JetStream consumer in the encode propagation IT
+- test(tracing): add NATS-gated integration test for encode trace propagation
+- fix(tracing): attach inbound trace context for non-generation publishes
+- feat(tracing): inject queue trace context for non-generation endpoints
+- fix(adapters): guard empty-document MaxSim batches; strengthen single-doc test (#1539)
+- refactor(preprocessor): extract shared _load_rgb image loader (#1540)
+- refactor(adapters): shared multivector MaxSim scoring helpers (#1539)
+- refactor(adapters): extract shared flash varlen position-id builder (#1538)
+- test(server): add score/extract invalid-item regressions for decode_item seam (#1537)
+- refactor(server): validate queue-path items through one decode_item seam (#1537)
+- fix(candle): keep catalog additions candle-only
+- fix(models): restore per-task MTEB instruction for stella_en_v5 (#1340)
+- docs(helm): document collector suppression + exporterInsecure in chart README
+- fix(helm): make bundled collector downstream OTLP TLS configurable
+- fix(helm): suppress bundled collector when explicit tracing endpoint set
+- fix(helm): set OTEL_EXPORTER_OTLP_PROTOCOL=grpc on traced pods
+- feat(helm): add opt-in OTLP tracing wiring + bundled collector to sie-cluster
+- fix(candle): harden native worker routing
+- fix(tracing): assert items/metadata alignment before zip in scheduler batch
+- feat(tracing): propagate trace context through the non-streaming worker loop
+- fix(muvera): center tokens before SimHash to fix answerai @muvera Blackwell collapse (#1528)
+- fix(candle): harden native worker runtime
+- fix(sdk): raise actionable error on encode result-count desync (#1526)
+- fix(models): load stock tokenizer for gte-Qwen2-7B-instruct (#1483)
+- fix(server): skip EOS on empty input; cover non-default profile on queue path
+- fix(models): serve embeddinggemma-300m via SentenceTransformerDenseAdapter (#1523)
+- fix(server): apply profile runtime options and append EOS on cluster encode path (#1489)
+- fix(candle): publish loaded models in health
+- chore(deps): bump Rust gateway and sidecar dependencies
+- fix: repair candle rebase fallout
+- fix(gateway): separate queue timeouts from model loading
+- fix(candle): run bge-m3 profile in bf16
+- perf(candle): optimize bge-m3 xlm-r runtime path
+- fix(candle): align readiness with loaded model state
+- fix(candle): restore sidecar model readiness
+- fix(sidecar): keep only config hash wiring
+- fix(sidecar): bound scheduler bulk enqueue waves
+- perf(sidecar): bulk enqueue scheduler batches
+- feat: tune candle forward concurrency
+- fix: remove candle replica fallback path
+- feat: improve candle replica concurrency
+- fix: log candle batch failure context
+- fix: restore default candle cuda stream
+- perf: improve candle worker concurrency and build cache
+- fix: improve candle embedding runtime throughput
+- fix: install gateway pool config hashes
+- fix: preserve control-plane bundle hash in sidecar
+- fix: align worker pool config hashes
+- fix: export profile bundle targets
+- fix: repair candle ci routing checks
+- fix: harden candle bge-m3 runtime bring-up
+- feat(candle): add native adapter runtime
+- fix(muvera): drop same-dim count-sketch + retune colbert muvera configs (#1493)
+
 ## v0.6.14
 
 - chore(main): release 0.6.14

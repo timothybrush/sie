@@ -388,11 +388,8 @@ class HotReloader:
                 # Drain in-flight requests
                 await self._drain_requests(model_name)
 
-                # Stop worker if running
-                await self._registry.stop_worker(model_name)
-
-                # Unload the model
-                self._registry.unload(model_name)
+                # Unload the model through the registry's async load lock.
+                await self._registry.unload_async(model_name)
 
                 # Clear custom adapter from module cache
                 self._clear_custom_adapter_cache(model_name)
@@ -418,7 +415,7 @@ class HotReloader:
         # Reload model if it was loaded before
         if was_loaded and model_name in new_configs:
             try:
-                self._registry.load(model_name, self._device)
+                await self._registry.load_async(model_name, self._device)
                 await self._registry.start_worker(model_name)
                 logger.info("Reloaded model: %s", model_name)
             except (RuntimeError, OSError, ValueError) as e:
@@ -464,11 +461,8 @@ class HotReloader:
                 # Drain in-flight requests
                 await self._drain_requests(model_name)
 
-                # Stop worker if running
-                await self._registry.stop_worker(model_name)
-
-                # Unload the model
-                self._registry.unload(model_name)
+                # Unload the model through the registry's async load lock.
+                await self._registry.unload_async(model_name)
 
             finally:
                 self._reloading.discard(model_name)

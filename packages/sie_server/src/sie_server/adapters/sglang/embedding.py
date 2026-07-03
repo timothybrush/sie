@@ -31,6 +31,7 @@ from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters.sglang import _server
 from sie_server.core.inference_output import EncodeOutput
+from sie_server.core.tokenizer import load_tokenizer
 
 if TYPE_CHECKING:
     from sie_server.types.inputs import Item
@@ -86,6 +87,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         query_template: str | None = None,
         doc_template: str | None = None,
         default_instruction: str | None = None,
+        append_eos: bool = False,
         pooling_method: str | None = None,
         lora_paths: dict[str, str] | None = None,
         max_loras_per_batch: int = 8,
@@ -108,6 +110,16 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             doc_template: Template for formatting documents. Use {text} placeholder.
             default_instruction: Default instruction when query_template uses
                 {instruction} but none is provided.
+            append_eos: When True, append the model's EOS token to every text
+                sent to SGLang (after template formatting). Required for
+                last-token-pooled LLM embedders whose tokenizer does NOT add an
+                EOS automatically (e.g. the Mistral-family embedders
+                e5-mistral-7b-instruct / SFR-Embedding / Linq-Embed-Mistral):
+                without the trailing EOS, last-token pooling reads the wrong
+                position and retrieval collapses (#1489). The EOS string is read
+                from the model's own tokenizer at load time (see ``load``), so it
+                is never hardcoded. Leave False for models SGLang already handles
+                (e.g. Qwen3-Embedding).
             pooling_method: Pooling method for embeddings. Options: "cls", "lasttoken",
                 "max", "mean", "mean_sqrt_len_tokens", "weightedmean". If None, uses
                 SGLang's default (usually lasttoken for LLM models).
@@ -129,6 +141,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._default_instruction = default_instruction
+        self._append_eos = append_eos
+        self._eos_token = ""  # Resolved from the model tokenizer in load() when append_eos
         self._pooling_method = pooling_method
         self._lora_paths = lora_paths or {}
         self._max_loras_per_batch = max_loras_per_batch
@@ -166,6 +180,9 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             RuntimeError: If server fails to start within timeout.
         """
         self._device = device
+
+        if self._append_eos:
+            self._eos_token = self._resolve_eos_token()
 
         device_index = _server.parse_device_index(device)
         port = _server.find_free_port()
@@ -231,7 +248,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         ):
             _server.terminate_process(self._process)
             self._process = None
-            raise RuntimeError(_server.ERR_SERVER_STARTUP)
+            raise _server.startup_failure_error(self._output_file)
 
         logger.info(
             "SGLang server ready: %s at %s",
@@ -257,6 +274,14 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         registry use actual GPU memory monitoring instead.
         """
         return 0
+
+    def load_required_memory_bytes(self, *, device_type: str, device_total_bytes: int) -> int | None:
+        """Return SGLang's startup reservation requirement for load staging."""
+        return _server.estimate_load_required_memory_bytes(
+            device_type=device_type,
+            device_total_bytes=device_total_bytes,
+            mem_fraction_static=self._mem_fraction_static,
+        )
 
     def encode(
         self,
@@ -411,6 +436,38 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             msg = f"Unsupported output types: {unsupported}. SGLang adapter only supports 'dense'."
             raise ValueError(msg)
 
+    def _resolve_eos_token(self) -> str:
+        """Read the model's EOS token string from its own tokenizer.
+
+        Reuses the shared ``core.tokenizer.load_tokenizer`` helper (the same path
+        ``PyTorchEmbeddingAdapter`` uses) rather than hardcoding an EOS string, so
+        the value always matches the served model. Only invoked when
+        ``append_eos`` is set, so models that don't opt in never load a tokenizer
+        in-process. A resolution failure degrades to "no EOS appended" (logged)
+        rather than failing the whole model load.
+        """
+        try:
+            tokenizer = load_tokenizer(self._model_name_or_path, trust_remote_code=self._trust_remote_code)
+        except Exception:  # noqa: BLE001 - tokenizer load must never take the model down
+            logger.warning(
+                "append_eos: could not load tokenizer for %s to resolve EOS; last-token pooling may be degraded",
+                self._model_name_or_path,
+                exc_info=True,
+            )
+            return ""
+
+        eos = tokenizer.eos_token
+        if not eos and tokenizer.eos_token_id is not None:
+            eos = tokenizer.decode([tokenizer.eos_token_id]).strip()
+        if not eos:
+            logger.warning(
+                "append_eos: model %s exposes no EOS token; last-token pooling may be degraded",
+                self._model_name_or_path,
+            )
+            return ""
+        logger.info("append_eos enabled for %s: appending EOS %r", self._model_name_or_path, eos)
+        return eos
+
     def _format_texts(
         self,
         items: list[Item],
@@ -446,6 +503,13 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             elif instruction:
                 # Fallback: prepend instruction if provided but no template
                 text = f"{instruction} {text}"
+
+            # Append the model's EOS so last-token pooling reads the trained
+            # summary position (queries and documents alike). Skip empty /
+            # whitespace text so it still takes the zero-vector fallback in
+            # encode() instead of becoming an EOS-only input.
+            if self._append_eos and self._eos_token and text.strip():
+                text = f"{text}{self._eos_token}"
 
             texts.append(text)
         return texts

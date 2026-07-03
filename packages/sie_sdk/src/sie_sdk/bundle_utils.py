@@ -8,15 +8,51 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+def _adapter_module_from_path(adapter_path: object) -> str | None:
+    if not isinstance(adapter_path, str) or not adapter_path:
+        return None
+    module_path = adapter_path.split(":", maxsplit=1)[0]
+    return module_path or None
+
+
+def _effective_adapter_path(profiles: dict, profile_name: str) -> str | None:
+    current: str | None = profile_name
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            return None
+        seen.add(current)
+        profile = profiles.get(current)
+        if not isinstance(profile, dict):
+            return None
+        adapter_path = profile.get("adapter_path")
+        if isinstance(adapter_path, str) and adapter_path:
+            return adapter_path
+        parent = profile.get("extends")
+        current = parent if isinstance(parent, str) and parent else None
+    return None
+
+
+def _profile_adapter_modules(profiles: dict, profile_name: str) -> set[str]:
+    module_path = _adapter_module_from_path(_effective_adapter_path(profiles, profile_name))
+    return {module_path} if module_path else set()
+
+
+def _base_route_adapter_modules(profiles: dict) -> set[str]:
+    if "default" not in profiles:
+        return set()
+    return _profile_adapter_modules(profiles, "default")
+
+
 def _scan_model_adapters(models_dir: Path) -> dict[str, tuple[set[str], str | None]]:
-    """Scan model config YAMLs and return adapter modules per model.
+    """Scan model config YAMLs and return adapter modules per route identity.
 
     Args:
         models_dir: Path to the models directory containing *.yaml configs.
 
     Returns:
-        Dict mapping model name to ``(modules, pool)`` where ``modules`` is
-        the set of adapter module paths declared by the model profiles and
+        Dict mapping model/profile route name to ``(modules, pool)`` where
+        ``modules`` is the set of effective adapter module paths for that route and
         ``pool`` is the optional configured pool name.
     """
     result: dict[str, tuple[set[str], str | None]] = {}
@@ -30,16 +66,24 @@ def _scan_model_adapters(models_dir: Path) -> dict[str, tuple[set[str], str | No
             logger.exception("Failed to parse model config %s", model_path.name)
             continue
         model_name = model_data.get("sie_id", model_path.stem.replace("__", "/"))
-        modules: set[str] = set()
-        for profile in model_data.get("profiles", {}).values():
-            adapter_path = profile.get("adapter_path", "")
-            module_path = adapter_path.split(":", maxsplit=1)[0]
-            if module_path:
-                modules.add(module_path)
-        if modules:
-            raw_pool = model_data.get("pool")
-            pool = raw_pool.strip().lower() if isinstance(raw_pool, str) else None
-            result[model_name] = (modules, pool or None)
+        profiles = model_data.get("profiles", {})
+        if not isinstance(profiles, dict):
+            continue
+
+        raw_pool = model_data.get("pool")
+        pool = raw_pool.strip().lower() if isinstance(raw_pool, str) else None
+        route_pool = pool or None
+
+        base_modules = _base_route_adapter_modules(profiles)
+        if base_modules:
+            result[model_name] = (base_modules, route_pool)
+
+        for profile_name in sorted(profiles):
+            if profile_name == "default":
+                continue
+            modules = _profile_adapter_modules(profiles, str(profile_name))
+            if modules:
+                result[f"{model_name}:{profile_name}"] = (modules, route_pool)
 
     return result
 

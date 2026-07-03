@@ -638,10 +638,71 @@ telemetry:
 
 ## Observability
 
-Observability components (Prometheus, Grafana, Loki, DCGM Exporter, Alloy, Event Exporter) are included as optional sub-chart dependencies. Enable them in your values overlay (e.g. `kube-prometheus-stack.install: true`, `observability.logs.install: true`, or `kubernetes-event-exporter.install: true`).
+Observability components (Prometheus, Grafana, Loki, Tempo, DCGM Exporter, Alloy, Event Exporter) are included as optional sub-chart dependencies. Enable them in your values overlay (e.g. `kube-prometheus-stack.install: true`, `observability.logs.install: true`, `observability.tracing.tempo.install: true`, or `kubernetes-event-exporter.install: true`).
 
 Pre-configured dashboards:
 
 - Cluster overview (QPS, latency, GPU utilization)
 - Per-model performance
 - Worker health
+- Queue routing
+- Generation
+- Performance tuning
+- SIE Tracing
+
+### Distributed Tracing (OTLP)
+
+Distributed tracing is **off by default** — the rendered chart is unchanged unless you opt in. Enabling injects the OpenTelemetry exporter env onto the gateway, worker sidecar, Python worker, and Rust worker so a request is traced end to end (OTLP gRPC, `:4317`). Non-generation endpoints (encode/score/extract/embeddings) publish through `gateway.publish` before `sidecar.dispatch` and `worker.run_batch`; generation (`/v1/generate`, `/v1/chat/completions`) uses `gateway.proxy_generate` / `gateway.proxy_chat` and `worker.streaming_processor`, bypassing the sidecar. Sampling defaults to a head-based parent sampler (`parentbased_traceidratio` at `0.05`), which honors an inbound `traceparent` decision and otherwise samples 5% of new traces.
+
+**Bring your own collector** (Tempo, Jaeger, or an existing OTel Collector) — recommended:
+
+```yaml
+observability:
+  tracing:
+    enabled: true
+    endpoint: "http://tempo:4317"   # OTLP gRPC
+```
+
+Or with `--set`:
+
+```bash
+helm upgrade ... \
+  --set observability.tracing.enabled=true \
+  --set observability.tracing.endpoint=http://tempo:4317
+```
+
+**Bundled collector** (opt-in; never installed by default) — renders a minimal OTel Collector and points the pods at it automatically. Leave `collector.exporterEndpoint` empty to debug-log spans in the collector pod (handy for a first run), or set it to forward to Tempo/Jaeger:
+
+```yaml
+observability:
+  tracing:
+    enabled: true
+    collector:
+      install: true
+      exporterEndpoint: "http://tempo:4317"   # optional downstream; omit to debug-log
+      exporterInsecure: true                   # set false for a TLS-enabled downstream
+```
+
+The bundled collector forwards over plaintext by default (`exporterInsecure: true`); set it to `false` when `exporterEndpoint` targets a TLS-enabled backend. Setting an explicit top-level `endpoint` takes precedence and **suppresses** the bundled collector even if `collector.install: true`, so pods export straight to your external backend and no unused collector is rendered.
+
+**Bundled Tempo backend** (opt-in; never installed by default) — renders Grafana Tempo as an in-cluster trace backend via the `grafana-community/tempo` 2.2.3 chart (Tempo app 2.10.7) from the grafana-community repo. With tracing enabled and no explicit endpoint or bundled collector, the gateway and workers automatically export OTLP gRPC spans to `http://tempo:4317`. The Tempo query API is exposed at `http://tempo:3200`, and the chart renders a Grafana Tempo datasource ConfigMap for the already-enabled Grafana datasource sidecar:
+
+```yaml
+observability:
+  tracing:
+    enabled: true       # required for gateway/worker span emission
+    tempo:
+      install: true     # installs Tempo and defaults pods to http://tempo:4317
+kube-prometheus-stack:
+  install: true         # required for bundled Grafana to pick up the datasource
+```
+
+Installing Tempo without `observability.tracing.enabled=true` is allowed; it creates an idle backend and, when bundled Grafana is installed, a datasource. Installing both the bundled collector and bundled Tempo points pods at the collector and makes the collector forward to `http://tempo:4317` unless `collector.exporterEndpoint` is set. An explicit top-level `observability.tracing.endpoint` always wins over both bundled modes.
+
+The SIE Tracing dashboard renders with the standard dashboards gate (`dashboards.enabled=true` or `kube-prometheus-stack.install=true`). Its Tempo panels require a Grafana datasource with `uid: tempo`; the chart auto-provisions that datasource only when both `observability.tracing.tempo.install=true` and `kube-prometheus-stack.install=true`. External Grafana installs, or bundled Grafana pointed at an external Tempo via `observability.tracing.endpoint`, must provision the datasource themselves or the trace panels will report "datasource not found".
+
+Bundled Tempo enables a persistent volume (`~10Gi`) and requires a default StorageClass in the target cluster; otherwise the Tempo pod will not schedule. The upstream chart also exposes unused legacy receiver Service ports (`9411`, `55680`, `55681`) even though SIE only configures OTLP gRPC ingest on `4317` and the query API on `3200`.
+
+Tunables: `observability.tracing.sampler` / `samplerArg` (sampling), and `observability.tracing.serviceName.{gateway,worker,workerSidecar}` (the `OTEL_SERVICE_NAME` shown in the backend, defaulting to `sie-gateway` / `sie-server` / `sie-worker-sidecar`). When `enabled: true` you must set `endpoint`, `collector.install: true`, or `tempo.install: true`, or the chart fails fast.
+
+Local / non-Helm note: the gateway, Python worker, and Rust worker-sidecar all require `SIE_TRACING_ENABLED=true` and an OTLP endpoint (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or `OTEL_EXPORTER_OTLP_ENDPOINT`) before exporting traces. Setting only one yields no traces rather than a partial trace. In-cluster, the Helm chart sets both for you.

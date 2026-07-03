@@ -239,11 +239,11 @@ fn pinned_pool_count_for_home_queue(pools: &[Value], home_pool: &str) -> usize {
 /// non-empty-trimmed list. Missing spec / field / non-array all yield an empty
 /// set (the worker un-pins everything). Sorting makes change detection stable.
 ///
-/// Ids are shipped gateway-canonical (bare or `model:profile`); normalization
-/// (strip `:profile`, lowercase) is the worker's job, so the dedup here is on
-/// the canonical form. Distinct canonical ids that collapse to the same bare id
-/// on the worker are pushed as a "change" and the worker no-ops them — harmless,
-/// but it means the logged count is canonical, not effective.
+/// Ids are shipped gateway-canonical (bare or `model:profile`); worker-side
+/// normalization owns exact profile handling. Python preserves non-default
+/// profiles while lowercasing ids, and native Rust workers preserve HuggingFace
+/// base-id casing while folding only `:default`, so dedup here stays on the
+/// gateway form.
 fn parse_pinned_models(pool: &Value) -> Vec<String> {
     let mut out: Vec<String> = pool
         .get("spec")

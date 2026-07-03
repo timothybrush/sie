@@ -97,7 +97,7 @@ mod tests {
     use axum::http::{HeaderName, HeaderValue};
     use opentelemetry::trace::{Span as _, TraceContextExt, Tracer, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     /// Install the propagator once per test process. Each test path
     /// is independent; installing twice is harmless (the global
@@ -120,7 +120,7 @@ mod tests {
         let cx = extract_context_from_headers(&headers);
         // Attach the context, create a child span; the child's parent
         // should match the extracted trace id.
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
         let span = tracer.start_with_context("child", &cx);
         let span_cx = span.span_context().clone();
@@ -145,12 +145,11 @@ mod tests {
     #[test]
     fn inject_with_active_span_yields_w3c_traceparent() {
         install_propagator();
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
         let span = tracer.start("parent");
-        // `TraceContextExt::with_span` is the 0.24 API for building a
-        // context that carries a span; the older `current_with_span`
-        // free function was retired with 0.23.
+        // `TraceContextExt::with_span` builds a context that carries
+        // a span for propagation.
         let cx = Context::current().with_span(span);
         let (tp, _ts) = inject_context(&cx);
         let tp = tp.expect("active span should inject a traceparent");

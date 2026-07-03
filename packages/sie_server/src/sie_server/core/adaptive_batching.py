@@ -4,8 +4,21 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class AdaptiveBatchTarget(Protocol):
+    """The mutable batch limits the controller drives.
+
+    ``BatchConfig`` satisfies this structurally; declaring it here lets the
+    controller own its write-back without importing the concrete config
+    (which would couple this leaf module to ``batcher`` and risk a cycle).
+    """
+
+    max_batch_wait_ms: float
+    max_batch_cost: int
 
 
 @dataclass(slots=True)
@@ -401,6 +414,29 @@ class AdaptiveBatchController:
         )
 
         return self._current_wait_ms, self._current_batch_cost
+
+    def apply_step(
+        self,
+        target: AdaptiveBatchTarget,
+        observed_p50_ms: float | None,
+        fill_ratio: float | None,
+        *,
+        batch_size: int | None = None,
+    ) -> tuple[float, int]:
+        """Advance the controller and write the new limits into ``target``.
+
+        Single owner of the controller-output → batch-config write-back that
+        previously lived inline in ``ModelWorker._process_loop``. Returns
+        ``(max_batch_wait_ms, max_batch_cost)`` for the caller's metrics.
+
+        Synchronous (no ``await``): both assignments happen together on the
+        event-loop thread, so the in-place mutation stays safe against
+        ``BatchFormer``'s async lock, which cannot interleave with this block.
+        """
+        new_wait, new_cost = self.step(observed_p50_ms, fill_ratio, batch_size=batch_size)
+        target.max_batch_wait_ms = new_wait
+        target.max_batch_cost = new_cost
+        return new_wait, new_cost
 
     # ------------------------------------------------------------------
     # Starvation detector helpers

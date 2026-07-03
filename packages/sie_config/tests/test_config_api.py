@@ -1,6 +1,10 @@
+import asyncio
 import tempfile
+import threading
 from pathlib import Path
 
+import httpx
+import pytest
 import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -25,8 +29,17 @@ def _create_test_app(
     return app
 
 
-def _write_bundle(bundles_dir: Path, name: str, adapters: list[str], priority: int = 10) -> None:
+def _write_bundle(
+    bundles_dir: Path,
+    name: str,
+    adapters: list[str],
+    priority: int = 10,
+    *,
+    engine: str | None = None,
+) -> None:
     bundle = {"name": name, "priority": priority, "adapters": adapters}
+    if engine is not None:
+        bundle["engine"] = engine
     (bundles_dir / f"{name}.yaml").write_text(yaml.dump(bundle))
 
 
@@ -71,6 +84,31 @@ class TestConfigAPIModels:
         assert data["models"][0]["model_id"] == "test/model"
         assert data["models"][0]["source"] == "filesystem"
 
+    def test_list_models_uses_profile_only_candle_route_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundles = root / "bundles"
+            models = root / "models"
+            bundles.mkdir()
+            models.mkdir()
+            _write_bundle(bundles, "candle", ["sie_server_rust.adapters.candle"], priority=30, engine="candle")
+            (models / "candle-only.yaml").write_text(
+                "sie_id: org/candle-only\n"
+                "profiles:\n"
+                "  candle:\n"
+                "    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter\n"
+            )
+            app = _create_test_app(bundles, models)
+            client = TestClient(app)
+
+            resp = client.get("/v1/configs/models")
+
+        assert resp.status_code == 200
+        models_body = resp.json()["models"]
+        assert [model["model_id"] for model in models_body] == ["org/candle-only:candle"]
+        assert models_body[0]["profiles"] == ["candle"]
+        assert models_body[0]["source"] == "filesystem"
+
     def test_get_model_not_found(self) -> None:
         resp = self.client.get("/v1/configs/models/nonexistent/model")
         assert resp.status_code == 404
@@ -105,6 +143,7 @@ class TestConfigAPIModels:
         assert export.status_code == 200
         models = {m["model_id"]: m for m in export.json()["models"]}
         assert models["pool/model"]["model_config"]["pool"] == "customer-a"
+        assert models["pool/model"]["pool"] == "customer-a"
         assert "pool: customer-a" in models["pool/model"]["raw_yaml"]
 
     def test_append_model_profile_preserves_pool_in_export(self) -> None:
@@ -132,6 +171,7 @@ class TestConfigAPIModels:
         models = {m["model_id"]: m for m in export.json()["models"]}
         entry = models["pool/model"]
         assert entry["model_config"]["pool"] == "customer-a"
+        assert entry["pool"] == "customer-a"
         assert set(entry["model_config"]["profiles"]) == {"default", "fast"}
         assert "pool: customer-a" in entry["raw_yaml"]
 
@@ -254,12 +294,14 @@ class TestConfigAPIBundles:
         bundles = resp.json()["bundles"]
         assert len(bundles) == 2
         assert bundles[0]["bundle_id"] == "default"
+        assert bundles[0]["engine"] == "pytorch"
         assert bundles[0]["priority"] == 10
 
     def test_get_bundle(self) -> None:
         resp = self.client.get("/v1/configs/bundles/default")
         assert resp.status_code == 200
         assert "application/x-yaml" in resp.headers["content-type"]
+        assert "engine: pytorch" in resp.text
 
     def test_get_bundle_not_found(self) -> None:
         resp = self.client.get("/v1/configs/bundles/nonexistent")
@@ -463,9 +505,11 @@ class TestConfigAPIExport:
         assert data["bundle_config_hashes"]["default"] == self.app.state.model_registry.compute_bundle_config_hash(
             "default"
         )
+        assert data["bundle_pool_config_hashes"]["default"]["default"] == data["bundle_config_hashes"]["default"]
         assert len(data["models"]) == 1
         assert data["models"][0]["model_id"] == "test/model"
         assert data["models"][0]["affected_bundles"] == ["default"]
+        assert data["models"][0]["pool"] == "default"
 
     def test_export_includes_api_added_models(self) -> None:
         yaml_body = "sie_id: api/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:Bert\n    max_batch_tokens: 8192\n"
@@ -486,7 +530,30 @@ class TestConfigAPIExport:
         data = resp.json()
         assert data["models"] == []
         assert data["bundle_config_hashes"] == {"default": ""}
+        assert data["bundle_pool_config_hashes"] == {"default": {}}
         assert data["epoch"] == 0
+
+    def test_export_bundle_pool_hashes_are_scoped_by_model_pool(self) -> None:
+        _write_model(
+            self._models,
+            "tenant/model",
+            "sie_server.adapters.bert_flash:BertFlashAdapter",
+            pool="customer-a",
+        )
+        registry: ModelRegistry = self.app.state.model_registry
+        registry.reload()
+
+        resp = self.client.get("/v1/configs/export")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        global_hash = data["bundle_config_hashes"]["default"]
+        default_pool_hash = data["bundle_pool_config_hashes"]["default"]["default"]
+        tenant_pool_hash = data["bundle_pool_config_hashes"]["default"]["customer-a"]
+        assert default_pool_hash == registry.compute_bundle_config_hash_for_pool("default", "default")
+        assert tenant_pool_hash == registry.compute_bundle_config_hash_for_pool("default", "customer-a")
+        assert global_hash != default_pool_hash
+        assert global_hash != tenant_pool_hash
 
     def test_export_generated_at_is_utc_iso8601(self) -> None:
         from datetime import datetime
@@ -644,8 +711,100 @@ class TestConfigAPIExportNoConfigStore:
         models = {m["model_id"]: m for m in resp.json()["models"]}
         entry = models["mem/model"]
         assert entry["model_config"]["pool"] == "customer-a"
+        assert entry["pool"] == "customer-a"
         assert set(entry["model_config"]["profiles"]) == {"default", "fast"}
         assert "pool: customer-a" in entry["raw_yaml"]
+
+    def test_export_targets_variant_bundle_for_filesystem_model_without_store(self) -> None:
+        _write_bundle(
+            self._bundles,
+            "default",
+            ["sie_server.adapters.bert_flash", "sie_server.adapters.bge_m3_flash"],
+        )
+        _write_bundle(self._bundles, "candle", ["sie_server_rust.adapters.candle"], priority=30, engine="candle")
+        (self._models / "BAAI__bge-m3.yaml").write_text(
+            "sie_id: BAAI/bge-m3\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bge_m3_flash:BGEM3FlashAdapter\n"
+            "    max_batch_tokens: 16384\n"
+            "  candle:\n"
+            "    extends: default\n"
+            "    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter\n"
+        )
+        self.app = _create_test_app(self._bundles, self._models, config_store_dir=None)
+        self.client = TestClient(self.app)
+
+        resp = self.client.get("/v1/configs/export")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        models = {m["model_id"]: m for m in data["models"]}
+        entry = models["BAAI/bge-m3"]
+        assert entry["affected_bundles"] == ["default", "candle"]
+        assert entry["pool"] == "default"
+        assert set(entry["model_config"]["profiles"]) == {"default", "candle"}
+        registry: ModelRegistry = self.app.state.model_registry
+        assert data["bundle_pool_config_hashes"]["candle"]["default"] == registry.compute_bundle_config_hash_for_pool(
+            "candle", "default"
+        )
+        candle_applied = [m for m in data["models"] if "candle" in m["affected_bundles"]]
+        assert [m["model_id"] for m in candle_applied] == ["BAAI/bge-m3"]
+
+    def test_export_prefers_registry_merge_for_filesystem_append_without_store(self) -> None:
+        _write_bundle(
+            self._bundles,
+            "default",
+            ["sie_server.adapters.bert_flash", "sie_server.adapters.bge_m3_flash"],
+        )
+        _write_bundle(self._bundles, "candle", ["sie_server_rust.adapters.candle"], priority=30, engine="candle")
+        (self._models / "BAAI__bge-m3.yaml").write_text(
+            "sie_id: BAAI/bge-m3\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bge_m3_flash:BGEM3FlashAdapter\n"
+            "    max_batch_tokens: 16384\n"
+        )
+        self.app = _create_test_app(self._bundles, self._models, config_store_dir=None)
+        self.client = TestClient(self.app)
+
+        appended = (
+            "sie_id: BAAI/bge-m3\n"
+            "profiles:\n"
+            "  candle:\n"
+            "    extends: default\n"
+            "    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter\n"
+        )
+        post = self.client.post("/v1/configs/models", content=appended)
+        assert post.status_code == 201
+        assert post.json()["routable_bundles_by_profile"] == {"candle": ["candle"]}
+
+        resp = self.client.get("/v1/configs/export")
+
+        assert resp.status_code == 200
+        models = {m["model_id"]: m for m in resp.json()["models"]}
+        entry = models["BAAI/bge-m3"]
+        assert entry["affected_bundles"] == ["default", "candle"]
+        assert set(entry["model_config"]["profiles"]) == {"default", "candle"}
+        assert "candle:" in entry["raw_yaml"]
+
+    def test_export_replaces_invalid_raw_yaml_with_registry_config(self) -> None:
+        _write_model(self._models, "test/model", "sie_server.adapters.bert_flash:BertFlashAdapter")
+        app = _create_test_app(self._bundles, self._models, str(self._root / "invalid_store"))
+        client = TestClient(app)
+        store: ConfigStore = app.state.config_store
+        store.write_model("test/model", "profiles: [")
+
+        resp = client.get("/v1/configs/export")
+
+        assert resp.status_code == 200
+        models = {m["model_id"]: m for m in resp.json()["models"]}
+        entry = models["test/model"]
+        assert entry["raw_yaml"] != "profiles: ["
+        assert "profiles:" in entry["raw_yaml"]
+        assert entry["model_config"]["profiles"]["default"]["adapter_path"] == (
+            "sie_server.adapters.bert_flash:BertFlashAdapter"
+        )
 
     def test_nats_delta_carries_merged_yaml_without_store(self) -> None:
         """On the NATS publish path, the delta payload must be the full
@@ -1020,6 +1179,367 @@ class TestIdempotencyEvictionSafety:
             "idempotent replay must NOT bump the epoch"
         )
 
+    def test_concurrent_same_key_waiter_gets_cached_success(self, monkeypatch) -> None:
+        body = (
+            "sie_id: idem/concurrent-success\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        original_write_model = self.app.state.config_store.write_model
+        release_write = threading.Event()
+        calls: list[str] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            write_started = asyncio.Event()
+
+            def blocking_write_model(model_id: str, config_yaml: str) -> None:
+                calls.append(model_id)
+                loop.call_soon_threadsafe(write_started.set)
+                if not release_write.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release write")
+                original_write_model(model_id, config_yaml)
+
+            monkeypatch.setattr(self.app.state.config_store, "write_model", blocking_write_model)
+
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-success"})
+                )
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                waiter = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-success"})
+                )
+                await asyncio.sleep(0.05)
+                assert not waiter.done(), "same-key request did not wait on the in-flight owner"
+
+                release_write.set()
+                owner_resp, waiter_resp = await asyncio.gather(owner, waiter)
+
+                assert owner_resp.status_code == 201, owner_resp.text
+                assert waiter_resp.status_code == 201, waiter_resp.text
+                assert waiter_resp.json() == owner_resp.json()
+                assert calls == ["idem/concurrent-success"]
+
+        asyncio.run(run())
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 1
+
+    def test_concurrent_same_key_different_body_returns_422_while_owner_in_flight(self, monkeypatch) -> None:
+        owner_body = (
+            "sie_id: idem/concurrent-mismatch-a\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        mismatch_body = (
+            "sie_id: idem/concurrent-mismatch-b\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        original_write_model = self.app.state.config_store.write_model
+        release_write = threading.Event()
+        calls: list[str] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            write_started = asyncio.Event()
+
+            def blocking_write_model(model_id: str, config_yaml: str) -> None:
+                calls.append(model_id)
+                loop.call_soon_threadsafe(write_started.set)
+                if not release_write.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release write")
+                original_write_model(model_id, config_yaml)
+
+            monkeypatch.setattr(self.app.state.config_store, "write_model", blocking_write_model)
+
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=owner_body, headers={"Idempotency-Key": "K-mismatch"})
+                )
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                try:
+                    mismatch = await asyncio.wait_for(
+                        ac.post(
+                            "/v1/configs/models",
+                            content=mismatch_body,
+                            headers={"Idempotency-Key": "K-mismatch"},
+                        ),
+                        timeout=1,
+                    )
+                    assert mismatch.status_code == 422, mismatch.text
+                    assert mismatch.json()["detail"]["error"] == "idempotency_mismatch"
+                finally:
+                    release_write.set()
+
+                owner_resp = await asyncio.wait_for(owner, timeout=1)
+                assert owner_resp.status_code == 201, owner_resp.text
+                assert calls == ["idem/concurrent-mismatch-a"]
+
+        asyncio.run(run())
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 1
+
+    def test_concurrent_same_key_waiter_gets_owner_failure(self, monkeypatch) -> None:
+        body = (
+            "sie_id: idem/concurrent-failure\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        release_write = threading.Event()
+        calls: list[str] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            write_started = asyncio.Event()
+
+            def failing_write_model(model_id: str, _config_yaml: str) -> None:
+                calls.append(model_id)
+                loop.call_soon_threadsafe(write_started.set)
+                if not release_write.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release write")
+                raise RuntimeError("injected store write failure")
+
+            monkeypatch.setattr(self.app.state.config_store, "write_model", failing_write_model)
+
+            transport = httpx.ASGITransport(app=self.app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-failure"})
+                )
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                waiter = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-failure"})
+                )
+                await asyncio.sleep(0.05)
+                assert not waiter.done(), "same-key request did not wait on the in-flight owner"
+
+                release_write.set()
+                owner_resp, waiter_resp = await asyncio.gather(owner, waiter)
+
+                assert owner_resp.status_code == 500, owner_resp.text
+                assert waiter_resp.status_code == 500, waiter_resp.text
+                assert "idempotent_replay_evicted" not in waiter_resp.text
+                assert calls == ["idem/concurrent-failure"]
+
+        asyncio.run(run())
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 0
+
+    def test_waiter_reports_failed_owner_even_if_later_retry_starts_first(self, monkeypatch) -> None:
+        body = (
+            "sie_id: idem/concurrent-failure-retry\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        original_write_model = self.app.state.config_store.write_model
+        release_first_write = threading.Event()
+        calls: list[str] = []
+        call_lock = threading.Lock()
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            write_started = asyncio.Event()
+            write_failed = asyncio.Event()
+
+            def first_write_fails(model_id: str, config_yaml: str) -> None:
+                with call_lock:
+                    calls.append(model_id)
+                    call_index = len(calls)
+                if call_index == 1:
+                    loop.call_soon_threadsafe(write_started.set)
+                    if not release_first_write.wait(timeout=5):
+                        raise RuntimeError("timed out waiting to release failed write")
+                    loop.call_soon_threadsafe(write_failed.set)
+                    raise RuntimeError("injected first store write failure")
+                original_write_model(model_id, config_yaml)
+
+            monkeypatch.setattr(self.app.state.config_store, "write_model", first_write_fails)
+
+            transport = httpx.ASGITransport(app=self.app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-fail-retry"})
+                )
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                waiter = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-fail-retry"})
+                )
+                await asyncio.sleep(0.05)
+                assert not waiter.done(), "same-key request did not wait on the in-flight owner"
+
+                idem = self.app.state._config_idempotency_state
+                await idem.lock.acquire()
+                try:
+                    release_first_write.set()
+                    await asyncio.wait_for(write_failed.wait(), timeout=1)
+                    await asyncio.sleep(0.05)
+                    retry = asyncio.create_task(
+                        ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-fail-retry"})
+                    )
+                    await asyncio.sleep(0.05)
+                finally:
+                    idem.lock.release()
+
+                owner_resp, waiter_resp, retry_resp = await asyncio.gather(owner, waiter, retry)
+
+                assert owner_resp.status_code == 500, owner_resp.text
+                assert waiter_resp.status_code == 500, waiter_resp.text
+                assert "idempotent_replay_evicted" not in waiter_resp.text
+                assert retry_resp.status_code == 201, retry_resp.text
+                assert calls == ["idem/concurrent-failure-retry", "idem/concurrent-failure-retry"]
+
+        asyncio.run(run())
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 1
+
+    def test_concurrent_same_key_cancellation_waits_for_durable_outcome(self, monkeypatch) -> None:
+        body = (
+            "sie_id: idem/concurrent-cancel\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        original_write_model = self.app.state.config_store.write_model
+        release_write = threading.Event()
+        calls: list[str] = []
+        call_lock = threading.Lock()
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            write_started = asyncio.Event()
+
+            def slow_write_model(model_id: str, config_yaml: str) -> None:
+                with call_lock:
+                    calls.append(model_id)
+                    call_index = len(calls)
+                if call_index == 1:
+                    loop.call_soon_threadsafe(write_started.set)
+                    if not release_write.wait(timeout=5):
+                        raise RuntimeError("timed out waiting to release cancelled write")
+                original_write_model(model_id, config_yaml)
+
+            monkeypatch.setattr(self.app.state.config_store, "write_model", slow_write_model)
+
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-cancel"})
+                )
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                waiter = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-cancel"})
+                )
+                await asyncio.sleep(0.05)
+                assert not waiter.done(), "same-key request did not wait on the in-flight owner"
+
+                owner.cancel()
+                await asyncio.sleep(0.05)
+                assert not owner.done(), "cancelled owner returned before the store write finished"
+                assert not waiter.done(), "waiter returned before the owner published its durable outcome"
+                release_write.set()
+
+                try:
+                    owner_result = await asyncio.wait_for(owner, timeout=1)
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    pytest.fail(f"cancelled owner unexpectedly returned {owner_result!r}")
+
+                waiter_resp = await asyncio.wait_for(waiter, timeout=1)
+                assert waiter_resp.status_code == 201, waiter_resp.text
+
+                retry_resp = await ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-cancel"})
+                assert retry_resp.status_code == 201, retry_resp.text
+                assert retry_resp.json() == waiter_resp.json()
+
+        asyncio.run(run())
+        assert calls == ["idem/concurrent-cancel"]
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 1
+
+    def test_pre_commit_cancellation_cleanup_survives_second_cancel(self, monkeypatch) -> None:
+        body = (
+            "sie_id: idem/pre-commit-cancel\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:A\n"
+            "    max_batch_tokens: 1\n"
+        )
+        original_read_model = self.app.state.config_store.read_model
+        release_read = threading.Event()
+        calls: list[str] = []
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            read_started = asyncio.Event()
+
+            def blocking_read_model(model_id: str) -> str | None:
+                calls.append(model_id)
+                loop.call_soon_threadsafe(read_started.set)
+                if not release_read.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release read")
+                return original_read_model(model_id)
+
+            monkeypatch.setattr(self.app.state.config_store, "read_model", blocking_read_model)
+
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+                owner = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-pre-cancel"})
+                )
+                await asyncio.wait_for(read_started.wait(), timeout=1)
+
+                waiter = asyncio.create_task(
+                    ac.post("/v1/configs/models", content=body, headers={"Idempotency-Key": "K-pre-cancel"})
+                )
+                await asyncio.sleep(0.05)
+                assert not waiter.done(), "same-key request did not wait on the in-flight owner"
+
+                idem = self.app.state._config_idempotency_state
+                await idem.lock.acquire()
+                try:
+                    owner.cancel()
+                    await asyncio.sleep(0.05)
+                    assert not owner.done(), "owner cleanup finished while idempotency lock was held"
+                    assert not waiter.done(), "waiter returned before cancellation cleanup completed"
+
+                    owner.cancel()
+                    await asyncio.sleep(0.05)
+                    assert not owner.done(), "second cancellation interrupted idempotency cleanup"
+                    assert not waiter.done(), "second cancellation left waiter with a partial outcome"
+                finally:
+                    idem.lock.release()
+                    release_read.set()
+
+                try:
+                    owner_result = await asyncio.wait_for(owner, timeout=1)
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    pytest.fail(f"cancelled owner unexpectedly returned {owner_result!r}")
+
+                waiter_resp = await asyncio.wait_for(waiter, timeout=1)
+                assert waiter_resp.status_code == 503, waiter_resp.text
+                assert waiter_resp.json()["detail"]["error"] == "idempotent_inflight_cancelled"
+
+        asyncio.run(run())
+        assert calls == ["idem/pre-commit-cancel"]
+        assert self.client.get("/v1/configs/epoch").json()["epoch"] == 0
+
     def test_concurrent_writes_serialize_and_bump_epoch_once_each(self) -> None:
         # Real concurrent-write regression: fire off N POSTs from the same
         # async event loop and assert (a) every write succeeded, (b) the
@@ -1030,10 +1550,6 @@ class TestIdempotencyEvictionSafety:
         # — without the lock, two concurrent `increment_epoch` calls both
         # read N, both write N+1, and the final epoch would be N+1 instead
         # of N+M.
-        import asyncio
-
-        import httpx
-
         async def run() -> None:
             transport = httpx.ASGITransport(app=self.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
@@ -1076,10 +1592,6 @@ class TestIdempotencyEvictionSafety:
         # snapshot's `epoch` never exceeds `len(models_in_snapshot) -
         # preseed_count` (each successful write bumps the epoch once and
         # adds exactly one model).
-        import asyncio
-
-        import httpx
-
         async def run() -> None:
             transport = httpx.ASGITransport(app=self.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:

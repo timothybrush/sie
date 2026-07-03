@@ -26,6 +26,7 @@ from sie_server.config.engine import EngineConfig
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.memory import MemoryConfig
 from sie_server.core.registry import ModelRegistry
+from sie_server.core.residency import EvictionResult
 from sie_server.observability.metrics import IDLE_EVICTIONS_TOTAL
 
 
@@ -346,3 +347,100 @@ async def test_idle_evictor_skips_pinned_model(mock_load_adapter: MagicMock) -> 
     # Non-pinned model evicted; pinned model kept
     assert not reg.is_loaded("model-evictable")
     assert reg.is_loaded("model-pinned")
+
+
+# --------------------------------------------------------------------------
+# _do_unload must not leave a MemoryManager "ghost" on adapter failure (#1600)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_do_unload_raising_adapter_leaves_no_ghost(mock_load_adapter: MagicMock) -> None:
+    """A raising ``adapter.unload()`` must still unregister the model from the
+    MemoryManager.
+
+    Otherwise the model becomes a ghost — absent from ``_loaded`` but still in
+    ``_models`` — that ``get_lru_model`` keeps re-selecting while ``_do_unload``
+    no-ops on it, a no-yield spin under ``_load_lock`` that hangs the server.
+    See #1600.
+    """
+    adapter = MagicMock()
+    adapter.capabilities.outputs = ["dense"]
+    adapter.aclose_client = None  # not an SGLang-style client-holding adapter
+    adapter.unload.side_effect = RuntimeError("unload boom")
+    mock_load_adapter.return_value = adapter
+
+    reg = _build_registry(idle_evict_s=None)
+    reg.add_config(_make_config(name="doomed"))
+    await reg.load_async("doomed", device="cpu")
+    assert reg._memory_manager.get_model_info("doomed") is not None
+
+    # _do_unload re-raises the adapter error (try/finally, not try/except)...
+    with pytest.raises(RuntimeError, match="unload boom"):
+        await reg._do_unload("doomed")
+
+    # ...but the model is gone from BOTH _loaded and the MemoryManager — the
+    # finally ran unregister_model, so there is no ghost to spin on.
+    assert "doomed" not in reg._loaded
+    assert reg._memory_manager.get_model_info("doomed") is None
+    assert reg._memory_manager.loaded_model_count == 0
+
+
+# --------------------------------------------------------------------------
+# evict_lru_excluding — typed EvictionResult (issue #1569)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_evict_lru_excluding_no_candidate(mock_load_adapter: MagicMock) -> None:
+    """Only the excluded model is resident → NO_CANDIDATE (not a bare False)."""
+    adapter = MagicMock()
+    adapter.capabilities.outputs = ["dense"]
+    mock_load_adapter.return_value = adapter
+
+    reg = _build_registry(idle_evict_s=None)
+    reg.add_config(_make_config(name="only-self"))
+    await reg.load_async("only-self", device="cpu")
+
+    assert await reg.evict_lru_excluding("only-self") is EvictionResult.NO_CANDIDATE
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_evict_lru_excluding_evicts_sibling(mock_load_adapter: MagicMock) -> None:
+    """A cold sibling is unloaded → EVICTED, targeting that sibling."""
+    adapters = [MagicMock(), MagicMock()]
+    for a in adapters:
+        a.capabilities.outputs = ["dense"]
+    mock_load_adapter.side_effect = adapters
+
+    reg = _build_registry(idle_evict_s=None)
+    reg.add_config(_make_config(name="keep-me"))
+    reg.add_config(_make_config(name="evict-me"))
+    await reg.load_async("keep-me", device="cpu")
+    await reg.load_async("evict-me", device="cpu")
+
+    reg._do_unload = AsyncMock()
+    assert await reg.evict_lru_excluding("keep-me") is EvictionResult.EVICTED
+    reg._do_unload.assert_awaited_once_with("evict-me")
+
+
+@pytest.mark.asyncio
+@patch("sie_server.core.model_loader.load_adapter")
+async def test_evict_lru_excluding_unload_failure(mock_load_adapter: MagicMock) -> None:
+    """If the chosen candidate's unload raises → UNLOAD_FAILED."""
+    adapters = [MagicMock(), MagicMock()]
+    for a in adapters:
+        a.capabilities.outputs = ["dense"]
+    mock_load_adapter.side_effect = adapters
+
+    reg = _build_registry(idle_evict_s=None)
+    reg.add_config(_make_config(name="keep-me"))
+    reg.add_config(_make_config(name="evict-me"))
+    await reg.load_async("keep-me", device="cpu")
+    await reg.load_async("evict-me", device="cpu")
+
+    reg._do_unload = AsyncMock(side_effect=RuntimeError("boom"))
+    assert await reg.evict_lru_excluding("keep-me") is EvictionResult.UNLOAD_FAILED

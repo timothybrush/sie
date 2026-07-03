@@ -28,7 +28,9 @@ deps:
   #   * grammar backends: ``xgrammar`` / ``outlines`` / ``llguidance`` / ``none``
   #   * ``sgl_kernel`` covers SM_80 / SM_89 / SM_90 / SM_100 via gencode.
   #   * torch==2.9.1 (CUDA 12.9 wheels); ``cuda-python==12.9``.
-  sglang: '==0.5.10.post1'
+  sglang:
+    version: '==0.5.10.post1'
+    marker: sys_platform == 'linux'
   #
   # Grammar backend deps — pinned to exactly what SGLang 0.5.10 imports
   # internally to prevent silent pip resolution drift.
@@ -37,7 +39,9 @@ deps:
   # ``xgrammar==0.1.32`` exactly. That release also brought the
   # structured-output VRAM-leak fix (PR #20697) and grammar-error
   # propagation (PR #20467). Kept available as the fallback backend.
-  xgrammar: '==0.1.32'
+  xgrammar:
+    version: '==0.1.32'
+    marker: sys_platform == 'linux'
   #
   # ``outlines==0.1.11`` is a hard transitive dep of sglang==0.5.10.post1. We
   # declare it explicitly at bundle level so the surface is visible.
@@ -58,9 +62,22 @@ deps:
   # ``OutlinesGrammarBackend`` does internally), so the mismatch is gone
   # for json_schema/regex; ebnf is forwarded straight to SGLang. See
   # ``processors/grammar_compile.py`` ("Tokenizer adapter").
-  outlines: '==0.1.11'
+  outlines:
+    version: '==0.1.11'
+    marker: sys_platform == 'linux'
   #
   # llguidance is the third grammar backend (regex / json_schema / ebnf).
   # Pinned to SGLang 0.5.10's compatible range. Kept available as the
   # fallback if a future model regresses on xgrammar.
-  llguidance: '>=0.7.11,<0.8.0'
+  llguidance:
+    version: '>=0.7.11,<0.8.0'
+    marker: sys_platform == 'linux'
+  # Apple Silicon (Metal) generation. SGLang is CUDA-only, so on macOS the
+  # SGLangGenerationAdapter.create_for_device swap serves generation via Apple's
+  # MLX (mlx_lm.server) instead — this makes the same bundle resolve correctly on
+  # both platforms (CUDA -> SGLang, Darwin -> MLX). mlx-lm pulls transformers>=5,
+  # which the MLX path needs and which is darwin-only here so it never perturbs
+  # the Linux resolve.
+  mlx-lm:
+    version: '>=0.30.7'
+    marker: sys_platform == 'darwin'

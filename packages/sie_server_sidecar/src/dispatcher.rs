@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::backend::{BackendError, SharedBackend};
+use crate::batch_cancel::BatchCancelState;
 use crate::config_subscriber::ConfigApplyState;
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::ipc_types::{
@@ -40,11 +41,11 @@ use crate::payload_store::{PayloadError, PayloadStore};
 use crate::pool_admission::PoolAdmissionGate;
 use crate::publisher::{should_publish, Timings, WorkPublisher};
 use crate::scheduler::{
-    lora_from_options, Op as SchedOp, ProductionScheduler, ProductionSchedulerRegistry,
+    lora_from_options, HasCost, Op as SchedOp, ProductionScheduler, ProductionSchedulerRegistry,
     SchedulerItem, SchedulerMeta,
 };
 use crate::shutdown::Shutdown;
-use crate::subject::extract_model_id;
+use crate::subject::{extract_model_id, is_worker_direct_work_subject};
 use crate::tokenize::TokenizerRegistry;
 use crate::work_types::WorkItem;
 
@@ -348,6 +349,7 @@ pub struct Dispatcher {
     /// final-drain windows have a chance to complete.
     pub scheduler_drain_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     pub generation_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pub batch_cancel_state: BatchCancelState,
 }
 
 impl Dispatcher {
@@ -376,6 +378,7 @@ impl Dispatcher {
         shutdown: Option<Arc<Shutdown>>,
         config_apply_state: Option<Arc<ConfigApplyState>>,
         pool_admission: Option<Arc<PoolAdmissionGate>>,
+        batch_cancel_state: BatchCancelState,
     ) -> Self {
         debug_assert_eq!(
             scheduler_registry.is_some(),
@@ -397,6 +400,7 @@ impl Dispatcher {
             pool_admission,
             scheduler_drain_handles: Arc::new(Mutex::new(HashMap::new())),
             generation_handles: Arc::new(Mutex::new(Vec::new())),
+            batch_cancel_state,
         }
     }
 }
@@ -406,6 +410,32 @@ impl Dispatcher {
         self.config_apply_state
             .as_ref()
             .map(|state| state.current_bundle_config_hash())
+    }
+
+    fn is_cancelled_worker_direct_batch(
+        &self,
+        request_id: &str,
+        operation: &str,
+        worker_direct: bool,
+    ) -> bool {
+        worker_direct && operation != "generate" && self.batch_cancel_state.is_cancelled(request_id)
+    }
+
+    async fn ack_cancelled_worker_direct_batch(&self, wi: &WorkItem, msg: &Message) {
+        debug!(
+            request_id = %wi.request_id,
+            work_item_id = %wi.work_item_id,
+            operation = %wi.operation,
+            subject = %msg.subject,
+            "batch-direct: ACKing cancelled worker-direct item"
+        );
+        match ack(msg).await {
+            Ok(()) => self.metrics.messages_acked_total.inc(),
+            Err(e) => {
+                warn!(error = %e, "ack failed on cancelled worker-direct batch item");
+                self.metrics.jetstream_ack_failures_total.inc();
+            }
+        }
     }
 }
 
@@ -503,6 +533,15 @@ impl Dispatcher {
                                 self.metrics.jetstream_ack_failures_total.inc();
                             }
                         }
+                        continue;
+                    }
+                    let worker_direct = is_worker_direct_work_subject(&msg.subject);
+                    if self.is_cancelled_worker_direct_batch(
+                        &wi.request_id,
+                        &wi.operation,
+                        worker_direct,
+                    ) {
+                        self.ack_cancelled_worker_direct_batch(&wi, &msg).await;
                         continue;
                     }
                     if let Some(gate) = self.pool_admission.as_ref() {
@@ -855,6 +894,7 @@ impl Dispatcher {
                                 &wi,
                                 "internal_error",
                                 "failed to decode offloaded generate payload",
+                                is_worker_direct_work_subject(&msg.subject),
                             )
                             .await
                         {
@@ -917,7 +957,12 @@ impl Dispatcher {
                     "failed to re-encode generate WorkItem — publishing error + ACK"
                 );
                 match self
-                    .publish_error(&wi, "internal_error", "failed to encode generate work item")
+                    .publish_error(
+                        &wi,
+                        "internal_error",
+                        "failed to encode generate work item",
+                        is_worker_direct_work_subject(&msg.subject),
+                    )
                     .await
                 {
                     Ok(_) => match ack(&msg).await {
@@ -1169,7 +1214,12 @@ impl Dispatcher {
         for (wi, msg) in &unknown_items {
             warn!(op = %wi.operation, "unknown operation — publishing error + ACK");
             match self
-                .publish_error(wi, "bad_operation", "unknown operation")
+                .publish_error(
+                    wi,
+                    "bad_operation",
+                    "unknown operation",
+                    is_worker_direct_work_subject(&msg.subject),
+                )
                 .await
             {
                 Ok(_) => match ack(msg).await {
@@ -1290,7 +1340,12 @@ impl Dispatcher {
                         "failed to resolve encode item"
                     );
                     match self
-                        .publish_error(&wi, "payload_error", "failed to resolve item")
+                        .publish_error(
+                            &wi,
+                            "payload_error",
+                            "failed to resolve item",
+                            is_worker_direct_work_subject(&msg.subject),
+                        )
                         .await
                     {
                         Ok(_) => match ack(&msg).await {
@@ -1405,7 +1460,12 @@ impl Dispatcher {
                         "failed to resolve score payload"
                     );
                     match self
-                        .publish_error(&wi, "payload_error", "failed to resolve score payload")
+                        .publish_error(
+                            &wi,
+                            "payload_error",
+                            "failed to resolve score payload",
+                            is_worker_direct_work_subject(&msg.subject),
+                        )
                         .await
                     {
                         Ok(_) => match ack(&msg).await {
@@ -1520,7 +1580,12 @@ impl Dispatcher {
                         "failed to resolve extract item"
                     );
                     match self
-                        .publish_error(&wi, "payload_error", "failed to resolve item")
+                        .publish_error(
+                            &wi,
+                            "payload_error",
+                            "failed to resolve item",
+                            is_worker_direct_work_subject(&msg.subject),
+                        )
                         .await
                     {
                         Ok(_) => match ack(&msg).await {
@@ -1685,7 +1750,12 @@ impl Dispatcher {
                     });
                     match self
                         .publisher
-                        .publish_result(&wi.reply_subject, outcome, timings)
+                        .publish_result(
+                            &wi.reply_subject,
+                            outcome,
+                            timings,
+                            is_worker_direct_work_subject(&msg.subject),
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -1827,6 +1897,7 @@ impl Dispatcher {
         wi: &WorkItem,
         code: &str,
         message: &str,
+        worker_direct: bool,
     ) -> Result<bool, crate::publisher::PublishError> {
         // Synthetic outcome so we reuse the publisher encoder. No timings:
         // error-only publishes omit queue_ms / processing_ms / payload_fetch_ms.
@@ -1846,7 +1917,7 @@ impl Dispatcher {
         };
         match self
             .publisher
-            .publish_result(&wi.reply_subject, &outcome, None)
+            .publish_result(&wi.reply_subject, &outcome, None, worker_direct)
             .await
         {
             Ok(()) => Ok(true),
@@ -2023,7 +2094,8 @@ impl Dispatcher {
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens,
             };
-            let meta = SchedulerMeta::new(wi, msg, fetch_ms);
+            let worker_direct = is_worker_direct_work_subject(&msg.subject);
+            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
             scheduler
                 .submit(SchedOp::Encode, lora, SchedulerItem::Encode(ebi), meta)
                 .await;
@@ -2074,7 +2146,8 @@ impl Dispatcher {
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens: None,
             };
-            let meta = SchedulerMeta::new(wi, msg, fetch_ms);
+            let worker_direct = is_worker_direct_work_subject(&msg.subject);
+            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
             scheduler
                 .submit(SchedOp::Score, lora, SchedulerItem::Score(sbi), meta)
                 .await;
@@ -2122,7 +2195,8 @@ impl Dispatcher {
                 bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
                 payload_fetch_ms: fetch_ms,
             };
-            let meta = SchedulerMeta::new(wi, msg, fetch_ms);
+            let worker_direct = is_worker_direct_work_subject(&msg.subject);
+            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
             scheduler
                 .submit(SchedOp::Extract, lora, SchedulerItem::Extract(xbi), meta)
                 .await;
@@ -2144,7 +2218,12 @@ impl Dispatcher {
             "{log_msg}"
         );
         match self
-            .publish_error(wi, "payload_error", "failed to resolve item")
+            .publish_error(
+                wi,
+                "payload_error",
+                "failed to resolve item",
+                is_worker_direct_work_subject(&msg.subject),
+            )
             .await
         {
             Ok(_) => match ack(msg).await {
@@ -2751,6 +2830,51 @@ async fn process_scheduler_batch(
     if batch.items.is_empty() {
         return;
     }
+    assert_eq!(
+        batch.items.len(),
+        batch.metadata.len(),
+        "FormattedBatch items and metadata must stay aligned",
+    );
+    let crate::scheduler::FormattedBatch {
+        items,
+        metadata,
+        total_cost: _,
+    } = batch;
+    let mut kept_items = Vec::with_capacity(items.len());
+    let mut kept_metadata = Vec::with_capacity(metadata.len());
+    let mut kept_cost = 0_u64;
+    let mut cancelled = 0_usize;
+    for (item, meta) in items.into_iter().zip(metadata) {
+        if dispatcher.is_cancelled_worker_direct_batch(
+            &meta.wi.request_id,
+            &meta.wi.operation,
+            meta.worker_direct,
+        ) {
+            dispatcher
+                .ack_cancelled_worker_direct_batch(&meta.wi, &meta.msg)
+                .await;
+            cancelled += 1;
+            continue;
+        }
+        kept_cost += item.cost();
+        kept_items.push(item);
+        kept_metadata.push(meta);
+    }
+    if cancelled > 0 {
+        debug!(
+            model = %model_id,
+            cancelled,
+            "batch-direct: dropped cancelled worker-direct scheduler items before IPC"
+        );
+    }
+    let batch = crate::scheduler::FormattedBatch {
+        items: kept_items,
+        metadata: kept_metadata,
+        total_cost: kept_cost,
+    };
+    if batch.items.is_empty() {
+        return;
+    }
     let batch_size = batch.items.len();
     let total_cost = batch.total_cost;
     let op_label = match op {
@@ -2767,10 +2891,104 @@ async fn process_scheduler_batch(
     // ordering guarantees hang off it across threads.
     let batch_id = SCHEDULER_BATCH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // Zip each scheduler item with its parallel metadata so we can copy
+    // the originating `WorkItem`'s W3C trace context onto the wire item.
+    // `batch.metadata` is borrowed here and only consumed later in this
+    // function (the NAK / `apply_outcomes` paths), so `.iter()` is fine.
+    // Guard the parallel-vector invariant: `zip()` would silently truncate
+    // and drop work items if `items` and `metadata` ever drifted apart.
+    assert_eq!(
+        batch.items.len(),
+        batch.metadata.len(),
+        "FormattedBatch items and metadata must stay aligned",
+    );
+    // Open the `sidecar.dispatch` span so the queue hop is visible in
+    // the trace: `gateway.proxy → sidecar.dispatch → worker.run_batch`.
+    // It is created here (before the IPC dispatch) and kept alive — but
+    // only *entered* synchronously, never across an `.await` — so its
+    // OTel duration covers the dispatch and it is not held on the
+    // worker thread while the task is parked. When no OTLP exporter is
+    // configured the `tracing_opentelemetry` layer is absent, so this
+    // span produces no OTel span and the gateway-context fallback below
+    // keeps `gateway → worker` linkage intact (propagator-only parity).
+    let dispatch_span = tracing::info_span!(
+        "sidecar.dispatch",
+        otel.name = "sidecar.dispatch",
+        sie.op = op_label,
+        sie.model = %model_id,
+        sie.batch_id = batch_id,
+        sie.batch_size = batch_size,
+    );
+    {
+        // A coalesced batch can mix items from several gateway traces.
+        // A span has exactly one parent but may carry many links, so we
+        // parent on the first valid gateway context and record the
+        // remaining distinct contexts as links (OTel batch convention).
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let mut linked: HashSet<&str> = HashSet::new();
+        // Parent on the first item carrying a *valid* inbound context,
+        // not merely the first item. A leading untraced item would
+        // otherwise root the sidecar span on a fresh trace and — once
+        // the outgoing items are overwritten with that context below —
+        // strip the gateway lineage from the batch's genuinely-traced
+        // items. `set_parent` then always receives a valid context, so
+        // its `Result` is an `Ok` we discard.
+        if let Some(parent) = batch.metadata.iter().find(|meta| {
+            crate::observability::propagation::remote_span_context(
+                meta.wi.traceparent.as_deref(),
+                meta.wi.tracestate.as_deref(),
+            )
+            .is_some()
+        }) {
+            let tp = parent.wi.traceparent.as_deref();
+            let ts = parent.wi.tracestate.as_deref();
+            let _ = dispatch_span.set_parent(
+                crate::observability::propagation::extract_context_from_w3c(tp, ts),
+            );
+            if let Some(tp) = tp {
+                linked.insert(tp);
+            }
+        }
+        for meta in batch.metadata.iter() {
+            let Some(tp) = meta.wi.traceparent.as_deref() else {
+                continue;
+            };
+            if !linked.insert(tp) {
+                continue;
+            }
+            if let Some(sc) = crate::observability::propagation::remote_span_context(
+                Some(tp),
+                meta.wi.tracestate.as_deref(),
+            ) {
+                dispatch_span.add_link(sc);
+            }
+        }
+    }
+
+    // Serialise the sidecar span back into W3C strings (entered
+    // synchronously — no `.await` inside). With an exporter active this
+    // yields the sidecar span's context (new span_id under the inbound
+    // trace); without one it returns `(None, None)` and the per-item
+    // fallback below keeps the gateway context.
+    let (sidecar_tp, sidecar_ts) =
+        dispatch_span.in_scope(crate::observability::propagation::inject_current_context);
+
     let rb_items: Vec<crate::ipc_types::RunBatchItem> = batch
         .items
         .into_iter()
-        .map(SchedulerItem::into_run_batch_item)
+        .zip(batch.metadata.iter())
+        .map(|(item, meta)| {
+            // `into_run_batch_item_with_trace` copies the gateway
+            // context as the fallback; override with the sidecar span's
+            // context when one exists so `worker.run_batch` nests under
+            // `sidecar.dispatch`.
+            let mut rbi = item.into_run_batch_item_with_trace(&meta.wi);
+            if let Some(tp) = &sidecar_tp {
+                rbi.traceparent = Some(tp.clone());
+                rbi.tracestate = sidecar_ts.clone();
+            }
+            rbi
+        })
         .collect();
     let req = RunBatchRequest {
         model_id: model_id.to_string(),
@@ -2861,10 +3079,11 @@ async fn process_scheduler_batch(
     //     submitted_at`) covers the time the item spent inside our
     //     own (Rust) `BatchFormer` waiting to flush — the analogue
     //     of Python's `total_ms` via `metadata.timing._start_time`
-    //     getting set in `EncodePipeline.run_encode`. Note: in
-    //     passthrough mode Python no longer has a per-LoRA BatchFormer,
-    //     so the entire batch-form delta is observed here on the Rust
-    //     side instead of being split across Rust and Python batchers.
+    //     getting set in `EncodePipeline.run_encode`. Note: the sidecar
+    //     calls Python's pre-formed batch IPC entrypoint, so Python does
+    //     not run its per-LoRA BatchFormer on this path; the entire
+    //     batch-form delta is observed here on the Rust side instead of
+    //     being split across Rust and Python batchers.
     let now = Instant::now();
     let inference_ms_sample = outcome
         .outcomes
@@ -3091,17 +3310,18 @@ pub(crate) async fn scheduler_drain_loop(
         "rust-scheduler: drain loop started",
     );
 
-    // Python runs in passthrough mode here: there is no per-LoRA
-    // BatchFormer and every IPC frame is one GPU forward pass,
-    // serialized by `_passthrough_lock`. All batching now lives in
-    // the Rust scheduler (`ProductionScheduler` -> `BatchFormer`).
+    // Python runs the pre-formed batch IPC entrypoint here: there is no
+    // per-LoRA BatchFormer on the queue path and every IPC frame is one
+    // caller-formed GPU dispatch, serialized by ModelWorker's adapter
+    // dispatch lock. All queue batching now lives in the Rust scheduler
+    // (`ProductionScheduler` -> `BatchFormer`).
     //
     // What `depth = 2` still buys us in this regime: the Python IPC
     // server (`ipc_server.py::_handle_request`) spawns each `RUN_BATCH`
     // as an `asyncio.create_task` (non-blocking on the read loop), so
     // shipping batch N+1 while N is on the GPU lets N+1 cross the IPC
     // boundary, msgpack-decode, and park on the contended
-    // `_passthrough_lock`. When N's forward pass finishes the lock
+    // adapter dispatch lock. When N's forward pass finishes the lock
     // releases, N+1 enters the forward pass without paying the IPC
     // roundtrip + decode on the critical path.
     //
@@ -3115,9 +3335,10 @@ pub(crate) async fn scheduler_drain_loop(
     // frame behind a long GPU forward pass.
     let pipeline_sem = Arc::new(Semaphore::new(depth));
 
-    // Idle-bypass + continuous-batching state. In passthrough mode,
-    // `model_worker.py::_process_loop` is bypassed and the Rust scheduler
-    // is the sole batcher in the system, so the logic below stands alone:
+    // Idle-bypass + continuous-batching state. On the queue path,
+    // Python's `model_worker.py::_process_loop` is bypassed and the Rust
+    // scheduler is the sole batcher in the system, so the logic below
+    // stands alone:
     //
     //   * `was_idle` starts true and is forwarded to `consume_next`
     //     as the `immediate` flag. When the worker just polled an

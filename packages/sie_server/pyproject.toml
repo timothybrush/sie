@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.14"
+version = "0.6.15"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -13,6 +13,7 @@ dependencies = [
     # Serialization
     "msgpack>=1.1,<2",
     "msgpack-numpy>=0.4,<1",
+    "orjson>=3.10,<4",
     # ML / Inference
     # torch 2.9.x required - flash-attn prebuilt wheels are version-specific
     "torch>=2.9,<2.10",
@@ -83,6 +84,21 @@ xformers = ["xformers>=0.0.30,<0.1 ; sys_platform == 'linux'"]
 gpu-metrics = ["nvidia-ml-py>=13.5,<14"]
 # TUI dependencies
 top = ["textual>=3.0,<4"]
+# Local embeddings + reranking on Apple Silicon / CPU (no Docker/mise). The torch /
+# sentence-transformers / FlagEmbedding stack is already in the base deps; the base
+# leaves transformers at >=4.57,<6 so the transformers-5 bundle overlays resolve.
+# This extra tightens it to <5 — the version the embed/rerank adapters need — for a
+# bare install with no bundle overlay:
+#   uv tool install "sie-server[local]" && sie-server serve
+#
+# Generation is deliberately NOT a locked extra. mlx-lm requires transformers>=5; as
+# a workspace extra it would drag the base resolution toward 5.x (which breaks
+# embed/rerank on a bare install). Instead overlay it per-invocation, mirroring the
+# bundle's `uv run --with-requirements` — keeps generation deps out of the base lock:
+#   uvx --with "mlx-lm>=0.30.7" --from sie-server sie-server serve -b sglang -p 8081
+# (Linux/CUDA generation uses the Docker image: SGLang pins timm==1.0.16, which
+# conflicts with the embed/rerank stack's timm<1.0, so it can't share a pip env.)
+local = ["transformers>=4.57,<5"]
 
 [project.scripts]
 sie-server = "sie_server.cli:app"

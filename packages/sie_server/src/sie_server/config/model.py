@@ -488,8 +488,8 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_profiles(self) -> "ModelConfig":
-        if "default" not in self.profiles:
-            msg = "'default' key must exist in profiles"
+        if not self.profiles:
+            msg = "'profiles' must contain at least one profile"
             raise ValueError(msg)
 
         # ``grammar_profile`` must name a real profile (it becomes the

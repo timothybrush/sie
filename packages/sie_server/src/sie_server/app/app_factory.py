@@ -15,6 +15,7 @@ from sie_server.api.health import router as health_router
 from sie_server.api.metrics import router as metrics_router
 from sie_server.api.models import router as models_router
 from sie_server.api.openai_compat import router as openai_router
+from sie_server.api.openai_local import router as openai_local_router
 from sie_server.api.openapi import setup_custom_openapi_schema
 from sie_server.api.root import router as root_router
 from sie_server.api.score import router as score_router
@@ -29,7 +30,7 @@ from sie_server.core.shutdown import ShutdownMiddleware, ShutdownState, setup_si
 from sie_server.ipc_server import IpcServer
 from sie_server.observability.gpu import _init_nvml, shutdown_nvml
 from sie_server.observability.telemetry import telemetry_sender
-from sie_server.observability.tracing import setup_tracing
+from sie_server.observability.tracing import setup_tracing, shutdown_tracing
 from sie_server.queue_executor import QueueExecutor
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class AppFactory:
         # Add graceful shutdown middleware (for spot instance preemption)
         app.add_middleware(ShutdownMiddleware, shutdown_state=shutdown_state)
 
-        # Setup OpenTelemetry tracing (no-op if SIE_TRACING_ENABLED is not set)
+        # Setup OpenTelemetry tracing (no-op unless the flag and endpoint are set)
         setup_tracing(app)
 
         # Queue is the only supported routing mode: the worker-sidecar
@@ -102,6 +103,9 @@ class AppFactory:
         app.include_router(score_router)
         app.include_router(models_router)
         app.include_router(openai_router)  # OpenAI-compatible /v1/embeddings
+        # Local-only convenience (single-node/dev); intentionally NOT in the published
+        # openapi.json — see cli.openapi_export. The Rust gateway is the prod API authority.
+        app.include_router(openai_local_router)  # local /v1/chat/completions + /v1/rerank
         setup_custom_openapi_schema(app)
 
         return app
@@ -124,6 +128,9 @@ class AppFactory:
             cls._configure_torch_threads()
             cls._configure_cuda_defaults()
             async with (
+                # First to enter → last to tear down, so spans emitted during
+                # other stages' shutdown (model unload, drain) are still flushed.
+                _timed_stage("tracing", cls._tracing()),
                 _timed_stage("nvml", cls._nvml()),
                 _timed_stage("telemetry", telemetry_sender()),
                 _timed_stage("model_registry", cls._model_registry(config)) as registry,
@@ -133,6 +140,10 @@ class AppFactory:
             ):
                 app.state.registry = registry
                 app.state.ipc_server = ipc_server
+                # /ws/status reads queue_runtime for the canonical worker_id.
+                # The Python NATS pull loop is gone, so the IPC server is the
+                # remaining Python object that mirrors the sidecar identity.
+                app.state.queue_runtime = ipc_server
                 yield
 
         return lifespan
@@ -220,6 +231,20 @@ class AppFactory:
         finally:
             register_liveness_probe(None)
             await server.stop()
+
+    @classmethod
+    @asynccontextmanager
+    async def _tracing(cls) -> AsyncGenerator[None, None]:
+        """Bounded tracing flush on shutdown.
+
+        Setup happens in ``build_app`` (``setup_tracing``); this stage only owns
+        the deterministic, bounded shutdown so exit can't stall on an unreachable
+        OTLP collector.
+        """
+        try:
+            yield
+        finally:
+            shutdown_tracing()
 
     @classmethod
     @asynccontextmanager

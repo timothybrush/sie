@@ -42,10 +42,13 @@ import json
 import logging
 import math
 import os
+import time
+import uuid
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sie_sdk.queue_types import denormalize_model_id
 
 from sie_server.adapters._generation_base import GenerationAdapter, collect_generation
@@ -94,6 +97,7 @@ _SUPPORTED_FIELDS = {
     "temperature",
     "top_p",
     "stop",
+    "stream",
     "grammar",
     "frequency_penalty",
     "presence_penalty",
@@ -295,6 +299,99 @@ def _payload_too_large(message: str, *, param: str | None = None) -> HTTPExcepti
     return HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=detail)
 
 
+async def _stream_generate_events(
+    adapter: GenerationAdapter,
+    *,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+    seed: int | None,
+    logit_bias: dict[str, float] | None,
+) -> AsyncIterator[str]:
+    """Yield SIE-native ``GenerateChunk`` SSE lines for ``SIEClient.stream_generate``.
+
+    Wire shape mirrors the gateway's ``build_generate_chunk_event``
+    (``sie_gateway/src/handlers/sse.rs``) and the ``GenerateChunk`` TypedDict in
+    ``sie_sdk.types``: incremental ``text_delta`` chunks, a terminal ``done:
+    true`` chunk carrying ``finish_reason`` / ``usage`` / ``ttft_ms``, then the
+    literal ``[DONE]`` terminator the SDK's SSE reader honours. A mid-stream
+    failure is surfaced as a terminal chunk with ``finish_reason: "error"`` +
+    ``error`` so the SDK raises ``ServerError`` instead of truncating silently.
+    """
+    request_id = uuid.uuid4().hex
+    seq = 0
+    t0 = time.perf_counter()
+    ttft_ms: float | None = None
+    finish_reason = "stop"
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        async for chunk in adapter.generate(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            seed=seed,
+            logit_bias=logit_bias,
+        ):
+            if chunk.done:
+                finish_reason = chunk.finish_reason or "stop"
+                if chunk.prompt_tokens is not None:
+                    prompt_tokens = chunk.prompt_tokens
+                if chunk.completion_tokens is not None:
+                    completion_tokens = chunk.completion_tokens
+                # The contract allows a terminal chunk to also carry final text; emit it as a
+                # delta so it isn't dropped (MLX's terminal text is always empty, but SGLang
+                # and future adapters may pack final tokens here).
+                if chunk.text_delta:
+                    if ttft_ms is None:
+                        ttft_ms = (time.perf_counter() - t0) * 1000.0
+                    yield f"data: {json.dumps({'request_id': request_id, 'seq': seq, 'text_delta': chunk.text_delta})}\n\n"
+                    seq += 1
+                continue
+            if chunk.text_delta:
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t0) * 1000.0
+                event = {"request_id": request_id, "seq": seq, "text_delta": chunk.text_delta}
+                seq += 1
+                yield f"data: {json.dumps(event)}\n\n"
+    except Exception:  # noqa: BLE001 — surface as a terminal error chunk, never 500 mid-stream
+        logger.warning("stream_generate failed mid-stream", exc_info=True)
+        err = {
+            "request_id": request_id,
+            "seq": seq,
+            "text_delta": "",
+            "done": True,
+            "finish_reason": "error",
+            # Generic client message — the exception detail is logged server-side
+            # (above, with exc_info) and must not leak to the client (CodeQL).
+            "error": {"code": "inference_error", "message": "internal error during generation"},
+        }
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    terminal: dict[str, Any] = {
+        "request_id": request_id,
+        "seq": seq,
+        "text_delta": "",
+        "done": True,
+        "finish_reason": finish_reason,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    if ttft_ms is not None:
+        terminal["ttft_ms"] = ttft_ms
+    yield f"data: {json.dumps(terminal)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 @router.post(
     "/generate/{model:path}",
     response_model=None,
@@ -309,7 +406,7 @@ async def generate(
     model: str,
     http_request: Request,
     x_machine_profile: Annotated[str | None, Header(alias="X-SIE-MACHINE-PROFILE")] = None,
-) -> JSONResponse:
+) -> JSONResponse | StreamingResponse:
     """Generate text from a prompt using the named model.
 
     The ``model`` path segment uses the **SIE-safe** id (double-underscore
@@ -410,6 +507,7 @@ async def generate(
             )
 
         adapter = registry.get(registry_key)
+        registry.touch_lru(registry_key)
         if not isinstance(adapter, GenerationAdapter):
             raise _bad_request(
                 f"Model '{model}' adapter does not support generate (not a GenerationAdapter)",
@@ -440,7 +538,7 @@ async def generate(
         # the same here.
         if stop_raw is not None and any(s == "" for s in stop_raw):
             raise _bad_request("'stop' must not contain empty strings", param="stop")
-        stop = list(stop_raw) if stop_raw else None
+        stop = [str(s) for s in stop_raw] if stop_raw else None
 
         # ``frequency_penalty`` / ``presence_penalty`` / ``grammar`` are
         # whitelisted (so a schema-compliant body still 200s) but the
@@ -462,6 +560,27 @@ async def generate(
         seed = _validate_seed(body.get("seed"))
         logit_bias = _validate_logit_bias(body.get("logit_bias"))
         _validate_logprobs(body.get("logprobs"), body.get("top_logprobs"))
+
+        # Streaming path: emit SIE-native GenerateChunk SSE (drives
+        # SIEClient.stream_generate). The blocking JSON path below is unchanged.
+        stream_raw = body.get("stream", False)
+        if stream_raw is not None and not isinstance(stream_raw, bool):
+            raise _bad_request("'stream' must be a boolean", param="stream")
+        if stream_raw:
+            return StreamingResponse(
+                _stream_generate_events(
+                    adapter,
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    seed=seed,
+                    logit_bias=logit_bias,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         try:
             # ``adapter.generate`` is an async iterator. The

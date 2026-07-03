@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
-from sie_server.core.memory import MemoryConfig
+from sie_server.core.memory import MemoryConfig, MemoryStats
 from sie_server.core.registry import ModelRegistry
 
 
@@ -373,6 +373,65 @@ class TestProactiveEviction:
         assert not registry_with_models.is_loaded("model-a")
         assert not registry_with_models.is_loaded("model-b")
         assert registry_with_models.is_loaded("model-c")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_pre_load_eviction_uses_adapter_load_headroom(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """Load evicts for adapter-owned headroom, not only current pressure."""
+        gb = 1024**3
+        registry = ModelRegistry(device="cuda:0")
+        registry.add_config(_make_config(name="model-a", hf_id="org/model-a"))
+        registry.add_config(_make_config(name="model-c", hf_id="org/model-c"))
+        model_a_adapter = mock_adapter_factory()
+        model_c_adapter = mock_adapter_factory()
+        required_bytes = 9 * gb
+        model_c_adapter.load_required_memory_bytes.return_value = required_bytes
+        mock_load_adapter.side_effect = [model_a_adapter, model_c_adapter]
+
+        with patch.object(registry._memory_manager, "should_evict_for_load", return_value=False):
+            await registry.load_async("model-a", "cuda:0")
+
+        stats = MemoryStats(used_bytes=2 * gb, total_bytes=10 * gb, device_type="cuda")
+        with (
+            patch.object(registry._memory_manager, "get_stats", return_value=stats),
+            patch.object(registry._memory_manager, "should_evict_for_load", side_effect=[True, False]) as should_evict,
+        ):
+            await registry.load_async("model-c", "cuda:0")
+
+        model_c_adapter.load_required_memory_bytes.assert_called_once_with(
+            device_type="cuda",
+            device_total_bytes=10 * gb,
+        )
+        assert should_evict.call_args_list[0].args == (required_bytes,)
+        assert not registry.is_loaded("model-a")
+        assert registry.is_loaded("model-c")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_pre_load_eviction_ignores_adapter_load_headroom_exception(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """A bad adapter headroom hook falls back to pressure-only eviction."""
+        gb = 1024**3
+        registry = ModelRegistry(device="cuda:0")
+        registry.add_config(_make_config(name="model-a", hf_id="org/model-a"))
+        adapter = mock_adapter_factory()
+        adapter.load_required_memory_bytes.side_effect = RuntimeError("boom")
+        mock_load_adapter.return_value = adapter
+
+        stats = MemoryStats(used_bytes=2 * gb, total_bytes=10 * gb, device_type="cuda")
+        with (
+            patch.object(registry._memory_manager, "get_stats", return_value=stats),
+            patch.object(registry._memory_manager, "should_evict_for_load", return_value=False) as should_evict,
+        ):
+            await registry.load_async("model-a", "cuda:0")
+
+        adapter.load_required_memory_bytes.assert_called_once_with(
+            device_type="cuda",
+            device_total_bytes=10 * gb,
+        )
+        should_evict.assert_called_once_with(None)
+        assert registry.is_loaded("model-a")
 
     async def test_background_monitor_loop_runs(self) -> None:
         """Background monitor loop runs and checks pressure periodically."""

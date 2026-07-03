@@ -5,7 +5,7 @@
 //!   * It can reach a real NATS JetStream server and create the expected
 //!     pool stream + durable pull consumer.
 //!   * It can open the UDS to the Python `IpcServer` and exchange
-//!     msgpack-framed RPCs (Ping, EnsureModelReady, ProcessEncodeBatch).
+//!     msgpack-framed RPCs (Ping, EnsureModelReady, RunBatch).
 //!   * It can direct-dispatch generation work to `ProcessGenerate`, stream
 //!     generation events back over IPC, publish the raw response, and ACK.
 //!   * It publishes a `WorkResult` to the reply subject whose shape matches
@@ -1121,8 +1121,8 @@ async fn smoke_generation_direct_dispatch_is_active_before_capability_reconcile(
 ///   * The worker-sidecar honors `SIE_PAYLOAD_STORE_URL`.
 ///   * `LocalPayloadStore::get` resolves the absolute path and returns
 ///     the bytes the gateway wrote.
-///   * The dispatcher feeds the decoded item into `ProcessEncodeBatch`
-///     and gets a successful outcome back.
+///   * The dispatcher feeds the decoded item into the Rust scheduler and
+///     gets a successful `RunBatch` outcome back.
 ///   * `payload_fetch_ms` is populated (> 0) on the success path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn smoke_payload_ref_request_round_trips_through_rust_worker() {
@@ -2052,12 +2052,11 @@ fn histogram_count(metrics_body: &str, name: &str) -> u64 {
 ///   the same model into a single IPC call** (that's the whole point
 ///   of the adaptive batcher). A naive "fire 8 requests to the same
 ///   model" test would therefore observe `inflight=1` even with a
-///   4-slot pool, because there's only one ProcessEncodeBatch RPC to
-///   issue for that group. The test used to fail for exactly that
-///   reason.
+///   4-slot pool, because there's only one `RunBatch` RPC to issue for
+///   that group. The test used to fail for exactly that reason.
 /// - To actually exercise the pool we need ≥ 2 **distinct model
 ///   groups** running concurrently through the dispatcher. With N
-///   models, the dispatcher's `ensure_model_ready` + `process_encode_batch`
+///   models, the dispatcher's `EnsureModelReady` + `RunBatch`
 ///   for each group become independent RPCs that the pool should run
 ///   in parallel.
 /// - Python-side delay (via `--per-request-delay-ms`) stretches each
@@ -2091,8 +2090,8 @@ async fn pool_enables_concurrent_in_flight_ipc() {
         ("intfloat/e5-base-v2", "intfloat__e5-base-v2"),
     ];
     const PYTHON_DELAY_MS: u64 = 150;
-    // Serialized floor: MODELS.len() groups × (ensure_model_ready +
-    // process_encode_batch) × PYTHON_DELAY_MS ≈ 4 × 2 × 150ms = 1.2s
+    // Serialized floor: MODELS.len() groups × (EnsureModelReady +
+    // RunBatch) × PYTHON_DELAY_MS ≈ 4 × 2 × 150ms = 1.2s
     // minimum if everything ran on one socket.
     //  Parallel floor with 4-slot pool: ~2 × 150ms (ensure then process)
     // for each group running in parallel + dispatcher/NATS overhead,
@@ -2252,7 +2251,7 @@ async fn pool_enables_concurrent_in_flight_ipc() {
     assert!(
         acquire_count >= MODELS.len() as u64,
         "sie_worker_ipc_pool_acquire_wait_seconds_count = {acquire_count}; \
-         expected >= {} (one per model group's process_encode_batch RPC)",
+         expected >= {} (one per model group's RunBatch RPC)",
         MODELS.len(),
     );
 
@@ -2275,7 +2274,7 @@ async fn pool_enables_concurrent_in_flight_ipc() {
 ///   * For a plain-text encode request with no instruction/template and
 ///     `is_query = false`, the dispatcher pre-tokenizes the text in Rust
 ///     and attaches a `PreparedTokens` payload to the outgoing
-///     `ProcessEncodeBatch` IPC call.
+///     encode item inside the outgoing `RunBatch` IPC call.
 ///   * The Python IPC stub (`_ipc_test_harness`) receives
 ///     `prepared_tokens` on the `EncodeBatchItem`, and echoes back the
 ///     tokenizer id, the first `input_ids` sequence, and the configured

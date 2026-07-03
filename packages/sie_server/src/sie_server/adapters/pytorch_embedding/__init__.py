@@ -88,7 +88,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         pooling: PoolingStrategy = "last_token",
         normalize: bool = True,
         max_seq_length: int = 8192,
-        compute_precision: ComputePrecision = "bfloat16",
+        compute_precision: ComputePrecision | None = None,
         attn_implementation: AttnImplementation = "sdpa",
         trust_remote_code: bool = True,
         revision: str | None = None,
@@ -109,7 +109,9 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
                 - "mean": Mean of all non-padding tokens
             normalize: Whether to L2-normalize embeddings.
             max_seq_length: Maximum sequence length.
-            compute_precision: Compute precision (bfloat16 recommended for CUDA).
+            compute_precision: Compute precision. None (default) selects fp32 off-CUDA
+                (safe on MPS) and bfloat16 on CUDA; set explicitly to override (e.g.
+                float16 to opt a curated model into fp16 on MPS).
             attn_implementation: Attention implementation. Default "sdpa".
                 Use "flash_attention_2" only if inputs are consistently >512 tokens.
                 Use "eager" for models that don't support SDPA (e.g., Stella).
@@ -226,17 +228,25 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         Returns:
             Tuple of (torch.dtype, attention_implementation string).
         """
-        # CPU should use FP32; respect explicit eager but default to SDPA
-        if not device.startswith("cuda"):
-            return torch.float32, self._attn_implementation if self._attn_implementation == "eager" else "sdpa"
-
         # Map precision to dtype
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        dtype = dtype_map.get(self._compute_precision, torch.bfloat16)
+        # Default fp32 off-CUDA (safe on CPU/MPS); honor an explicit compute_precision
+        # everywhere so curated Mac models can opt into fp16 on MPS. CUDA keeps bf16.
+        precision = self._compute_precision
+        if precision is None:
+            precision = "bfloat16" if device.startswith("cuda") else "float32"
+        # NOTE: bf16 is coerced to fp16 on MPS at the loader (MPS bf16 is incomplete in
+        # torch and can hang model load). See core/loader.load_adapter.
+        dtype = dtype_map.get(precision, torch.float32)
+
+        if not device.startswith("cuda"):
+            # Off-CUDA: respect an explicit eager request but default to SDPA.
+            attn = self._attn_implementation if self._attn_implementation == "eager" else "sdpa"
+            return dtype, attn
 
         # Use configured attention implementation directly
         return dtype, self._attn_implementation

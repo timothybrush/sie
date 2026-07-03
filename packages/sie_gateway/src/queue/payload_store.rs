@@ -5,6 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
+#[cfg(feature = "cloud-storage")]
+use object_store::ObjectStoreExt;
+
 const OBJECT_STORE_SCHEMES: &[&str] = &["s3://", "gs://", "abfs://", "abfss://"];
 
 fn object_store_scheme(url: &str) -> Option<&'static str> {

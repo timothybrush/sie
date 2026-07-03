@@ -22,9 +22,10 @@ profiles:
     adapter_options:
       loadtime:
         muvera_config:
-          num_repetitions: 20
+          num_repetitions: 40
           num_simhash_projections: 6
           projection_dim: 8
+          final_projection_dim: null
         token_dim: 64
         normalize: true
         query_max_length: 32

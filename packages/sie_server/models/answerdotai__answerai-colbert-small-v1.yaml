@@ -22,9 +22,15 @@ profiles:
     adapter_options:
       loadtime:
         muvera_config:
-          num_repetitions: 20
+          num_repetitions: 40
           num_simhash_projections: 6
           projection_dim: 8
+          final_projection_dim: null
+          # answerai tokens carry a dominant shared DC component (mean-token norm
+          # ~0.93) that tips SimHash into collapse on Blackwell (@muvera nDCG 0.0
+          # while @default MaxSim is healthy 0.57). Centering removes it and also
+          # improves FDE on healthy hardware (MPS 0.287 -> 0.379). See #1528.
+          center_tokens: true
         token_dim: 96
         normalize: true
         query_max_length: 32

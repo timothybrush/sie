@@ -67,17 +67,20 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(rate_per_sec: f64, burst: f64) -> Self {
+    /// `now` is injected rather than read from `Instant::now()` inside, so the
+    /// refill / burst-cap logic is unit-testable by advancing a synthetic
+    /// clock instead of `thread::sleep`. Production callers pass
+    /// `Instant::now()`. First seam of the injectable-clock work in #1575.
+    fn new(rate_per_sec: f64, burst: f64, now: Instant) -> Self {
         Self {
             tokens: burst,
             rate_per_sec,
             burst,
-            last_refill: Instant::now(),
+            last_refill: now,
         }
     }
 
-    fn try_take(&mut self) -> bool {
-        let now = Instant::now();
+    fn try_take(&mut self, now: Instant) -> bool {
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
@@ -526,6 +529,8 @@ pub struct WorkResult {
     pub postprocessing_ms: Option<f64>,
     #[serde(default)]
     pub payload_fetch_ms: Option<f64>,
+    #[serde(default)]
+    pub worker_direct: bool,
 }
 
 struct CachedStreamInfo {
@@ -671,14 +676,24 @@ struct ResultCollector {
     pool_label: String,
     model_label: String,
     pool_fallback_subject: Option<String>,
+    direct_fallback_worker_id: Option<String>,
+    direct_fallback_republished_indices: BTreeSet<usize>,
     direct_fallback_payloads: Vec<Option<Vec<u8>>>,
     direct_fallback_republished: bool,
 }
 
 struct PublishedWorkItem {
     index: usize,
-    ack: jetstream::context::PublishAckFuture,
+    ack: Option<jetstream::context::PublishAckFuture>,
     encoded: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreResultOutcome {
+    Stored,
+    Duplicate,
+    StaleDirectFallback,
+    OutOfRange,
 }
 
 type DirectFallbackPayload = (usize, Vec<u8>);
@@ -686,11 +701,12 @@ type DirectFallbackPayloads = Vec<DirectFallbackPayload>;
 
 fn take_direct_fallback_payloads(
     collector: &mut ResultCollector,
-) -> Option<(String, DirectFallbackPayloads)> {
+) -> Option<(String, Option<String>, DirectFallbackPayloads)> {
     if collector.direct_fallback_republished {
         return None;
     }
     let subject = collector.pool_fallback_subject.clone()?;
+    let worker_id = collector.direct_fallback_worker_id.clone();
     let mut payloads = Vec::new();
     for (index, payload) in collector.direct_fallback_payloads.iter().enumerate() {
         let still_missing = collector.results.get(index).is_some_and(Option::is_none);
@@ -704,7 +720,68 @@ fn take_direct_fallback_payloads(
         return None;
     }
     collector.direct_fallback_republished = true;
-    Some((subject, payloads))
+    Some((subject, worker_id, payloads))
+}
+
+fn store_result_if_missing(
+    collector: &mut ResultCollector,
+    result: WorkResult,
+) -> StoreResultOutcome {
+    let idx = result.item_index as usize;
+    if idx >= collector.results.len() {
+        return StoreResultOutcome::OutOfRange;
+    }
+    if result.worker_direct && collector.direct_fallback_republished_indices.contains(&idx) {
+        return StoreResultOutcome::StaleDirectFallback;
+    }
+    if collector.results[idx].is_some() {
+        return StoreResultOutcome::Duplicate;
+    }
+    collector.results[idx] = Some(result);
+    StoreResultOutcome::Stored
+}
+
+fn mark_direct_fallback_republished_indices(
+    collector: &mut ResultCollector,
+    indices: impl IntoIterator<Item = usize>,
+) {
+    collector
+        .direct_fallback_republished_indices
+        .extend(indices);
+}
+
+fn mark_direct_fallback_confirmed(
+    collector: &mut ResultCollector,
+    indices: impl IntoIterator<Item = usize>,
+) {
+    collector.direct_fallback_republished = true;
+    mark_direct_fallback_republished_indices(collector, indices);
+}
+
+fn take_ack_futures(items: &mut [PublishedWorkItem]) -> Vec<jetstream::context::PublishAckFuture> {
+    items
+        .iter_mut()
+        .filter_map(|item| item.ack.take())
+        .collect()
+}
+
+async fn await_batch_direct_fallback_acks(
+    request_id: &str,
+    acks: Vec<jetstream::context::PublishAckFuture>,
+) -> bool {
+    let mut all_acked = true;
+    for ack in acks {
+        if let Err(e) = ack.await {
+            warn!(
+                request_id = %request_id,
+                error = %e,
+                "JetStream ack failed for batch direct fallback"
+            );
+            metrics::QUEUE_ACK_FAILURES.inc();
+            all_acked = false;
+        }
+    }
+    all_acked
 }
 
 fn stream_name(pool: &str) -> String {
@@ -1183,9 +1260,11 @@ fn skip_msgpack_value(data: &[u8]) -> Option<&[u8]> {
 /// The legacy [`WorkPublisher::republish_to_pool`] wrapper collapses the
 /// non-`Republished` arms to `false`, but `handle_nak` needs to tell
 /// "already republished" apart from "no collector / no payload": a NAK
-/// that arrives after the request already fell back to the pool means the
-/// item has been retried as far as it can be, so the client should get a
-/// 429 immediately rather than hang until the first-chunk timeout.
+/// that arrives after the request already fell back to the pool needs a
+/// second collector-state check: before a successor emits its first chunk,
+/// a late NAK from the abandoned attempt is indistinguishable from a NAK
+/// emitted by the successor. Once a current attempt has latched, the NAK can
+/// be classified precisely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepublishOutcome {
     /// The item was re-issued to the pool subject.
@@ -1202,6 +1281,56 @@ enum RepublishOutcome {
     /// should surface a 504 to the client (the request has already
     /// failed-over once; we won't safely re-fallback now).
     RateLimited,
+}
+
+/// Whether a NAK must be ignored because it is from an ABANDONED attempt.
+///
+/// After a first-chunk-timeout (or earlier NAK) republishes a request to the
+/// pool, a healthy successor worker relatches a newer `current_attempt_id` and
+/// streams into the same collector. A late NAK from the abandoned attempt would
+/// otherwise tear that live successor down. The NAK is stale iff it carries a
+/// non-empty attempt id and either:
+///
+/// - the collector has latched a different `current_attempt_id`, or
+/// - the collector is between republish and successor first chunk, and the NAK
+///   matches an explicitly recorded abandoned attempt id.
+///
+/// When neither guard can identify the NAK as abandoned, this predicate returns
+/// `false`; callers then decide whether the NAK is actionable or ambiguous for
+/// their state. See #1601.
+fn nak_is_stale(
+    current_attempt_id: Option<&str>,
+    abandoned_attempt_id: Option<&str>,
+    nak_attempt_id: &str,
+) -> bool {
+    if nak_attempt_id.is_empty() {
+        return false;
+    }
+    match current_attempt_id {
+        Some(current) => current != nak_attempt_id,
+        None => abandoned_attempt_id.is_some_and(|abandoned| abandoned == nak_attempt_id),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlreadyRepublishedNakDecision {
+    DropStale,
+    WaitForSuccessor,
+    Fail,
+}
+
+fn already_republished_nak_decision(
+    current_attempt_id: Option<&str>,
+    abandoned_attempt_id: Option<&str>,
+    nak_attempt_id: &str,
+) -> AlreadyRepublishedNakDecision {
+    if nak_is_stale(current_attempt_id, abandoned_attempt_id, nak_attempt_id) {
+        return AlreadyRepublishedNakDecision::DropStale;
+    }
+    if current_attempt_id.is_none() {
+        return AlreadyRepublishedNakDecision::WaitForSuccessor;
+    }
+    AlreadyRepublishedNakDecision::Fail
 }
 
 impl WorkPublisher {
@@ -1246,6 +1375,7 @@ impl WorkPublisher {
             std::sync::Mutex::new(TokenBucket::new(
                 self.fallback_rate_per_sec,
                 self.fallback_burst,
+                Instant::now(),
             ))
         });
         // Lock is a plain (non-async) ``std::sync::Mutex``; the critical
@@ -1257,7 +1387,7 @@ impl WorkPublisher {
             Ok(g) => g,
             Err(_) => return false,
         };
-        guard.try_take()
+        guard.try_take(Instant::now())
     }
 
     #[allow(dead_code)]
@@ -1488,12 +1618,17 @@ impl WorkPublisher {
         };
 
         let subject = target.subject();
-        let pool_fallback_subject = match (&target, endpoint) {
-            (PublishTarget::Worker { .. }, "generate") => None,
-            (PublishTarget::Worker { .. }, _) => Some(target.as_pool_fallback().subject()),
-            (PublishTarget::Pool { .. }, _) => None,
+        let (pool_fallback_subject, direct_fallback_worker_id) = match (&target, endpoint) {
+            (PublishTarget::Worker { .. }, "generate") | (PublishTarget::Pool { .. }, _) => {
+                (None, None)
+            }
+            (PublishTarget::Worker { worker_id, .. }, _) => (
+                Some(target.as_pool_fallback().subject()),
+                Some(worker_id.clone()),
+            ),
         };
         let direct_publish_fallback_subject = pool_fallback_subject.clone();
+        let direct_publish_fallback_worker_id = direct_fallback_worker_id.clone();
         let direct_publish_retry_items = if direct_publish_fallback_subject.is_some() {
             Some(items.clone())
         } else {
@@ -1514,6 +1649,8 @@ impl WorkPublisher {
                 pool_label: pool.clone(),
                 model_label: model.to_string(),
                 pool_fallback_subject,
+                direct_fallback_worker_id,
+                direct_fallback_republished_indices: BTreeSet::new(),
                 direct_fallback_payloads: vec![None; total_items as usize],
                 direct_fallback_republished: false,
             },
@@ -1525,9 +1662,11 @@ impl WorkPublisher {
             .unwrap_or_default()
             .as_secs_f64();
 
-        // Generation queue fallback carries trace context. Encode /
-        // score / extract intentionally keep the pre-generation queue
-        // hot path and wire shape: no OTel lookup, no envelope fields.
+        // All recognized endpoints carry W3C trace context on the work
+        // envelope so the worker span attaches to the gateway/client
+        // trace (issue #1500). The endpoint classifier gates this and
+        // fails closed for unknown labels; `inject_current_context()` is
+        // a no-op when no context is active.
         let (traceparent, tracestate) = Self::trace_context_for_endpoint(endpoint);
 
         // Every work item in a request shares the same pool / model /
@@ -1583,7 +1722,31 @@ impl WorkPublisher {
                         )
                         .await
                     {
-                        Ok(items) => {
+                        Ok(mut items) => {
+                            let fallback_indices: Vec<usize> =
+                                items.iter().map(|item| item.index).collect();
+                            let fallback_acks = take_ack_futures(&mut items);
+                            let fallback_confirmed =
+                                await_batch_direct_fallback_acks(&request_id, fallback_acks).await;
+                            if fallback_confirmed {
+                                if let Some(mut entry) = self.pending_results.get_mut(&request_id) {
+                                    mark_direct_fallback_confirmed(
+                                        entry.value_mut(),
+                                        fallback_indices,
+                                    );
+                                }
+                                if let Some(worker_id) =
+                                    direct_publish_fallback_worker_id.as_deref()
+                                {
+                                    self.publish_batch_direct_cancel(worker_id, &request_id)
+                                        .await;
+                                }
+                            } else {
+                                warn!(
+                                    request_id = %request_id,
+                                    "skipping batch direct-dispatch cancel because pool fallback was not durably acked"
+                                );
+                            }
                             metrics::ROUTING_FALLBACK_TOTAL
                                 .with_label_values(&[
                                     &metrics::sanitize_model_label(model),
@@ -1623,14 +1786,17 @@ impl WorkPublisher {
                 }
             }
         }
-        for item in published_items {
-            ack_futures.push(item.ack);
+        for mut item in published_items {
+            if let Some(ack) = item.ack.take() {
+                ack_futures.push(ack);
+            }
         }
 
         // Fire-and-forget: spawn background task to monitor acks.
         // The request handler proceeds immediately to wait for inbox results.
         // JetStream acks confirm durability but our streams are ephemeral
-        // (memory, 60s TTL) — clients retry on timeout if messages are lost.
+        // (memory + configured max_age) — clients retry on timeout if
+        // messages are lost.
         if !ack_futures.is_empty() {
             tokio::spawn(async move {
                 for ack in ack_futures {
@@ -1677,7 +1843,7 @@ impl WorkPublisher {
                 .map(|(ack, encoded)| {
                     vec![PublishedWorkItem {
                         index: 0,
-                        ack,
+                        ack: Some(ack),
                         encoded,
                     }]
                 })
@@ -1687,7 +1853,7 @@ impl WorkPublisher {
                 .map(|(ack, encoded)| {
                     vec![PublishedWorkItem {
                         index: 0,
-                        ack,
+                        ack: Some(ack),
                         encoded,
                     }]
                 })
@@ -1705,7 +1871,7 @@ impl WorkPublisher {
                         .await
                         .map(|(ack, encoded)| PublishedWorkItem {
                             index,
-                            ack,
+                            ack: Some(ack),
                             encoded,
                         })
                 }
@@ -1721,8 +1887,9 @@ impl WorkPublisher {
     /// delivery budget. If that worker or its private consumer disappears
     /// after the gateway publishes, the worker-specific stream cannot fail
     /// over by itself. This timer republishes any still-missing items to the
-    /// lane's pool subject once; late duplicate results are harmless because
-    /// the result collector removes itself on first complete response.
+    /// lane's pool subject once. After those fallback publishes are durably
+    /// acked, it emits a worker-scoped batch cancel so the original sidecar
+    /// can ACK queued worker-direct items that have not reached IPC yet.
     pub fn spawn_batch_direct_fallback(self: &Arc<Self>, request_id: String, delay: Duration) {
         let publisher = Arc::clone(self);
         tokio::spawn(async move {
@@ -1745,19 +1912,22 @@ impl WorkPublisher {
         request_id: &str,
         reason: &'static str,
     ) -> Result<bool, String> {
-        let (subject, payloads, operation, pool, model) = {
+        let (subject, direct_worker_id, payloads, operation, pool, model) = {
             let Some(mut entry) = self.pending_results.get_mut(request_id) else {
                 return Ok(false);
             };
-            let Some((subject, payloads)) = take_direct_fallback_payloads(entry.value_mut()) else {
+            let Some((subject, direct_worker_id, payloads)) =
+                take_direct_fallback_payloads(entry.value_mut())
+            else {
                 return Ok(false);
             };
             let operation = entry.operation.clone();
             let pool = entry.pool_label.clone();
             let model = entry.model_label.clone();
-            (subject, payloads, operation, pool, model)
+            (subject, direct_worker_id, payloads, operation, pool, model)
         };
 
+        let fallback_indices: Vec<usize> = payloads.iter().map(|(index, _)| *index).collect();
         let mut acks = Vec::with_capacity(payloads.len());
         for (index, payload) in payloads {
             let ack = self
@@ -1773,6 +1943,22 @@ impl WorkPublisher {
             acks.push(ack);
         }
 
+        let fallback_confirmed = await_batch_direct_fallback_acks(request_id, acks).await;
+        if fallback_confirmed {
+            if let Some(mut entry) = self.pending_results.get_mut(request_id) {
+                mark_direct_fallback_confirmed(entry.value_mut(), fallback_indices);
+            }
+            if let Some(worker_id) = direct_worker_id.as_deref() {
+                self.publish_batch_direct_cancel(worker_id, request_id)
+                    .await;
+            }
+        } else {
+            warn!(
+                request_id = %request_id,
+                "skipping batch direct-dispatch cancel because pool fallback was not durably acked"
+            );
+        }
+
         metrics::ROUTING_FALLBACK_TOTAL
             .with_label_values(&[
                 &metrics::sanitize_model_label(&model),
@@ -1785,19 +1971,9 @@ impl WorkPublisher {
             operation = %operation,
             subject = %subject,
             reason,
+            fallback_confirmed,
             "republished non-streaming direct-dispatch work to pool fallback"
         );
-
-        for ack in acks {
-            if let Err(e) = ack.await {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "JetStream ack failed for batch direct fallback"
-                );
-                metrics::QUEUE_ACK_FAILURES.inc();
-            }
-        }
 
         Ok(true)
     }
@@ -2224,6 +2400,32 @@ impl WorkPublisher {
         }
     }
 
+    /// Best-effort cancel for abandoned non-streaming worker-direct batch
+    /// work. Unlike the generation gateway-request cancel signal, this is
+    /// scoped to the original direct worker. Sidecars only drop items pulled
+    /// from worker-direct subjects, so the pool fallback with the same request
+    /// id remains eligible to run.
+    pub async fn publish_batch_direct_cancel(&self, worker_id: &str, request_id: &str) {
+        let client_opt = { self.nats_client.read().await.clone() };
+        let Some(client) = client_opt else {
+            return;
+        };
+        let subject = format!(
+            "batch_cancel.{}.{}.{}",
+            self.router_id,
+            normalize_model_id(worker_id),
+            request_id
+        );
+        if let Err(e) = client.publish(subject, Vec::new().into()).await {
+            warn!(
+                error = %e,
+                request_id = %request_id,
+                worker_id = %worker_id,
+                "failed to publish batch direct-dispatch cancel signal"
+            );
+        }
+    }
+
     /// Returns ``true`` iff the streaming collector for ``request_id``
     /// has already observed at least one chunk — used to label
     /// cancellation metrics (`before_first_chunk` vs `mid_stream`).
@@ -2407,6 +2609,16 @@ impl WorkPublisher {
         request_id: &str,
         reason: &'static str,
     ) -> Result<RepublishOutcome, String> {
+        self.republish_to_pool_outcome_with_abandoned_attempt(request_id, reason, None)
+            .await
+    }
+
+    async fn republish_to_pool_outcome_with_abandoned_attempt(
+        &self,
+        request_id: &str,
+        reason: &'static str,
+        abandoned_attempt_id: Option<&str>,
+    ) -> Result<RepublishOutcome, String> {
         // Take a short lock to: check + flip `republished`, copy out
         // the encoded bytes + the pool subject, bump the attempt
         // generation. We drop the entry lock before awaiting the
@@ -2448,6 +2660,9 @@ impl WorkPublisher {
             }
             entry.republished = true;
             let gen = entry.bump_attempt_generation();
+            if let Some(attempt_id) = abandoned_attempt_id {
+                entry.record_abandoned_attempt_id(attempt_id);
+            }
             (
                 subject,
                 payload,
@@ -2612,6 +2827,7 @@ impl WorkPublisher {
     /// Handle an incoming result message (called from inbox subscription).
     pub async fn handle_result(&self, result: WorkResult) {
         let request_id = result.request_id.clone();
+        let item_index = result.item_index;
 
         // Insert result into collector (per-key lock via DashMap)
         let all_done = {
@@ -2623,9 +2839,30 @@ impl WorkPublisher {
                 }
             };
             let collector = entry.value_mut();
-            let idx = result.item_index as usize;
-            if idx < collector.results.len() {
-                collector.results[idx] = Some(result);
+            match store_result_if_missing(collector, result) {
+                StoreResultOutcome::Stored => {}
+                StoreResultOutcome::Duplicate => {
+                    debug!(
+                        request_id = %request_id,
+                        item_index,
+                        "ignoring duplicate result for already-completed batch item"
+                    );
+                }
+                StoreResultOutcome::StaleDirectFallback => {
+                    debug!(
+                        request_id = %request_id,
+                        item_index,
+                        "ignoring stale worker-direct result for republished batch fallback item"
+                    );
+                }
+                StoreResultOutcome::OutOfRange => {
+                    warn!(
+                        request_id = %request_id,
+                        item_index,
+                        total_items = collector.results.len(),
+                        "received result with out-of-range item_index"
+                    );
+                }
             }
             collector.results.iter().all(|r| r.is_some())
         };
@@ -2759,6 +2996,59 @@ impl WorkPublisher {
     /// Unknown reasons fall through to the generic ``nak`` bucket so
     /// we never lose data on a forward-compat addition.
     async fn handle_nak(&self, nak: NakEnvelope) {
+        // Attempt-isolation guard (mirrors the stale-chunk filter in
+        // StreamCollector::apply, streaming.rs): a NAK from an ABANDONED
+        // attempt must not act on the request. After a first-chunk-timeout (or
+        // earlier NAK) republishes to the pool, a healthy successor worker
+        // relatches a newer `current_attempt_id` and streams. A late NAK from
+        // the abandoned attempt would otherwise reach the `AlreadyRepublished`
+        // arm and `fail_pending_stream` the live successor with a spurious 429,
+        // dropping its already-produced terminal. If the collector has either
+        // latched a different current_attempt_id or recorded this NAK's attempt
+        // id as abandoned during a prior republish, it is a stale leftover —
+        // drop it. See #1601.
+        // Capture the latched/abandoned attempt ids plus the bounded metric labels
+        // (display_model/pool) in one lookup so the stale-drop path can record
+        // a metric without a second DashMap probe. The `Ref` guard is dropped
+        // at the end of the closure — nothing is held across the `.inc()`.
+        let collector_state = self.pending_streams.get(&nak.request_id).map(|e| {
+            let collector = e.value();
+            (
+                collector.current_attempt_id.clone(),
+                collector.abandoned_attempt_id.clone(),
+                collector.display_model.clone(),
+                collector.pool.clone(),
+            )
+        });
+        let latched_attempt = collector_state
+            .as_ref()
+            .and_then(|(current, ..)| current.clone());
+        let abandoned_attempt = collector_state
+            .as_ref()
+            .and_then(|(_, abandoned, ..)| abandoned.clone());
+        if nak_is_stale(
+            latched_attempt.as_deref(),
+            abandoned_attempt.as_deref(),
+            &nak.attempt_id,
+        ) {
+            // Mirror the chunk-path stale-drop metric so an operator can see
+            // abandoned-attempt NAKs being dropped (#1601).
+            if let Some((_, _, model, pool)) = &collector_state {
+                metrics::GENERATION_STALE_ATTEMPT_NAKS
+                    .with_label_values(&[
+                        &metrics::sanitize_model_label(model),
+                        &metrics::sanitize_label(pool),
+                    ])
+                    .inc();
+            }
+            debug!(
+                request_id = %nak.request_id,
+                nak_attempt_id = %nak.attempt_id,
+                "dropping stale NAK from an abandoned attempt"
+            );
+            return;
+        }
+
         let reason: &'static str = match nak.reason.as_str() {
             "kv_budget" => "nak_kv_budget",
             "model_not_loaded" => "nak_model_not_loaded",
@@ -2781,7 +3071,11 @@ impl WorkPublisher {
             }
         };
         match self
-            .republish_to_pool_outcome(&nak.request_id, reason)
+            .republish_to_pool_outcome_with_abandoned_attempt(
+                &nak.request_id,
+                reason,
+                Some(nak.attempt_id.as_str()),
+            )
             .await
         {
             Ok(RepublishOutcome::Republished) => debug!(
@@ -2790,17 +3084,63 @@ impl WorkPublisher {
                 "NAK observed, republished to pool"
             ),
             Ok(RepublishOutcome::AlreadyRepublished) => {
-                // The request already fell back to the pool (via an
-                // earlier NAK or the first-chunk timeout) and is now
-                // being NAKed again. There is nothing further to retry,
-                // so don't leave the client hanging until the first-chunk
-                // timeout — surface a 429 immediately, mirroring the
-                // pool-republish-failed arm below.
-                let (display_model, pool) = self
+                // Re-read under the collector lock before deciding. A
+                // first-chunk-timeout fallback can set `republished` before
+                // any worker attempt id has latched; in that window, a late
+                // NAK from the abandoned direct attempt is indistinguishable
+                // from a NAK emitted by the pool successor. Failing the
+                // request here would recreate #1601's spurious 429. Once a
+                // current attempt has latched, we can classify the NAK
+                // precisely and keep the immediate 429 for a live attempt
+                // that really NAKs after fallback.
+                let Some((decision, display_model, pool)) = self
                     .pending_streams
-                    .get(&nak.request_id)
-                    .map(|e| (e.value().display_model.clone(), e.value().pool.clone()))
-                    .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+                    .get_mut(&nak.request_id)
+                    .map(|mut entry| {
+                        let decision = already_republished_nak_decision(
+                            entry.current_attempt_id.as_deref(),
+                            entry.abandoned_attempt_id.as_deref(),
+                            &nak.attempt_id,
+                        );
+                        if matches!(decision, AlreadyRepublishedNakDecision::WaitForSuccessor) {
+                            entry.record_abandoned_attempt_id(&nak.attempt_id);
+                        }
+                        (decision, entry.display_model.clone(), entry.pool.clone())
+                    })
+                else {
+                    debug!(
+                        request_id = %nak.request_id,
+                        reason = %nak.reason,
+                        "NAK on already-republished request after collector completed"
+                    );
+                    return;
+                };
+                match decision {
+                    AlreadyRepublishedNakDecision::DropStale => {
+                        metrics::GENERATION_STALE_ATTEMPT_NAKS
+                            .with_label_values(&[
+                                &metrics::sanitize_model_label(&display_model),
+                                &metrics::sanitize_label(&pool),
+                            ])
+                            .inc();
+                        debug!(
+                            request_id = %nak.request_id,
+                            nak_attempt_id = %nak.attempt_id,
+                            "dropping stale NAK from an abandoned attempt"
+                        );
+                        return;
+                    }
+                    AlreadyRepublishedNakDecision::WaitForSuccessor => {
+                        debug!(
+                            request_id = %nak.request_id,
+                            nak_attempt_id = %nak.attempt_id,
+                            reason = %nak.reason,
+                            "ignoring ambiguous NAK on already-republished request before successor attempt latched"
+                        );
+                        return;
+                    }
+                    AlreadyRepublishedNakDecision::Fail => {}
+                }
                 metrics::RATE_LIMIT_TOTAL
                     .with_label_values(&[
                         &metrics::sanitize_model_label(&display_model),
@@ -3502,6 +3842,7 @@ mod tests {
                     tokenization_ms: None,
                     postprocessing_ms: None,
                     payload_fetch_ms: None,
+                    worker_direct: false,
                 }),
                 None,
             ],
@@ -3512,16 +3853,131 @@ mod tests {
             pool_label: "default".into(),
             model_label: "BAAI/bge-m3".into(),
             pool_fallback_subject: Some("sie.work.default.l4.default.BAAI__bge-m3".into()),
+            direct_fallback_worker_id: Some("worker-1".into()),
+            direct_fallback_republished_indices: BTreeSet::new(),
             direct_fallback_payloads: vec![Some(vec![0]), Some(vec![1]), Some(vec![2])],
             direct_fallback_republished: false,
         };
 
-        let (subject, payloads) =
+        let (subject, worker_id, payloads) =
             take_direct_fallback_payloads(&mut collector).expect("fallback payloads");
         assert_eq!(subject, "sie.work.default.l4.default.BAAI__bge-m3");
+        assert_eq!(worker_id.as_deref(), Some("worker-1"));
         assert_eq!(payloads, vec![(0, vec![0]), (2, vec![2])]);
         assert!(collector.direct_fallback_republished);
         assert!(take_direct_fallback_payloads(&mut collector).is_none());
+    }
+
+    #[test]
+    fn test_batch_result_collector_keeps_first_result_for_duplicate_item() {
+        let (tx, _rx) = oneshot::channel();
+        let mut collector = ResultCollector {
+            _total_items: 1,
+            results: vec![None],
+            sender: Some(tx),
+            deadline: Instant::now() + Duration::from_secs(30),
+            operation: "encode".into(),
+            published_at: Instant::now(),
+            pool_label: "default".into(),
+            model_label: "BAAI/bge-m3".into(),
+            pool_fallback_subject: None,
+            direct_fallback_worker_id: None,
+            direct_fallback_republished_indices: BTreeSet::new(),
+            direct_fallback_payloads: vec![None],
+            direct_fallback_republished: false,
+        };
+
+        let first = WorkResult {
+            work_item_id: "req.0".into(),
+            request_id: "req".into(),
+            item_index: 0,
+            success: true,
+            result_msgpack: vec![1],
+            error: None,
+            error_code: None,
+            inference_ms: None,
+            queue_ms: None,
+            processing_ms: None,
+            worker_id: Some("direct-worker".into()),
+            tokenization_ms: None,
+            postprocessing_ms: None,
+            payload_fetch_ms: None,
+            worker_direct: false,
+        };
+        let duplicate = WorkResult {
+            result_msgpack: vec![2],
+            worker_id: Some("pool-worker".into()),
+            ..first.clone()
+        };
+
+        assert_eq!(
+            store_result_if_missing(&mut collector, first),
+            StoreResultOutcome::Stored
+        );
+        assert_eq!(
+            store_result_if_missing(&mut collector, duplicate),
+            StoreResultOutcome::Duplicate
+        );
+        let stored = collector.results[0].as_ref().expect("stored result");
+        assert_eq!(stored.result_msgpack, vec![1]);
+        assert_eq!(stored.worker_id.as_deref(), Some("direct-worker"));
+    }
+
+    #[test]
+    fn test_batch_result_collector_ignores_stale_direct_after_fallback_confirmed() {
+        let (tx, _rx) = oneshot::channel();
+        let mut collector = ResultCollector {
+            _total_items: 1,
+            results: vec![None],
+            sender: Some(tx),
+            deadline: Instant::now() + Duration::from_secs(30),
+            operation: "encode".into(),
+            published_at: Instant::now(),
+            pool_label: "default".into(),
+            model_label: "BAAI/bge-m3".into(),
+            pool_fallback_subject: Some("sie.work.default.l4.default.BAAI__bge-m3".into()),
+            direct_fallback_worker_id: Some("direct-worker".into()),
+            direct_fallback_republished_indices: BTreeSet::from([0]),
+            direct_fallback_payloads: vec![Some(vec![0])],
+            direct_fallback_republished: true,
+        };
+
+        let stale_direct = WorkResult {
+            work_item_id: "req.0".into(),
+            request_id: "req".into(),
+            item_index: 0,
+            success: true,
+            result_msgpack: vec![1],
+            error: None,
+            error_code: None,
+            inference_ms: None,
+            queue_ms: None,
+            processing_ms: None,
+            worker_id: Some("direct-worker".into()),
+            tokenization_ms: None,
+            postprocessing_ms: None,
+            payload_fetch_ms: None,
+            worker_direct: true,
+        };
+        let pool_result = WorkResult {
+            result_msgpack: vec![2],
+            worker_id: Some("pool-worker".into()),
+            worker_direct: false,
+            ..stale_direct.clone()
+        };
+
+        assert_eq!(
+            store_result_if_missing(&mut collector, stale_direct),
+            StoreResultOutcome::StaleDirectFallback
+        );
+        assert!(collector.results[0].is_none());
+        assert_eq!(
+            store_result_if_missing(&mut collector, pool_result),
+            StoreResultOutcome::Stored
+        );
+        let stored = collector.results[0].as_ref().expect("stored result");
+        assert_eq!(stored.result_msgpack, vec![2]);
+        assert_eq!(stored.worker_id.as_deref(), Some("pool-worker"));
     }
 
     #[test]
@@ -3868,6 +4324,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: true,
         };
 
         let encoded = rmp_serde::to_vec(&result).unwrap();
@@ -3877,6 +4334,7 @@ mod tests {
         assert_eq!(decoded.item_index, 2);
         assert!(decoded.success);
         assert_eq!(decoded.result_msgpack, vec![5, 6, 7]);
+        assert!(decoded.worker_direct);
     }
 
     #[test]
@@ -3982,6 +4440,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -4005,6 +4464,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         };
         let encoded = rmp_serde::to_vec_named(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -4045,6 +4505,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -4574,10 +5035,10 @@ mod tests {
         use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
         use opentelemetry::Context;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
-        use opentelemetry_sdk::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
 
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("gateway-test");
         let span = tracer.start("gateway.proxy_chat");
         let cx = Context::current().with_span(span);
@@ -4592,28 +5053,36 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_trace_context_stays_off_for_non_generation() {
+    fn test_queue_trace_context_injects_for_non_generation() {
         use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
         use opentelemetry::Context;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
-        use opentelemetry_sdk::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
 
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("gateway-test");
         let span = tracer.start("gateway.proxy_request");
         let cx = Context::current().with_span(span);
         let _guard = cx.attach();
 
+        // Non-generation endpoints now inject the active W3C context into
+        // the queue work-item envelope so the worker span attaches to the
+        // gateway span (issue #1500). A real 4-part traceparent proves the
+        // context was actually serialized, not just left non-None.
         for endpoint in InferenceEndpoint::NON_GENERATION_QUEUE_LABELS {
             assert!(
-                !WorkPublisher::should_propagate_queue_trace(endpoint),
-                "{endpoint} must keep the pre-generation queue hot path"
+                WorkPublisher::should_propagate_queue_trace(endpoint),
+                "{endpoint} must inject queue trace context"
             );
-            let (tp, ts) = WorkPublisher::trace_context_for_endpoint(endpoint);
-            assert!(tp.is_none(), "{endpoint} unexpectedly injected traceparent");
-            assert!(ts.is_none(), "{endpoint} unexpectedly injected tracestate");
+            let (tp, _ts) = WorkPublisher::trace_context_for_endpoint(endpoint);
+            let tp = tp.unwrap_or_else(|| panic!("{endpoint} should propagate traceparent"));
+            let parts: Vec<&str> = tp.split('-').collect();
+            assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+            assert_eq!(parts[1].len(), 32, "trace_id is 32 hex chars");
+            assert_eq!(parts[2].len(), 16, "span_id is 16 hex chars");
         }
+        // Unrecognized endpoints still fail closed (no envelope injection).
         let (tp, ts) = WorkPublisher::trace_context_for_endpoint("unknown");
         assert!(
             tp.is_none(),
@@ -4626,14 +5095,14 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_trace_context_is_generation_only() {
+    fn test_queue_trace_context_propagates_for_generate() {
         use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
         use opentelemetry::Context;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
-        use opentelemetry_sdk::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
 
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("gateway-test");
         let span = tracer.start("gateway.proxy_generate");
         let cx = Context::current().with_span(span);
@@ -4646,25 +5115,388 @@ mod tests {
         assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
     }
 
+    #[tokio::test]
+    async fn test_inbound_context_continues_into_non_generation_envelope() {
+        // End-to-end mechanism for #1500 on the non-generation path: the
+        // gateway extracts the inbound client `traceparent`, scopes it
+        // over the publish via `with_context` (no billed gateway span),
+        // and the queue-publish injection re-emits it. The emitted
+        // traceparent must CONTINUE the inbound trace — same trace_id and
+        // parent == the inbound span_id — so the worker's run_batch span
+        // attaches to the client trace instead of rooting a fresh one.
+        use opentelemetry::trace::FutureExt;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let inbound_trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let inbound_span_id = "b7ad6b7169203331";
+        let inbound_tp = format!("00-{inbound_trace_id}-{inbound_span_id}-01");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("traceparent"),
+            axum::http::HeaderValue::from_str(&inbound_tp).unwrap(),
+        );
+        let cx = crate::observability::propagation::extract_context_from_headers(&headers);
+
+        // Mirror the gateway: the inbound context is current over the
+        // publish future, then a non-generation endpoint injects it.
+        let (tp, _ts) = async { WorkPublisher::trace_context_for_endpoint("encode") }
+            .with_context(cx)
+            .await;
+
+        let tp = tp.expect("encode must inject the inbound trace context");
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+        assert_eq!(
+            parts[1], inbound_trace_id,
+            "must continue the inbound trace_id"
+        );
+        assert_eq!(
+            parts[2], inbound_span_id,
+            "worker's parent must be the inbound span"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_publish_span_context_parents_non_generation_envelope() {
+        use opentelemetry::trace::{FutureExt, TraceContextExt, TracerProvider as _};
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::Instrument;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        async fn publish_with_gateway_span(
+            headers: axum::http::HeaderMap,
+        ) -> (String, String, String) {
+            let provider = SdkTracerProvider::builder().build();
+            let tracer = provider.tracer("gateway-test");
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer));
+            let dispatch = tracing::Dispatch::new(subscriber);
+
+            let publish_fut = tracing::dispatcher::with_default(&dispatch, || {
+                let inbound_cx =
+                    crate::observability::propagation::extract_context_from_headers(&headers);
+                let span = tracing::info_span!(
+                    "gateway.publish",
+                    otel.name = "gateway.publish",
+                    sie.endpoint = "encode",
+                    sie.model = "BAAI/bge-m3",
+                    sie.pool = "default",
+                    sie.publish_ms = tracing::field::Empty,
+                );
+                let _ = span.set_parent(inbound_cx);
+                let publish_cx = span.context();
+                let span_context = publish_cx.span().span_context().clone();
+                let gateway_trace_id = span_context.trace_id().to_string();
+                let gateway_span_id = span_context.span_id().to_string();
+
+                async move {
+                    let (tp, _ts) = async { WorkPublisher::trace_context_for_endpoint("encode") }
+                        .with_context(publish_cx)
+                        .instrument(span)
+                        .await;
+                    (
+                        tp.expect("encode envelope must carry gateway.publish context"),
+                        gateway_trace_id,
+                        gateway_span_id,
+                    )
+                }
+            });
+
+            publish_fut.await
+        }
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let inbound_trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let inbound_span_id = "b7ad6b7169203331";
+        let inbound_tp = format!("00-{inbound_trace_id}-{inbound_span_id}-01");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("traceparent"),
+            axum::http::HeaderValue::from_str(&inbound_tp).unwrap(),
+        );
+
+        let (tp, gateway_trace_id, gateway_span_id) = publish_with_gateway_span(headers).await;
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+        assert_eq!(
+            parts[1], inbound_trace_id,
+            "gateway.publish must continue the inbound trace_id"
+        );
+        assert_eq!(parts[1], gateway_trace_id);
+        assert_eq!(
+            parts[2], gateway_span_id,
+            "worker's parent must be gateway.publish"
+        );
+        assert_ne!(
+            parts[2], inbound_span_id,
+            "worker must not attach directly to the inbound client span"
+        );
+        assert_eq!(parts[3], "01", "gateway.publish span should be sampled");
+
+        let (root_tp, root_gateway_trace_id, root_gateway_span_id) =
+            publish_with_gateway_span(axum::http::HeaderMap::new()).await;
+        let root_parts: Vec<&str> = root_tp.split('-').collect();
+        assert_eq!(root_parts.len(), 4, "wire shape: version-trace-span-flags");
+        assert_eq!(
+            root_parts[1], root_gateway_trace_id,
+            "gateway.publish must be the fresh trace root when no inbound context exists"
+        );
+        assert_eq!(
+            root_parts[2], root_gateway_span_id,
+            "worker's parent must be the root gateway.publish span"
+        );
+        assert_ne!(root_parts[1], "00000000000000000000000000000000");
+        assert_ne!(root_parts[2], "0000000000000000");
+        assert_eq!(
+            root_parts[3], "01",
+            "root gateway.publish span should be sampled"
+        );
+    }
+
+    /// Integration test (issue #1500): drive a real `WorkPublisher` encode
+    /// publish over a live NATS/JetStream broker, with the inbound trace
+    /// context scoped over the publish via `with_context` exactly as
+    /// `proxy_request` does, and assert the published work-item envelope
+    /// (decoded off the wire) carries a `traceparent` that CONTINUES the
+    /// inbound trace. Unlike the unit tests above this exercises the real
+    /// JetStream publish, the real msgpack `WorkItemRef` serialization,
+    /// and the context surviving the publish future's own `.await`s.
+    ///
+    /// NATS-gated, mirroring `tests/nak_republish.rs`: a no-op pass when
+    /// `NATS_URL` is unset / unreachable so the hermetic `cargo test` run
+    /// (and the gateway CI job, which runs no NATS sidecar) stays green;
+    /// the full flow runs when `NATS_URL` points at a JetStream server.
+    #[tokio::test]
+    async fn test_encode_publish_continues_inbound_trace_over_nats() {
+        use futures_util::StreamExt;
+        use opentelemetry::trace::FutureExt;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+        let Ok(url) = std::env::var("NATS_URL") else {
+            eprintln!("skipping: NATS_URL not set");
+            return;
+        };
+        let client =
+            match tokio::time::timeout(Duration::from_secs(2), async_nats::connect(&url)).await {
+                Ok(Ok(c)) => c,
+                _ => {
+                    eprintln!("skipping: could not connect to NATS at {url}");
+                    return;
+                }
+            };
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        // Unique pool token so this run's JetStream stream + work subject
+        // never collide with a parallel run on a shared broker.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pool = format!("itpool{nanos}");
+        let model = "BAAI__bge-m3";
+
+        let publisher = WorkPublisher::new(
+            async_nats::jetstream::new(client.clone()),
+            "it-router".to_string(),
+            Arc::new(crate::queue::payload_store::DisabledPayloadStore),
+            Duration::from_secs(5),
+            1024,
+            Duration::from_secs(300),
+        );
+
+        let target = PublishTarget::Pool {
+            pool: pool.clone(),
+            machine_profile: "l4".to_string(),
+            bundle: "default".to_string(),
+            model: model.to_string(),
+        };
+        let subject = target.subject();
+
+        // Pre-create the work stream + a JetStream consumer so the
+        // publisher sees a live consumer (`num_consumers > 0`), mirroring a
+        // real worker bound to the pool. Without it `publish_work` fails
+        // backpressure with "no consumers available for work stream". The
+        // stream config matches `ensure_stream` so its later
+        // `get_or_create_stream` is a no-op.
+        let stream = async_nats::jetstream::new(client.clone())
+            .get_or_create_stream(jetstream::stream::Config {
+                name: stream_name(&pool),
+                subjects: vec![format!("sie.work.{pool}.*.*.*")],
+                retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(300),
+                max_messages: 100_000,
+                ..Default::default()
+            })
+            .await
+            .expect("create work stream");
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some("itworker".to_string()),
+                filter_subject: subject.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("create work consumer");
+
+        // Subscribe BEFORE publishing — a core subscriber also receives
+        // JetStream-published messages on the subject.
+        let mut sub = client.subscribe(subject.clone()).await.expect("subscribe");
+        client.flush().await.expect("flush");
+
+        // Inbound client trace context (as a `/v1/encode` caller sends).
+        let inbound_trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let inbound_span_id = "b7ad6b7169203331";
+        let inbound_tp = format!("00-{inbound_trace_id}-{inbound_span_id}-01");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("traceparent"),
+            axum::http::HeaderValue::from_str(&inbound_tp).unwrap(),
+        );
+        let cx = crate::observability::propagation::extract_context_from_headers(&headers);
+
+        let params = WorkParams {
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            labels: None,
+            output_schema: None,
+            query_item: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+        };
+        let items = vec![rmpv::Value::Map(vec![(
+            rmpv::Value::String("text".into()),
+            rmpv::Value::String("hello".into()),
+        )])];
+
+        // Mirror the handler: scope the inbound context over the publish.
+        let (_request_id, _rx) = publisher
+            .publish_work(
+                target, &pool, "encode", model, "pytorch", "", items, &params,
+            )
+            .with_context(cx)
+            .await
+            .expect("publish_work");
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("timed out waiting for the published work item")
+            .expect("subscription closed before a message arrived");
+        let work: WorkItem =
+            rmp_serde::from_slice(&msg.payload).expect("decode work-item envelope");
+
+        let tp = work
+            .traceparent
+            .expect("encode envelope must carry the inbound traceparent");
+        let parts: Vec<&str> = tp.split('-').collect();
+        assert_eq!(parts.len(), 4, "wire shape: version-trace-span-flags");
+        assert_eq!(
+            parts[1], inbound_trace_id,
+            "must continue the inbound trace_id"
+        );
+        assert_eq!(
+            parts[2], inbound_span_id,
+            "worker's parent must be the inbound span"
+        );
+
+        // Best-effort cleanup so repeated local runs don't accumulate
+        // per-run streams on a persistent broker.
+        let _ = async_nats::jetstream::new(client.clone())
+            .delete_stream(stream_name(&pool))
+            .await;
+    }
+
     // ----- H9 — first-chunk-fallback rate limit ---------------------
 
-    /// The bucket admits exactly ``burst`` tokens immediately, then
-    /// refuses until the rate refills enough for the next whole token.
-    /// Refilling is driven by monotonic time so the test sleeps briefly
-    /// to advance the clock; the timing window is generous enough to
-    /// avoid flakes on a loaded CI runner.
+    /// A NAK is dropped as stale only when the collector can identify it as an
+    /// abandoned, non-empty attempt id — either by comparing with the latched
+    /// current attempt, or with the abandoned attempt recorded during a
+    /// NAK-driven republish before the successor's first chunk. See #1601.
+    #[test]
+    fn test_nak_is_stale_for_latched_or_recorded_abandoned_attempt() {
+        // Stale: collector latched gen1, NAK is from the abandoned gen0.
+        assert!(nak_is_stale(Some("gen1"), None, "gen0"));
+        // Not stale: NAK is from the currently-latched attempt.
+        assert!(!nak_is_stale(Some("gen0"), None, "gen0"));
+        // Stale: republish happened before any successor chunk latched, but the
+        // NAK-driven republish recorded the abandoned attempt id.
+        assert!(nak_is_stale(None, Some("gen0"), "gen0"));
+        // Not stale by this predicate: before successor latch, a different NAK
+        // may be from the live pool attempt. The already-republished handler
+        // treats that state as ambiguous and waits instead of failing.
+        assert!(!nak_is_stale(None, Some("gen0"), "gen1"));
+        // Fail open — no attempt latched or recorded yet: act on the NAK.
+        assert!(!nak_is_stale(None, None, "gen0"));
+        // Fail open — NAK carries no attempt id: act on the NAK.
+        assert!(!nak_is_stale(Some("gen1"), Some("gen0"), ""));
+        assert!(!nak_is_stale(None, Some("gen0"), ""));
+        assert!(!nak_is_stale(None, None, ""));
+    }
+
+    #[test]
+    fn test_already_republished_nak_waits_before_successor_latches() {
+        use AlreadyRepublishedNakDecision::{DropStale, Fail, WaitForSuccessor};
+
+        // Timeout-driven fallback: no worker attempt id was known when the
+        // request republished, so a later NAK before the pool worker's first
+        // chunk is ambiguous. Do not synthesize the spurious 429 from #1601.
+        assert_eq!(
+            already_republished_nak_decision(None, None, "gen0"),
+            WaitForSuccessor
+        );
+        // Even if a previous pre-latch NAK recorded an abandoned id, a
+        // different pre-latch NAK is still ambiguous until a successor chunk
+        // proves which attempt is live.
+        assert_eq!(
+            already_republished_nak_decision(None, Some("gen0"), "gen1"),
+            WaitForSuccessor
+        );
+        // Exact abandoned-id matches are still stale drops.
+        assert_eq!(
+            already_republished_nak_decision(None, Some("gen0"), "gen0"),
+            DropStale
+        );
+        assert_eq!(
+            already_republished_nak_decision(Some("gen1"), Some("gen0"), "gen0"),
+            DropStale
+        );
+        // Once an attempt has latched, a NAK from that same attempt is the live
+        // retry failure and may surface immediately.
+        assert_eq!(
+            already_republished_nak_decision(Some("gen1"), Some("gen0"), "gen1"),
+            Fail
+        );
+    }
+
+    /// The bucket admits exactly ``burst`` tokens immediately, then refuses
+    /// until the rate refills enough for the next whole token. Time is
+    /// injected, so the refill is exercised by advancing a synthetic clock —
+    /// deterministic, no ``thread::sleep`` and no CI-timing window.
     #[test]
     fn test_token_bucket_burst_and_refill() {
-        let mut bucket = TokenBucket::new(10.0, 3.0); // 10/s, burst 3
-                                                      // Burst exhausted in three takes.
-        assert!(bucket.try_take());
-        assert!(bucket.try_take());
-        assert!(bucket.try_take());
-        assert!(!bucket.try_take(), "burst exceeded — must refuse");
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::new(10.0, 3.0, t0); // 10/s, burst 3
+                                                          // Burst exhausted in three takes at t0.
+        assert!(bucket.try_take(t0));
+        assert!(bucket.try_take(t0));
+        assert!(bucket.try_take(t0));
+        assert!(!bucket.try_take(t0), "burst exceeded — must refuse");
 
-        // Sleep ~120ms — at 10/s that's >=1 token of refill.
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(bucket.try_take(), "expected refill to permit one more take");
+        // Advance 150ms — at 10/s that is >=1 token of refill.
+        let t1 = t0 + Duration::from_millis(150);
+        assert!(
+            bucket.try_take(t1),
+            "expected refill to permit one more take"
+        );
     }
 
     /// Regression for the burst cap: the bucket must NOT accumulate
@@ -4673,13 +5505,15 @@ mod tests {
     /// hours of accrued tokens at once.
     #[test]
     fn test_token_bucket_caps_at_burst() {
-        let mut bucket = TokenBucket::new(100.0, 2.0); // very fast refill, tiny burst
-        std::thread::sleep(Duration::from_millis(50)); // would refill 5 tokens uncapped
-                                                       // Two takes succeed (burst), the third refuses (no overflow stored).
-        assert!(bucket.try_take());
-        assert!(bucket.try_take());
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::new(100.0, 2.0, t0); // very fast refill, tiny burst
+                                                           // 50ms at 100/s would refill 5 tokens uncapped; the cap must hold.
+        let t1 = t0 + Duration::from_millis(50);
+        // Two takes succeed (burst), the third refuses (no overflow stored).
+        assert!(bucket.try_take(t1));
+        assert!(bucket.try_take(t1));
         assert!(
-            !bucket.try_take(),
+            !bucket.try_take(t1),
             "burst cap must be enforced even after a long idle window"
         );
     }
@@ -4690,10 +5524,12 @@ mod tests {
     /// permits and we want a deterministic, bounded number of republishes.
     #[test]
     fn test_token_bucket_drops_excess_attempts() {
-        let mut bucket = TokenBucket::new(5.0, 4.0); // 5/s, burst 4
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::new(5.0, 4.0, t0); // 5/s, burst 4
         let mut admitted = 0usize;
+        // All attempts at the same instant — no refill, so exactly burst admit.
         for _ in 0..20 {
-            if bucket.try_take() {
+            if bucket.try_take(t0) {
                 admitted += 1;
             }
         }
@@ -4722,19 +5558,24 @@ mod tests {
             burst: f64,
             model: &str,
             pool: &str,
+            now: Instant,
         ) -> bool {
             let key = format!("{}|{}", model, pool);
             let entry = buckets
                 .entry(key)
-                .or_insert_with(|| std::sync::Mutex::new(TokenBucket::new(rate, burst)));
-            let admitted = entry.value().lock().unwrap().try_take();
+                .or_insert_with(|| std::sync::Mutex::new(TokenBucket::new(rate, burst, now)));
+            let admitted = entry.value().lock().unwrap().try_take(now);
             admitted
         }
+
+        // All attempts at one instant — no refill, so each key admits exactly
+        // burst-many before refusing.
+        let t0 = Instant::now();
 
         // Same key — admit exactly burst, then refuse.
         let mut admitted_a = 0usize;
         for _ in 0..30 {
-            if try_take(&buckets, rate, burst, "model-A", "pool-1") {
+            if try_take(&buckets, rate, burst, "model-A", "pool-1", t0) {
                 admitted_a += 1;
             }
         }
@@ -4743,7 +5584,7 @@ mod tests {
         // Different model on same pool → independent bucket → full burst.
         let mut admitted_b = 0usize;
         for _ in 0..30 {
-            if try_take(&buckets, rate, burst, "model-B", "pool-1") {
+            if try_take(&buckets, rate, burst, "model-B", "pool-1", t0) {
                 admitted_b += 1;
             }
         }
@@ -4752,7 +5593,7 @@ mod tests {
         // Different pool on same model → also independent.
         let mut admitted_c = 0usize;
         for _ in 0..30 {
-            if try_take(&buckets, rate, burst, "model-A", "pool-2") {
+            if try_take(&buckets, rate, burst, "model-A", "pool-2", t0) {
                 admitted_c += 1;
             }
         }

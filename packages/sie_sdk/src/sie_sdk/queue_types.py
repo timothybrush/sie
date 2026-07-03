@@ -354,8 +354,7 @@ def work_worker_subject(
         machine_profile: Hardware lane (e.g., ``"rtx6000"``).
         bundle_id: Runtime/image bundle identifier (e.g., ``"sglang"``).
         model_id: Model identifier (e.g., ``"BAAI/bge-m3"``).
-        worker_id: Stable worker identity (matches
-            :attr:`sie_server.nats_pull_loop.NatsPullLoop.worker_id`).
+        worker_id: Stable worker identity advertised by the worker-sidecar.
 
     Returns:
         NATS subject like

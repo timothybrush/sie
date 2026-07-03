@@ -33,3 +33,35 @@ def test_yaml_filename_matches_sie_id(yaml_path: Path) -> None:
         f"expected {_expected_filename(sie_id)!r}. "
         f"Case-sensitive filesystems (Linux CI) will fail to find this config."
     )
+
+
+@pytest.mark.parametrize("yaml_path", sorted(MODELS_DIR.glob("*.yaml")), ids=lambda p: p.name)
+def test_instruction_template_has_placeholder(yaml_path: Path) -> None:
+    """An ``Instruct:``-prefixed ``query_template`` must contain the ``{instruction}``
+    placeholder.
+
+    Otherwise the eval harness's instruction gating
+    (``EvalRunner._model_uses_instruction``, added in #1432) treats the model as
+    non-instruction-following and silently drops the per-task MTEB prompt, so the
+    model is measured with a hardcoded generic instruction instead of each task's
+    instruction. This is the stella_en_*_v5 regression (#1340).
+    """
+    with yaml_path.open() as f:
+        config = yaml.safe_load(f) or {}
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        return
+    offenders: list[str] = []
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        adapter_options = profile.get("adapter_options")
+        runtime = adapter_options.get("runtime") if isinstance(adapter_options, dict) else None
+        query_template = runtime.get("query_template") if isinstance(runtime, dict) else None
+        if isinstance(query_template, str) and "Instruct:" in query_template and "{instruction}" not in query_template:
+            offenders.append(profile_name)
+    assert not offenders, (
+        f"{yaml_path.name}: profile(s) {offenders} hardcode an 'Instruct:' instruction "
+        f"without a '{{instruction}}' placeholder; the eval harness drops the per-task "
+        f"MTEB instruction (#1340). Use 'Instruct: {{instruction}}' + 'default_instruction'."
+    )

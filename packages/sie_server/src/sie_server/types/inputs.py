@@ -214,3 +214,42 @@ def media_bytes(media: object, *, kind: str = "media") -> bytes:
         f"{kind} data must be bytes, got {type(data).__name__} "
         "(base64 JSON strings must be decoded to bytes before inference)"
     )
+
+
+# =============================================================================
+# Validated item decode
+# =============================================================================
+
+
+def decode_item(raw: dict[str, Any]) -> Item:
+    """Validate a wire-format item mapping into a typed :class:`Item`.
+
+    The HTTP ingress path decodes request bodies straight into typed msgspec
+    structs (``msgspec.json/msgpack.decode(body, type=...)``), so an item whose
+    fields have the wrong type is rejected at the seam with ``INVALID_INPUT``.
+    The queue / IPC path receives each item as a plain ``dict``
+    (``msgpack.unpackb``) and historically built ``Item(**kwargs)``, which
+    performs *no* type validation — a malformed item slipped through to fail
+    deep inside a preprocessor/adapter (see issue #1026).
+
+    This is the single validating decode for dict-sourced items: it runs the
+    same ``Item`` contract through :func:`msgspec.convert`, so the queue path
+    rejects type violations exactly where the HTTP path does and base64-decodes
+    ``str`` media ``data`` to ``bytes`` the same way the JSON path does. The
+    ``*Input`` TypedDicts are ``total=False``, so missing/empty media ``data``
+    is still enforced at point of use by :func:`media_bytes`.
+
+    Args:
+        raw: The wire-format item mapping. The SDK ships ``content`` as an
+            alias for ``text``; it is remapped when ``text`` is absent.
+
+    Returns:
+        A validated :class:`Item`.
+
+    Raises:
+        msgspec.ValidationError: If a field is present with the wrong type.
+            Both ingress paths surface this as ``INVALID_INPUT`` (HTTP 400).
+    """
+    if "content" in raw and "text" not in raw:
+        raw = {**raw, "text": raw["content"]}
+    return msgspec.convert(raw, type=Item)

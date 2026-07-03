@@ -7,6 +7,7 @@
 //! runtime contract.
 
 pub mod backend;
+pub mod batch_cancel;
 pub mod config;
 pub mod config_reconciler;
 pub mod config_subscriber;
@@ -19,6 +20,7 @@ pub mod latency;
 pub mod log_util;
 pub mod metrics;
 pub mod nats_consumer;
+pub mod observability;
 pub mod output;
 pub mod payload_store;
 pub mod pinned_reconciler;
@@ -34,7 +36,7 @@ pub mod tokenize;
 pub mod work_types;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -45,6 +47,7 @@ use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::backend::{BackendRouter, PythonIpcBackend, SharedBackend};
+use crate::batch_cancel::{request_id_from_batch_cancel_subject, BatchCancelState};
 use crate::config::WorkerConfig;
 use crate::config_subscriber::ConfigApplyState;
 use crate::dispatcher::Dispatcher;
@@ -271,7 +274,6 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         config.ping_interval_ms,
         config.ready_stale_mult,
     ));
-    let loaded_models = Arc::new(RwLock::new(Vec::<String>::new()));
     info!(
         ping_interval_ms = config.ping_interval_ms,
         ready_stale_mult = config.ready_stale_mult,
@@ -408,6 +410,8 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     info!("rust-scheduler: enabled for every model (per-model drain loops spawn on first traffic)");
 
     let config_apply_state = Arc::new(ConfigApplyState::new(config.bundle_config_hash.clone()));
+    let loaded_models = config_apply_state.loaded_models();
+    let batch_cancel_state = BatchCancelState::default();
 
     let dispatcher = Arc::new(Dispatcher::new(
         Arc::clone(&backend),
@@ -421,6 +425,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         Some(shutdown.clone()),
         Some(Arc::clone(&config_apply_state)),
         pool_admission.clone(),
+        batch_cancel_state.clone(),
     ));
 
     let generation_direct_dispatch = Arc::new(GenerationDirectDispatch::new(
@@ -434,6 +439,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         pool_admission.clone(),
         Arc::clone(&ipc),
         Arc::clone(&nats_direct_active),
+        batch_cancel_state,
     ));
     generation_direct_dispatch
         .activate("startup")
@@ -449,6 +455,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         shutdown.clone(),
         crate::config_subscriber::ConfigSubscriberOptions {
             trusted_producers: config.nats_config_trusted_producers.clone(),
+            pool: config.pool.clone(),
         },
     );
     let config_reconciler_handle = crate::config_reconciler::spawn(
@@ -457,6 +464,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
                 base_url: base_url.clone(),
                 admin_token: config.config_service_token.clone(),
                 bundle: config.bundle.clone(),
+                pool: config.pool.clone(),
                 poll_interval: Duration::from_millis(config.config_poll_interval_ms),
                 full_export_interval: if config.config_full_export_interval_ms == 0 {
                     None
@@ -683,11 +691,11 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
 #[derive(Default)]
 struct GenerationDirectHandles {
     pull: Option<JoinHandle<()>>,
-    cancel: Option<JoinHandle<()>>,
+    generation_cancel: Option<JoinHandle<()>>,
+    batch_cancel: Option<JoinHandle<()>>,
 }
 
-/// Owns the worker-specific direct-dispatch stream and generation cancel
-/// subscription.
+/// Owns the worker-specific direct-dispatch stream and cancel subscriptions.
 ///
 /// The stream is always active: capped logical batch requests can target an
 /// assigned worker directly, and generation uses the same worker subject for
@@ -703,6 +711,7 @@ struct GenerationDirectDispatch {
     pool_admission: Option<Arc<PoolAdmissionGate>>,
     ipc: Arc<IpcClient>,
     active: Arc<AtomicBool>,
+    batch_cancel_state: BatchCancelState,
     handles: Mutex<GenerationDirectHandles>,
 }
 
@@ -719,6 +728,7 @@ impl GenerationDirectDispatch {
         pool_admission: Option<Arc<PoolAdmissionGate>>,
         ipc: Arc<IpcClient>,
         active: Arc<AtomicBool>,
+        batch_cancel_state: BatchCancelState,
     ) -> Self {
         Self {
             jetstream,
@@ -731,6 +741,7 @@ impl GenerationDirectDispatch {
             pool_admission,
             ipc,
             active,
+            batch_cancel_state,
             handles: Mutex::new(GenerationDirectHandles::default()),
         }
     }
@@ -755,6 +766,22 @@ impl GenerationDirectDispatch {
             }
         };
 
+        let batch_cancel = match spawn_batch_direct_cancel_subscriber(
+            self.nats_client.clone(),
+            self.config.worker_id.clone(),
+            self.batch_cancel_state.clone(),
+            Arc::clone(&self.shutdown),
+        )
+        .await
+        .context("start batch direct-dispatch cancel subscriber")
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.active.store(false, Ordering::Release);
+                return Err(e);
+            }
+        };
+
         let nats_worker_consumer = NatsConsumer::new(worker_consumer);
         let direct_fetch_ctrl = self.fetch_ctrl.clone();
         let direct_dispatcher = Arc::clone(&self.dispatcher);
@@ -772,7 +799,7 @@ impl GenerationDirectDispatch {
             )
             .await;
         });
-        let cancel = spawn_generation_cancel_subscriber(
+        let generation_cancel = spawn_generation_cancel_subscriber(
             self.nats_client.clone(),
             Arc::clone(&self.ipc),
             Arc::clone(&self.shutdown),
@@ -780,7 +807,8 @@ impl GenerationDirectDispatch {
 
         let mut handles = self.handles.lock().await;
         handles.pull = Some(pull);
-        handles.cancel = Some(cancel);
+        handles.generation_cancel = Some(generation_cancel);
+        handles.batch_cancel = Some(batch_cancel);
         info!(reason, "worker direct-dispatch activated");
         Ok(true)
     }
@@ -790,7 +818,8 @@ impl GenerationDirectDispatch {
             let mut guard = self.handles.lock().await;
             GenerationDirectHandles {
                 pull: guard.pull.take(),
-                cancel: guard.cancel.take(),
+                generation_cancel: guard.generation_cancel.take(),
+                batch_cancel: guard.batch_cancel.take(),
             }
         };
 
@@ -800,7 +829,11 @@ impl GenerationDirectDispatch {
             }
             let _ = h.await;
         }
-        if let Some(h) = handles.cancel {
+        if let Some(h) = handles.generation_cancel {
+            h.abort();
+            let _ = h.await;
+        }
+        if let Some(h) = handles.batch_cancel {
             h.abort();
             let _ = h.await;
         }
@@ -892,6 +925,67 @@ fn spawn_generation_cancel_subscriber(
             }
         }
     })
+}
+
+async fn spawn_batch_direct_cancel_subscriber(
+    nats_client: async_nats::Client,
+    worker_id: String,
+    batch_cancel_state: BatchCancelState,
+    shutdown: Arc<Shutdown>,
+) -> anyhow::Result<JoinHandle<()>> {
+    let subject = "batch_cancel.>".to_string();
+    let mut sub = nats_client
+        .subscribe(subject.clone())
+        .await
+        .context("subscribe to batch_cancel.>")?;
+
+    Ok(tokio::spawn(async move {
+        info!("batch-direct: cancel subscription started");
+        let retry_backoff = Duration::from_millis(500);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => return,
+                maybe_msg = sub.next() => {
+                    let Some(msg) = maybe_msg else {
+                        warn!("batch-direct: cancel subscription ended; retrying");
+                        loop {
+                            match nats_client.subscribe(subject.clone()).await {
+                                Ok(next_sub) => {
+                                    sub = next_sub;
+                                    info!("batch-direct: cancel subscription restarted");
+                                    break;
+                                }
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "batch-direct: failed to resubscribe to batch_cancel.>"
+                                ),
+                            }
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.wait() => return,
+                                _ = sleep(retry_backoff) => {}
+                            }
+                        }
+                        continue;
+                    };
+                    let subject = msg.subject.to_string();
+                    let Some(request_id) =
+                        request_id_from_batch_cancel_subject(&subject, &worker_id)
+                    else {
+                        debug!(subject = %subject, "batch-direct: ignoring non-local cancel subject");
+                        continue;
+                    };
+                    batch_cancel_state.cancel(request_id.clone());
+                    debug!(
+                        request_id = %request_id,
+                        worker_id = %worker_id,
+                        "batch-direct: cancel recorded for worker-direct queued work"
+                    );
+                }
+            }
+        }
+    }))
 }
 
 fn request_id_from_cancel_subject(subject: &str) -> Option<String> {

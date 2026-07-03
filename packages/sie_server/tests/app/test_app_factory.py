@@ -2,7 +2,9 @@
 
 import logging
 import uuid
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -23,6 +25,11 @@ def client() -> TestClient:
     """Create a test client for the SIE server."""
     app = AppFactory.create_app(AppStateConfig())
     return TestClient(app)
+
+
+@asynccontextmanager
+async def _async_value(value: Any = None) -> AsyncGenerator[Any, None]:
+    yield value
 
 
 class TestAppFactory:
@@ -50,6 +57,28 @@ class TestAppFactory:
         assert "/healthz" in paths
         assert "/livez" in paths
         assert "/readyz" in paths
+
+
+class TestAppLifespanState:
+    @pytest.mark.asyncio
+    async def test_lifespan_wires_ipc_server_as_queue_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        registry = MagicMock()
+        ipc_server = MagicMock()
+
+        monkeypatch.setattr(AppFactory, "_configure_torch_threads", MagicMock())
+        monkeypatch.setattr(AppFactory, "_configure_cuda_defaults", MagicMock())
+        monkeypatch.setattr(AppFactory, "_nvml", MagicMock(return_value=_async_value()))
+        monkeypatch.setattr(AppFactory, "_model_registry", MagicMock(return_value=_async_value(registry)))
+        monkeypatch.setattr(AppFactory, "_ipc_server", MagicMock(return_value=_async_value(ipc_server)))
+        monkeypatch.setattr(AppFactory, "_graceful_shutdown", MagicMock(return_value=_async_value()))
+        monkeypatch.setattr(AppFactory, "_readiness_handling", MagicMock(return_value=_async_value()))
+
+        app = AppFactory.create_app(AppStateConfig())
+
+        async with app.router.lifespan_context(app):
+            assert app.state.registry is registry
+            assert app.state.ipc_server is ipc_server
+            assert app.state.queue_runtime is ipc_server
 
 
 class TestAllRoutersAlwaysMounted:
@@ -112,13 +141,15 @@ class TestIpcHeartbeatReadiness:
     @pytest.mark.asyncio
     async def test_direct_server_readiness_does_not_require_sidecar_ping(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SIE_IPC_REQUIRE_HEARTBEAT", raising=False)
+        monkeypatch.setenv("SIE_WORKER_ID", "worker-from-env")
         socket_path = self._short_socket_path()
         monkeypatch.setenv("SIE_IPC_SOCKET_PATH", str(socket_path))
         readiness.register_liveness_probe(None)
         readiness.mark_ready()
 
         try:
-            async with AppFactory._ipc_server(MagicMock()):
+            async with AppFactory._ipc_server(MagicMock()) as server:
+                assert server.worker_id == "worker-from-env"
                 assert readiness.is_ready() is True
         finally:
             readiness.mark_not_ready()

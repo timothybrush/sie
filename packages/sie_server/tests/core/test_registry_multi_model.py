@@ -187,18 +187,19 @@ class TestMultiModelRouting:
         # Initially A is LRU (loaded first)
         assert registry.memory_manager.get_lru_model() == "model-a"
 
-        # Access A -> now B is LRU
-        registry.get("model-a")
+        # touch_lru(A) -> now B is LRU. (get() is a pure read since #1541; the
+        # request hot paths call touch_lru explicitly to mark recent use.)
+        registry.touch_lru("model-a")
         assert registry.memory_manager.get_lru_model() == "model-b"
 
-        # Access B -> now C is LRU
-        registry.get("model-b")
+        # touch_lru(B) -> now C is LRU
+        registry.touch_lru("model-b")
         assert registry.memory_manager.get_lru_model() == "model-c"
 
-        # Access C -> now A is LRU (full rotation)
-        registry.get("model-c")
+        # touch_lru(C) -> now A is LRU (full rotation)
+        registry.touch_lru("model-c")
         assert registry.memory_manager.get_lru_model() == "model-a"
 
-        # Access A again -> now B is LRU
-        registry.get("model-a")
+        # touch_lru(A) again -> now B is LRU
+        registry.touch_lru("model-a")
         assert registry.memory_manager.get_lru_model() == "model-b"

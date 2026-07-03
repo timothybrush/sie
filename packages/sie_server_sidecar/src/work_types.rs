@@ -109,6 +109,8 @@ pub struct WorkResult {
     pub postprocessing_ms: Option<f64>,
     #[serde(default)]
     pub payload_fetch_ms: Option<f64>,
+    #[serde(default)]
+    pub worker_direct: bool,
 }
 
 #[cfg(test)]
@@ -252,6 +254,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: true,
         };
         let bytes = rmp_serde::to_vec_named(&result).unwrap();
         let back: WorkResult = rmp_serde::from_slice(&bytes).unwrap();
@@ -260,5 +263,6 @@ mod tests {
         assert_eq!(back.item_index, 2);
         assert_eq!(back.result_msgpack.len(), 8);
         assert_eq!(back.inference_ms, Some(12.5));
+        assert!(back.worker_direct);
     }
 }

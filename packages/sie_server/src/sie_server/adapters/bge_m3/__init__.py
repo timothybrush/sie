@@ -66,7 +66,7 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
         *,
         normalize: bool = True,
         max_seq_length: int = 8192,
-        compute_precision: ComputePrecision = "bfloat16",
+        compute_precision: ComputePrecision | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -75,7 +75,9 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path.
             normalize: Whether to L2-normalize dense embeddings.
             max_seq_length: Maximum sequence length (default 8192).
-            compute_precision: Compute precision (bfloat16 recommended).
+            compute_precision: Compute precision. None (default) selects fp32 off-CUDA
+                (safe on MPS) and bfloat16 on CUDA; set explicitly to override (e.g.
+                float16 to opt a curated model into fp16 on MPS).
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -135,17 +137,21 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
         Returns:
             Tuple of (torch.dtype, attention_implementation string).
         """
-        # CPU should use FP32
-        if not device.startswith("cuda"):
-            return torch.float32, "sdpa"
-
         # Map precision to dtype
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        dtype = dtype_map.get(self._compute_precision, torch.bfloat16)
+        # Default fp32 off-CUDA (safe on CPU/MPS); honor an explicit compute_precision
+        # everywhere so curated Mac models can opt into fp16 on MPS. CUDA keeps bf16.
+        precision = self._compute_precision
+        if precision is None:
+            precision = "bfloat16" if device.startswith("cuda") else "float32"
+        # NOTE: bf16 is coerced to fp16 on MPS at the loader (MPS bf16 is incomplete
+        # in torch and hangs XLM-RoBERTa load), so ``precision`` is never bf16 here on
+        # MPS via the serving path. See core/loader.load_adapter.
+        dtype = dtype_map.get(precision, torch.float32)
 
         # XLMRoberta (BGE-M3) does not support Flash Attention 2, always use SDPA
         return dtype, "sdpa"

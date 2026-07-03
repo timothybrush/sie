@@ -210,6 +210,10 @@ class IpcServer:
     def socket_path(self) -> Path:
         return self._socket_path
 
+    @property
+    def worker_id(self) -> str:
+        return self._worker_id
+
     def is_heartbeat_fresh(self, *, now_monotonic: float | None = None) -> bool:
         """Return True iff the Rust side has pinged within ``stale_after_ms``.
 
@@ -572,11 +576,19 @@ class IpcServer:
 
     def _handle_worker_capabilities(self, _req: WorkerCapabilitiesRequest) -> WorkerCapabilitiesResponse:
         generation_models: list[str] = []
+        supported_models: list[str] = []
+        loaded_models: list[str] = []
         try:
             configs = self._executor.registry.get_configs_snapshot()
         except Exception:  # noqa: BLE001
             logger.debug("Could not snapshot configs for worker capabilities", exc_info=True)
             return WorkerCapabilitiesResponse()
+
+        supported_models = sorted(configs)
+        try:
+            loaded_models = sorted(self._executor.registry.loaded_model_names)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not snapshot loaded models for worker capabilities", exc_info=True)
 
         for model_id, config in configs.items():
             try:
@@ -589,6 +601,8 @@ class IpcServer:
         return WorkerCapabilitiesResponse(
             has_generation_models=bool(generation_models),
             generation_models=generation_models,
+            supported_models=supported_models,
+            loaded_models=loaded_models,
         )
 
     async def _handle_signal_generate_cancel(

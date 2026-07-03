@@ -10,6 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._multivector import maxsim_scores
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
@@ -352,13 +353,9 @@ class ColQwen3Adapter(BaseAdapter):
         if doc_output.multivector is None:
             raise RuntimeError("Failed to encode documents: no multivector output")
 
-        scores: list[float] = []
         query_tensor = torch.from_numpy(query_vecs).to(self._device)
-        for doc_vecs in doc_output.multivector:
-            doc_tensor = torch.from_numpy(doc_vecs).to(self._device)
-            sim = torch.matmul(query_tensor, doc_tensor.T)
-            scores.append(sim.max(dim=-1).values.sum().item())
-        return scores
+        doc_tensors = [torch.from_numpy(d).to(self._device) for d in doc_output.multivector]
+        return maxsim_scores(query_tensor, doc_tensors)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -19,8 +19,9 @@
 {{- /* Validate: `clusterRouting` is queue-only today. The Rust gateway has
      no direct-mode code path; "direct" belongs to Python-gateway deployments
      and is now a footgun (operators requesting direct would silently
-     get queue behavior). Workers still honor SIE_CLUSTER_ROUTING=queue for
-     pull-loop gating; see packages/sie_server/src/sie_server/app/app_factory.py.
+     get queue behavior). Queue workers rely on the worker-sidecar as the
+     NATS consumer; Python exposes IPC, health, and readiness for that sidecar
+     (see packages/sie_server/src/sie_server/app/app_factory.py).
      Queue mode requires NATS+JetStream; large-payload offload additionally
      requires a shared object-store payload store. */}}
 {{- $routing := default "queue" .Values.clusterRouting }}
@@ -270,6 +271,9 @@ spec:
             # Use polling watcher for ConfigMap (inotify doesn't work with K8s symlink-based mounts)
             - name: SIE_GATEWAY_POLLING_WATCHER
               value: "true"
+            {{- end }}
+            {{- if .Values.observability.tracing.enabled }}
+            {{- include "sie-cluster.tracing.env" (dict "root" . "serviceName" .Values.observability.tracing.serviceName.gateway) | nindent 12 }}
             {{- end }}
             {{- with .Values.gateway.extraEnv }}
             # Operator-supplied env passthrough (parity with workers.common.extraEnv).

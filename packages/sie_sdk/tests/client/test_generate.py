@@ -29,12 +29,12 @@ def _ok_response(payload: dict) -> MagicMock:
 
 
 def _resp_504() -> MagicMock:
-    # A 504 carrying MODEL_LOADING is what the idempotent paths retry on;
-    # generate() must NOT retry it (post-publish, non-idempotent).
+    # A gateway-owned queue result timeout is retryable for idempotent encode
+    # paths; generate() must NOT retry it (post-publish, non-idempotent).
     response = MagicMock()
     response.status_code = 504
     response.headers = {"Retry-After": "0.01", "content-type": "application/json"}
-    response.json.return_value = {"error": {"code": "MODEL_LOADING", "message": "Timeout waiting for queue result"}}
+    response.json.return_value = {"detail": {"code": "GATEWAY_TIMEOUT", "message": "Timeout waiting for queue result"}}
     response.content = json.dumps(response.json.return_value).encode("utf-8")
     return response
 

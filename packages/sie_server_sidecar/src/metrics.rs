@@ -63,7 +63,7 @@ const DELIVER_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0];
 ///
 /// The `sie_worker_*` surface is internal/Rust-only; the `sie_pull_loop_*`
 /// surface preserves the metric names used by existing Grafana dashboards
-/// originally wired to the Python pull loop.
+/// that predate the sidecar-owned scheduler.
 ///
 /// ## Label cardinality
 ///

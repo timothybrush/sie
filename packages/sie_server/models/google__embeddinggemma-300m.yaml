@@ -32,18 +32,11 @@ max_sequence_length: 2048
 profiles:
   default:
     max_batch_tokens: 16384
-    # bfloat16 on CUDA matches the captured reference embedding in
-    # ``test_all_models.py``. On CPU the adapter falls back to fp32
-    # automatically (see pytorch_embedding adapter); the loaded model
-    # still works, but numerical-equivalence tests should be gated on
-    # CUDA availability if drift becomes an issue.
-    compute_precision: bfloat16
-    adapter_path: sie_server.adapters.pytorch_embedding:PyTorchEmbeddingAdapter
-    adapter_options:
-      loadtime:
-        attn_implementation: sdpa
-      runtime:
-        pooling: mean
-        normalize: true
-        query_template: 'task: search result | query: {text}'
-        doc_template: 'title: none | text: {text}'
+    # EmbeddingGemma carries trained Dense projection layers on top of the
+    # transformer (Transformer -> mean Pooling -> Dense -> Dense -> Normalize),
+    # so it is served through the sentence-transformers pipeline; a plain
+    # transformers.AutoModel path would expose only the backbone without the
+    # projection head. Pooling and normalization are owned by the pipeline, and
+    # query/document prompts come from the model's own prompt set selected by
+    # is_query, so none are configured here.
+    adapter_path: sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter

@@ -11,6 +11,7 @@ from sie_server.core.adaptive_batching import (
     BatchEfficiencyTracker,
     LatencyTracker,
 )
+from sie_server.core.batcher import BatchConfig
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.core.prepared import make_text_item
 from sie_server.core.worker import ModelWorker, WorkerConfig
@@ -187,6 +188,23 @@ class TestAdaptiveBatchController:
         )
         wait, _ = ctrl.step(observed_p50_ms=30.0, fill_ratio=0.5)
         assert wait == pytest.approx(20.0)
+
+    def test_apply_step_writes_back_to_target(self) -> None:
+        # apply_step advances the controller and writes the new limits into
+        # the target (a real BatchConfig, proving it satisfies the structural
+        # AdaptiveBatchTarget), returning the same pair for metrics. Mirrors
+        # the deterministic single-step case above.
+        ctrl = AdaptiveBatchController(
+            target_p50_ms=50.0,
+            gain=0.5,
+            update_interval=1,
+            _current_wait_ms=10.0,
+        )
+        target = BatchConfig(max_batch_wait_ms=10.0)
+        wait, cost = ctrl.apply_step(target, observed_p50_ms=30.0, fill_ratio=0.5)
+        assert wait == pytest.approx(20.0)
+        assert target.max_batch_wait_ms == wait
+        assert target.max_batch_cost == cost
 
     def test_decreases_wait_when_over_target(self) -> None:
         ctrl = AdaptiveBatchController(

@@ -1,0 +1,21 @@
+{{- if and .Values.observability.tracing.tempo.install (index .Values "kube-prometheus-stack" "install") }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sie-cluster.fullname" . }}-datasource-tempo
+  namespace: {{ include "sie-cluster.namespace" . }}
+  labels:
+    {{- include "sie-cluster.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datasource
+data:
+  tempo-datasource.yaml: |-
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo:3200
+        isDefault: false
+{{- end }}

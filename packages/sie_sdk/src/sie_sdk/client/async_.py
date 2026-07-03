@@ -101,6 +101,7 @@ from ._shared import (
     retry_after_or_default,
     sse_chunk_error,
     sse_headers,
+    validate_encode_result_count,
 )
 from ._sse import aiter_sse_payloads
 from .errors import (
@@ -1285,13 +1286,10 @@ class SIEAsyncClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. A cold-start request that triggers a
-            # worker-side on-demand model load will typically exceed the
-            # gateway's per-request timeout on the first call; treat that
-            # the same as MODEL_LOADING and retry under the existing
-            # provision_timeout_s budget.
+            # Handle 504 (gateway timeout): queued work was published, but the
+            # gateway did not receive a worker result before its deadline.
+            # Encode/score/extract are idempotent, so callers that opted into
+            # wait_for_capacity can retry within provision_timeout_s.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
@@ -1325,6 +1323,10 @@ class SIEAsyncClient:
 
         # Parse results and inject timing into each
         results = parse_encode_results(response_data["items"])
+        # Guard the 1:1 input↔output contract before any positional access
+        # (``results[0]`` below, or batch reassembly in callers). A desynced
+        # count otherwise surfaces as a context-free ``IndexError`` (#1526).
+        validate_encode_result_count(results, len(items_list), model)
         if timing:
             for result in results:
                 result["timing"] = timing
@@ -1695,9 +1697,7 @@ class SIEAsyncClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. See encode() above for rationale.
+            # Handle 504 (gateway timeout). See encode() above for rationale.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
@@ -2455,9 +2455,7 @@ class SIEAsyncClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. See encode() above for rationale.
+            # Handle 504 (gateway timeout). See encode() above for rationale.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:

@@ -458,6 +458,10 @@ async fn run_sse_driver(args: SseDriverArgs) {
     // (`biased`) iteration would re-poll the now-consumed receiver and
     // panic on the request path. Disable the branch once it has fired.
     let mut outcome_done = false;
+    // Latched when the terminal outcome resolves Ok (the generation completed
+    // server-side). The Lagged arm uses it to skip a pointless worker cancel
+    // for an already-completed request. #1602
+    let mut stream_succeeded = false;
 
     // Helper: send an SSE event onto the mpsc channel. Returns false
     // if the receiver is closed (HTTP client disconnect), which is
@@ -693,11 +697,14 @@ async fn run_sse_driver(args: SseDriverArgs) {
                             publisher.drop_pending_stream(&request_id);
                             return;
                         }
-                        // A success outcome resolved here means the
-                        // terminal chunk was already forwarded through the
-                        // tap (which fires the oneshot on the same
-                        // terminal apply). The chunk arm's `is_terminal`
-                        // branch owns the `[DONE]`; nothing more to do.
+                        // A success outcome resolved here means the terminal
+                        // chunk was already forwarded through the tap (which
+                        // fires the oneshot on the same terminal apply). The
+                        // chunk arm's `is_terminal` branch owns the `[DONE]`;
+                        // latch that the generation completed server-side so the
+                        // Lagged arm can skip a pointless cancel of an
+                        // already-finished request. See #1602.
+                        stream_succeeded = true;
                         continue;
                     }
                     Err(_) => {
@@ -727,10 +734,19 @@ async fn run_sse_driver(args: SseDriverArgs) {
         let chunk = match recv_result {
             Ok(c) => c,
             Err(broadcast::error::RecvError::Lagged(n)) => {
+                // A lagged consumer means the sender overwrote `n` of the
+                // oldest still-UNforwarded chunks in the bounded broadcast ring
+                // before this driver read them, so the client's response is
+                // genuinely INCOMPLETE — real content was dropped. (If all
+                // content had been forwarded, the cursor would be caught up and
+                // recv() would return the terminal in order, not `Lagged`.)
+                // Always surface that: a bare `[DONE]` would present a
+                // silently-truncated stream as a complete success. See #1602.
                 warn!(
                     request_id = %request_id,
                     lagged = n,
-                    "SSE consumer lagged behind chunk tap; surfacing as inter_chunk_timeout"
+                    succeeded = stream_succeeded,
+                    "SSE consumer lagged behind chunk tap; response is incomplete"
                 );
                 send_error_chunk(
                     &event_tx,
@@ -740,12 +756,18 @@ async fn run_sse_driver(args: SseDriverArgs) {
                     &model,
                     &request_id,
                     "inter_chunk_timeout",
-                    "SSE consumer fell behind",
+                    "SSE consumer fell behind; response is incomplete",
                 )
                 .await;
                 send_done(&event_tx).await;
                 cancel_guard.defuse();
-                publisher.publish_cancel(&request_id).await;
+                // Only cancel the worker if the generation is still in flight.
+                // A request whose terminal outcome already resolved Ok has
+                // completed server-side — there is nothing to cancel, so the
+                // publish_cancel would be a redundant wire op. See #1602.
+                if !stream_succeeded {
+                    publisher.publish_cancel(&request_id).await;
+                }
                 publisher.drop_pending_stream(&request_id);
                 return;
             }

@@ -1,0 +1,25 @@
+sie_id: jinaai/jina-embeddings-v2-base-de
+hf_id: jinaai/jina-embeddings-v2-base-de
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  encode:
+    dense:
+      dim: 768
+    sparse: null
+    multivector: null
+  score: null
+  extract: null
+max_sequence_length: 8192
+profiles:
+  candle:
+    max_batch_tokens: 16384
+    compute_precision: null
+    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
+    adapter_options:
+      runtime:
+        pooling: mean
+        normalize: true

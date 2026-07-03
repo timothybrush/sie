@@ -151,19 +151,6 @@ class WorkerConfig:
     # Reactive OOM recovery applied inside `_process_batch`. When disabled,
     # OOM exceptions propagate as before (legacy behaviour).
     oom_recovery: OomRecoveryConfig = field(default_factory=OomRecoveryConfig)
-    # When ``True`` the ModelWorker bypasses its internal BatchFormer /
-    # per-LoRA queues / adaptive controller / FCFS process loop, and instead
-    # treats every ``submit*`` call as a fully-formed GPU batch — exactly the
-    # frame that arrived over IPC from the worker-sidecar. Used when the
-    # sidecar already owns batch formation
-    # (its own adaptive batcher) and re-running the batcher here only adds
-    # queue depth and competing controllers (the "dual batching" pathology).
-    # The Python tokenizer / templating / output framing all stay alive as
-    # fallback for items that arrive without ``prepared_tokens``.
-    #
-    # The env var ``SIE_WORKER_PASSTHROUGH=1`` overrides this at construction
-    # time so we can A/B without redeploying with a different config.
-    passthrough_mode: bool = False
 
 
 @dataclass

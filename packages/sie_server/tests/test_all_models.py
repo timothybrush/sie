@@ -225,7 +225,9 @@ def test_google_embeddinggemma_300m_dense() -> None:
     # gate the test rather than letting numerical-equivalence drift mask the
     # underlying problem (sie-test#85).
     pytest.importorskip("transformers", minversion="4.56.0")
-    _assert_dense("google/embeddinggemma-300m", 768, [0.01641845703125, 0.052001953125, -0.0009312629699707031])
+    # Reference is the sentence-transformers pipeline output (incl. the Dense
+    # projection head) for "test" encoded as a document, on CPU/fp32.
+    _assert_dense("google/embeddinggemma-300m", 768, [-0.069580078125, -0.03155517578125, 0.025390625])
 
 
 @pytest.mark.xfail(reason="7B model too large for CPU unit tests", strict=False)

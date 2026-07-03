@@ -26,3 +26,12 @@ profiles:
         normalize: true
         query_template: 'search_query: {text}'
         doc_template: 'search_document: {text}'
+  candle:
+    extends: default
+    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
+    adapter_options:
+      runtime:
+        pooling: mean
+        normalize: true
+        query_template: 'search_query: {text}'
+        doc_template: 'search_document: {text}'

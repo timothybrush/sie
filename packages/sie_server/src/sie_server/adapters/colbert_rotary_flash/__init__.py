@@ -7,6 +7,7 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._multivector import maxsim_scores_batched
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters._utils import apply_rotary_pos_emb, grouped_score_pairs, validate_output_types
@@ -401,30 +402,10 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             is_query=False,
         )
 
-        # Compute MaxSim for all documents in a single batched operation
+        # MaxSim over all documents in one padded, masked batched matmul.
         query_tensor = torch.from_numpy(query_vecs).to(self._device)
-
-        doc_list = doc_output.multivector
-        doc_lengths = [d.shape[0] for d in doc_list]
-        max_doc_tokens = max(doc_lengths)
-        dim = query_vecs.shape[1]
-
-        docs_padded = torch.zeros(
-            (len(doc_list), max_doc_tokens, dim),
-            dtype=query_tensor.dtype,
-            device=self._device,
-        )
-        for i, doc_vecs in enumerate(doc_list):
-            t = torch.from_numpy(doc_vecs).to(self._device)
-            docs_padded[i, : t.shape[0]] = t
-
-        sim = torch.matmul(query_tensor, docs_padded.transpose(1, 2))
-
-        lengths_t = torch.tensor(doc_lengths, device=self._device)
-        mask = torch.arange(max_doc_tokens, device=self._device).unsqueeze(0) < lengths_t.unsqueeze(1)
-        sim.masked_fill_(~mask.unsqueeze(1), float("-inf"))
-
-        return sim.max(dim=-1).values.sum(dim=-1).tolist()
+        doc_tensors = [torch.from_numpy(d).to(self._device) for d in doc_output.multivector]
+        return maxsim_scores_batched(query_tensor, doc_tensors)
 
     def score_pairs(
         self,

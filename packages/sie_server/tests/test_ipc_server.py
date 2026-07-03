@@ -14,6 +14,8 @@ import msgpack
 import numpy as np
 import pytest
 import yaml
+from sie_config.model_registry import ModelRegistry as ConfigModelRegistry
+from sie_sdk.bundle_utils import match_bundle_models
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
@@ -46,6 +48,10 @@ def _short_sock_path() -> Path:
     if len(str(base)) > 20:
         base = Path("/tmp")  # noqa: S108
     return base / f"sie-{uuid.uuid4().hex[:12]}.sock"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
 
 
 class _Client:
@@ -368,6 +374,32 @@ class TestEnsureModelReady:
 
 
 class TestApplyModelConfig:
+    def test_python_bundle_hash_matches_config_registry_and_skips_rust_profiles(self) -> None:
+        root = _repo_root()
+        bundles_dir = root / "packages/sie_server/bundles"
+        models_dir = root / "packages/sie_server/models"
+        config_registry = ConfigModelRegistry(bundles_dir, models_dir)
+
+        default_filter = match_bundle_models(bundles_dir / "default.yaml", models_dir)
+        default_registry = ModelRegistry(
+            models_dir=models_dir,
+            model_filter=default_filter,
+            enable_hot_reload=False,
+        )
+        assert compute_bundle_config_hash_cached(
+            default_registry,
+            "default",
+        ) == config_registry.compute_bundle_config_hash("default")
+
+        candle_filter = match_bundle_models(bundles_dir / "candle.yaml", models_dir)
+        candle_registry = ModelRegistry(
+            models_dir=models_dir,
+            model_filter=candle_filter,
+            enable_hot_reload=False,
+        )
+        assert compute_bundle_config_hash_cached(candle_registry, "candle") == ""
+        assert config_registry.compute_bundle_config_hash("candle")
+
     @pytest.mark.asyncio
     async def test_apply_model_config_hash_cache_is_per_registry(self) -> None:
         stale_registry = ModelRegistry(models_dir=None)
@@ -1021,7 +1053,7 @@ profiles:
 
 class TestSetPinnedModels:
     @pytest.mark.asyncio
-    async def test_executor_passthrough_returns_count(self) -> None:
+    async def test_executor_batch_budget_returns_count(self) -> None:
         registry = ModelRegistry(models_dir=None)
         registry.start_load_async = AsyncMock(return_value=True)  # type: ignore[method-assign]
         executor = QueueExecutor(registry)
@@ -1152,7 +1184,7 @@ class TestProcessScoreAndExtract:
         wr = WorkerResult(output=score_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_score = AsyncMock(return_value=fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
         srv._executor._registry.start_worker = AsyncMock(return_value=worker)
 
         client = await _Client.connect(sock)
@@ -1202,7 +1234,7 @@ class TestProcessScoreAndExtract:
         wr = WorkerResult(output=extract_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_extract = AsyncMock(return_value=fut)
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
         srv._executor._registry.start_worker = AsyncMock(return_value=worker)
 
         client = await _Client.connect(sock)
@@ -1279,6 +1311,7 @@ class TestGenerationSidecarIpc:
             "encode/model": encode_cfg,
             "z-generate/model": gen_cfg,
         }
+        reg.loaded_model_names = ["encode/model"]
         sock = _short_sock_path()
         async with IpcServer(sock, executor, worker_id="w"):
             client = await _Client.connect(sock)
@@ -1291,6 +1324,8 @@ class TestGenerationSidecarIpc:
         assert resp["body"] == {
             "has_generation_models": True,
             "generation_models": ["z-generate/model"],
+            "supported_models": ["encode/model", "z-generate/model"],
+            "loaded_models": ["encode/model"],
         }
 
     @pytest.mark.asyncio

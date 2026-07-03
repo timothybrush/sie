@@ -40,6 +40,13 @@ class TestSGLangEmbeddingAdapter:
         assert SGLangEmbeddingAdapter.requires_main_thread is False
         assert SGLangEmbeddingAdapter.manages_own_load_timeout is True
 
+    def test_load_required_memory_bytes_uses_mem_fraction_static(self) -> None:
+        gb = 1024**3
+        adapter = SGLangEmbeddingAdapter("test-model", mem_fraction_static=0.8)
+
+        assert adapter.load_required_memory_bytes(device_type="cuda", device_total_bytes=10 * gb) == 9 * gb
+        assert adapter.load_required_memory_bytes(device_type="cpu", device_total_bytes=10 * gb) is None
+
     def test_startup_timeout_prefers_explicit_profile_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name in _server.STARTUP_TIMEOUT_ENV_VARS:
             monkeypatch.setenv(name, "120")
@@ -119,6 +126,38 @@ class TestSGLangEmbeddingAdapter:
 
         # Verify server URL is set
         assert adapter._server_url == "http://localhost:30000"
+
+    @patch("sie_server.adapters.sglang._server.subprocess.Popen")
+    @patch("sie_server.adapters.sglang._server.requests.get")
+    @patch("sie_server.adapters.sglang._server.find_free_port")
+    def test_load_trust_remote_code_flag(
+        self,
+        mock_find_port: MagicMock,
+        mock_requests_get: MagicMock,
+        mock_popen: MagicMock,
+    ) -> None:
+        """--trust-remote-code is emitted only when trust_remote_code is set.
+
+        gte-Qwen2-7B-instruct opts out (trust_remote_code=False) so SGLang loads
+        the stock tokenizer instead of the model's fragile remote-code tokenizer.
+        """
+        mock_find_port.return_value = 30000
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+        mock_requests_get.return_value = MagicMock(status_code=200)
+
+        def _cmd_for(*, trust_remote_code: bool) -> list[str]:
+            mock_popen.reset_mock()
+            adapter = SGLangEmbeddingAdapter(
+                model_name_or_path="Alibaba-NLP/gte-Qwen2-7B-instruct",
+                trust_remote_code=trust_remote_code,
+            )
+            adapter.load("cuda:0")
+            return mock_popen.call_args[0][0]
+
+        assert "--trust-remote-code" in _cmd_for(trust_remote_code=True)
+        assert "--trust-remote-code" not in _cmd_for(trust_remote_code=False)
 
     @patch("sie_server.adapters.sglang._server.subprocess.Popen")
     @patch("sie_server.adapters.sglang._server.requests.get")

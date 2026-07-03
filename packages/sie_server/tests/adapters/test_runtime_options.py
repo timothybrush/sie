@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -273,6 +273,69 @@ class TestRuntimeOptionsConsumption:
             query_template="custom: {text}",
         )
         assert texts == ["custom: hello"]
+
+    # --- SGLang append_eos (last-token pooling fix, #1489) ---
+
+    def test_sglang_append_eos_appends_to_queries_and_docs(self) -> None:
+        """append_eos appends the resolved EOS to BOTH queries and documents."""
+        adapter = SGLangEmbeddingAdapter(
+            "test-model",
+            query_template="Instruct: {instruction}\nQuery: {text}",
+            default_instruction="do retrieval",
+            append_eos=True,
+        )
+        # EOS is resolved from the tokenizer in load(); set it directly here.
+        adapter._eos_token = "</s>"  # noqa: S105 - EOS token, not a secret
+
+        q = adapter._format_texts([Item(text="hello")], None, is_query=True)
+        d = adapter._format_texts([Item(text="world")], None, is_query=False)
+        assert q == ["Instruct: do retrieval\nQuery: hello</s>"]
+        assert d == ["world</s>"]
+
+    def test_sglang_append_eos_skips_empty_and_whitespace(self) -> None:
+        """EOS is NOT appended to empty/whitespace docs, so encode() still routes
+        them to the zero-vector fallback instead of an EOS-only input.
+        """
+        adapter = SGLangEmbeddingAdapter("test-model", append_eos=True)
+        adapter._eos_token = "</s>"  # noqa: S105 - EOS token, not a secret
+        texts = adapter._format_texts(
+            [Item(text=""), Item(text="   "), Item(text="real")],
+            None,
+            is_query=False,
+        )
+        assert texts == ["", "   ", "real</s>"]
+
+    def test_sglang_append_eos_disabled_by_default(self) -> None:
+        """Without append_eos, no EOS is appended (current behaviour preserved)."""
+        adapter = SGLangEmbeddingAdapter("test-model")
+        adapter._eos_token = "</s>"  # noqa: S105 - EOS token, not a secret; ignored when append_eos is False
+        texts = adapter._format_texts([Item(text="hello")], None, is_query=False)
+        assert texts == ["hello"]
+
+    def test_sglang_append_eos_noop_when_eos_unresolved(self) -> None:
+        """append_eos with an empty resolved EOS leaves text unchanged (graceful degrade)."""
+        adapter = SGLangEmbeddingAdapter("test-model", append_eos=True)
+        adapter._eos_token = ""  # tokenizer didn't expose an EOS
+        texts = adapter._format_texts([Item(text="hello")], None, is_query=False)
+        assert texts == ["hello"]
+
+    def test_sglang_resolve_eos_token_reads_tokenizer(self) -> None:
+        """_resolve_eos_token reads the real eos_token via the shared loader util."""
+        adapter = SGLangEmbeddingAdapter("test-model", append_eos=True)
+        mock_tok = MagicMock()
+        mock_tok.eos_token = "</s>"  # noqa: S105 - EOS token, not a secret
+        with patch("sie_server.adapters.sglang.embedding.load_tokenizer", return_value=mock_tok) as ld:
+            assert adapter._resolve_eos_token() == "</s>"
+        ld.assert_called_once()
+
+    def test_sglang_resolve_eos_token_degrades_on_failure(self) -> None:
+        """A tokenizer load failure degrades to '' rather than raising (model stays up)."""
+        adapter = SGLangEmbeddingAdapter("test-model", append_eos=True)
+        with patch(
+            "sie_server.adapters.sglang.embedding.load_tokenizer",
+            side_effect=RuntimeError("no tokenizer"),
+        ):
+            assert adapter._resolve_eos_token() == ""
 
     # --- Normalize override in encode() flow ---
 

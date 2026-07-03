@@ -123,6 +123,8 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r.register(Box::new(QUEUE_ACK_FAILURES.clone())).unwrap();
     r.register(Box::new(GENERATION_STALE_ATTEMPT_CHUNKS.clone()))
         .unwrap();
+    r.register(Box::new(GENERATION_STALE_ATTEMPT_NAKS.clone()))
+        .unwrap();
     r.register(Box::new(GENERATION_INVALID_CHUNKS.clone()))
         .unwrap();
     r.register(Box::new(GENERATION_SEQ_GAP_CHUNKS.clone()))
@@ -569,6 +571,25 @@ pub static GENERATION_STALE_ATTEMPT_CHUNKS: LazyLock<CounterVec> = LazyLock::new
         Opts::new(
             "sie_gateway_generation_stale_attempt_chunks_total",
             "Streaming chunks dropped due to stale attempt_id",
+        ),
+        &["model", "pool"],
+    )
+    .unwrap()
+});
+
+// sie_gateway_generation_stale_attempt_naks_total
+//
+// Counts NAKs dropped because their ``attempt_id`` does not match the
+// latched attempt for the request. The canonical producer is a late NAK from
+// an attempt already abandoned by a first-chunk-timeout/NAK republish: acting
+// on it would tear down the healthy successor stream that re-latched a newer
+// attempt (#1601). Mirrors ``GENERATION_STALE_ATTEMPT_CHUNKS`` on the chunk
+// path.
+pub static GENERATION_STALE_ATTEMPT_NAKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        Opts::new(
+            "sie_gateway_generation_stale_attempt_naks_total",
+            "NAKs dropped due to stale attempt_id",
         ),
         &["model", "pool"],
     )
@@ -1116,14 +1137,18 @@ pub fn record_rejected_request_for_pool(
     bundle: &str,
     reason: &str,
 ) {
-    let effective_pool = if pool.is_empty() { "unknown" } else { pool };
-    let effective_profile = if machine_profile.is_empty() {
-        "unknown"
-    } else {
-        machine_profile
-    };
+    // Route the caller-influenced labels through the canonical `sanitize_label`
+    // (empty -> "unknown", over-length / junk-charset -> "invalid") rather than
+    // an ad-hoc empty-check. This also normalizes `bundle` — previously passed
+    // raw, so call sites compensated by hand-passing a literal "unknown" — and
+    // gives the rejected-requests metric the same cardinality / charset bound
+    // the rest of the label surface already has. `reason` is a fixed in-tree
+    // literal, not caller-influenced, so it is left as-is.
+    let pool = sanitize_label(pool);
+    let machine_profile = sanitize_label(machine_profile);
+    let bundle = sanitize_label(bundle);
     REJECTED_REQUESTS
-        .with_label_values(&[effective_pool, effective_profile, bundle, reason])
+        .with_label_values(&[&pool, &machine_profile, &bundle, reason])
         .inc();
 }
 
@@ -2189,6 +2214,35 @@ mod tests {
         assert!((after - before - 1.0).abs() < f64::EPSILON);
     }
 
+    /// `record_rejected_request_for_pool` routes all three caller-influenced
+    /// labels through `sanitize_label`, so empty pool/profile/**bundle** all
+    /// normalize to "unknown" (bundle was previously passed raw). See #1573.
+    #[test]
+    fn test_record_rejected_normalizes_labels_via_sanitize() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let reason = "test_normalizes_via_sanitize";
+        let unknown_before = REJECTED_REQUESTS
+            .with_label_values(&["unknown", "unknown", "unknown", reason])
+            .get();
+
+        record_rejected_request_for_pool("", "", "", reason);
+
+        assert_eq!(
+            REJECTED_REQUESTS
+                .with_label_values(&["unknown", "unknown", "unknown", reason])
+                .get(),
+            unknown_before + 1.0,
+            "empty labels must normalize to the 'unknown' series"
+        );
+        assert_eq!(
+            REJECTED_REQUESTS
+                .with_label_values(&["", "", "", reason])
+                .get(),
+            0.0,
+            "the raw empty-label series must never be touched (bundle included)"
+        );
+    }
+
     /// Without `init_metric_families`, `*Vec` metrics with no
     /// observations are silently elided by Prometheus' text encoder,
     /// so a freshly booted gateway shows "no data" for the
@@ -2286,6 +2340,9 @@ mod tests {
         GENERATION_STALE_ATTEMPT_CHUNKS
             .with_label_values(&["surface/model", "surface/pool"])
             .inc();
+        GENERATION_STALE_ATTEMPT_NAKS
+            .with_label_values(&["surface/model", "surface/pool"])
+            .inc();
         GENERATION_TIMEOUTS
             .with_label_values(&["surface/model", "surface/pool", "first_chunk"])
             .inc();
@@ -2306,6 +2363,7 @@ mod tests {
             "sie_gateway_generation_total_tokens",
             "sie_gateway_routing_fallback_total",
             "sie_gateway_generation_stale_attempt_chunks_total",
+            "sie_gateway_generation_stale_attempt_naks_total",
             "sie_gateway_routing_cache_hit_estimate",
             "sie_gateway_kv_reservation_known",
             "sie_gateway_generation_timeout_total",

@@ -9,6 +9,7 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
@@ -314,18 +315,8 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         )
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
-        """Build position IDs for packed sequences.
-
-        Each sequence has positions starting from 0.  Fully vectorized
-        to avoid per-sequence .item() CUDA sync points.
-        """
-        total_tokens = cu_seqlens[-1].item()
-        positions = torch.arange(total_tokens, device=self._device)
-        seq_starts = torch.repeat_interleave(
-            cu_seqlens[:-1],
-            cu_seqlens[1:] - cu_seqlens[:-1],
-        )
-        return positions - seq_starts
+        """Build position IDs for packed sequences (each restarts at 0)."""
+        return build_position_ids(cu_seqlens)
 
     def _compute_rope(
         self,

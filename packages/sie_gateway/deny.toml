@@ -14,18 +14,14 @@ yanked = "deny"
 # the corresponding transitive bump lands (kube-rs, async-nats,
 # prometheus), drop the entry — `cargo-deny` warns on unmatched ignores.
 ignore = [
-    # ── Vulnerabilities (transitive, blocked on upstream dep bumps) ──
-    { id = "RUSTSEC-2024-0437", reason = "protobuf v2 stack overflow on malformed input; transitive via prometheus 0.13 (which pins protobuf=2.28). Fixed by bumping prometheus." },
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki <0.103.13 CRL distribution-point matching; transitive via async-nats 0.38 (pulls webpki 0.102). Fixed by bumping async-nats >=0.39." },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name-constraint bypass; transitive via async-nats 0.38. Fixed by bumping async-nats >=0.39." },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name-constraint accept; transitive via async-nats 0.38. Fixed by bumping async-nats >=0.39." },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; transitive via async-nats 0.38. Fixed by bumping async-nats >=0.39." },
-
-    # ── Unmaintained / unsound (low impact, all transitive) ──
-    { id = "RUSTSEC-2025-0012", reason = "`backoff` crate unmaintained; transitive via kube-runtime 0.98. Fixed by bumping kube-rs (newer versions migrated to `backon`)." },
-    { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained; transitive via backoff -> kube-runtime. Resolves with the kube-rs bump above." },
-    { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` archived; transitive via kube-client 0.98. Resolves with the kube-rs bump above." },
-    { id = "RUSTSEC-2026-0097", reason = "`rand` soundness issue only triggers under a custom `log` impl that calls `rand::rng()`; sie-gateway uses tracing-subscriber and never reaches that path." },
+    # Two quick-xml 0.40.1 DoS advisories, both fixed in the breaking 0.41.0
+    # release. quick-xml comes in only transitively via object_store 0.14.0
+    # (latest), which pins quick-xml ^0.40.1, so there is no version to update
+    # to yet, and it parses only trusted cloud-provider API responses, not
+    # attacker-controlled XML. Drop both when object_store ships a release
+    # depending on quick-xml >=0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 quadratic duplicate-attribute parse DoS (upstream #969); transitive via object_store 0.14.0 (pins ^0.40.1); awaiting upstream bump" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 namespace-declaration allocation DoS (upstream #970); transitive via object_store 0.14.0 (pins ^0.40.1); awaiting upstream bump" },
 ]
 
 [licenses]

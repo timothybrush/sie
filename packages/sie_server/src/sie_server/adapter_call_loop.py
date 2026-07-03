@@ -14,16 +14,16 @@ Design rationale — why this isn't just a method on ``QueueExecutor``:
 
 * The existing ``process_encode_batch`` / ``process_score_batch`` /
   ``process_extract_batch`` methods on ``QueueExecutor`` are the
-  *authoritative* Python path. They stay untouched so direct Python
-  execution and the focused IPC compatibility tests behave
-  exactly as today — zero diff in the hot path.
+  IPC execution path. They prepare adapter-coupled inputs and call
+  ``ModelWorker.submit_preformed*`` so Rust-owned batches do not re-enter
+  Python's local ``BatchFormer``.
 * ``adapter_call_loop`` is a **strict subset** of what those three
   methods do: it accepts an already-formed batch (no batching, no
   coalesce, no adaptive control — those live in Rust now) and fans
   each ``RunBatchItem`` into the same per-op handlers the executor
   already calls. All the adapter-side logic (``handlers.make_config_key``,
-  ``EncodePipeline.run_encode``, ``ModelWorker.submit``, ``_group_by_inference_config``,
-  ``_complete_requests``) is reused verbatim.
+  ``EncodePipeline.run_encode``, ``ModelWorker.submit_preformed``,
+  ``_group_by_inference_config``, ``_complete_requests``) is reused.
 * Keeping the dispatch thin here lets the Rust side own the only
   behaviourally-novel piece (batch formation + FCFS across LoRAs + PI
   loop) without duplicating the Python handler vocabulary.
@@ -34,17 +34,14 @@ LoRA plumbing (single source of truth for the wire-boundary contract):
   batch — items inside the batch are guaranteed homogeneous by the
   upstream FCFS-across-LoRAs scheduler. We forward that key into each
   ``EncodeBatchItem.options["lora"]`` / ``ExtractBatchItem.options["lora"]``
-  before fanning out to the per-op handler. From there the existing
-  ``ModelWorker.submit`` path picks it up at lines like
-  ``options.get("lora")`` (``model_worker.py``) and routes the items into
-  the matching per-LoRA ``BatchFormer``, where ``_process_loop`` calls
-  ``self._adapter.set_active_lora(active_lora)`` before the forward
-  pass.
+  before fanning out to the per-op handler. From there the pre-formed
+  ``ModelWorker`` entrypoint picks it up via ``options.get("lora")`` and
+  sets the adapter's active LoRA immediately before the forward pass.
 * Empty / missing ``lora_key`` → no injection → ``options.get("lora")``
   resolves to ``None`` → base-model batcher. The empty-string-to-``None``
   coercion is the wire-boundary contract; a future native adapter must
   apply the same normalisation.
-* Score is base-only — Python's ``ModelWorker.submit_score`` documents
+* Score is base-only — Python's ``ModelWorker.submit_score_preformed`` documents
   this as "Score operations use base model batcher (no LoRA support
   for reranking)". When ``RunBatch`` arrives with ``op="score"`` and a
   non-empty ``lora_key`` we **log** and serve the base path rather
@@ -83,6 +80,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import propagate, trace
+from opentelemetry.context import Context
+
 from sie_server.ipc_types import (
     BatchOutcome,
     EncodeBatchItem,
@@ -91,6 +91,7 @@ from sie_server.ipc_types import (
     ProcessEncodeBatchRequest,
     ProcessExtractBatchRequest,
     ProcessScoreBatchRequest,
+    RunBatchItem,
     RunBatchRequest,
 )
 
@@ -120,7 +121,7 @@ def _merge_lora_into_options(
 ) -> dict[str, Any] | None:
     """Return an options dict with ``options["lora"] = lora_key`` set.
 
-    Matches the legacy ``ModelWorker.submit`` contract where the
+    Matches the ``ModelWorker.submit_preformed`` contract where the
     batcher selection is sourced from ``options.get("lora")``. Returns
     ``existing`` unchanged when ``lora_key`` is empty (the base-model
     case — leaving ``options["lora"]`` unset rather than setting it to
@@ -205,20 +206,91 @@ async def handle_run_batch(
         )
         return _reject_all(req, RUN_BATCH_MIXED_OP, "mixed-op run_batch is not supported")
 
-    if op == "encode":
-        return await _dispatch_encode(executor, req)
-    if op == "score":
-        return await _dispatch_score(executor, req)
-    if op == "extract":
-        return await _dispatch_extract(executor, req)
+    # W3C Trace Context propagation (mirrors the streaming path in
+    # ``processors/streaming.py``). The gateway serialises its span into
+    # each work item's ``traceparent`` / ``tracestate``; the Rust
+    # scheduler copies those onto the wire items. We re-extract them here
+    # so ``worker.run_batch`` attaches to the gateway span instead of
+    # rooting a fresh trace. A batch can fan in items from several
+    # requests (each with its own trace) — we parent the span to the
+    # first distinct context and add OTel links to the rest.
+    parent_ctx, links = _extract_batch_trace_context(req.items)
+    tracer = trace.get_tracer("sie_server.adapter_call_loop")
+    with tracer.start_as_current_span(
+        "worker.run_batch",
+        context=parent_ctx,
+        links=links,
+        attributes={
+            "sie.model": req.model_id,
+            "sie.batch_id": req.batch_id,
+            "sie.op": op,
+            "sie.adapter": "run_batch",
+            "sie.batch_size": len(req.items),
+        },
+    ):
+        if op == "encode":
+            return await _dispatch_encode(executor, req)
+        if op == "score":
+            return await _dispatch_score(executor, req)
+        if op == "extract":
+            return await _dispatch_extract(executor, req)
 
-    logger.error(
-        "run_batch got unknown op=%r (model=%s, batch_id=%d)",
-        op,
-        req.model_id,
-        req.batch_id,
-    )
-    return _reject_all(req, RUN_BATCH_UNKNOWN_OP, f"unknown op {op!r}")
+        logger.error(
+            "run_batch got unknown op=%r (model=%s, batch_id=%d)",
+            op,
+            req.model_id,
+            req.batch_id,
+        )
+        return _reject_all(req, RUN_BATCH_UNKNOWN_OP, f"unknown op {op!r}")
+
+
+def _extract_batch_trace_context(
+    items: list[RunBatchItem],
+) -> tuple[Context, list[trace.Link]]:
+    """Resolve the parent context + span links for a ``worker.run_batch`` span.
+
+    A run_batch holds N items, each potentially from a different request
+    with its own ``traceparent`` / ``tracestate``. We:
+
+    * collect the DISTINCT ``(traceparent, tracestate)`` pairs, preserving
+      first-seen order;
+    * :func:`opentelemetry.propagate.extract` each into a parent
+      :class:`~opentelemetry.context.Context` and keep only the ones that
+      carry a *valid* span context;
+    * return the FIRST valid context as the parent and OTel
+      :class:`~opentelemetry.trace.Link` s to the remaining valid ones so
+      the fan-in is visible in the trace graph.
+
+    When no item carries a valid trace context, the empty context from
+    ``propagate.extract({})`` is returned (a safe no-op) so the caller
+    opens a root span.
+    """
+    distinct: list[tuple[str | None, str | None]] = []
+    for item in items:
+        key = (item.traceparent, item.tracestate)
+        if key not in distinct:
+            distinct.append(key)
+
+    valid_ctxs: list[Context] = []
+    for traceparent, tracestate in distinct:
+        carrier: dict[str, str] = {}
+        if traceparent is not None:
+            carrier["traceparent"] = traceparent
+        if tracestate is not None:
+            carrier["tracestate"] = tracestate
+        ctx = propagate.extract(carrier)
+        if trace.get_current_span(ctx).get_span_context().is_valid:
+            valid_ctxs.append(ctx)
+
+    if not valid_ctxs:
+        # No valid parent — open a root span. ``propagate.extract({})``
+        # yields an empty context that ``start_as_current_span`` treats
+        # as "no parent" (root).
+        return propagate.extract({}), []
+
+    parent_ctx = valid_ctxs[0]
+    links = [trace.Link(trace.get_current_span(ctx).get_span_context()) for ctx in valid_ctxs[1:]]
+    return parent_ctx, links
 
 
 # --------------------------------------------------------------------
@@ -250,10 +322,8 @@ async def _dispatch_encode(
             )
             continue
         # Plumb RunBatchRequest.lora_key into the per-item options so
-        # ``ModelWorker.submit`` (line ~411 of model_worker.py:
-        # ``options.get("lora")``) routes the item into the matching
-        # per-LoRA batcher and ``_process_loop`` calls
-        # ``set_active_lora(active_lora)`` before the forward pass.
+        # ``ModelWorker.submit_preformed`` sets the adapter's active LoRA
+        # immediately before the forward pass.
         merged_options = _merge_lora_into_options(
             ri.encode.options,
             req.lora_key,
@@ -282,14 +352,14 @@ async def _dispatch_score(
     executor: QueueExecutor,
     req: RunBatchRequest,
 ) -> BatchOutcome:
-    # Score is base-only: ``ModelWorker.submit_score`` always uses
-    # ``self._batchers[None]``. We "downgrade to WARN, serve base" here
+    # Score is base-only: ``ModelWorker.submit_score_preformed`` ignores
+    # LoRA. We "downgrade to WARN, serve base" here
     # so a misrouted batch produces a visible log line rather than a
     # silent drop or a NAK that confuses retry logic.
     if req.lora_key:
         logger.warning(
             "run_batch op=score for model=%s arrived with lora_key=%r — "
-            "score has no LoRA support (ModelWorker.submit_score), "
+            "score has no LoRA support (ModelWorker.submit_score_preformed), "
             "serving base weights for batch_id=%d",
             req.model_id,
             req.lora_key,
@@ -337,9 +407,8 @@ async def _dispatch_extract(
             )
             continue
         # Same reasoning as ``_dispatch_encode``: plumb the batch-level
-        # lora_key into ``options["lora"]`` so the legacy
-        # ``ModelWorker.submit_extract`` path picks the right batcher
-        # (model_worker.py line ~464).
+        # lora_key into ``options["lora"]`` so the pre-formed ModelWorker
+        # path selects the right LoRA for this IPC batch.
         merged_options = _merge_lora_into_options(
             ri.extract.options,
             req.lora_key,

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,57 +21,174 @@ _PROFILE_HASH_FIELDS = ("adapter_path", "max_batch_tokens", "compute_precision",
 
 def _canonical_profile_dict(profile: dict) -> dict:
     """Extract canonical routable fields from a raw profile dict for hashing."""
-    return {k: profile.get(k) for k in _PROFILE_HASH_FIELDS}
+    return {
+        k: _canonical_adapter_options(profile.get(k)) if k == "adapter_options" else profile.get(k)
+        for k in _PROFILE_HASH_FIELDS
+    }
 
 
 def _is_hash_falsy(value: object) -> bool:
-    if value is None:
-        return True
-    if value is False:
+    """Falsy for bundle-hash canonicalization: ``None``, ``False``, ``0`` / ``0.0``,
+    or an empty ``str``/``list``/``tuple``/``dict`` — mirrors the gateway's Rust
+    ``canonicalize_adapter_options`` (see #1542).
+    """
+    if value is None or value is False:
         return True
     if isinstance(value, int | float) and value == 0:
         return True
     return isinstance(value, str | list | tuple | dict) and len(value) == 0
 
 
-def _canonical_adapter_options_for_hash(adapter_options: object) -> object | None:
-    """Mirror gateway canonicalization for adapter_options in bundle hashes."""
-    if isinstance(adapter_options, dict) and not any(not _is_hash_falsy(value) for value in adapter_options.values()):
+def _canonical_adapter_options(adapter_options: object) -> object | None:
+    """Mirror the gateway (Rust) ``canonicalize_adapter_options`` for adapter_options
+    in bundle hashes: drop keys whose value is an empty nested map, then collapse to
+    ``None`` when every remaining value is falsy (null/false/0/0.0/``""``/``[]``/``{}``).
+    Diverging from the gateway leaves workers stuck in ``pending_workers`` (#1542).
+    """
+    if not isinstance(adapter_options, dict):
+        return adapter_options
+    compact = {key: value for key, value in adapter_options.items() if not (isinstance(value, dict) and not value)}
+    if not compact or all(_is_hash_falsy(value) for value in compact.values()):
         return None
-    return adapter_options
+    return compact
 
 
-def _resolve_profile_for_hash(profiles: dict, profile_name: str) -> dict:
-    """Resolve profile inheritance into the fields covered by bundle hashes."""
+def _merge_hash_adapter_options(parent_options: object, child_options: object) -> object | None:
+    """Merge inherited adapter_options using the worker's profile resolution rules."""
+    if not isinstance(child_options, dict):
+        return (
+            _canonical_adapter_options(child_options)
+            if child_options is not None
+            else _canonical_adapter_options(parent_options)
+        )
 
-    def resolve(name: str, seen: set[str]) -> dict:
-        if name in seen:
-            msg = f"Profile '{name}' has an inheritance cycle"
-            raise ValueError(msg)
-        seen.add(name)
+    merged: dict[str, object] = {}
+    if isinstance(parent_options, dict):
+        merged.update({str(key): copy.deepcopy(value) for key, value in parent_options.items()})
+    for key_obj, value in child_options.items():
+        key = str(key_obj)
+        if key in {"loadtime", "runtime"} and isinstance(value, dict):
+            if value:
+                merged[key] = copy.deepcopy(value)
+            continue
+        merged[key] = copy.deepcopy(value)
+    return _canonical_adapter_options(merged)
 
-        profile = profiles.get(name)
+
+def _resolved_profile_hash_config(
+    profiles: dict,
+    profile_name: str,
+    seen: set[str] | None = None,
+) -> dict[str, object] | None:
+    """Return hash-relevant profile fields after applying ``extends``."""
+    if seen is None:
+        seen = set()
+    if profile_name in seen:
+        return None
+    seen.add(profile_name)
+
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        return None
+
+    parent_name = profile.get("extends")
+    if isinstance(parent_name, str) and parent_name:
+        resolved = _resolved_profile_hash_config(profiles, parent_name, seen)
+        if resolved is None:
+            return None
+    else:
+        resolved = {
+            "adapter_path": None,
+            "max_batch_tokens": None,
+            "compute_precision": None,
+            "adapter_options": None,
+        }
+
+    for key in ("adapter_path", "max_batch_tokens", "compute_precision"):
+        value = profile.get(key)
+        if value is not None:
+            resolved[key] = value
+
+    if "adapter_options" in profile:
+        resolved["adapter_options"] = _merge_hash_adapter_options(
+            resolved.get("adapter_options"),
+            profile.get("adapter_options"),
+        )
+    else:
+        resolved["adapter_options"] = _canonical_adapter_options(resolved.get("adapter_options"))
+
+    return resolved
+
+
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _adapter_module_from_path(adapter_path: object) -> str | None:
+    """Extract ``module`` from ``module:Class`` adapter paths."""
+    if not isinstance(adapter_path, str) or not adapter_path:
+        return None
+    module_path = adapter_path.split(":", maxsplit=1)[0]
+    return module_path or None
+
+
+def _validate_profile_name(profile_name: str) -> None:
+    """Validate profile names that become ``base:profile`` route ids."""
+    if not _PROFILE_NAME_RE.fullmatch(profile_name):
+        msg = (
+            f"Profile name '{profile_name}' must match [A-Za-z0-9._-]+ (no '/', ':', whitespace, or other punctuation)"
+        )
+        raise ValueError(msg)
+
+
+def _effective_adapter_path(profiles: dict, profile_name: str) -> str | None:
+    """Return the adapter path for a profile, following ``extends`` if needed."""
+    current: str | None = profile_name
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            return None
+        seen.add(current)
+        profile = profiles.get(current)
         if not isinstance(profile, dict):
-            msg = f"Profile '{name}' not found"
-            raise ValueError(msg)
+            return None
+        adapter_path = profile.get("adapter_path")
+        if isinstance(adapter_path, str) and adapter_path:
+            return adapter_path
+        parent = profile.get("extends")
+        current = parent if isinstance(parent, str) and parent else None
+    return None
 
-        parent_name = profile.get("extends")
-        if parent_name:
-            resolved = resolve(str(parent_name), seen)
-        else:
-            resolved = dict.fromkeys(_PROFILE_HASH_FIELDS)
 
-        for field_name in ("adapter_path", "max_batch_tokens", "compute_precision"):
-            value = profile.get(field_name)
-            if value is not None:
-                resolved[field_name] = value
+def _adapter_modules_for_profiles(profiles: dict, profile_names: set[str] | None = None) -> set[str]:
+    """Collect effective adapter modules for selected profiles."""
+    selected = profile_names if profile_names is not None else set(profiles.keys())
+    modules: set[str] = set()
+    for profile_name in selected:
+        adapter_path = _effective_adapter_path(profiles, profile_name)
+        module_path = _adapter_module_from_path(adapter_path)
+        if module_path:
+            modules.add(module_path)
+    return modules
 
-        if "adapter_options" in profile:
-            resolved["adapter_options"] = _canonical_adapter_options_for_hash(profile.get("adapter_options"))
 
-        return resolved
+def _base_route_adapter_modules(profiles: dict) -> set[str]:
+    """Adapter modules used when callers request the base model id."""
+    if "default" not in profiles:
+        return set()
+    module_path = _adapter_module_from_path(_effective_adapter_path(profiles, "default"))
+    return {module_path} if module_path else set()
 
-    return resolve(profile_name, set())
+
+def _matching_bundle_names(adapter_modules: set[str], bundles: dict[str, BundleInfo]) -> list[str]:
+    """Return bundle ids compatible with the provided adapter modules."""
+    if not adapter_modules:
+        return []
+    matching_bundles: list[tuple[int, str]] = []
+    for bundle in bundles.values():
+        if adapter_modules & set(bundle.adapters):
+            matching_bundles.append((bundle.priority, bundle.name))
+    matching_bundles.sort(key=lambda x: (x[0], x[1]))
+    return [bundle_name for _, bundle_name in matching_bundles]
 
 
 class ModelNotFoundError(Exception):
@@ -115,20 +233,35 @@ class ProfileConflictError(ValueError):
 # resolution and the worker's IPC contract. Drift is the easiest way to
 # silently mis-route traffic, so we surface unknown values as a config
 # load error rather than tolerating them.
-KNOWN_ENGINES: frozenset[str] = frozenset({"pytorch"})
+KNOWN_ENGINES: frozenset[str] = frozenset({"pytorch", "candle"})
 DEFAULT_ENGINE: str = "pytorch"
+DEFAULT_MODEL_POOL: str = "default"
 _MAX_POOL_NAME_LEN = 128
 
 # Adapter-module prefix expected for each engine. The gateway's matcher
 # is engine-agnostic (it intersects ``bundle.adapters`` with the model's
 # ``adapter_path`` modules), so this constraint is enforced at config-
 # load time rather than at the matcher level — a mismatch is a deploy
-# bug, not a runtime fall-through. Today we ship one engine; extend in
-# lock-step with KNOWN_ENGINES (mirroring
+# bug, not a runtime fall-through. Extend this in lock-step with
+# KNOWN_ENGINES (mirroring
 # ``sie_gateway::types::bundle::engine_adapter_prefixes``).
 _ENGINE_ADAPTER_PREFIXES: dict[str, tuple[str, ...]] = {
     "pytorch": ("sie_server.adapters.",),
+    "candle": ("sie_server_rust.adapters.candle",),
 }
+
+
+def _adapter_mismatches_engine(adapter: str, engine: str) -> bool:
+    expected_prefixes = _ENGINE_ADAPTER_PREFIXES.get(engine, ())
+    if engine == DEFAULT_ENGINE:
+        foreign_prefixes = tuple(
+            prefix
+            for other_engine, prefixes in _ENGINE_ADAPTER_PREFIXES.items()
+            if other_engine != engine
+            for prefix in prefixes
+        )
+        return adapter.startswith(foreign_prefixes)
+    return bool(expected_prefixes) and not adapter.startswith(expected_prefixes)
 
 
 def _normalize_pool_name(config: dict) -> None:
@@ -160,6 +293,17 @@ def _normalize_pool_name(config: dict) -> None:
     config["pool"] = pool
 
 
+def _model_pool_name(full_config: dict[str, object] | None) -> str:
+    """Return the canonical routing pool for a model config snapshot."""
+    if not full_config:
+        return DEFAULT_MODEL_POOL
+    raw_pool = full_config.get("pool")
+    if not isinstance(raw_pool, str):
+        return DEFAULT_MODEL_POOL
+    pool = raw_pool.strip().lower()
+    return pool or DEFAULT_MODEL_POOL
+
+
 @dataclass
 class BundleInfo:
     """Information about a bundle.
@@ -176,11 +320,12 @@ class BundleInfo:
             in the event of an ambiguous resolution. Surfaced as
             metadata; the priority field is what actually decides ties.
         engine: Execution engine the bundle's worker image speaks
-            (today the only recognised value is ``"pytorch"`` for the
-            Python adapter image; see ``KNOWN_ENGINES``). Defaults to
-            ``"pytorch"`` for back-compat with bundle YAMLs written
-            before this field existed. The gateway uses ``engine`` to
-            disambiguate when a model resolves to multiple bundles.
+            (``"pytorch"`` for the Python adapter image, ``"candle"``
+            for the native Rust worker; see ``KNOWN_ENGINES``).
+            Defaults to ``"pytorch"`` for back-compat with bundle YAMLs
+            written before this field existed. The gateway uses
+            ``engine`` to disambiguate when a model resolves to
+            multiple bundles.
     """
 
     name: str
@@ -232,6 +377,9 @@ class ModelRegistry:
         self._bundles: dict[str, BundleInfo] = {}
         self._models: dict[str, ModelInfo] = {}
         self._model_names_lower: dict[str, str] = {}  # lowercase -> canonical
+        self._profile_variant_models: dict[str, ModelInfo] = {}
+        self._profile_variant_names_lower: dict[str, str] = {}  # lowercase -> canonical variant
+        self._profile_variant_base_models: dict[str, str] = {}  # variant -> base model
         self._model_adapter_modules: dict[str, set[str]] = {}  # model -> adapter modules
         self._model_profiles: dict[str, set[str]] = {}  # model -> profile names
         self._model_profile_configs: dict[str, dict[str, dict]] = {}  # model -> {profile_name: config_dict}
@@ -277,7 +425,11 @@ class ModelRegistry:
         new_bundles: dict[str, BundleInfo] = {}
         new_models: dict[str, ModelInfo] = {}
         new_model_names_lower: dict[str, str] = {}
+        new_profile_variant_models: dict[str, ModelInfo] = {}
+        new_profile_variant_names_lower: dict[str, str] = {}
+        new_profile_variant_base_models: dict[str, str] = {}
         new_model_adapter_modules: dict[str, set[str]] = {}
+        new_model_route_adapter_modules: dict[str, set[str]] = {}
         new_model_profiles: dict[str, set[str]] = {}
         new_model_profile_configs: dict[str, dict[str, dict]] = {}
         new_model_full_configs: dict[str, dict] = {}
@@ -321,19 +473,18 @@ class ModelRegistry:
                     # this at config-load time makes the failure mode
                     # an obvious deploy-rejection rather than a stream
                     # of cryptic IPC NAKs.
-                    expected_prefixes = _ENGINE_ADAPTER_PREFIXES.get(engine, ())
-                    if expected_prefixes:
-                        bad_adapters = [a for a in adapters if not any(a.startswith(p) for p in expected_prefixes)]
-                        if bad_adapters:
-                            logger.warning(
-                                "Bundle %r (engine=%r) lists adapter(s) outside the "
-                                "expected namespace(s) %s: %s — these will not be "
-                                "servable by a worker speaking this engine.",
-                                name,
-                                engine,
-                                expected_prefixes,
-                                bad_adapters,
-                            )
+                    bad_adapters = [a for a in adapters if _adapter_mismatches_engine(a, engine)]
+                    if bad_adapters:
+                        logger.error(
+                            "Bundle %r (engine=%r) lists adapter(s) outside the "
+                            "expected namespace(s) %s: %s — these will not be "
+                            "servable by a worker speaking this engine; skipping load.",
+                            name,
+                            engine,
+                            _ENGINE_ADAPTER_PREFIXES.get(engine, ()),
+                            bad_adapters,
+                        )
+                        continue
 
                     new_bundles[name] = BundleInfo(
                         name=name,
@@ -365,26 +516,47 @@ class ModelRegistry:
                     with config_path.open() as f:
                         config = yaml.safe_load(f)
 
-                    model_name = config.get("sie_id") or config.get("name")
-                    if model_name:
-                        adapter_modules: set[str] = set()
+                    raw_model_name = config.get("sie_id") or config.get("name")
+                    if raw_model_name:
+                        model_name = str(raw_model_name)
                         profiles = config.get("profiles", {})
-                        for profile in profiles.values():
-                            adapter_path = profile.get("adapter_path", "")
-                            if adapter_path:
-                                module_path = adapter_path.split(":", maxsplit=1)[0]
-                                adapter_modules.add(module_path)
+                        if not isinstance(profiles, dict):
+                            msg = f"Model '{model_name}' profiles must be a mapping"
+                            raise ValueError(msg)
+
+                        profile_names = {str(profile_name) for profile_name in profiles}
+                        for profile_name in profile_names:
+                            if profile_name != "default":
+                                _validate_profile_name(profile_name)
+
+                        adapter_modules = _adapter_modules_for_profiles(profiles)
+                        route_adapter_modules = _base_route_adapter_modules(profiles)
 
                         new_models[model_name] = ModelInfo(name=model_name)
                         new_model_adapter_modules[model_name] = adapter_modules
+                        new_model_route_adapter_modules[model_name] = route_adapter_modules
                         new_model_names_lower[model_name.lower()] = model_name
                         logger.debug("Discovered model: %s (adapters: %s)", model_name, adapter_modules)
-                        new_model_profiles[model_name] = set(profiles.keys())
+                        new_model_profiles[model_name] = profile_names
                         new_model_profile_configs[model_name] = {
-                            pname: _canonical_profile_dict(pdata) for pname, pdata in profiles.items()
+                            str(pname): _canonical_profile_dict(pdata) for pname, pdata in profiles.items()
                         }
                         if isinstance(config, dict):
                             new_model_full_configs[model_name] = dict(config)
+
+                        for profile_name in sorted(profiles):
+                            if profile_name == "default":
+                                continue
+                            adapter_path = _effective_adapter_path(profiles, profile_name)
+                            module_path = _adapter_module_from_path(adapter_path)
+                            variant_modules = {module_path} if module_path else set()
+                            variant_name = f"{model_name}:{profile_name}"
+                            new_profile_variant_models[variant_name] = ModelInfo(
+                                name=variant_name,
+                                bundles=_matching_bundle_names(variant_modules, new_bundles),
+                            )
+                            new_profile_variant_names_lower[variant_name.lower()] = variant_name
+                            new_profile_variant_base_models[variant_name] = model_name
 
                 except Exception:
                     logger.exception("Failed to load model config: %s", config_path)
@@ -393,18 +565,8 @@ class ModelRegistry:
 
         # Compute mappings
         for model_name, model_info in new_models.items():
-            adapter_modules = new_model_adapter_modules.get(model_name, set())
-            if not adapter_modules:
-                continue
-
-            matching_bundles: list[tuple[int, str]] = []
-            for bundle in new_bundles.values():
-                if adapter_modules & set(bundle.adapters):
-                    matching_bundles.append((bundle.priority, bundle.name))
-
-            if matching_bundles:
-                matching_bundles.sort(key=lambda x: x[0])
-                model_info.bundles = [b[1] for b in matching_bundles]
+            route_adapter_modules = new_model_route_adapter_modules.get(model_name, set())
+            model_info.bundles = _matching_bundle_names(route_adapter_modules, new_bundles)
 
         # Detect baked-in inconsistency: any model profile whose adapter
         # module is not declared in *any* bundle. We report the missing
@@ -448,6 +610,9 @@ class ModelRegistry:
             self._bundles = new_bundles
             self._models = new_models
             self._model_names_lower = new_model_names_lower
+            self._profile_variant_models = new_profile_variant_models
+            self._profile_variant_names_lower = new_profile_variant_names_lower
+            self._profile_variant_base_models = new_profile_variant_base_models
             self._model_adapter_modules = new_model_adapter_modules
             self._model_profiles = new_model_profiles
             self._model_profile_configs = new_model_profile_configs
@@ -464,10 +629,6 @@ class ModelRegistry:
     def resolve_bundle(self, model: str, bundle_override: str | None = None) -> str:
         """Resolve which bundle to use for a model.
 
-        Lock-free: reads dict references that are atomically swapped by
-        ``reload()``.  The GIL guarantees a single pointer read is atomic
-        in CPython, so concurrent hot-reload cannot produce a torn read.
-
         Args:
             model: Model name (e.g., "BAAI/bge-m3").
             bundle_override: Optional explicit bundle (e.g., "default").
@@ -479,39 +640,50 @@ class ModelRegistry:
             ModelNotFoundError: Model not in any bundle (404).
             BundleConflictError: Override bundle doesn't support model (409).
         """
-        # Snapshot references (atomic in CPython -- GIL protects pointer reads)
-        models = self._models
-        model_names_lower = self._model_names_lower
+        with self._lock:
+            models = self._models
+            model_names_lower = self._model_names_lower
+            profile_variant_models = self._profile_variant_models
+            profile_variant_names_lower = self._profile_variant_names_lower
 
-        # Normalize model name (case-insensitive lookup)
-        canonical_model = model_names_lower.get(model.lower())
-        if canonical_model is None:
-            # Try exact match
-            if model not in models:
+            # Normalize model name (case-insensitive lookup)
+            canonical_model = model_names_lower.get(model.lower())
+            if canonical_model is None:
+                canonical_variant = profile_variant_names_lower.get(model.lower())
+                if canonical_variant is not None:
+                    canonical_model = canonical_variant
+                    model_info = profile_variant_models.get(canonical_model)
+                else:
+                    model_info = None
+                # Try exact match
+                if model_info is None and model in profile_variant_models:
+                    canonical_model = model
+                    model_info = profile_variant_models.get(canonical_model)
+                elif model_info is None and model in models:
+                    canonical_model = model
+                    model_info = models.get(canonical_model)
+                elif model_info is None:
+                    raise ModelNotFoundError(model)
+            else:
+                model_info = models.get(canonical_model)
+            if model_info is None or not model_info.bundles:
                 raise ModelNotFoundError(model)
-            canonical_model = model
 
-        model_info = models.get(canonical_model)
-        if model_info is None or not model_info.bundles:
-            raise ModelNotFoundError(model)
+            if bundle_override is not None:
+                # Validate override is compatible
+                if bundle_override not in model_info.bundles:
+                    raise BundleConflictError(
+                        model=model,
+                        bundle=bundle_override,
+                        compatible_bundles=model_info.bundles,
+                    )
+                return bundle_override
 
-        if bundle_override is not None:
-            # Validate override is compatible
-            if bundle_override not in model_info.bundles:
-                raise BundleConflictError(
-                    model=model,
-                    bundle=bundle_override,
-                    compatible_bundles=model_info.bundles,
-                )
-            return bundle_override
-
-        # Return highest priority (first in sorted list)
-        return model_info.bundles[0]
+            # Return highest priority (first in sorted list)
+            return model_info.bundles[0]
 
     def get_model_info(self, model: str) -> ModelInfo | None:
         """Get model info including compatible bundles.
-
-        Lock-free: reads dict references atomically swapped by ``reload()``.
 
         Args:
             model: Model name.
@@ -519,13 +691,17 @@ class ModelRegistry:
         Returns:
             ModelInfo if found, None otherwise.
         """
-        models = self._models
-        model_names_lower = self._model_names_lower
-        # Try case-insensitive lookup first
-        canonical = model_names_lower.get(model.lower())
-        if canonical:
-            return models.get(canonical)
-        return models.get(model)
+        with self._lock:
+            # Try case-insensitive lookup first
+            canonical = self._model_names_lower.get(model.lower())
+            if canonical:
+                return self._models.get(canonical)
+            variant = self._profile_variant_names_lower.get(model.lower())
+            if variant:
+                return self._profile_variant_models.get(variant)
+            if model in self._profile_variant_models:
+                return self._profile_variant_models.get(model)
+            return self._models.get(model)
 
     def list_models(self) -> list[str]:
         """List all known model names.
@@ -533,7 +709,83 @@ class ModelRegistry:
         Returns:
             Sorted list of model names.
         """
-        return sorted(self._models.keys())
+        with self._lock:
+            return sorted(self._models.keys())
+
+    def list_serving_models(self) -> list[str]:
+        """List routable model/profile identities.
+
+        Unlike :meth:`list_models`, this is a serving surface: profile-only
+        configs omit the bare base id and expose only their ``base:profile``
+        variants. ``list_models`` intentionally remains catalog inventory so
+        export/bootstrap can serialize the base YAML once.
+        """
+        with self._lock:
+            serving: set[str] = {model_name for model_name, model_info in self._models.items() if model_info.bundles}
+            serving.update(
+                model_name for model_name, model_info in self._profile_variant_models.items() if model_info.bundles
+            )
+            return sorted(serving)
+
+    def get_catalog_model_name(self, model_name: str) -> str:
+        """Return the base catalog config id for a serving route identity."""
+        with self._lock:
+            canonical_variant = self._profile_variant_names_lower.get(model_name.lower())
+            if canonical_variant is not None:
+                return self._profile_variant_base_models.get(canonical_variant, canonical_variant)
+            if model_name in self._profile_variant_models:
+                return self._profile_variant_base_models.get(model_name, model_name)
+            canonical = self._model_names_lower.get(model_name.lower())
+            return canonical or model_name
+
+    def get_route_profile_names(self, model_name: str) -> set[str]:
+        """Return profile names represented by a serving route identity."""
+        with self._lock:
+            canonical_variant = self._profile_variant_names_lower.get(model_name.lower())
+            if canonical_variant is not None:
+                return {canonical_variant.rsplit(":", maxsplit=1)[1]}
+            if model_name in self._profile_variant_models:
+                return {model_name.rsplit(":", maxsplit=1)[1]}
+            return self.get_model_profile_names(model_name)
+
+    def get_model_profile_bundles(
+        self,
+        model_name: str,
+        profile_names: set[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return compatible bundles for each selected catalog profile."""
+        with self._lock:
+            canonical = self._model_names_lower.get(model_name.lower(), model_name)
+            full_config = self._model_full_configs.get(canonical, {})
+            profiles = full_config.get("profiles", {}) if isinstance(full_config, dict) else {}
+            if not isinstance(profiles, dict):
+                return {}
+            selected = profile_names if profile_names is not None else self._model_profiles.get(canonical, set())
+            out: dict[str, list[str]] = {}
+            for profile_name in sorted(selected):
+                if profile_name not in profiles:
+                    continue
+                module_path = _adapter_module_from_path(_effective_adapter_path(profiles, profile_name))
+                modules = {module_path} if module_path else set()
+                out[profile_name] = _matching_bundle_names(modules, self._bundles)
+            return out
+
+    def get_model_export_bundles(self, model_name: str) -> list[str]:
+        """Return union of bundles targeted by any profile on a catalog model."""
+        with self._lock:
+            canonical = self._model_names_lower.get(model_name.lower(), model_name)
+            full_config = self._model_full_configs.get(canonical, {})
+            profiles = full_config.get("profiles", {}) if isinstance(full_config, dict) else {}
+            if not isinstance(profiles, dict):
+                return []
+            modules = _adapter_modules_for_profiles(profiles, self._model_profiles.get(canonical, set()))
+            return _matching_bundle_names(modules, self._bundles)
+
+    def get_model_pool_name(self, model_name: str) -> str:
+        """Return the canonical routing pool for a catalog model."""
+        with self._lock:
+            canonical = self._model_names_lower.get(model_name.lower(), model_name)
+            return _model_pool_name(self._model_full_configs.get(canonical, {}))
 
     def list_bundles(self) -> list[str]:
         """List all bundle names.
@@ -541,9 +793,9 @@ class ModelRegistry:
         Returns:
             List of bundle names sorted by priority.
         """
-        bundles = self._bundles
-        bundles_sorted = sorted(bundles.values(), key=lambda b: b.priority)
-        return [b.name for b in bundles_sorted]
+        with self._lock:
+            bundles_sorted = sorted(self._bundles.values(), key=lambda b: b.priority)
+            return [b.name for b in bundles_sorted]
 
     def compute_bundles_hash(self) -> str:
         """Stable SHA-256 over the registry's full bundle surface.
@@ -604,11 +856,10 @@ class ModelRegistry:
                 return ""
             for bundle_id in bundle_ids:
                 model_pools = {}
-                for model_name, model_info in sorted(self._models.items()):
-                    if bundle_id not in model_info.bundles:
+                for model_name in sorted(self._models):
+                    if bundle_id not in self.get_model_export_bundles(model_name):
                         continue
-                    pool = self._model_full_configs.get(model_name, {}).get("pool") or "default"
-                    model_pools[model_name] = str(pool).strip().lower() or "default"
+                    model_pools[model_name] = _model_pool_name(self._model_full_configs.get(model_name, {}))
                 by_bundle[bundle_id] = {
                     "bundle_config_hash": self.compute_bundle_config_hash(bundle_id),
                     "model_pools": model_pools,
@@ -625,7 +876,8 @@ class ModelRegistry:
         Returns:
             BundleInfo if found, None otherwise.
         """
-        return self._bundles.get(bundle)
+        with self._lock:
+            return self._bundles.get(bundle)
 
     def get_models_for_bundle(self, bundle: str) -> list[str]:
         """Get all models that can be served by a bundle.
@@ -636,8 +888,14 @@ class ModelRegistry:
         Returns:
             List of model names.
         """
-        models = self._models
-        return [model_name for model_name, model_info in models.items() if bundle in model_info.bundles]
+        with self._lock:
+            models = self._models
+            profile_variant_models = self._profile_variant_models
+            return [
+                model_name
+                for model_name, model_info in {**models, **profile_variant_models}.items()
+                if bundle in model_info.bundles
+            ]
 
     def model_exists(self, model: str) -> bool:
         """Check if a model exists in the registry.
@@ -648,9 +906,12 @@ class ModelRegistry:
         Returns:
             True if model is known, False otherwise.
         """
-        if model.lower() in self._model_names_lower:
-            return True
-        return model in self._models
+        with self._lock:
+            if model.lower() in self._model_names_lower:
+                return True
+            if model.lower() in self._profile_variant_names_lower:
+                return True
+            return model in self._models or model in self._profile_variant_models
 
     def validate_model_config(
         self,
@@ -700,19 +961,25 @@ class ModelRegistry:
             msg = "Field 'profiles' must be a mapping of profile_name -> profile_config"
             raise ValueError(msg)
 
-        new_adapter_modules: set[str] = set()
         for profile_name, profile in profiles.items():
+            _validate_profile_name(str(profile_name))
             if not isinstance(profile, dict):
                 msg = f"Profile '{profile_name}' must be a mapping"
                 raise ValueError(msg)
-            adapter_path = profile.get("adapter_path", "")
+            adapter_path = _effective_adapter_path(profiles, str(profile_name))
             if not adapter_path:
                 if not profile.get("extends"):
                     msg = f"Profile '{profile_name}' missing adapter_path"
                     raise ValueError(msg)
                 continue
-            module_path = adapter_path.split(":", maxsplit=1)[0]
-            new_adapter_modules.add(module_path)
+
+        existing_full_profiles = self._model_full_configs.get(sie_id, {}).get("profiles", {})
+        merged_profiles_for_routing = dict(existing_full_profiles) if isinstance(existing_full_profiles, dict) else {}
+        merged_profiles_for_routing.update(profiles)
+        new_adapter_modules = _adapter_modules_for_profiles(
+            merged_profiles_for_routing,
+            {str(profile_name) for profile_name in profiles},
+        )
 
         all_bundle_adapters: set[str] = set()
         for bundle in self._bundles.values():
@@ -756,20 +1023,8 @@ class ModelRegistry:
         # Compute the post-apply adapter set so bundle mappings reflect
         # the hypothetical new state. This is a pure computation on a
         # local copy — no self._* mutation.
-        post_adapter_modules: set[str] = set(self._model_adapter_modules.get(sie_id, set()))
-        for profile_name in created_profiles:
-            adapter_path = profiles[profile_name].get("adapter_path", "")
-            if adapter_path:
-                post_adapter_modules.add(adapter_path.split(":", maxsplit=1)[0])
-        if not existing:
-            post_adapter_modules = new_adapter_modules
-
-        matching_bundles: list[tuple[int, str]] = []
-        for bundle in self._bundles.values():
-            if post_adapter_modules & set(bundle.adapters):
-                matching_bundles.append((bundle.priority, bundle.name))
-        matching_bundles.sort(key=lambda x: x[0])
-        affected_bundles = [b[1] for b in matching_bundles]
+        post_adapter_modules = _adapter_modules_for_profiles(merged_profiles_for_routing)
+        affected_bundles = _matching_bundle_names(post_adapter_modules, self._bundles)
 
         # Reject changes that land in zero bundles. `extends`-only
         # profiles skip the `adapter_path` collection step, so
@@ -838,31 +1093,6 @@ class ModelRegistry:
             # semantics of CPython dict assignment is what keeps those
             # readers lock-free and correct — in-place mutation (set.add,
             # list.append, dict.update on a live value) would break that.
-            new_adapter_modules_set: set[str]
-            if existing:
-                base_modules = self._model_adapter_modules.get(sie_id, set())
-                new_adapter_modules_set = set(base_modules)
-                for profile_name in created_profiles:
-                    adapter_path = profiles[profile_name].get("adapter_path", "")
-                    if adapter_path:
-                        module_path = adapter_path.split(":", maxsplit=1)[0]
-                        new_adapter_modules_set.add(module_path)
-            else:
-                new_adapter_modules_set = set()
-                for profile in profiles.values():
-                    adapter_path = profile.get("adapter_path", "")
-                    if adapter_path:
-                        new_adapter_modules_set.add(adapter_path.split(":", maxsplit=1)[0])
-
-            matching_bundles: list[tuple[int, str]] = []
-            for bundle in self._bundles.values():
-                if new_adapter_modules_set & set(bundle.adapters):
-                    matching_bundles.append((bundle.priority, bundle.name))
-            matching_bundles.sort(key=lambda x: x[0])
-            affected_bundles = [b[1] for b in matching_bundles]
-
-            new_model_info = ModelInfo(name=sie_id, bundles=list(affected_bundles))
-
             new_profile_names = set(self._model_profiles.get(sie_id, set()))
             new_profile_names.update(created_profiles)
 
@@ -899,6 +1129,44 @@ class ModelRegistry:
             if "sie_id" not in new_full_config:
                 new_full_config["sie_id"] = sie_id
 
+            new_adapter_modules_set = _adapter_modules_for_profiles(merged_profiles_full)
+            route_adapter_modules = _base_route_adapter_modules(merged_profiles_full)
+            affected_bundles = _matching_bundle_names(new_adapter_modules_set, self._bundles)
+            new_model_info = ModelInfo(
+                name=sie_id,
+                bundles=_matching_bundle_names(route_adapter_modules, self._bundles),
+            )
+
+            new_profile_variant_models = {
+                name: info
+                for name, info in self._profile_variant_models.items()
+                if self._profile_variant_base_models.get(name) != sie_id
+            }
+            new_profile_variant_names_lower = {
+                lower: name
+                for lower, name in self._profile_variant_names_lower.items()
+                if self._profile_variant_base_models.get(name) != sie_id
+            }
+            new_profile_variant_base_models = {
+                name: base for name, base in self._profile_variant_base_models.items() if base != sie_id
+            }
+            for profile_name in sorted(new_profile_names):
+                if profile_name == "default":
+                    continue
+                adapter_path = _effective_adapter_path(merged_profiles_full, profile_name)
+                module_path = _adapter_module_from_path(adapter_path)
+                variant_modules = {module_path} if module_path else set()
+                variant_name = f"{sie_id}:{profile_name}"
+                new_profile_variant_models[variant_name] = ModelInfo(
+                    name=variant_name,
+                    bundles=_matching_bundle_names(variant_modules, self._bundles),
+                )
+                new_profile_variant_names_lower[variant_name.lower()] = variant_name
+                new_profile_variant_base_models[variant_name] = sie_id
+                affected_bundles.extend(new_profile_variant_models[variant_name].bundles)
+            affected_bundles.sort()
+            affected_bundles = list(dict.fromkeys(affected_bundles))
+
             # Atomic swaps (CPython guarantees single-pointer-store is
             # not interleaved with a concurrent pointer-load under the GIL).
             self._models = {**self._models, sie_id: new_model_info}
@@ -907,6 +1175,9 @@ class ModelRegistry:
                     **self._model_names_lower,
                     sie_id.lower(): sie_id,
                 }
+            self._profile_variant_models = new_profile_variant_models
+            self._profile_variant_names_lower = new_profile_variant_names_lower
+            self._profile_variant_base_models = new_profile_variant_base_models
             self._model_adapter_modules = {
                 **self._model_adapter_modules,
                 sie_id: new_adapter_modules_set,
@@ -961,7 +1232,11 @@ class ModelRegistry:
 
     def get_model_profile_names(self, model_name: str) -> set[str]:
         """Get known profile names for a model."""
-        return set(self._model_profiles.get(model_name, set()))
+        with self._lock:
+            canonical_variant = self._profile_variant_names_lower.get(model_name.lower())
+            if canonical_variant or model_name in self._profile_variant_models:
+                return {"default"}
+            return set(self._model_profiles.get(model_name, set()))
 
     def get_full_config(self, model_name: str) -> dict | None:
         """Return a deep-copied snapshot of the full merged model config.
@@ -971,13 +1246,14 @@ class ModelRegistry:
         in-memory state for both filesystem-seeded and API-added models.
         Returns ``None`` for unknown models.
         """
-        full = self._model_full_configs.get(model_name)
-        if full is None:
-            return None
-        # Full deep copy: the docstring promises a snapshot, and shallow-copying
-        # only top-level keys leaves nested lists/dicts outside ``profiles``
-        # aliased to registry-owned state so a mutating caller could corrupt it.
-        return copy.deepcopy(full)
+        with self._lock:
+            full = self._model_full_configs.get(model_name)
+            if full is None:
+                return None
+            # Full deep copy: the docstring promises a snapshot, and shallow-copying
+            # only top-level keys leaves nested lists/dicts outside ``profiles``
+            # aliased to registry-owned state so a mutating caller could corrupt it.
+            return copy.deepcopy(full)
 
     def compute_bundle_config_hash(self, bundle_id: str) -> str:
         """Compute the config hash for a specific bundle.
@@ -997,48 +1273,83 @@ class ModelRegistry:
             if cached is not None:
                 return cached
 
-            bundle = self._bundles.get(bundle_id)
-            if not bundle:
-                return ""
-
-            bundle_adapter_set = set(bundle.adapters)
-            items: list[dict] = []
-
-            for model_name, model_info in sorted(self._models.items()):
-                if bundle_id not in model_info.bundles:
-                    continue
-                adapter_modules = self._model_adapter_modules.get(model_name, set())
-                # Only include if model has adapters in this bundle
-                if adapter_modules & bundle_adapter_set:
-                    full_profiles = self._model_full_configs.get(model_name, {}).get("profiles", {})
-                    profiles_for_hash = []
-                    # Hash only the fields that affect inference behaviour,
-                    # matching the worker-side hash in
-                    # ``sie_server.api.ws._compute_bundle_config_hash``.
-                    for pname in sorted(self.get_model_profile_names(model_name)):
-                        # Only include profiles whose adapter is routable in this bundle
-                        p_cfg = _resolve_profile_for_hash(full_profiles, pname)
-                        p_adapter = p_cfg.get("adapter_path", "")
-                        if p_adapter:
-                            p_module = p_adapter.split(":", maxsplit=1)[0]
-                            if p_module not in bundle_adapter_set:
-                                continue
-                        filtered_cfg = {k: p_cfg.get(k) for k in _PROFILE_HASH_FIELDS}
-                        profiles_for_hash.append({"name": pname, "config": filtered_cfg})
-                    items.append(
-                        {
-                            "sie_id": model_name,
-                            "profiles": profiles_for_hash,
-                        }
-                    )
-
-            if not items:
-                return ""
-
-            serialized = orjson.dumps(items, option=orjson.OPT_SORT_KEYS)
-            result = hashlib.sha256(serialized).hexdigest()
+            result = self._compute_bundle_config_hash_locked(bundle_id)
             self._bundle_hash_cache[bundle_id] = result
             return result
+
+    def compute_bundle_config_hash_for_pool(self, bundle_id: str, pool_name: str) -> str:
+        """Compute the worker-parity config hash for a bundle within one pool."""
+        normalized_pool = (pool_name or "").strip().lower() or DEFAULT_MODEL_POOL
+        with self._lock:
+            return self._compute_bundle_config_hash_locked(bundle_id, normalized_pool)
+
+    def compute_bundle_pool_config_hashes(self) -> dict[str, dict[str, str]]:
+        """Return worker-parity config hashes grouped by bundle and model pool."""
+        with self._lock:
+            hashes: dict[str, dict[str, str]] = {bundle_id: {} for bundle_id in self._bundles}
+            pools_by_bundle: dict[str, set[str]] = {bundle_id: set() for bundle_id in self._bundles}
+            for model_name in sorted(self._models):
+                pool = _model_pool_name(self._model_full_configs.get(model_name, {}))
+                for bundle_id in self.get_model_export_bundles(model_name):
+                    if bundle_id in self._bundles:
+                        pools_by_bundle.setdefault(bundle_id, set()).add(pool)
+
+            for bundle_id, pools in pools_by_bundle.items():
+                for pool in sorted(pools):
+                    hash_value = self._compute_bundle_config_hash_locked(bundle_id, pool)
+                    if hash_value:
+                        hashes[bundle_id][pool] = hash_value
+            return hashes
+
+    def _compute_bundle_config_hash_locked(self, bundle_id: str, pool_name: str | None = None) -> str:
+        bundle = self._bundles.get(bundle_id)
+        if not bundle:
+            return ""
+
+        normalized_pool = (pool_name or "").strip().lower() or None
+        bundle_adapter_set = set(bundle.adapters)
+        items: list[dict] = []
+
+        for model_name in sorted(self._models):
+            full_config = self._model_full_configs.get(model_name, {})
+            if normalized_pool is not None and _model_pool_name(full_config) != normalized_pool:
+                continue
+
+            adapter_modules = self._model_adapter_modules.get(model_name, set())
+            # Only include if model has adapters in this bundle
+            if adapter_modules & bundle_adapter_set:
+                full_profiles = full_config.get("profiles", {}) if isinstance(full_config, dict) else {}
+                if not isinstance(full_profiles, dict):
+                    full_profiles = {}
+                profiles_for_hash = []
+                # Hash only the fields that affect inference behaviour,
+                # matching the worker-side hash in
+                # ``sie_server.api.ws._compute_bundle_config_hash``.
+                for pname in sorted(self.get_model_profile_names(model_name)):
+                    # Only include profiles whose adapter is routable in this bundle
+                    filtered_cfg = _resolved_profile_hash_config(full_profiles, pname)
+                    if filtered_cfg is None:
+                        continue
+                    p_adapter = filtered_cfg.get("adapter_path", "")
+                    if isinstance(p_adapter, str) and p_adapter:
+                        p_module = p_adapter.split(":", maxsplit=1)[0]
+                        if p_module not in bundle_adapter_set:
+                            continue
+                    profiles_for_hash.append({"name": pname, "config": filtered_cfg})
+                if not profiles_for_hash:
+                    continue
+                items.append(
+                    {
+                        "sie_id": model_name,
+                        "profiles": profiles_for_hash,
+                    }
+                )
+
+        if not items:
+            return ""
+
+        serialized = orjson.dumps(items, option=orjson.OPT_SORT_KEYS)
+        return hashlib.sha256(serialized).hexdigest()
 
 
 def parse_model_spec(model_spec: str) -> tuple[str | None, str]:

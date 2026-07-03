@@ -52,6 +52,14 @@ def test_load_contract_flags() -> None:
     assert SGLangGenerationAdapter.manages_own_load_timeout is True
 
 
+def test_load_required_memory_bytes_uses_mem_fraction_static() -> None:
+    gb = 1024**3
+    adapter = SGLangGenerationAdapter("test-model", mem_fraction_static=0.8)
+
+    assert adapter.load_required_memory_bytes(device_type="cuda", device_total_bytes=10 * gb) == 9 * gb
+    assert adapter.load_required_memory_bytes(device_type="cpu", device_total_bytes=10 * gb) is None
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [

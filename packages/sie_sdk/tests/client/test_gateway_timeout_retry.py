@@ -1,11 +1,9 @@
 # Tests for the 504 Gateway Timeout retry branch.
 #
-# The SDK already retries on 503 + X-SIE-Error-Code: MODEL_LOADING. The
-# gateway also maps upstream timeouts (e.g. a worker cold-loading a
-# model on demand) to that contract in the current release, but the
-# SDK adds a defense-in-depth 504 retry so older gateways (or any path
-# that still returns plain 504) don't surface as a hard failure to a
-# caller who opted into wait_for_capacity=True.
+# The SDK already retries on 503 + X-SIE-Error-Code: MODEL_LOADING when a
+# worker explicitly reports an in-progress model load. Gateway-owned queue
+# result timeouts are distinct 504 GATEWAY_TIMEOUT responses; idempotent encode
+# retries them when the caller opted into wait_for_capacity=True.
 #
 # Covers: sync + async clients, encode (representative path; the score
 # and extract paths share the same retry block by construction).
@@ -25,7 +23,7 @@ def _mock_response_504() -> MagicMock:
     resp = MagicMock()
     resp.status_code = 504
     resp.headers = {"Retry-After": "0.01", "content-type": "application/json"}
-    resp.json.return_value = {"error": {"code": "MODEL_LOADING", "message": "Timeout waiting for queue result"}}
+    resp.json.return_value = {"detail": {"code": "GATEWAY_TIMEOUT", "message": "Timeout waiting for queue result"}}
     return resp
 
 
@@ -42,7 +40,7 @@ def _async_response_504() -> object:
 
     return _AioResponse(
         504,
-        json.dumps({"error": {"code": "MODEL_LOADING", "message": "Timeout waiting for queue result"}}).encode(),
+        json.dumps({"detail": {"code": "GATEWAY_TIMEOUT", "message": "Timeout waiting for queue result"}}).encode(),
         {"Retry-After": "0.01", "content-type": "application/json"},
     )
 

@@ -330,13 +330,92 @@ class TestModelRegistryAdapterMatching:
                 "name: sglang\npriority: 20\nadapters:\n  - sie_server.adapters.sglang\n"
             )
             (models_dir / "multi.yaml").write_text(
-                "name: multi/model\nprofiles:\n  cpu:\n    adapter_path: sie_server.adapters.sentence_transformer:STAdapter\n  gpu:\n    adapter_path: sie_server.adapters.sglang:SGLangAdapter\n"
+                "name: multi/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.sentence_transformer:STAdapter\n  gpu:\n    adapter_path: sie_server.adapters.sglang:SGLangAdapter\n"
             )
             registry = ModelRegistry(bundles_dir, models_dir)
             info = registry.get_model_info("multi/model")
             assert info is not None
-            assert "default" in info.bundles
-            assert "sglang" in info.bundles
+            assert info.bundles == ["default"]
+            variant = registry.get_model_info("multi/model:gpu")
+            assert variant is not None
+            assert variant.bundles == ["sglang"]
+
+    def test_profile_variant_routes_through_profile_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            bundles_dir = tmppath / "bundles"
+            models_dir = tmppath / "models"
+            bundles_dir.mkdir()
+            models_dir.mkdir()
+            (bundles_dir / "default.yaml").write_text(
+                "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n"
+            )
+            (bundles_dir / "candle.yaml").write_text(
+                "name: candle\npriority: 30\nengine: candle\nadapters:\n  - sie_server_rust.adapters.candle\n"
+            )
+            (models_dir / "dual.yaml").write_text(
+                "sie_id: dual/model\n"
+                "profiles:\n"
+                "  default:\n"
+                "    adapter_path: sie_server.adapters.sentence_transformer:STAdapter\n"
+                "  candle:\n"
+                "    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter\n"
+            )
+
+            registry = ModelRegistry(bundles_dir, models_dir)
+
+            assert registry.resolve_bundle("dual/model") == "default"
+            base = registry.get_model_info("dual/model")
+            assert base is not None
+            assert base.bundles == ["default"]
+            assert registry.get_model_profile_bundles("dual/model") == {
+                "candle": ["candle"],
+                "default": ["default"],
+            }
+            assert registry.get_model_export_bundles("dual/model") == ["default", "candle"]
+
+            assert registry.model_exists("dual/model:candle")
+            assert "dual/model:candle" not in registry.list_models()
+            variant = registry.get_model_info("dual/model:candle")
+            assert variant is not None
+            assert variant.bundles == ["candle"]
+            assert registry.get_model_profile_names("dual/model:candle") == {"default"}
+            assert registry.resolve_bundle("dual/model:candle") == "candle"
+            assert "dual/model:candle" in registry.get_models_for_bundle("candle")
+            assert registry.list_serving_models() == ["dual/model", "dual/model:candle"]
+            assert registry.get_catalog_model_name("dual/model:candle") == "dual/model"
+            assert registry.get_route_profile_names("dual/model:candle") == {"candle"}
+
+            with pytest.raises(BundleConflictError) as exc_info:
+                registry.resolve_bundle("dual/model:candle", bundle_override="default")
+            assert exc_info.value.compatible_bundles == ["candle"]
+
+    def test_profile_only_candle_model_list_exposes_variant_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            bundles_dir = tmppath / "bundles"
+            models_dir = tmppath / "models"
+            bundles_dir.mkdir()
+            models_dir.mkdir()
+            (bundles_dir / "candle.yaml").write_text(
+                "name: candle\npriority: 30\nengine: candle\nadapters:\n  - sie_server_rust.adapters.candle\n"
+            )
+            (models_dir / "candle-only.yaml").write_text(
+                "sie_id: org/candle-only\n"
+                "profiles:\n"
+                "  candle:\n"
+                "    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter\n"
+            )
+
+            registry = ModelRegistry(bundles_dir, models_dir)
+
+            assert registry.list_models() == ["org/candle-only"]
+            assert registry.list_serving_models() == ["org/candle-only:candle"]
+            with pytest.raises(ModelNotFoundError):
+                registry.resolve_bundle("org/candle-only")
+            assert registry.resolve_bundle("org/candle-only:candle") == "candle"
+            assert registry.get_catalog_model_name("org/candle-only:candle") == "org/candle-only"
+            assert registry.get_route_profile_names("org/candle-only:candle") == {"candle"}
 
 
 class TestModelRegistryThreadSafety:
@@ -671,7 +750,7 @@ class TestUnrouteableModelsSurface:
             (models_dir / "mixed.yaml").write_text(
                 "sie_id: mixed/model\n"
                 "profiles:\n"
-                "  cpu:\n"
+                "  default:\n"
                 "    adapter_path: sie_server.adapters.good:Adapter\n"
                 "  gpu:\n"
                 "    adapter_path: sie_server.adapters.missing:Adapter\n"
@@ -796,7 +875,7 @@ class TestEngineField:
                 for rec in caplog.records
             )
 
-    def test_engine_namespace_mismatch_is_warned_but_loads(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_engine_namespace_mismatch_is_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bundles_dir, models_dir = self._mk_dirs(Path(tmpdir))
             (bundles_dir / "mixed.yaml").write_text(
@@ -805,19 +884,18 @@ class TestEngineField:
                 "priority: 10\n"
                 "adapters:\n"
                 "  - sie_server.adapters.bert_flash\n"
-                "  - some_unrelated.module\n"
+                "  - sie_server_rust.adapters.candle\n"
             )
 
-            with caplog.at_level(logging.WARNING, logger="sie_config.model_registry"):
+            with caplog.at_level(logging.ERROR, logger="sie_config.model_registry"):
                 registry = ModelRegistry(bundles_dir, models_dir)
 
             info = registry.get_bundle_info("mixed")
-            assert info is not None
-            assert info.engine == "pytorch"
-            assert len(info.adapters) == 2
+            assert info is None
             assert any(
-                rec.levelname == "WARNING" and "some_unrelated.module" in rec.getMessage() for rec in caplog.records
+                rec.levelname == "ERROR" and "sie_server_rust.adapters.candle" in rec.getMessage()
+                for rec in caplog.records
             )
 
-    def test_known_engines_only_pytorch(self) -> None:
-        assert frozenset({"pytorch"}) == KNOWN_ENGINES
+    def test_known_engines_include_candle(self) -> None:
+        assert frozenset({"pytorch", "candle"}) == KNOWN_ENGINES

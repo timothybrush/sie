@@ -33,6 +33,8 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
+from sie_server.adapters._multivector import maxsim_scores_batched
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters._utils import grouped_score_pairs
@@ -397,7 +399,15 @@ class ColBERTAdapter(BaseAdapter):
         return None
 
     def _resolve_dtype(self) -> torch.dtype:
-        """Resolve compute dtype."""
+        """Resolve compute dtype.
+
+        Off-CUDA (CPU/MPS) ALWAYS uses fp32 for numerical safety — ColBERT is not
+        validated for fp16 on MPS, so unlike ``bge_m3``/``pytorch_embedding`` (which
+        honor an explicit precision off-CUDA for benchmarked models) it ignores
+        ``compute_precision`` off-CUDA. fp16/bf16 are only used on CUDA.
+        """
+        if not self._device or not str(self._device).startswith("cuda"):
+            return torch.float32
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
@@ -833,35 +843,11 @@ class ColBERTAdapter(BaseAdapter):
             is_query=False,
         )
 
-        # Compute MaxSim for all documents in a single batched operation
+        # MaxSim over all documents in one padded, masked batched matmul.
         query_tensor = torch.from_numpy(query_vecs).to(self._device)
-
         assert doc_output.multivector is not None
-        doc_list = doc_output.multivector
-        doc_lengths = [d.shape[0] for d in doc_list]
-        max_doc_tokens = max(doc_lengths)
-        dim = query_vecs.shape[1]
-
-        # Pad documents to uniform length and transfer once
-        docs_padded = torch.zeros(
-            (len(doc_list), max_doc_tokens, dim),
-            dtype=query_tensor.dtype,
-            device=self._device,
-        )
-        for i, doc_vecs in enumerate(doc_list):
-            t = torch.from_numpy(doc_vecs).to(self._device)
-            docs_padded[i, : t.shape[0]] = t
-
-        # Batched sim: [Q, D] @ [N, D, T]^T -> [N, Q, T]
-        sim = torch.matmul(query_tensor, docs_padded.transpose(1, 2))
-
-        # Mask padded positions
-        lengths_t = torch.tensor(doc_lengths, device=self._device)
-        mask = torch.arange(max_doc_tokens, device=self._device).unsqueeze(0) < lengths_t.unsqueeze(1)
-        sim.masked_fill_(~mask.unsqueeze(1), float("-inf"))
-
-        # MaxSim: max over doc tokens, sum over query tokens -> [N]
-        return sim.max(dim=-1).values.sum(dim=-1).tolist()
+        doc_tensors = [torch.from_numpy(d).to(self._device) for d in doc_output.multivector]
+        return maxsim_scores_batched(query_tensor, doc_tensors)
 
     def score_pairs(
         self,
@@ -884,11 +870,7 @@ class ColBERTAdapter(BaseAdapter):
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences."""
-        pos_list = []
-        for i in range(num_seqs):
-            seq_len = int(cu_seqlens[i + 1].item() - cu_seqlens[i].item())
-            pos_list.append(torch.arange(0, seq_len, device=self._device, dtype=torch.long))
-        return torch.cat(pos_list)
+        return build_position_ids(cu_seqlens)
 
     def _run_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Compute embeddings for packed input.

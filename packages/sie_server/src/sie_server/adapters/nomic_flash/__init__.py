@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
@@ -303,11 +304,7 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences (starting from 0 for each)."""
-        pos_list = []
-        for i in range(num_seqs):
-            seq_len = cu_seqlens[i + 1].item() - cu_seqlens[i].item()
-            pos_list.append(torch.arange(0, seq_len, device=self._device))
-        return torch.cat(pos_list)
+        return build_position_ids(cu_seqlens)
 
     def _compute_rope(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute RoPE cos/sin values for packed positions.

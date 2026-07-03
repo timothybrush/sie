@@ -7,7 +7,7 @@ use k8s_openapi::api::core::v1::Endpoints;
 use kube::api::{Api, ListParams};
 use kube::runtime::watcher::{self, Event};
 use kube::Client;
-use rand::prelude::*;
+use rand::RngExt as _;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -64,8 +64,8 @@ impl K8sDiscovery {
 
                     // Add jitter (20%)
                     let jitter_factor = {
-                        let mut rng = rand::thread_rng();
-                        rng.gen_range(0.8..1.2)
+                        let mut rng = rand::rng();
+                        rng.random_range(0.8..1.2)
                     };
                     let sleep_duration =
                         Duration::from_secs_f64(backoff.as_secs_f64() * jitter_factor);

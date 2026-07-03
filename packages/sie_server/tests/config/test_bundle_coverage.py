@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from sie_sdk.bundle_utils import match_bundle_models
 
 SIE_SERVER_ROOT = Path(__file__).resolve().parents[2]
 BUNDLES_DIR = SIE_SERVER_ROOT / "bundles"
@@ -108,6 +109,19 @@ def test_bundle_and_model_dirs_are_non_empty() -> None:
     # a loud failure regardless of what the parametrized test does.
     assert sorted(BUNDLES_DIR.glob("*.yaml")), f"No bundle YAML files found in {BUNDLES_DIR}"
     assert sorted(MODELS_DIR.glob("*.yaml")), f"No model YAML files found in {MODELS_DIR}"
+
+
+def test_candle_bundle_only_exposes_profile_variants() -> None:
+    matches = match_bundle_models(BUNDLES_DIR / "candle.yaml", MODELS_DIR)
+    assert matches, "candle bundle should expose at least one model profile variant"
+
+    bare_model_matches = [model for model in matches if ":" not in model]
+    formatted_matches = "\n  ".join(bare_model_matches)
+    assert not bare_model_matches, (
+        "Candle must be selected through explicit model profile variants, not bare model ids. "
+        "For overlap models, keep the bare default profile on a Python adapter; for Candle-only "
+        f"models, omit the default profile and expose only `model:candle`:\n  {formatted_matches}"
+    )
 
 
 @pytest.mark.parametrize("bundle_yaml", sorted(BUNDLES_DIR.glob("*.yaml")))

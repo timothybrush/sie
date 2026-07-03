@@ -30,6 +30,14 @@ class TestConfigStore:
         assert self.store.increment_epoch() == 2
         assert self.store.increment_epoch() == 3
 
+    def test_read_epoch_returns_zero_for_empty_file(self) -> None:
+        (Path(self.store.base_dir) / "epoch").write_text("")
+        assert self.store.read_epoch() == 0
+
+    def test_read_epoch_returns_zero_for_corrupt_file(self) -> None:
+        (Path(self.store.base_dir) / "epoch").write_text("not-an-int")
+        assert self.store.read_epoch() == 0
+
     def test_write_and_read_model(self) -> None:
         yaml_content = "sie_id: BAAI/bge-m3\nhf_id: BAAI/bge-m3\n"
         self.store.write_model("BAAI/bge-m3", yaml_content)

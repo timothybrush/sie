@@ -14,6 +14,9 @@ dependencies:
 - name: alloy
   repository: https://grafana.github.io/helm-charts
   version: 0.10.1
+- name: tempo
+  repository: https://grafana-community.github.io/helm-charts
+  version: 2.2.3
 - name: kubernetes-event-exporter
   repository: oci://registry-1.docker.io/bitnamicharts
   version: 3.6.3
@@ -26,5 +29,5 @@ dependencies:
 - name: trust-manager
   repository: https://charts.jetstack.io
   version: v0.13.0
-digest: sha256:523f3a647cb890c2b06d96b06097e871d3dec6fdef1fa3712c9c5bcc6a5c0fed
-generated: "2026-05-26T13:51:40.00581+02:00"
+digest: sha256:d9a00b62c8fb60d1481fce18a98aea0291ff81aa5b661d73b88d56845e3bbe64
+generated: "2026-07-02T11:24:24.047532+02:00"

@@ -16,6 +16,7 @@ Paper: https://arxiv.org/abs/2405.19504
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -23,6 +24,8 @@ import numpy as np
 
 if TYPE_CHECKING:
     from sie_server.core.inference_output import EncodeOutput
+
+logger = logging.getLogger(__name__)
 
 
 class Postprocessor(Protocol):
@@ -143,11 +146,11 @@ class MuveraConfig:
 
     This gives: 40 * 64 * 128 = 327,680 intermediate dims -> 10,240 final
 
-    Alternative (memory-efficient but lower quality):
+    Alternative (memory-efficient; the text ColBERT models use this — #1493):
     - projection_dim: 8 (AMS sketch per-token compression)
-    - final_projection_dim: None (no final compression)
+    - final_projection_dim: None (no final Count Sketch — it is harmful here)
 
-    This gives: 20 * 64 * 8 = 10,240 directly
+    This gives: 40 * 64 * 8 = 20,480 directly
 
     References:
         - Paper: https://arxiv.org/abs/2405.19504
@@ -162,10 +165,18 @@ class MuveraConfig:
             Set to None for identity projection (paper's approach).
             Set to small value (e.g., 8) for AMS sketch (lower quality).
         final_projection_dim: If set, apply Count Sketch to compress the
-            concatenated FDE to this dimension. Paper uses 10240.
+            concatenated FDE to this dimension. Paper uses 10240. A value
+            ``>= intermediate_dim`` is ignored (the sketch is skipped), since
+            a same-or-larger Count Sketch can only destroy information (#1493).
         seed: Random seed for reproducibility. Default: 42.
         normalize: Whether to L2 normalize FDE vectors. Default: False.
             Set True for cosine similarity, False for inner product.
+        center_tokens: If True, subtract the per-multivector mean token before
+            SimHash partitioning. A dominant shared DC component otherwise makes
+            SimHash bucket all tokens together (near-tied FDEs that collapse
+            ranking, while MaxSim stays healthy); centering partitions on the
+            discriminative residual. Improves FDE quality for near-collinear
+            models. Default: False (#1528).
     """
 
     num_repetitions: int = 40  # Paper uses 40
@@ -174,11 +185,26 @@ class MuveraConfig:
     final_projection_dim: int | None = 10240  # Count Sketch to this dim (paper uses 10240)
     seed: int = 42
     normalize: bool = False  # True for cosine, False for inner product
+    center_tokens: bool = False  # subtract per-multivector mean before SimHash (#1528)
 
     @property
     def num_partitions(self) -> int:
         """Number of partitions per repetition."""
         return 2**self.num_simhash_projections
+
+    def _effective_final_dim(self, token_dim: int) -> int | None:
+        """Final Count-Sketch target dim, or None when no sketch should run.
+
+        A Count-Sketch is only ever a *reduction*. When the configured
+        final_projection_dim is >= the intermediate dim it can only destroy
+        information (same-dim destructive hashing, see #1493), so it is
+        skipped and the intermediate FDE is returned unprojected.
+        """
+        if self.final_projection_dim is None:
+            return None
+        if self.final_projection_dim >= self.intermediate_dim(token_dim):
+            return None
+        return self.final_projection_dim
 
     def fde_dim(self, token_dim: int) -> int:
         """Calculate FDE output dimension.
@@ -189,12 +215,8 @@ class MuveraConfig:
         Returns:
             Total FDE dimension (after final projection if configured).
         """
-        proj_dim = self.projection_dim or token_dim
-        intermediate_dim = self.num_repetitions * self.num_partitions * proj_dim
-
-        if self.final_projection_dim is not None:
-            return self.final_projection_dim
-        return intermediate_dim
+        final = self._effective_final_dim(token_dim)
+        return final if final is not None else self.intermediate_dim(token_dim)
 
     def intermediate_dim(self, token_dim: int) -> int:
         """Calculate intermediate FDE dimension before final projection.
@@ -252,9 +274,28 @@ class MuveraPostprocessor:
         self._proj_dim = self.config.projection_dim or token_dim
         self._use_identity = self.config.projection_dim is None
 
-        # Calculate dimensions
+        # Calculate dimensions. ``_final_dim`` is the effective Count-Sketch
+        # target dim (None = skip the sketch); ``target_dim`` stays consistent
+        # with it via ``fde_dim`` (both route through ``_effective_final_dim``).
         self._intermediate_dim = self.config.intermediate_dim(token_dim)
+        self._final_dim = self.config._effective_final_dim(token_dim)
         self.target_dim = self.config.fde_dim(token_dim)
+
+        # Warn once (at construction) when a configured final_projection_dim is
+        # ignored because it would not reduce the FDE (#1493 footgun guard).
+        if (
+            self.config.final_projection_dim is not None
+            and self.config.final_projection_dim >= self.config.intermediate_dim(token_dim)
+        ):
+            logger.warning(
+                "MUVERA final Count-Sketch skipped: final_projection_dim=%d >= intermediate_dim=%d "
+                "(token_dim=%d) — a same-or-larger sketch only destroys information; "
+                "returning unprojected %d-dim FDE (#1493).",
+                self.config.final_projection_dim,
+                self.config.intermediate_dim(token_dim),
+                token_dim,
+                self.target_dim,
+            )
 
         # Pre-compute Gray code lookup table for fast partition index conversion
         # Gray code: adjacent indices differ by 1 bit (preserves LSH locality)
@@ -323,6 +364,13 @@ class MuveraPostprocessor:
         if num_tokens == 0:
             return np.zeros(self.target_dim, dtype=np.float32)
 
+        # Subtract the per-multivector mean token before partitioning/projection.
+        # A dominant shared DC component makes SimHash bucket all tokens together
+        # (near-tied FDEs -> collapsed ranking), so centering partitions on the
+        # discriminative residual. MaxSim is DC-shift-tolerant and unaffected (#1528).
+        if self.config.center_tokens:
+            token_embeddings = token_embeddings - token_embeddings.mean(axis=0, keepdims=True)
+
         num_partitions = self.config.num_partitions
         proj_dim = self._proj_dim
         rep_block_size = num_partitions * proj_dim
@@ -358,9 +406,10 @@ class MuveraPostprocessor:
             rep_start = rep_num * rep_block_size
             intermediate_fde[rep_start : rep_start + rep_block_size] = rep_fde
 
-        # Step 6: Apply final Count Sketch projection if configured
-        if self.config.final_projection_dim is not None:
-            return _apply_count_sketch(intermediate_fde, self.config.final_projection_dim, self.config.seed)
+        # Step 6: Apply final Count Sketch projection if it would reduce the
+        # FDE. ``_final_dim`` is None when the sketch is skipped (#1493 guard).
+        if self._final_dim is not None:
+            return _apply_count_sketch(intermediate_fde, self._final_dim, self.config.seed)
 
         return intermediate_fde
 

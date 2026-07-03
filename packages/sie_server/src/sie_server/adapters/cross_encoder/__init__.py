@@ -58,7 +58,7 @@ class CrossEncoderAdapter(BaseAdapter):
         *,
         trust_remote_code: bool = False,
         max_length: int | None = None,
-        compute_precision: ComputePrecision = "float16",
+        compute_precision: ComputePrecision | None = None,
         attn_implementation: AttnImplementation = "sdpa",
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
@@ -68,7 +68,9 @@ class CrossEncoderAdapter(BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path.
             trust_remote_code: Whether to trust remote code in model files.
             max_length: Override default max sequence length for query+document.
-            compute_precision: Compute precision for inference (float16, bfloat16, float32).
+            compute_precision: Compute precision for inference. None (default) selects
+                fp32 off-CUDA (safe on MPS) and fp16 on CUDA; set explicitly to override
+                (e.g. float16 to opt a curated model into fp16 on MPS).
             attn_implementation: Attention implementation ("sdpa" for optimized, "eager" for baseline).
             **kwargs: Additional arguments (ignored, for compatibility).
         """
@@ -93,16 +95,29 @@ class CrossEncoderAdapter(BaseAdapter):
         # Build model_kwargs for performance optimizations
         model_kwargs: dict[str, Any] = {}
 
-        # Use SDPA for efficient attention on GPU
+        # Use SDPA for efficient attention on accelerators
         if device.startswith("cuda") or device == "mps":
-            model_kwargs["attn_implementation"] = self._attn_implementation
+            # FA2 is CUDA-only; off-CUDA (MPS) coerce anything but "eager" to "sdpa"
+            # (mirrors PyTorchEmbeddingAdapter._resolve_dtype_and_attn) so a reranker
+            # profile requesting flash_attention_2 still loads on Metal.
+            if device.startswith("cuda") or self._attn_implementation == "eager":
+                model_kwargs["attn_implementation"] = self._attn_implementation
+            else:
+                model_kwargs["attn_implementation"] = "sdpa"
 
-            # Use FP16/BF16 for faster inference
-            if self._compute_precision == "float16":
+            # Resolve precision. Default to fp32 off-CUDA (numerically safe on MPS);
+            # honor an explicit compute_precision everywhere so curated Mac models can
+            # opt into fp16 on MPS. CUDA keeps the historical fp16 default.
+            precision = self._compute_precision
+            if precision is None:
+                precision = "float16" if device.startswith("cuda") else "float32"
+            # NOTE: bf16 is coerced to fp16 on MPS at the loader (MPS bf16 is incomplete
+            # in torch and can hang load). See core/loader.load_adapter.
+            if precision == "float16":
                 model_kwargs["dtype"] = torch.float16
-            elif self._compute_precision == "bfloat16":
+            elif precision == "bfloat16":
                 model_kwargs["dtype"] = torch.bfloat16
-            # float32 is the default, no need to specify
+            # float32 -> CrossEncoder default, no dtype kwarg needed
 
         self._model = CrossEncoder(
             self._model_name_or_path,

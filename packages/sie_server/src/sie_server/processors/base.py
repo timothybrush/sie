@@ -1,9 +1,7 @@
-"""``MessageProcessor`` Protocol — the seam introduced by the walking skeleton.
+"""``MessageProcessor`` Protocol for sidecar-driven generation work.
 
-The existing batch path (encode/score/extract) still lives in
-``NatsPullLoop._process_messages`` and is not yet flipped through this
-protocol — the seam is sufficient for the walking skeleton. Generation
-work items are dispatched here.
+The sidecar owns queue fetch and settlement. Python generation work items are
+dispatched here through the sidecar IPC path.
 
 A processor owns the full lifecycle of a single message: deserialization,
 inference, reply publish, and ACK/NAK. Returning from ``process()``

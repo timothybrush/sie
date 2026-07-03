@@ -26,6 +26,8 @@ from pathlib import Path
 
 import requests
 
+from sie_server.core.oom import is_oom_error
+
 logger = logging.getLogger(__name__)
 
 # In-process record of ports already handed out by ``find_free_port`` but
@@ -57,6 +59,8 @@ HEALTH_CHECK_INTERVAL_S = 2.0
 BASE_PORT = 30000  # Starting port for SGLang servers
 
 ERR_SERVER_STARTUP = "SGLang server failed to start within timeout"
+STARTUP_LOG_TAIL_CHARS = 5000
+LOAD_HEADROOM_BYTES = 1024**3
 
 
 def _resolve_liveness_budget() -> float | None:
@@ -251,18 +255,51 @@ def wait_for_server(
 
 
 def _log_subprocess_output(output_file: tempfile._TemporaryFileWrapper | None) -> None:
+    output = read_subprocess_output_tail(output_file)
+    if output:
+        log_path = getattr(output_file, "name", "<unknown>")
+        logger.error("SGLang subprocess output from %s:\n%s", log_path, output)
+
+
+def read_subprocess_output_tail(output_file: tempfile._TemporaryFileWrapper | None) -> str:
     if output_file is None:
-        return
+        return ""
     try:
         output_file.flush()
     except Exception:  # noqa: BLE001
-        return
+        return ""
     try:
-        with Path(output_file.name).open() as f:
+        with Path(output_file.name).open(encoding="utf-8", errors="replace") as f:
             output = f.read()
-        logger.error("SGLang subprocess output from %s:\n%s", output_file.name, output[-5000:])
-    except OSError as e:
-        logger.error("Failed to read SGLang log: %s", e)
+        return output[-STARTUP_LOG_TAIL_CHARS:]
+    except OSError as exc:
+        return f"<failed to read SGLang log: {exc}>"
+
+
+def startup_failure_error(output_file: tempfile._TemporaryFileWrapper | None) -> RuntimeError:
+    output = read_subprocess_output_tail(output_file).strip()
+    if output:
+        if is_oom_error(RuntimeError(output)):
+            return RuntimeError(f"{ERR_SERVER_STARTUP}: out of memory detected in startup log")
+    return RuntimeError(ERR_SERVER_STARTUP)
+
+
+def estimate_load_required_memory_bytes(
+    *,
+    device_type: str,
+    device_total_bytes: int,
+    mem_fraction_static: float,
+) -> int | None:
+    """Estimate free memory needed before launching a SGLang server."""
+    if device_type != "cuda" or device_total_bytes <= 0:
+        return None
+    if isinstance(mem_fraction_static, bool) or not isinstance(mem_fraction_static, int | float):
+        return None
+    fraction = float(mem_fraction_static)
+    if not 0.0 < fraction <= 1.0:
+        return None
+    required = int(device_total_bytes * fraction) + LOAD_HEADROOM_BYTES
+    return min(required, device_total_bytes)
 
 
 def terminate_process(process: subprocess.Popen[bytes] | None) -> None:

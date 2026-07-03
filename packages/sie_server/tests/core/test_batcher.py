@@ -670,6 +670,29 @@ class TestBatchFormerDrain:
         assert result.size == 3
         assert batcher.pending_count == 0
 
+    @pytest.mark.asyncio
+    async def test_try_drain_respects_max_items_cap(self, batcher: BatchFormer[TextPreparedItem, str]) -> None:
+        """try_drain(max_items=N) takes at most N items and leaves the rest pending.
+
+        This is the fairness bound behind the LoRA drain loop (#1606): a drain
+        must not sweep in more than the caller's snapshot budget, even when the
+        batcher holds more items (including ones that arrived mid-drain).
+        """
+        for i in range(5):
+            await batcher.submit(make_text_item([i], i), f"req-{i}")
+        assert batcher.pending_count == 5
+
+        first = await batcher.try_drain(max_items=2)
+        assert first is not None
+        assert first.size == 2
+        assert batcher.pending_count == 3
+
+        # A follow-up drain honors its own cap and drains part of the remainder.
+        second = await batcher.try_drain(max_items=2)
+        assert second is not None
+        assert second.size == 2
+        assert batcher.pending_count == 1
+
 
 class TestBatchFormerSubmitMany:
     """Tests for BatchFormer submit_many (bulk submit)."""

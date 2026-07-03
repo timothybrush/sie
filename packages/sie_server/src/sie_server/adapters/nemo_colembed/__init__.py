@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._multivector import maxsim_scores
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.adapters._vision_patch_embed import rebind_vision_patch_embed
@@ -677,13 +678,8 @@ class NemoColEmbedAdapter(BaseAdapter):
             scores_matrix = self._model.get_scores([query_emb], doc_embs)
             return scores_matrix[0].cpu().tolist()
 
-        # Fallback: compute MaxSim manually
-        scores = []
-        for doc_emb in doc_embs:
-            sim = torch.matmul(query_emb, doc_emb.T)
-            maxsim_score = sim.max(dim=-1).values.sum().item()
-            scores.append(maxsim_score)
-        return scores
+        # Fallback: compute MaxSim manually.
+        return maxsim_scores(query_emb, doc_embs)
 
     def _validate_output_types(self, output_types: list[str]) -> None:
         """Validate that output types are supported."""

@@ -59,6 +59,7 @@ impl WorkPublisher {
         reply_subject: &str,
         outcome: &ItemOutcome,
         timings: Option<Timings>,
+        worker_direct: bool,
     ) -> Result<(), PublishError> {
         check_reply_subject(reply_subject)?;
 
@@ -75,7 +76,7 @@ impl WorkPublisher {
             }
         };
 
-        let result = build_work_result(effective, &self.worker_id, timings);
+        let result = build_work_result(effective, &self.worker_id, timings, worker_direct);
         let bytes = rmp_serde::to_vec_named(&result)?;
         debug!(
             reply = %reply_subject,
@@ -223,6 +224,7 @@ pub fn build_work_result(
     outcome: &ItemOutcome,
     worker_id: &str,
     timings: Option<Timings>,
+    worker_direct: bool,
 ) -> WorkResult {
     let (success, error, error_code) = match outcome.disposition {
         Disposition::PublishAndAck => (true, None, None),
@@ -272,6 +274,7 @@ pub fn build_work_result(
         tokenization_ms: outcome.tokenization_ms,
         postprocessing_ms: outcome.postprocessing_ms,
         payload_fetch_ms,
+        worker_direct,
     }
 }
 
@@ -317,12 +320,13 @@ mod tests {
 
     #[test]
     fn success_outcome_maps_to_success_result() {
-        let r = build_work_result(&outcome(), "worker-1", None);
+        let r = build_work_result(&outcome(), "worker-1", None, true);
         assert!(r.success);
         assert!(r.error.is_none());
         assert_eq!(r.request_id, "req-1");
         assert_eq!(r.item_index, 0);
         assert_eq!(r.worker_id.as_deref(), Some("worker-1"));
+        assert!(r.worker_direct);
         assert_eq!(r.inference_ms, Some(17.5));
         assert_eq!(r.tokenization_ms, Some(1.1));
         assert_eq!(r.postprocessing_ms, Some(0.3));
@@ -335,7 +339,7 @@ mod tests {
         o.disposition = Disposition::PublishErrorAndAck;
         o.error = Some("kapow".into());
         o.error_code = Some("INTERNAL".into());
-        let r = build_work_result(&o, "w", None);
+        let r = build_work_result(&o, "w", None, false);
         assert!(!r.success);
         assert_eq!(r.error.as_deref(), Some("kapow"));
         assert_eq!(r.error_code.as_deref(), Some("INTERNAL"));
@@ -350,7 +354,7 @@ mod tests {
 
     #[test]
     fn work_result_is_msgpack_round_trippable() {
-        let r = build_work_result(&outcome(), "w", None);
+        let r = build_work_result(&outcome(), "w", None, false);
         let bytes = rmp_serde::to_vec_named(&r).unwrap();
         let back: WorkResult = rmp_serde::from_slice(&bytes).unwrap();
         assert!(back.success);
@@ -364,7 +368,7 @@ mod tests {
             queue_ms: 12.5,
             payload_fetch_ms: 3.2,
         };
-        let r = build_work_result(&outcome(), "w", Some(timings));
+        let r = build_work_result(&outcome(), "w", Some(timings), false);
         assert_eq!(r.queue_ms, Some(12.5));
         // Python sets processing_ms = 0.0 as a placeholder; we match exactly.
         assert_eq!(r.processing_ms, Some(0.0));
@@ -378,7 +382,7 @@ mod tests {
             queue_ms: 5.0,
             payload_fetch_ms: 0.0,
         };
-        let r = build_work_result(&outcome(), "w", Some(timings));
+        let r = build_work_result(&outcome(), "w", Some(timings), false);
         assert_eq!(r.queue_ms, Some(5.0));
         assert!(r.payload_fetch_ms.is_none());
     }
@@ -410,7 +414,7 @@ mod tests {
         o.disposition = Disposition::PublishErrorAndAck;
         o.error = Some("oops".into());
         o.error_code = Some("payload_error".into());
-        let r = build_work_result(&o, "w", None);
+        let r = build_work_result(&o, "w", None, false);
         assert!(!r.success);
         assert!(r.queue_ms.is_none());
         assert!(r.processing_ms.is_none());

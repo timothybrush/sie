@@ -73,6 +73,12 @@ class ModelAdapter(ABC):
         wrapping it in the generic Python wait_for timeout, which cannot kill
         the underlying thread.
 
+    Adapter-Owned Load Headroom:
+        Adapters that reserve device memory during load can override
+        load_required_memory_bytes() to tell the registry how much free memory
+        should be available before load() starts. The registry may use that
+        engine-agnostic estimate to evict non-pinned LRU models before loading.
+
     Device-Aware Factory Method:
         Adapters can override create_for_device() to return different adapter
         implementations based on device compatibility. Flash adapters inherit
@@ -202,6 +208,25 @@ class ModelAdapter(ABC):
             pass
 
         return 0
+
+    def load_required_memory_bytes(self, *, device_type: str, device_total_bytes: int) -> int | None:
+        """Return minimum free device memory recommended before ``load()``.
+
+        This is an optional load-staging hook for adapters whose startup
+        reserves memory outside the parent process or whose footprint cannot be
+        inferred from ``memory_footprint()`` before load. ``None`` means the
+        registry should fall back to pressure-only eviction.
+
+        Args:
+            device_type: Memory tracker device type, such as ``"cuda"``.
+            device_total_bytes: Total bytes reported for the target device.
+
+        Returns:
+            Minimum free bytes preferred before load, or ``None`` if the
+            adapter has no additional load-headroom requirement.
+        """
+        _ = (device_type, device_total_bytes)
+        return None
 
     def encode(
         self,

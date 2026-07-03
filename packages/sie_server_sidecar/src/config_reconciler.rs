@@ -19,7 +19,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::config_subscriber::{
-    replace_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
+    advertised_bundle_hash, replace_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
 };
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::ipc_types::{
@@ -31,12 +31,14 @@ use crate::shutdown::Shutdown;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 pub const DEFAULT_FULL_EXPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_MODEL_POOL: &str = "default";
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
     pub base_url: String,
     pub admin_token: Option<String>,
     pub bundle: String,
+    pub pool: String,
     pub poll_interval: Duration,
     pub full_export_interval: Option<Duration>,
 }
@@ -56,6 +58,8 @@ struct ExportSnapshot {
     #[serde(default)]
     bundle_config_hashes: HashMap<String, String>,
     #[serde(default)]
+    bundle_pool_config_hashes: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
     models: Vec<ExportedModel>,
 }
 
@@ -69,11 +73,29 @@ struct ExportedModel {
     model_config: Option<serde_json::Value>,
     #[serde(default)]
     affected_bundles: Vec<String>,
+    #[serde(default)]
+    pool: Option<String>,
 }
 
 impl ExportedModel {
     fn targets_bundle(&self, bundle: &str) -> bool {
         self.affected_bundles.iter().any(|b| b == bundle)
+    }
+
+    fn targets_pool(&self, pool: &str) -> bool {
+        self.pool_name() == normalize_pool_name(pool)
+    }
+
+    fn pool_name(&self) -> String {
+        if let Some(pool) = self.pool.as_deref() {
+            return normalize_pool_name(pool);
+        }
+        self.model_config
+            .as_ref()
+            .and_then(|value| value.get("pool"))
+            .and_then(|value| value.as_str())
+            .map(normalize_pool_name)
+            .unwrap_or_else(|| DEFAULT_MODEL_POOL.to_string())
     }
 
     fn config_body(&self) -> Result<Option<String>, serde_json::Error> {
@@ -129,10 +151,17 @@ struct ReconcileClient {
 struct ReconcileRuntime<'a> {
     client: &'a ReconcileClient,
     bundle: &'a str,
+    pool: &'a str,
     ipc: Arc<IpcClient>,
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
+}
+
+#[derive(Clone, Copy)]
+struct ReconcileScope<'a> {
+    bundle: &'a str,
+    pool: &'a str,
 }
 
 impl ReconcileClient {
@@ -189,6 +218,15 @@ fn record_reconcile(metrics: &MetricsRegistry, result: &str) {
         .config_deltas_total
         .with_label_values(&["export", result])
         .inc();
+}
+
+fn normalize_pool_name(raw: &str) -> String {
+    let pool = raw.trim().to_ascii_lowercase();
+    if pool.is_empty() {
+        DEFAULT_MODEL_POOL.to_string()
+    } else {
+        pool
+    }
 }
 
 fn drift_reason(
@@ -271,6 +309,7 @@ pub fn spawn(
         info!(
             base_url = %config.base_url,
             bundle = %config.bundle,
+            pool = %config.pool,
             poll_interval_ms = config.poll_interval.as_millis() as u64,
             full_export_interval_ms = config.full_export_interval.map(|d| d.as_millis() as u64),
             "worker-config: export reconciler started"
@@ -279,6 +318,7 @@ pub fn spawn(
         let runtime = ReconcileRuntime {
             client: &client,
             bundle: &config.bundle,
+            pool: &config.pool,
             ipc: Arc::clone(&ipc),
             state: Arc::clone(&state),
             metrics: Arc::clone(&metrics),
@@ -440,7 +480,10 @@ async fn reconcile_export(
     let shutdown = Arc::clone(&runtime.shutdown);
     Ok(reconcile_export_snapshot(
         snapshot,
-        runtime.bundle,
+        ReconcileScope {
+            bundle: runtime.bundle,
+            pool: runtime.pool,
+        },
         &runtime.state,
         &runtime.metrics,
         ExportReconcileOptions {
@@ -459,7 +502,7 @@ async fn reconcile_export(
 
 async fn reconcile_export_snapshot<F, Fut>(
     snapshot: ExportSnapshot,
-    bundle: &str,
+    scope: ReconcileScope<'_>,
     state: &ConfigApplyState,
     metrics: &MetricsRegistry,
     options: ExportReconcileOptions<'_>,
@@ -488,11 +531,20 @@ where
     let mut failed = 0usize;
     let mut skipped = 0usize;
     let mut exported_models = Vec::new();
-    let control_plane_hash = snapshot.bundle_config_hashes.get(bundle).cloned();
+    let normalized_pool = normalize_pool_name(scope.pool);
+    let control_plane_hash = match snapshot.bundle_pool_config_hashes.get(scope.bundle) {
+        Some(pool_hashes) => Some(
+            pool_hashes
+                .get(&normalized_pool)
+                .cloned()
+                .unwrap_or_default(),
+        ),
+        None => snapshot.bundle_config_hashes.get(scope.bundle).cloned(),
+    };
     let mut first_hash_mismatch: Option<String> = None;
 
     for model in snapshot.models {
-        if !model.targets_bundle(bundle) {
+        if !model.targets_bundle(scope.bundle) || !model.targets_pool(&normalized_pool) {
             skipped += 1;
             continue;
         }
@@ -533,7 +585,7 @@ where
 
     let export_signature = if failed == 0 {
         Some(compute_export_signature(
-            bundle,
+            scope.bundle,
             control_plane_hash.as_deref(),
             &exported_models,
         ))
@@ -563,7 +615,7 @@ where
 
     let state_updated = if failed == 0 {
         let req = ReplaceModelConfigsRequest {
-            bundle_id: bundle.to_string(),
+            bundle_id: scope.bundle.to_string(),
             epoch: snapshot.epoch,
             bundle_config_hash: control_plane_hash.clone().unwrap_or_default(),
             models: exported_models,
@@ -623,8 +675,10 @@ where
                 first_hash_mismatch = Some(resp.bundle_config_hash.clone());
             }
         }
-        let applied_bundle_hash = resp.bundle_config_hash.clone();
+        let advertised_hash =
+            advertised_bundle_hash(control_plane_hash.as_deref(), &resp.bundle_config_hash);
         applied = resp.applied_models.len();
+        state.set_loaded_models(resp.applied_models);
 
         if let (Some(control_hash), Some(applied_hash)) = (
             control_plane_hash.as_deref(),
@@ -634,12 +688,12 @@ where
                 epoch = snapshot.epoch,
                 advertised_hash = %control_hash,
                 applied_hash = %applied_hash,
-                "worker-config: Python registry hash differs from control-plane export hash; advertising Python-applied hash"
+                "worker-config: Python registry hash differs from control-plane export hash; advertising control-plane hash"
             );
         }
         let state_updated = state.mark_export_reconciled(
             snapshot.epoch,
-            Some(applied_bundle_hash),
+            Some(advertised_hash),
             options.force_epoch,
         );
         if state_updated {
@@ -667,6 +721,7 @@ where
         failed,
         skipped,
         reason = options.reason,
+        pool = %normalized_pool,
         state_updated,
         "worker-config: export reconcile attempt finished"
     );
@@ -695,6 +750,7 @@ mod tests {
             raw_yaml: Some(raw_yaml.to_string()),
             model_config: None,
             affected_bundles: bundles.iter().map(|b| (*b).to_string()).collect(),
+            pool: None,
         }
     }
 
@@ -704,6 +760,22 @@ mod tests {
             bundles,
             &format!("sie_id: {model_id}\nprofiles:\n  default: {{}}\n"),
         )
+    }
+
+    fn exported_model_with_pool(model_id: &str, bundles: &[&str], pool: &str) -> ExportedModel {
+        ExportedModel {
+            model_id: model_id.into(),
+            raw_yaml: Some(format!(
+                "sie_id: {model_id}\npool: {pool}\nprofiles:\n  default: {{}}\n"
+            )),
+            model_config: Some(serde_json::json!({"pool": pool})),
+            affected_bundles: bundles.iter().map(|b| (*b).to_string()).collect(),
+            pool: Some(pool.to_string()),
+        }
+    }
+
+    fn scope<'a>(bundle: &'a str, pool: &'a str) -> ReconcileScope<'a> {
+        ReconcileScope { bundle, pool }
     }
 
     fn metrics() -> MetricsRegistry {
@@ -771,6 +843,7 @@ mod tests {
             raw_yaml: Some("sie_id: m\n".into()),
             model_config: None,
             affected_bundles: vec!["default".into(), "vision".into()],
+            pool: None,
         };
         assert!(model.targets_bundle("default"));
         assert!(!model.targets_bundle("def"));
@@ -784,6 +857,7 @@ mod tests {
             raw_yaml: Some("sie_id: raw\n".into()),
             model_config: Some(serde_json::json!({"sie_id": "json"})),
             affected_bundles: vec!["default".into()],
+            pool: None,
         };
         assert_eq!(model.config_body().unwrap().as_deref(), Some("sie_id: raw"));
     }
@@ -795,6 +869,7 @@ mod tests {
             raw_yaml: None,
             model_config: Some(serde_json::json!({"sie_id": "json"})),
             affected_bundles: vec!["default".into()],
+            pool: None,
         };
         assert_eq!(
             model.config_body().unwrap().as_deref(),
@@ -807,6 +882,7 @@ mod tests {
         let snapshot = ExportSnapshot {
             epoch: 7,
             bundle_config_hashes: HashMap::new(),
+            bundle_pool_config_hashes: HashMap::new(),
             models: vec![
                 exported_model("target-model", &["default"]),
                 exported_model("other-model", &["vision"]),
@@ -818,7 +894,7 @@ mod tests {
 
         let outcome = reconcile_export_snapshot(
             snapshot,
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("test"),
@@ -849,6 +925,10 @@ mod tests {
             state.bundle_config_hash().read().unwrap().as_str(),
             "hash-7"
         );
+        assert_eq!(
+            state.loaded_models().read().unwrap().as_slice(),
+            ["target-model".to_string()]
+        );
 
         let applied = applied.lock().await;
         assert_eq!(applied.len(), 1);
@@ -859,10 +939,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_reconcile_filters_pool_and_uses_pool_hash() {
+        let snapshot = ExportSnapshot {
+            epoch: 13,
+            bundle_config_hashes: HashMap::from([(
+                "candle".to_string(),
+                "global-hash".to_string(),
+            )]),
+            bundle_pool_config_hashes: HashMap::from([(
+                "candle".to_string(),
+                HashMap::from([
+                    ("default".to_string(), "default-pool-hash".to_string()),
+                    ("customer-a".to_string(), "tenant-pool-hash".to_string()),
+                ]),
+            )]),
+            models: vec![
+                exported_model("default-model", &["candle"]),
+                exported_model_with_pool("tenant-model", &["candle"], "customer-a"),
+            ],
+        };
+        let state = ConfigApplyState::new("old".into());
+        let metrics = metrics();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+
+        let outcome = reconcile_export_snapshot(
+            snapshot,
+            scope("candle", "default"),
+            &state,
+            &metrics,
+            reconcile_options("test"),
+            {
+                let applied = Arc::clone(&applied);
+                move |req, _epoch| {
+                    let applied = Arc::clone(&applied);
+                    async move {
+                        applied.lock().await.push(req);
+                        Ok(Some(ReplaceModelConfigsResponse {
+                            applied: true,
+                            bundle_config_hash: "default-pool-hash".into(),
+                            config_version: 13,
+                            applied_models: vec!["default-model".into()],
+                        }))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert!(outcome.state_updated);
+        assert_eq!(
+            state.bundle_config_hash().read().unwrap().as_str(),
+            "default-pool-hash"
+        );
+        assert_eq!(
+            state.loaded_models().read().unwrap().as_slice(),
+            ["default-model".to_string()]
+        );
+
+        let applied = applied.lock().await;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].bundle_id, "candle");
+        assert_eq!(applied[0].bundle_config_hash, "default-pool-hash");
+        assert_eq!(applied[0].models.len(), 1);
+        assert_eq!(applied[0].models[0].model_id, "default-model");
+    }
+
+    #[tokio::test]
     async fn export_reconcile_partial_failure_does_not_advance_state() {
         let snapshot = ExportSnapshot {
             epoch: 8,
             bundle_config_hashes: HashMap::new(),
+            bundle_pool_config_hashes: HashMap::new(),
             models: vec![
                 exported_model("ok-model", &["default"]),
                 exported_model("bad-model", &["default"]),
@@ -873,7 +1023,7 @@ mod tests {
 
         let outcome = reconcile_export_snapshot(
             snapshot,
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("test"),
@@ -908,6 +1058,7 @@ mod tests {
         let snapshot = ExportSnapshot {
             epoch: 3,
             bundle_config_hashes: HashMap::new(),
+            bundle_pool_config_hashes: HashMap::new(),
             models: vec![exported_model("target-model", &["default"])],
         };
         let state = ConfigApplyState::new("old".into());
@@ -916,7 +1067,7 @@ mod tests {
 
         let outcome = reconcile_export_snapshot(
             snapshot,
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             ExportReconcileOptions {
@@ -945,13 +1096,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_reconcile_prefers_python_applied_bundle_hash() {
+    async fn export_reconcile_advertises_control_plane_hash_when_worker_hash_differs() {
         let snapshot = ExportSnapshot {
             epoch: 11,
             bundle_config_hashes: HashMap::from([(
                 "default".to_string(),
                 "control-hash".to_string(),
             )]),
+            bundle_pool_config_hashes: HashMap::new(),
             models: vec![exported_model("target-model", &["default"])],
         };
         let state = ConfigApplyState::new("old".into());
@@ -959,7 +1111,7 @@ mod tests {
 
         let outcome = reconcile_export_snapshot(
             snapshot,
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("test"),
@@ -979,7 +1131,7 @@ mod tests {
         assert_eq!(state.epoch(), 11);
         assert_eq!(
             state.bundle_config_hash().read().unwrap().as_str(),
-            "python-hash"
+            "control-hash"
         );
     }
 
@@ -988,6 +1140,7 @@ mod tests {
         let snapshot = ExportSnapshot {
             epoch: 12,
             bundle_config_hashes: HashMap::from([("default".to_string(), String::new())]),
+            bundle_pool_config_hashes: HashMap::new(),
             models: vec![exported_model("other-model", &["vision"])],
         };
         let state = ConfigApplyState::new("old".into());
@@ -996,7 +1149,7 @@ mod tests {
 
         let outcome = reconcile_export_snapshot(
             snapshot,
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("test"),
@@ -1023,6 +1176,7 @@ mod tests {
         assert_eq!(outcome.skipped, 1);
         assert!(outcome.state_updated);
         assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "");
+        assert!(state.loaded_models().read().unwrap().is_empty());
 
         let replace_calls = replace_calls.lock().await;
         assert_eq!(replace_calls.len(), 1);
@@ -1042,9 +1196,10 @@ mod tests {
                     "default".to_string(),
                     "control-hash".to_string(),
                 )]),
+                bundle_pool_config_hashes: HashMap::new(),
                 models: vec![exported_model("target-model", &["default"])],
             },
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("startup"),
@@ -1074,9 +1229,10 @@ mod tests {
                     "default".to_string(),
                     "control-hash".to_string(),
                 )]),
+                bundle_pool_config_hashes: HashMap::new(),
                 models: vec![exported_model("target-model", &["default"])],
             },
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             ExportReconcileOptions {
@@ -1120,13 +1276,14 @@ mod tests {
                     "default".to_string(),
                     "stable-routing-hash".to_string(),
                 )]),
+                bundle_pool_config_hashes: HashMap::new(),
                 models: vec![exported_model_with_yaml(
                     "target-model",
                     &["default"],
                     "sie_id: target-model\nprofiles:\n  default:\n    max_batch_tokens: 4096\n",
                 )],
             },
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             reconcile_options("startup"),
@@ -1156,13 +1313,14 @@ mod tests {
                     "default".to_string(),
                     "stable-routing-hash".to_string(),
                 )]),
+                bundle_pool_config_hashes: HashMap::new(),
                 models: vec![exported_model_with_yaml(
                     "target-model",
                     &["default"],
                     "sie_id: target-model\nprofiles:\n  default:\n    max_batch_tokens: 8192\n",
                 )],
             },
-            "default",
+            scope("default", "default"),
             &state,
             &metrics,
             ExportReconcileOptions {

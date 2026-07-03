@@ -324,16 +324,17 @@ pub struct StreamCollector {
     /// requested. Snapshotted/cleared by the attempt-generation machinery
     /// exactly like ``chunks``.
     logprobs: Vec<serde_json::Value>,
-    /// Attempt id of the most recently abandoned attempt, set by
-    /// [`Self::bump_attempt_generation`] from the old
-    /// ``current_attempt_id``. While ``current_attempt_id`` is ``None``
-    /// (post-bump, pre-relatch), :meth:`apply` refuses to re-latch on
-    /// this id so a stale leftover chunk from the just-abandoned attempt
-    /// cannot hijack the latch and starve the genuinely-new attempt's
-    /// chunks (which would then be dropped as stale, hanging the
-    /// request). Cleared the moment a non-abandoned attempt latches.
-    /// uuid4 attempt ids are never reused, so an incoming chunk whose id
-    /// equals this is unambiguously from the abandoned attempt.
+    /// Attempt id of the most recently abandoned attempt. Usually set by
+    /// [`Self::bump_attempt_generation`] from the old ``current_attempt_id``;
+    /// NAK-driven republish may also fill it from the NAK envelope when the
+    /// abandoned attempt had not emitted a first chunk yet. While
+    /// ``current_attempt_id`` is ``None`` (post-bump, pre-relatch),
+    /// :meth:`apply` refuses to re-latch on this id so a stale leftover chunk
+    /// from the just-abandoned attempt cannot hijack the latch and starve the
+    /// genuinely-new attempt's chunks (which would then be dropped as stale,
+    /// hanging the request). Cleared the moment a non-abandoned attempt
+    /// latches. uuid4 attempt ids are never reused, so an incoming chunk whose
+    /// id equals this is unambiguously from the abandoned attempt.
     pub abandoned_attempt_id: Option<String>,
     /// Snapshot of the per-attempt state cleared by
     /// [`Self::bump_attempt_generation`], consumed only by an
@@ -472,6 +473,18 @@ impl StreamCollector {
         // arming, which is exactly what we want post-republish.
         self.last_chunk_at = None;
         self.attempt_generation
+    }
+
+    /// Fill the abandoned-attempt guard from an inbox NAK that caused a
+    /// republish before any chunk latched an attempt id.
+    pub fn record_abandoned_attempt_id(&mut self, attempt_id: &str) {
+        if attempt_id.is_empty()
+            || self.current_attempt_id.is_some()
+            || self.abandoned_attempt_id.is_some()
+        {
+            return;
+        }
+        self.abandoned_attempt_id = Some(attempt_id.to_string());
     }
 
     /// Undo a [`Self::bump_attempt_generation`] that was followed by
@@ -1393,6 +1406,26 @@ mod tests {
         assert_eq!(outcome.attempt_id, "att-B");
     }
 
+    #[test]
+    fn test_nak_recorded_abandoned_attempt_does_not_relatch_before_successor() {
+        let (tx, _rx) = oneshot::channel();
+        let mut c = StreamCollector::new(tx, "m".to_string(), "p".to_string());
+        c.bump_attempt_generation();
+        c.record_abandoned_attempt_id("att-A");
+
+        assert_eq!(
+            c.apply(_make_chunk("att-A", 0, "STALE", false)),
+            ChunkApplied::Stale
+        );
+        assert!(c.current_attempt_id.is_none());
+
+        let applied = c.apply(_make_chunk("att-B", 0, "fresh", true));
+        assert_eq!(applied, ChunkApplied::Terminal);
+        let outcome = c.build_outcome().expect("terminal");
+        assert_eq!(outcome.text, "fresh");
+        assert_eq!(outcome.attempt_id, "att-B");
+    }
+
     /// BUG B regression: a ``bump`` followed by a ``rewind`` (publish
     /// failed) must restore the accumulated chunks the bump cleared,
     /// rather than permanently dropping the abandoned attempt's partial
@@ -1410,6 +1443,25 @@ mod tests {
         assert_eq!(c.last_applied_seq, Some(0));
         assert!(c.first_chunk_at.is_some());
         assert!(c.last_chunk_at.is_some());
+    }
+
+    #[test]
+    fn test_rewind_clears_nak_recorded_abandoned_attempt() {
+        let (tx, _rx) = oneshot::channel();
+        let mut c = StreamCollector::new(tx, "m".to_string(), "p".to_string());
+        c.bump_attempt_generation();
+        c.record_abandoned_attempt_id("att-A");
+
+        c.rewind_attempt_generation();
+
+        assert!(c.abandoned_attempt_id.is_none());
+        assert_eq!(
+            c.apply(_make_chunk("att-A", 0, "restored", true)),
+            ChunkApplied::Terminal
+        );
+        let outcome = c.build_outcome().expect("terminal");
+        assert_eq!(outcome.text, "restored");
+        assert_eq!(outcome.attempt_id, "att-A");
     }
 
     /// BUG B regression: a successful new attempt (bump with NO rewind)

@@ -380,6 +380,10 @@ pub struct WorkerCapabilitiesResponse {
     pub has_generation_models: bool,
     #[serde(default)]
     pub generation_models: Vec<String>,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub loaded_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -798,6 +802,14 @@ pub struct RunBatchItem {
     pub score: Option<ScoreBatchItem>,
     #[serde(default)]
     pub extract: Option<ExtractBatchItem>,
+    /// W3C trace context copied off the originating [`crate::work_types::WorkItem`]
+    /// so the Python non-streaming worker loop can re-extract the gateway
+    /// span and attach `worker.run_batch` as its child. `None` when the
+    /// gateway didn't propagate a trace (older builds / untraced request).
+    #[serde(default)]
+    pub traceparent: Option<String>,
+    #[serde(default)]
+    pub tracestate: Option<String>,
 }
 
 impl RunBatchItem {
@@ -817,6 +829,8 @@ impl RunBatchItem {
             encode: Some(item),
             score: None,
             extract: None,
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -834,6 +848,8 @@ impl RunBatchItem {
             encode: None,
             score: Some(item),
             extract: None,
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -851,6 +867,8 @@ impl RunBatchItem {
             encode: None,
             score: None,
             extract: Some(item),
+            traceparent: None,
+            tracestate: None,
         }
     }
 }
@@ -1061,6 +1079,58 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&bi).unwrap();
         let back: EncodeBatchItem = rmp_serde::from_slice(&bytes).unwrap();
         assert!(back.prepared_tokens.is_none());
+    }
+
+    #[test]
+    fn run_batch_item_trace_context_roundtrips_msgpack() {
+        // The trace fields must survive the named-msgpack round-trip so
+        // the Python non-streaming worker loop can re-extract the
+        // gateway span. Build an encode item and stamp the trace
+        // context the way `into_run_batch_item_with_trace` would.
+        let mut rbi = RunBatchItem::encode(EncodeBatchItem {
+            work_item_id: "r.0".into(),
+            request_id: "r".into(),
+            item_index: 0,
+            total_items: 1,
+            timestamp: 0.0,
+            item: text_item("hello"),
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            profile_id: None,
+            bundle_config_hash: None,
+            payload_fetch_ms: 0.0,
+            prepared_tokens: None,
+        });
+        rbi.traceparent = Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into());
+        rbi.tracestate = Some("vendor=opaque".into());
+
+        let bytes = rmp_serde::to_vec_named(&rbi).unwrap();
+        let back: RunBatchItem = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            back.traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+        );
+        assert_eq!(back.tracestate.as_deref(), Some("vendor=opaque"));
+    }
+
+    #[test]
+    fn run_batch_item_trace_context_absent_decodes_to_none() {
+        // Old Python (or an untraced request) omits the trace keys
+        // entirely — new Rust must decode them as `None` via the
+        // additive `#[serde(default)]` contract.
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+            "op": "encode",
+            "work_item_id": "r.0",
+            "request_id": "r",
+            "item_index": 0,
+        }))
+        .unwrap();
+        let back: RunBatchItem = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.op, "encode");
+        assert!(back.traceparent.is_none());
+        assert!(back.tracestate.is_none());
     }
 
     #[test]

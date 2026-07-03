@@ -16,6 +16,7 @@ from sie_server.core.oom import (
     ResourceExhaustedError,
     is_oom_error,
 )
+from sie_server.core.residency import EvictionResult
 from sie_server.observability.metrics import record_oom_recovery_event
 
 if TYPE_CHECKING:
@@ -45,12 +46,12 @@ class RegistryCallbacks(Protocol):
     implementation to each worker at construction time.
     """
 
-    async def evict_lru_excluding(self, exclude_name: str, *, timeout_s: float) -> bool:
+    async def evict_lru_excluding(self, exclude_name: str, *, timeout_s: float) -> EvictionResult:
         """Evict the least-recently-used model other than ``exclude_name``.
 
-        Returns True if a model was actually unloaded, False if there was
-        no eligible candidate or the lock could not be acquired in time.
-        Implementations are expected to acquire the registry's load-lock
+        Returns an :class:`EvictionResult` reporting whether a sibling was
+        unloaded (``EVICTED``) or why not (``NO_CANDIDATE`` / ``LOCK_TIMEOUT``
+        / ``UNLOAD_FAILED``). Implementations acquire the registry's load-lock
         with the given soft timeout.
         """
         ...
@@ -357,12 +358,16 @@ class BatchExecutor:
     async def _try_evict_lru(self) -> bool:
         """Ask the registry to evict the LRU model, excluding self.
 
-        Returns True if a model was actually unloaded.
+        Returns True if a sibling model was actually unloaded. The registry
+        reports *why* an eviction did not happen via :class:`EvictionResult`;
+        we log that reason (so an OOM incident reads as "nothing to evict" vs
+        "lock contention") and collapse it to a bool for the recovery
+        strategy loop, which today only branches on success.
         """
         if self._registry is None:
             return False
         try:
-            return await self._registry.evict_lru_excluding(
+            result = await self._registry.evict_lru_excluding(
                 self._model_name,
                 timeout_s=self._config.eviction_lock_timeout_s,
             )
@@ -376,6 +381,13 @@ class BatchExecutor:
         except Exception:
             logger.exception("Unexpected error during evict_lru_excluding")
             return False
+        if result is not EvictionResult.EVICTED:
+            logger.info(
+                "OOM recovery: no eviction for model=%s (%s)",
+                self._model_name,
+                result.value,
+            )
+        return result is EvictionResult.EVICTED
 
     # ------------------------------------------------------------------
     # Fan-out and failure helpers

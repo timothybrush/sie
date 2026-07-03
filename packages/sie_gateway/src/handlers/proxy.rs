@@ -21,7 +21,7 @@ use crate::metrics;
 use crate::queue::publisher;
 
 use crate::server::AppState;
-use crate::state::model_registry::ResolveError;
+use crate::state::model_registry::{ModelRegistry, ResolveError};
 use crate::state::pool_manager::{normalize_pool_name, PoolManager, DEFAULT_POOL_NAME};
 use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
 use crate::types::AuditEntry;
@@ -55,12 +55,45 @@ pub(crate) fn system_fingerprint(model: &str) -> String {
     input.push_str(GATEWAY_VERSION);
     format!("fp_{:016x}", xxhash_rust::xxh3::xxh3_64(input.as_bytes()))
 }
+
+/// The `Retry-After` hints (seconds, as the wire strings stamped directly onto
+/// retryable capacity responses) the gateway returns for each cold-load /
+/// provisioning condition. One typed home for what were six loose constants,
+/// and the seam a future PR populates from config to make these an operator
+/// dial without a rebuild (see #1574). The named `*_RETRY_AFTER` constants
+/// below are thin aliases over [`RetryAfter::DEFAULT`], so existing call sites
+/// are unchanged.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryAfter {
+    pub provisioning: &'static str,
+    pub backpressure: &'static str,
+    pub gateway_timeout: &'static str,
+    pub model_loading: &'static str,
+    pub resource_exhausted: &'static str,
+    pub lora_loading: &'static str,
+}
+
+impl RetryAfter {
+    /// Compile-time defaults. `provisioning` is the longer pre-execution
+    /// capacity-miss hint (kept within the range common OpenAI SDKs honor);
+    /// the rest are short transient-retry hints.
+    pub const DEFAULT: RetryAfter = RetryAfter {
+        provisioning: "60",
+        backpressure: "5",
+        gateway_timeout: "5",
+        model_loading: "5",
+        resource_exhausted: "5",
+        lora_loading: "5",
+    };
+}
+
 /// Provisioning is a retryable pre-execution capacity miss, not an accepted
 /// asynchronous job. Keep the Retry-After hint within the range common OpenAI
 /// SDKs honor directly.
-pub(crate) const PROVISIONING_RETRY_AFTER: &str = "60";
-const BACKPRESSURE_RETRY_AFTER: &str = "5";
-const MODEL_LOADING_RETRY_AFTER: &str = "5";
+pub(crate) const PROVISIONING_RETRY_AFTER: &str = RetryAfter::DEFAULT.provisioning;
+const BACKPRESSURE_RETRY_AFTER: &str = RetryAfter::DEFAULT.backpressure;
+const GATEWAY_TIMEOUT_RETRY_AFTER: &str = RetryAfter::DEFAULT.gateway_timeout;
+const MODEL_LOADING_RETRY_AFTER: &str = RetryAfter::DEFAULT.model_loading;
 const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
 /// Server-side OOM recovery exhausted. Workers stamp this on
 /// ``WorkResult.error_code`` when the per-batch ``cache_clear → evict_lru
@@ -69,12 +102,12 @@ const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
 /// with bounded exponential backoff. The worker is **not** marked
 /// unhealthy — it lost an allocation race, it isn't broken.
 const RESOURCE_EXHAUSTED_ERROR_CODE: &str = "RESOURCE_EXHAUSTED";
-const RESOURCE_EXHAUSTED_RETRY_AFTER: &str = "5";
+const RESOURCE_EXHAUSTED_RETRY_AFTER: &str = RetryAfter::DEFAULT.resource_exhausted;
 /// Worker is loading a LoRA adapter on demand. The SDK retries this with
 /// the same ``provision_timeout_s`` budget it uses for ``MODEL_LOADING``;
 /// see ``sie_sdk.client._shared.LORA_LOADING_*``.
 const LORA_LOADING_ERROR_CODE: &str = "LORA_LOADING";
-const LORA_LOADING_RETRY_AFTER: &str = "5";
+const LORA_LOADING_RETRY_AFTER: &str = RetryAfter::DEFAULT.lora_loading;
 /// Terminal model load failure (non-retryable). Matches ``sie_server`` HTTP 502
 /// contract so ``sie_sdk`` can short-circuit before the ``MODEL_LOADING`` retry
 /// budget (see ``raise_if_model_load_failed``).
@@ -485,6 +518,36 @@ fn record_provisioning_response(gpu: &str, bundle: &str, status: StatusCode) {
         .inc();
 }
 
+/// Record metrics for a failed publish attempt and, for backpressure, also
+/// record pending demand so KEDA scales the saturated lane.
+///
+/// `backpressure` means a worker exists but its lane is saturated, so the
+/// lane is exactly the one to scale up. Unlike the no-worker path (which
+/// records demand upstream in `resolve_routing`), nothing else signals
+/// demand for an already-provisioned-but-saturated lane — without this a
+/// backpressure spike returns 503 but never triggers a scale-up, so KEDA
+/// stays flat while the pool stays hot. See #1568.
+///
+/// Returns the `Retry-After` value the caller should surface (`None` for a
+/// generic publish failure). The `no consumers` case is handled by the
+/// caller — it needs a provisioning response / surface-specific retry.
+fn record_publish_failure(
+    state: &AppState,
+    pool: &str,
+    gpu: &str,
+    bundle: &str,
+    err_lower: &str,
+) -> Option<&'static str> {
+    if err_lower.contains("backpressure") {
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
+        state.demand_tracker.record(pool, gpu, bundle);
+        Some(BACKPRESSURE_RETRY_AFTER)
+    } else {
+        metrics::record_rejected_request_for_pool(pool, gpu, bundle, "queue_publish_failed");
+        None
+    }
+}
+
 fn build_provisioning_response_for_surface(
     gpu: &str,
     bundle: &str,
@@ -712,7 +775,6 @@ async fn batch_publish_target(
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
-        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::EncodeRequest,
@@ -742,7 +804,6 @@ pub async fn proxy_encode(state: State<Arc<AppState>>, req: Request) -> impl Int
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
-        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::ScoreRequest,
@@ -772,7 +833,6 @@ pub async fn proxy_score(state: State<Arc<AppState>>, req: Request) -> impl Into
         ("model" = String, Path, description = "Model id; percent-encode slashes when using OpenAPI-generated clients"),
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
-        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     request_body = crate::openapi::ExtractRequest,
@@ -870,6 +930,292 @@ pub async fn proxy_generate(state: State<Arc<AppState>>, req: Request) -> impl I
     proxy_request(state, req, "generate").await
 }
 
+/// Resolve a request's model id to its serving bundle.
+///
+/// Extracted from `proxy_request` (#1543) so the model→bundle decision is one
+/// testable unit instead of being inlined in the 2000-line handler. Behaviour
+/// is identical to the block it replaces: on any failure it returns the exact
+/// caller-facing error `Response` (boxed to keep the `Result` small) that the
+/// inline code produced — model-not-found 404, bundle-routing-conflict 409, or
+/// the unknown-model 404 when the registry is populated. With an empty registry
+/// it falls back to the caller's bundle override (or `"default"`).
+fn resolve_bundle_for_request(
+    registry: &ModelRegistry,
+    model_name: &str,
+    bundle_override: &str,
+    engine_pin: Option<&str>,
+    endpoint: &str,
+) -> Result<String, Box<Response>> {
+    let bundle_override_ref = if bundle_override.is_empty() {
+        None
+    } else {
+        Some(bundle_override)
+    };
+    let bundle = if registry.model_exists(model_name) {
+        match registry.resolve_bundle_with_engine(model_name, bundle_override_ref, engine_pin) {
+            Ok(b) => b,
+            Err(ResolveError::ModelNotFound(e)) => {
+                return Err(Box::new(endpoint_error_response(
+                    endpoint,
+                    StatusCode::NOT_FOUND,
+                    err_code::MODEL_NOT_FOUND,
+                    oai_type::MODEL_NOT_FOUND,
+                    oai_code::MODEL_NOT_FOUND,
+                    Some("model"),
+                    e.to_string(),
+                )));
+            }
+            Err(ResolveError::BundleConflict(e)) => {
+                // Bundle conflict is non-OpenAI shaped; keep legacy envelope
+                // even for generate so the extra ``compatible_bundles`` array
+                // stays accessible to existing clients.
+                let mut m = Map::new();
+                m.insert(
+                    "compatible_bundles".to_string(),
+                    json!(e.compatible_bundles),
+                );
+                return Err(Box::new(
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json_detail_merge(
+                            err_code::BUNDLE_ROUTING_CONFLICT,
+                            e.to_string(),
+                            m,
+                        )),
+                    )
+                        .into_response(),
+                ));
+            }
+        }
+    } else if registry.has_any_models() {
+        return Err(Box::new(endpoint_error_response(
+            endpoint,
+            StatusCode::NOT_FOUND,
+            err_code::MODEL_NOT_FOUND,
+            oai_type::MODEL_NOT_FOUND,
+            oai_code::MODEL_NOT_FOUND,
+            Some("model"),
+            format!("Model '{}' not found", model_name),
+        )));
+    } else if bundle_override.is_empty() {
+        "default".to_string()
+    } else {
+        bundle_override.to_string()
+    };
+    Ok(bundle)
+}
+
+/// The routing decision for a request: canonical model name, serving bundle,
+/// and engine. Produced by [`resolve_routing`].
+struct RoutingResult {
+    model_name: String,
+    bundle: String,
+    engine: String,
+    gpu: String,
+    pool_name: String,
+    gpu_configured: bool,
+}
+
+/// Resolve a request into its routing decision (model → bundle → engine).
+///
+/// Extracted from `proxy_request` (#1543) so the routing decision is one unit,
+/// composed of the already-tested `decode_model_path` / `resolve_model_spec_with_aliases`
+/// / `parse_engine_pin` / [`resolve_bundle_for_request`] helpers. Behaviour is
+/// identical to the inline block it replaces: on any failure it returns the
+/// exact caller-facing error `Response` (boxed) the handler produced.
+async fn resolve_routing(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    endpoint: &str,
+) -> Result<RoutingResult, Box<Response>> {
+    // Extract model from path: /v1/{endpoint}/{model...}
+    let prefix = format!("/v1/{}/", endpoint);
+    let raw_model = path.strip_prefix(&prefix).unwrap_or("");
+    let model = match decode_model_path(raw_model) {
+        Ok(model) => model,
+        Err(message) => {
+            return Err(Box::new(endpoint_error_response(
+                endpoint,
+                StatusCode::BAD_REQUEST,
+                err_code::INVALID_REQUEST,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                Some("model"),
+                message,
+            )));
+        }
+    };
+
+    if model.is_empty() {
+        // Early exit, headers haven't been parsed yet — pass through
+        // placeholder labels. `record_rejected_request` normalizes
+        // empty `machine_profile` to `"unknown"` internally; `bundle`
+        // gets the same treatment here for cardinality discipline.
+        metrics::record_rejected_request_for_pool("unknown", "", "unknown", "model_required");
+        return Err(Box::new(endpoint_error_response(
+            endpoint,
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            Some("model"),
+            "model is required",
+        )));
+    }
+
+    // Parse model spec: [bundle:/]org/model, expanding a job/friendly alias
+    // whose target may carry a precision/profile bundle (see
+    // resolve_model_spec_with_aliases).
+    let (bundle_override, model_name) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, &model, |m| {
+            state.model_registry.resolve_canonical_model_name(m)
+        });
+    // Hidden operator/debug header: normal clients should select explicit
+    // model profile variants (for example ``model:candle``) or compatible
+    // bundle overrides. Lowercase normalisation + UTF-8 validation lives in
+    // ``parse_engine_pin`` (unit-tested below).
+    let engine_pin = match parse_engine_pin(headers) {
+        EnginePinParse::None => None,
+        EnginePinParse::Some(eng) => Some(eng),
+        EnginePinParse::Unknown(raw) => {
+            use crate::types::bundle::KNOWN_ENGINES;
+            // Route through endpoint_error_response so `generate` (an OpenAI-
+            // envelope endpoint that also flows through here) gets the OpenAI
+            // shape instead of the native `detail` one. See #1567.
+            return Err(Box::new(endpoint_error_response(
+                endpoint,
+                StatusCode::BAD_REQUEST,
+                err_code::INVALID_REQUEST,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                None,
+                format!("X-SIE-Engine value {:?} is not in {:?}", raw, KNOWN_ENGINES),
+            )));
+        }
+        EnginePinParse::InvalidUtf8 => {
+            return Err(Box::new(endpoint_error_response(
+                endpoint,
+                StatusCode::BAD_REQUEST,
+                err_code::INVALID_REQUEST,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                None,
+                "X-SIE-Engine header must be valid UTF-8 (got non-printable bytes)",
+            )));
+        }
+    };
+
+    // Try model registry resolution. Three cases:
+    //   1. Model is known        → resolve bundle (404 on BundleConflict, etc.)
+    //   2. Model unknown, registry populated → 404 (fail fast; avoids queueing
+    //      requests for typo'd model ids).
+    //   3. Model unknown, registry empty     → fall back to caller's bundle
+    //      override or "default". This is the pre-bootstrap / no-config
+    //      deployment path; workers may still match on bundle+gpu alone.
+    let bundle = resolve_bundle_for_request(
+        &state.model_registry,
+        &model_name,
+        &bundle_override,
+        engine_pin.as_deref(),
+        endpoint,
+    )?;
+
+    let engine = state
+        .model_registry
+        .get_bundle_info(&bundle)
+        .map(|info| info.engine)
+        .or_else(|| engine_pin.clone())
+        .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
+
+    // Parse GPU from X-SIE-MACHINE-PROFILE header
+    let mut gpu = headers
+        .get("x-sie-machine-profile")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let mut pool_name = headers
+        .get("x-sie-pool")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Parse pool from GPU param (e.g., "eval-l4/l4")
+    if !gpu.is_empty() && gpu.contains('/') {
+        let parts: Vec<&str> = gpu.splitn(2, '/').collect();
+        pool_name = parts[0].to_string();
+        gpu = parts[1].to_string();
+    }
+
+    // Validate the caller-supplied pool against a strict allowlist BEFORE it can
+    // flow into the JetStream work subject
+    // `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. An out-of-charset
+    // pool would otherwise re-tokenise the subject (subject injection) and
+    // silently mis-route the request, so reject with an OpenAI-shaped 400 rather
+    // than mangle. Empty pool means "gateway picks the default pool" and is left
+    // untouched.
+    if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
+        metrics::record_rejected_request_for_pool("unknown", &gpu, &bundle, "invalid_pool");
+        return Err(Box::new(endpoint_error_response(
+            endpoint,
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            Some("pool"),
+            "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
+        )));
+    }
+    if !pool_name.is_empty() {
+        pool_name = normalize_pool_name(&pool_name);
+    }
+    let model_pool = state.model_registry.get_model_pool_name(&model_name);
+    if let Err(message) = apply_model_pool_default(
+        &mut pool_name,
+        model_pool.as_deref(),
+        Some(&state.pool_manager),
+    )
+    .await
+    {
+        metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
+        return Err(Box::new(endpoint_error_response(
+            endpoint,
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            Some("pool"),
+            message,
+        )));
+    }
+
+    // Resolve bare GPU to spot variant
+    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
+        gpu = resolve_machine_profile(&gpu, &state.config.gpu_profile_map);
+    }
+
+    // Validate GPU is configured. Compute this *before* tagging the metric label
+    // slot so an arbitrary, unconfigured, caller-supplied GPU never reaches a
+    // Prometheus label (unbounded cardinality / DoS).
+    let gpu_configured = gpu.is_empty()
+        || state.config.configured_gpus.is_empty()
+        || state
+            .config
+            .configured_gpus
+            .iter()
+            .any(|cg| cg.eq_ignore_ascii_case(&gpu));
+
+    Ok(RoutingResult {
+        model_name,
+        bundle,
+        engine,
+        gpu,
+        pool_name,
+        gpu_configured,
+    })
+}
+
 async fn proxy_request(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -895,7 +1241,7 @@ async fn proxy_request(
         );
         {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
-            proxy_span.set_parent(parent_cx);
+            let _ = proxy_span.set_parent(parent_cx);
         }
         Some(proxy_span)
     } else {
@@ -903,237 +1249,35 @@ async fn proxy_request(
     };
     let _proxy_span_guard = proxy_span.as_ref().map(|span| span.enter());
 
-    // Extract model from path: /v1/{endpoint}/{model...}
-    let prefix = format!("/v1/{}/", endpoint);
-    let path = req.uri().path().to_string();
-    let raw_model = path.strip_prefix(&prefix).unwrap_or("");
-    let model = match decode_model_path(raw_model) {
-        Ok(model) => model,
-        Err(message) => {
-            return endpoint_error_response(
-                endpoint,
-                StatusCode::BAD_REQUEST,
-                err_code::INVALID_REQUEST,
-                oai_type::INVALID_REQUEST,
-                oai_code::INVALID_REQUEST,
-                Some("model"),
-                message,
-            );
-        }
-    };
-
-    if model.is_empty() {
-        // Early exit, headers haven't been parsed yet — pass through
-        // placeholder labels. `record_rejected_request` normalizes
-        // empty `machine_profile` to `"unknown"` internally; `bundle`
-        // gets the same treatment here for cardinality discipline.
-        metrics::record_rejected_request_for_pool("unknown", "", "unknown", "model_required");
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            Some("model"),
-            "model is required",
-        );
-    }
-
-    // Parse model spec: [bundle:/]org/model, expanding a job/friendly alias
-    // whose target may carry a precision/profile bundle (see
-    // resolve_model_spec_with_aliases).
-    let (bundle_override, model_name) =
-        resolve_model_spec_with_aliases(&state.config.model_aliases, &model, |m| {
-            state.model_registry.resolve_canonical_model_name(m)
-        });
-    let bundle_override_ref = if bundle_override.is_empty() {
+    // #1500: non-generation endpoints (encode / score / extract /
+    // embeddings) do not open a billed gateway span, but the
+    // queue-publish path still needs the inbound W3C context so
+    // `inject_current_context()` re-emits it into the work-item envelope
+    // (otherwise the worker's `worker.run_batch` span roots a fresh trace
+    // instead of continuing the client's). We capture the extracted
+    // context here and scope it over the publish future via
+    // `with_context` (Send- and thread-hop-safe, unlike attaching a
+    // `!Send` `ContextGuard` across the handler's awaits). The generation
+    // branch already establishes the context via its proxy span.
+    // Borrow `proxy_span` (don't move it) — `_proxy_span_guard` holds a
+    // live borrow of it via `span.enter()` for the rest of the handler.
+    let inbound_publish_cx = if proxy_span.is_some() {
         None
     } else {
-        Some(bundle_override.as_str())
+        Some(crate::observability::propagation::extract_context_from_headers(req.headers()))
     };
 
-    // Optional ``X-SIE-Engine`` header lets the caller pin engine
-    // selection when a model resolves to multiple bundles across
-    // engines. Today only ``"pytorch"`` is recognised, so the header
-    // is effectively a no-op (or a 400 if the caller types something
-    // else); the plumbing is preserved for the day a second engine
-    // lands. Lowercase normalisation + UTF-8 validation lives in
-    // ``parse_engine_pin`` (unit-tested below).
-    let engine_pin = match parse_engine_pin(req.headers()) {
-        EnginePinParse::None => None,
-        EnginePinParse::Some(eng) => Some(eng),
-        EnginePinParse::Unknown(raw) => {
-            use crate::types::bundle::KNOWN_ENGINES;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_detail(
-                    err_code::INVALID_REQUEST,
-                    format!("X-SIE-Engine value {:?} is not in {:?}", raw, KNOWN_ENGINES),
-                )),
-            )
-                .into_response();
-        }
-        EnginePinParse::InvalidUtf8 => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_detail(
-                    err_code::INVALID_REQUEST,
-                    "X-SIE-Engine header must be valid UTF-8 (got non-printable bytes)",
-                )),
-            )
-                .into_response();
-        }
+    let RoutingResult {
+        model_name,
+        bundle,
+        engine,
+        gpu,
+        pool_name,
+        gpu_configured,
+    } = match resolve_routing(&state, req.headers(), req.uri().path(), endpoint).await {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
-
-    // Try model registry resolution. Three cases:
-    //   1. Model is known        → resolve bundle (404 on BundleConflict, etc.)
-    //   2. Model unknown, registry populated → 404 (fail fast; avoids queueing
-    //      requests for typo'd model ids).
-    //   3. Model unknown, registry empty     → fall back to caller's bundle
-    //      override or "default". This is the pre-bootstrap / no-config
-    //      deployment path; workers may still match on bundle+gpu alone.
-    let bundle = if state.model_registry.model_exists(&model_name) {
-        match state.model_registry.resolve_bundle_with_engine(
-            &model_name,
-            bundle_override_ref,
-            engine_pin.as_deref(),
-        ) {
-            Ok(b) => b,
-            Err(ResolveError::ModelNotFound(e)) => {
-                return endpoint_error_response(
-                    endpoint,
-                    StatusCode::NOT_FOUND,
-                    err_code::MODEL_NOT_FOUND,
-                    oai_type::MODEL_NOT_FOUND,
-                    oai_code::MODEL_NOT_FOUND,
-                    Some("model"),
-                    e.to_string(),
-                );
-            }
-            Err(ResolveError::BundleConflict(e)) => {
-                // Bundle conflict is non-OpenAI shaped; keep legacy
-                // envelope even for generate so the extra
-                // ``compatible_bundles`` array stays accessible to
-                // existing clients.
-                let mut m = Map::new();
-                m.insert(
-                    "compatible_bundles".to_string(),
-                    json!(e.compatible_bundles),
-                );
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json_detail_merge(
-                        err_code::BUNDLE_ROUTING_CONFLICT,
-                        e.to_string(),
-                        m,
-                    )),
-                )
-                    .into_response();
-            }
-        }
-    } else if state.model_registry.has_any_models() {
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::NOT_FOUND,
-            err_code::MODEL_NOT_FOUND,
-            oai_type::MODEL_NOT_FOUND,
-            oai_code::MODEL_NOT_FOUND,
-            Some("model"),
-            format!("Model '{}' not found", model_name),
-        );
-    } else if bundle_override.is_empty() {
-        "default".to_string()
-    } else {
-        bundle_override.clone()
-    };
-
-    let engine = state
-        .model_registry
-        .get_bundle_info(&bundle)
-        .map(|info| info.engine)
-        .or_else(|| engine_pin.clone())
-        .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
-
-    // Parse GPU from X-SIE-MACHINE-PROFILE header
-    let mut gpu = req
-        .headers()
-        .get("x-sie-machine-profile")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let mut pool_name = req
-        .headers()
-        .get("x-sie-pool")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // Parse pool from GPU param (e.g., "eval-l4/l4")
-    if !gpu.is_empty() && gpu.contains('/') {
-        let parts: Vec<&str> = gpu.splitn(2, '/').collect();
-        pool_name = parts[0].to_string();
-        gpu = parts[1].to_string();
-    }
-
-    // Validate the caller-supplied pool against a strict allowlist
-    // BEFORE it can flow into the JetStream work subject
-    // `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. An
-    // out-of-charset pool would otherwise
-    // re-tokenise the subject (subject injection) and silently mis-route
-    // the request, so reject with an OpenAI-shaped 400 rather than
-    // mangle. Empty pool means "router picks the default pool" and is
-    // left untouched.
-    if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
-        metrics::record_rejected_request_for_pool("unknown", &gpu, &bundle, "invalid_pool");
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            Some("pool"),
-            "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
-        );
-    }
-    if !pool_name.is_empty() {
-        pool_name = normalize_pool_name(&pool_name);
-    }
-    let model_pool = state.model_registry.get_model_pool_name(&model_name);
-    if let Err(message) = apply_model_pool_default(
-        &mut pool_name,
-        model_pool.as_deref(),
-        Some(&state.pool_manager),
-    )
-    .await
-    {
-        metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            Some("pool"),
-            message,
-        );
-    }
-
-    // Resolve bare GPU to spot variant
-    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
-        gpu = resolve_machine_profile(&gpu, &state.config.gpu_profile_map);
-    }
-
-    // Validate GPU is configured. Compute this *before* tagging the
-    // metric label slot so an arbitrary, unconfigured, caller-supplied
-    // GPU never reaches a Prometheus label (unbounded cardinality / DoS).
-    let gpu_configured = gpu.is_empty()
-        || state.config.configured_gpus.is_empty()
-        || state
-            .config
-            .configured_gpus
-            .iter()
-            .any(|cg| cg.eq_ignore_ascii_case(&gpu));
 
     // Publish the canonical `machine_profile` to the HTTP metrics
     // middleware via a request extension slot. The middleware reads
@@ -1364,7 +1508,7 @@ async fn proxy_request(
         }
     };
 
-    queue_mode_proxy(
+    let publish_fut = queue_mode_proxy(
         &state,
         work_publisher,
         endpoint,
@@ -1382,8 +1526,46 @@ async fn proxy_request(
         Instant::now(),
         &bundle_config_hash,
         batch_target,
-    )
-    .await
+    );
+    // Scope an OTel context over the publish so the work-item envelope
+    // carries it (#1500): when the exporter is on we open a `gateway.publish`
+    // span and scope *its* context (first arm, #1596); otherwise we scope the
+    // raw inbound context (second arm). `with_context` re-attaches on every
+    // poll, so `Context::current()` is correct across the publish's own
+    // `.await`s and tokio thread hops — and the future stays `Send`, unlike
+    // holding a `!Send` `ContextGuard` across awaits.
+    use opentelemetry::trace::FutureExt;
+    use tracing::Instrument;
+    let cls = crate::endpoint::InferenceEndpoint::from_label(endpoint);
+    match inbound_publish_cx {
+        Some(inbound_cx)
+            if cls.uses_publish_gateway_span()
+                && crate::observability::tracing::exporter_enabled() =>
+        {
+            // #1596: give the non-streaming queue-publish path a sampled gateway
+            // span so we get edge latency attribution + a stable trace root. We
+            // scope the span's OWN context (not the raw inbound context) over the
+            // publish so the worker attaches to `gateway.publish`.
+            let span = tracing::info_span!(
+                "gateway.publish",
+                sie.endpoint = endpoint,
+                sie.model = %model_name,
+                sie.pool = %effective_pool,
+                sie.publish_ms = tracing::field::Empty,
+            );
+            {
+                use tracing_opentelemetry::OpenTelemetrySpanExt;
+                let _ = span.set_parent(inbound_cx);
+            }
+            let publish_cx = {
+                use tracing_opentelemetry::OpenTelemetrySpanExt;
+                span.context()
+            };
+            publish_fut.with_context(publish_cx).instrument(span).await
+        }
+        Some(inbound_cx) => publish_fut.with_context(inbound_cx).await,
+        None => publish_fut.await,
+    }
 }
 
 fn should_trace_proxy_request(endpoint: &str) -> bool {
@@ -1716,18 +1898,10 @@ async fn queue_mode_proxy(
             )
                 .into_response();
 
-            if lower.contains("backpressure") {
-                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
+            if let Some(retry_after) = record_publish_failure(state, pool, gpu, bundle, &lower) {
                 response.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
-                    HeaderValue::from_static(BACKPRESSURE_RETRY_AFTER),
-                );
-            } else {
-                metrics::record_rejected_request_for_pool(
-                    pool,
-                    gpu,
-                    bundle,
-                    "queue_publish_failed",
+                    HeaderValue::from_static(retry_after),
                 );
             }
 
@@ -1751,11 +1925,14 @@ async fn queue_mode_proxy(
         }
     }
     let publish_elapsed = publish_start.elapsed();
+    tracing::Span::current().record("sie.publish_ms", publish_elapsed.as_millis() as i64);
 
-    // Wait for results (use configured request_timeout instead of hardcoded 300s)
-    let timeout_secs = state.config.request_timeout as u64;
+    // Wait for results (use configured request_timeout instead of hardcoded 300s).
+    // Preserve fractional env values instead of truncating them through `as u64`.
+    let timeout = Duration::from_secs_f64(state.config.request_timeout.max(0.001));
+    let timeout_secs = timeout.as_secs_f64();
     let wait_start = Instant::now();
-    let results = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+    let results = match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(results)) => results,
         Ok(Err(_)) => {
             metrics::record_rejected_request_for_pool(pool, gpu, bundle, "result_channel_closed");
@@ -1769,27 +1946,13 @@ async fn queue_mode_proxy(
                 .into_response();
         }
         Err(_) => {
-            // Upstream timeout: the most common cause is a worker cold-loading
-            // the target model on demand. The worker NAKs the JetStream message
-            // and redelivers after load, but that cycle typically exceeds our
-            // per-request timeout on the first call. Surface this as
-            // 503 + MODEL_LOADING so SDK clients with wait_for_capacity=True
-            // retry using the existing model-loading contract rather than
-            // failing the cold-start request. Genuinely hung upstreams are
-            // still bounded by the SDK's provision_timeout_s budget.
-            //
-            // The rejection reason is intentionally only the specific
-            // `upstream_timeout_model_loading` — emitting both that
-            // and a generic `result_timeout` for the same event would
-            // double-count the timeout on the error-rate dashboards
-            // and break rate alerts that sum across reasons.
-            metrics::record_rejected_request_for_pool(
-                pool,
-                gpu,
-                bundle,
-                "upstream_timeout_model_loading",
-            );
-            return build_model_loading_timeout_response(model, timeout_secs);
+            // The gateway accepted and published work, but no worker result
+            // arrived before the request deadline. This is not the same signal
+            // as worker-emitted MODEL_LOADING: under heavy load it usually
+            // means queue/head-of-line delay or a lost NATS Core result, and
+            // reporting it as MODEL_LOADING hides the real bottleneck.
+            metrics::record_rejected_request_for_pool(pool, gpu, bundle, "upstream_result_timeout");
+            return build_queue_result_timeout_response(model, timeout_secs);
         }
     };
     let wait_elapsed = wait_start.elapsed();
@@ -2273,17 +2436,9 @@ pub(crate) async fn run_streaming_generate(
             let retry_after = if lower.contains("no consumers") {
                 metrics::record_rejected_request_for_pool(pool, gpu, bundle, "no_consumers");
                 Some(PROVISIONING_RETRY_AFTER)
-            } else if lower.contains("backpressure") {
-                metrics::record_rejected_request_for_pool(pool, gpu, bundle, "backpressure");
-                Some(BACKPRESSURE_RETRY_AFTER)
             } else {
-                metrics::record_rejected_request_for_pool(
-                    pool,
-                    gpu,
-                    bundle,
-                    "queue_publish_failed",
-                );
-                None
+                // backpressure (records demand for KEDA) / generic failure. #1568
+                record_publish_failure(state, pool, gpu, bundle, &lower)
             };
             return Err(StreamingDriverErr::PublishFailed {
                 message: e,
@@ -5152,7 +5307,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     );
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
-        chat_span.set_parent(parent_cx);
+        let _ = chat_span.set_parent(parent_cx);
     }
     let _chat_span_guard = chat_span.enter();
 
@@ -7036,39 +7191,37 @@ fn build_retryable_error_response(code: &'static str, message: &str) -> Response
     resp
 }
 
-/// Build a `503 + MODEL_LOADING` response for an upstream timeout.
+/// Build a gateway-owned timeout response for a queued request whose worker
+/// result did not arrive within the configured request deadline.
 ///
-/// Mirrors the contract the SDK already implements for worker-emitted
-/// `MODEL_LOADING` errors (see `sie_sdk.client._shared`):
+/// Worker-emitted `MODEL_LOADING` still uses the retryable 503 worker contract.
+/// This path is different: the gateway already accepted/published the request
+/// and timed out waiting for the NATS Core result, so surface an explicit
+/// gateway timeout instead of pretending the model is still loading.
 ///
-/// * status:  503 Service Unavailable
-/// * body:    `{"error": {"code": "MODEL_LOADING", "message": ...}}`
-/// * headers: `Retry-After: 5`, plus the standard `X-SIE-*` version pair.
-fn build_model_loading_timeout_response(model: &str, timeout_secs: u64) -> Response {
+/// * status:  504 Gateway Timeout
+/// * body:    `{"detail": {"code": "GATEWAY_TIMEOUT", "message": ...}}`
+/// * headers: `Retry-After: 5`, `X-SIE-Error-Code: GATEWAY_TIMEOUT`, plus the
+///   standard `X-SIE-*` version pair.
+fn build_queue_result_timeout_response(model: &str, timeout_secs: f64) -> Response {
     let mut resp = (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": {
-                "code": MODEL_LOADING_ERROR_CODE,
-                "message": format!(
-                    "Model '{}' did not respond within {}s; worker may be loading the model on demand. Please retry.",
-                    model, timeout_secs
-                ),
-            },
-        })),
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(json_detail(
+            err_code::GATEWAY_TIMEOUT,
+            format!(
+                "Timed out waiting {:.1}s for queued result from model '{}'. The request was published, but no worker result reached the gateway before the deadline.",
+                timeout_secs, model
+            ),
+        )),
     )
         .into_response();
     resp.headers_mut().insert(
         HeaderName::from_static("retry-after"),
-        HeaderValue::from_static(MODEL_LOADING_RETRY_AFTER),
+        HeaderValue::from_static(GATEWAY_TIMEOUT_RETRY_AFTER),
     );
-    // Advertised in architecture-guide.md, README.md, and
-    // docs/queue-based-routing.md. The SDK parses the body (see
-    // sie_sdk.client._shared.get_error_code), but external clients and
-    // retry/observability middleware key off this header.
     resp.headers_mut().insert(
         HeaderName::from_static("x-sie-error-code"),
-        HeaderValue::from_static(MODEL_LOADING_ERROR_CODE),
+        HeaderValue::from_static(err_code::GATEWAY_TIMEOUT),
     );
     resp.headers_mut().insert(
         HeaderName::from_static("x-sie-version"),
@@ -7391,6 +7544,26 @@ fn is_openai_embeddings_forwarded_header(name: &str) -> bool {
         "x-tokenization-time",
         "x-postprocessing-time",
         "x-payload-fetch-time",
+    ]
+    .iter()
+    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+/// Headers copied from an inbound ``/v1/embeddings`` request onto the
+/// internal ``/v1/encode`` request it is rewritten into. Auth/routing
+/// hints plus the W3C trace headers (`traceparent`/`tracestate`) so the
+/// worker span continues the client's trace instead of rooting a fresh
+/// one — every other endpoint already injects queue trace context, and
+/// without this embeddings would be the lone disconnected path.
+fn is_openai_embeddings_inner_request_header(name: &str) -> bool {
+    [
+        "authorization",
+        "x-sie-machine-profile",
+        "x-sie-pool",
+        "x-sie-engine",
+        "x-sie-sdk-version",
+        "traceparent",
+        "tracestate",
     ]
     .iter()
     .any(|allowed| name.eq_ignore_ascii_case(allowed))
@@ -9679,7 +9852,6 @@ fn openai_embedding_items_to_data(
     params(
         ("X-SIE-MACHINE-PROFILE" = Option<String>, Header, description = "Preferred GPU or machine profile"),
         ("X-SIE-Pool" = Option<String>, Header, description = "Explicit pool routing override"),
-        ("X-SIE-Engine" = Option<String>, Header, description = "Explicit engine routing override"),
         ("X-SIE-SDK-Version" = Option<String>, Header, description = "Client SDK version for skew warnings")
     ),
     responses(
@@ -9800,14 +9972,12 @@ pub async fn proxy_openai_embeddings(State(state): State<Arc<AppState>>, req: Re
     let extensions = parts.extensions;
     let mut inner_headers = HeaderMap::new();
     for (name, val) in hdr.iter() {
-        let n = name.as_str();
-        if n.eq_ignore_ascii_case("authorization")
-            || n.eq_ignore_ascii_case("x-sie-machine-profile")
-            || n.eq_ignore_ascii_case("x-sie-pool")
-            || n.eq_ignore_ascii_case("x-sie-engine")
-            || n.eq_ignore_ascii_case("x-sie-sdk-version")
-        {
-            inner_headers.insert(name.clone(), val.clone());
+        if is_openai_embeddings_inner_request_header(name.as_str()) {
+            // `append`, not `insert`: W3C `tracestate` may arrive as
+            // multiple header fields and `HeaderMap::iter()` yields each
+            // separately — `insert` would drop all but the last, so a
+            // multi-line `tracestate` would be truncated before forwarding.
+            inner_headers.append(name.clone(), val.clone());
         }
     }
     inner_headers.insert(
@@ -10245,6 +10415,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_bundle_for_request_empty_registry_falls_back_to_caller() {
+        // With an empty registry (no models), the resolver falls back to the
+        // caller's bundle override, or "default" when none is given — the same
+        // branch the inline `proxy_request` block took before #1543.
+        let bundles_dir = tempfile::TempDir::new().unwrap();
+        let models_dir = tempfile::TempDir::new().unwrap();
+        let registry = ModelRegistry::new(bundles_dir.path(), models_dir.path(), true);
+        assert!(!registry.has_any_models());
+
+        let default = resolve_bundle_for_request(&registry, "org/model", "", None, "encode")
+            .expect("empty registry + no override resolves");
+        assert_eq!(default, "default");
+
+        let overridden =
+            resolve_bundle_for_request(&registry, "org/model", "custom-bundle", None, "encode")
+                .expect("empty registry preserves caller bundle");
+        assert_eq!(overridden, "custom-bundle");
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_error_response_envelope_matches_endpoint() {
+        // generate/chat use the OpenAI `{error:{...}}` envelope; native endpoints
+        // keep `{detail:{...}}`. The engine-pin errors now route through this
+        // helper so a bad X-SIE-Engine on /v1/generate gets the OpenAI shape
+        // rather than the native one. See #1567.
+        let openai = endpoint_error_response(
+            "generate",
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            None,
+            "bad engine",
+        );
+        let native = endpoint_error_response(
+            "encode",
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            None,
+            "bad engine",
+        );
+        let openai_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(openai.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let native_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(native.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            openai_body.get("error").is_some(),
+            "generate must use the OpenAI envelope"
+        );
+        assert!(
+            native_body.get("detail").is_some(),
+            "encode must use the native envelope"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_defaults_pin_wire_values() {
+        // These Retry-After wire strings are part of the capacity contract
+        // clients/SDKs honor; pin them. See #1574.
+        assert_eq!(RetryAfter::DEFAULT.provisioning, "60");
+        assert_eq!(RetryAfter::DEFAULT.backpressure, "5");
+        assert_eq!(RetryAfter::DEFAULT.gateway_timeout, "5");
+        assert_eq!(RetryAfter::DEFAULT.model_loading, "5");
+        assert_eq!(RetryAfter::DEFAULT.resource_exhausted, "5");
+        assert_eq!(RetryAfter::DEFAULT.lora_loading, "5");
+        // The named constants alias the typed home — pin each against its wire
+        // literal (not against `RetryAfter::DEFAULT.*`, which would be a
+        // tautological `x == x`), so a broken alias is actually caught.
+        assert_eq!(PROVISIONING_RETRY_AFTER, "60");
+        assert_eq!(BACKPRESSURE_RETRY_AFTER, "5");
+        assert_eq!(GATEWAY_TIMEOUT_RETRY_AFTER, "5");
+        assert_eq!(MODEL_LOADING_RETRY_AFTER, "5");
+        assert_eq!(RESOURCE_EXHAUSTED_RETRY_AFTER, "5");
+        assert_eq!(LORA_LOADING_RETRY_AFTER, "5");
+    }
+
     fn admission_test_state(pool_manager: Arc<PoolManager>) -> AppState {
         let bundles_dir = tempfile::TempDir::new().unwrap();
         let models_dir = tempfile::TempDir::new().unwrap();
@@ -10461,6 +10718,46 @@ mod tests {
             .unwrap_or("")
             .contains("Provisioning in progress"));
         state.demand_tracker.clear(demand_pool, "l4", bundle);
+    }
+
+    #[tokio::test]
+    async fn test_record_publish_failure_backpressure_records_demand() {
+        // Backpressure (a present-but-saturated worker) must record pending
+        // demand so KEDA scales the lane; a generic publish failure must not.
+        // See #1568.
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let state = admission_test_state(Arc::clone(&pm));
+        let bp_pool = "test-bp-demand-pool";
+        let other_pool = "test-other-failure-pool";
+        let bundle = "test-bp-demand-bundle";
+
+        let retry = record_publish_failure(
+            &state,
+            bp_pool,
+            "l4",
+            bundle,
+            "stream publish failed: backpressure (lane saturated)",
+        );
+        assert_eq!(retry, Some(BACKPRESSURE_RETRY_AFTER));
+        let demand = metrics::PENDING_DEMAND
+            .with_label_values(&[bp_pool, "l4", bundle])
+            .get();
+        assert!(
+            (demand - 1.0).abs() < f64::EPSILON,
+            "backpressure must record pending demand for KEDA"
+        );
+        state.demand_tracker.clear(bp_pool, "l4", bundle);
+
+        let retry_other =
+            record_publish_failure(&state, other_pool, "l4", bundle, "connection reset by peer");
+        assert_eq!(retry_other, None);
+        let demand_other = metrics::PENDING_DEMAND
+            .with_label_values(&[other_pool, "l4", bundle])
+            .get();
+        assert!(
+            (demand_other - 0.0).abs() < f64::EPSILON,
+            "a generic publish failure must not record demand"
+        );
     }
 
     #[tokio::test]
@@ -11400,6 +11697,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         };
         let body = build_generate_success_body("Qwen/Qwen3-4B-Instruct", &[&r], false);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -11540,62 +11838,50 @@ mod tests {
         assert_eq!(value["tpot_ms"], 45.2);
     }
 
-    // ── build_model_loading_timeout_response ──────────────────────
+    // ── build_queue_result_timeout_response ──────────────────────
     //
-    // The queue proxy used to return 504 Gateway Timeout whenever the
-    // JetStream result channel did not reply within
-    // `request_timeout` seconds. The SDK has no retry branch for 504,
-    // which meant a cold-start request that triggered a worker-side
-    // model load (worker NAKs + redelivers after load) would bubble
-    // up as a hard failure even though `wait_for_capacity=True` was
-    // set. We now map that timeout to 503 + MODEL_LOADING, which the
-    // SDK already retries under the same `provision_timeout_s`
-    // budget it uses for worker-emitted MODEL_LOADING responses.
+    // A gateway-side result wait timeout is distinct from worker-emitted
+    // MODEL_LOADING. Keep the signal explicit so load tests and dashboards do
+    // not misread queue/head-of-line stalls as cold model loads.
 
     #[test]
-    fn test_build_model_loading_timeout_response_is_503_with_error_code() {
-        let resp = build_model_loading_timeout_response("BAAI/bge-m3", 30);
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    fn test_build_queue_result_timeout_response_is_504() {
+        let resp = build_queue_result_timeout_response("BAAI/bge-m3", 30.0);
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]
-    fn test_build_model_loading_timeout_response_sets_retry_after_and_version_headers() {
-        let resp = build_model_loading_timeout_response("BAAI/bge-m3", 30);
+    fn test_build_queue_result_timeout_response_sets_retry_after_and_version_headers() {
+        let resp = build_queue_result_timeout_response("BAAI/bge-m3", 30.0);
         let headers = resp.headers();
         assert_eq!(
             headers.get("retry-after").unwrap(),
-            MODEL_LOADING_RETRY_AFTER
+            GATEWAY_TIMEOUT_RETRY_AFTER
         );
         assert!(headers.get("x-sie-version").is_some());
         assert!(headers.get("x-sie-server-version").is_some());
     }
 
     #[test]
-    fn test_build_model_loading_timeout_response_sets_error_code_header() {
-        // The documented contract (architecture-guide.md, README.md,
-        // docs/queue-based-routing.md) advertises `X-SIE-Error-Code:
-        // MODEL_LOADING` alongside the body field. External clients and
-        // observability middleware key off the header, so it must be
-        // set even though the SDK itself reads the body.
-        let resp = build_model_loading_timeout_response("BAAI/bge-m3", 30);
+    fn test_build_queue_result_timeout_response_sets_error_code_header() {
+        let resp = build_queue_result_timeout_response("BAAI/bge-m3", 30.0);
         assert_eq!(
             resp.headers().get("x-sie-error-code").unwrap(),
-            MODEL_LOADING_ERROR_CODE
+            err_code::GATEWAY_TIMEOUT
         );
     }
 
     #[tokio::test]
-    async fn test_build_model_loading_timeout_response_body_matches_sdk_error_contract() {
-        // SDK parses `error.code` for the retry decision; body must
-        // include the MODEL_LOADING code and mention the model id.
-        let resp = build_model_loading_timeout_response("BAAI/bge-m3", 30);
+    async fn test_build_queue_result_timeout_response_body_is_gateway_detail_contract() {
+        let resp = build_queue_result_timeout_response("BAAI/bge-m3", 30.0);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("read body");
         let body: serde_json::Value =
             serde_json::from_slice(&body_bytes).expect("response body is valid JSON");
-        assert_eq!(body["error"]["code"], MODEL_LOADING_ERROR_CODE);
-        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert_eq!(body["detail"]["code"], err_code::GATEWAY_TIMEOUT);
+        assert!(body.get("error").is_none());
+        let msg = body["detail"]["message"].as_str().unwrap_or("");
         assert!(
             msg.contains("BAAI/bge-m3"),
             "message references the model id: {msg}"
@@ -11803,6 +12089,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         }
     }
 
@@ -11822,6 +12109,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         }
     }
 
@@ -12006,6 +12294,33 @@ mod tests {
         assert!(is_openai_embeddings_forwarded_header("X-SIE-WORKER"));
         assert!(!is_openai_embeddings_forwarded_header("content-type"));
         assert!(!is_openai_embeddings_forwarded_header("x-sie-error-code"));
+    }
+
+    #[test]
+    fn test_openai_embeddings_inner_request_forwards_trace_context() {
+        // Auth/routing hints plus the W3C trace headers must reach the
+        // internal /v1/encode request so the worker span continues the
+        // client's trace (otherwise embeddings is the lone disconnected
+        // path — every other endpoint injects queue trace context).
+        for name in [
+            "authorization",
+            "x-sie-machine-profile",
+            "x-sie-pool",
+            "x-sie-engine",
+            "x-sie-sdk-version",
+            "traceparent",
+            "tracestate",
+        ] {
+            assert!(
+                is_openai_embeddings_inner_request_header(name),
+                "{name} should be forwarded onto the internal /v1/encode request"
+            );
+        }
+        assert!(is_openai_embeddings_inner_request_header("TraceParent"));
+        assert!(!is_openai_embeddings_inner_request_header("cookie"));
+        assert!(!is_openai_embeddings_inner_request_header(
+            "x-sie-request-id"
+        ));
     }
 
     #[test]
@@ -12282,6 +12597,10 @@ mod tests {
             parse_engine_pin(&hdr(b"pytorch")),
             EnginePinParse::Some("pytorch".to_string()),
         );
+        assert_eq!(
+            parse_engine_pin(&hdr(b"candle")),
+            EnginePinParse::Some("candle".to_string()),
+        );
     }
 
     #[test]
@@ -12300,11 +12619,9 @@ mod tests {
 
     #[test]
     fn test_parse_engine_pin_unknown_token_is_unknown() {
-        // ``candle`` was the only other engine we used to ship; it's
-        // gone now, so it joins ``jax`` in the unknown bucket.
         assert_eq!(
-            parse_engine_pin(&hdr(b"candle")),
-            EnginePinParse::Unknown("candle".to_string()),
+            parse_engine_pin(&hdr(b"future-engine")),
+            EnginePinParse::Unknown("future-engine".to_string()),
         );
         assert_eq!(
             parse_engine_pin(&hdr(b"jax")),
@@ -12826,6 +13143,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            worker_direct: false,
         };
         let resp_body = result.result_msgpack.clone();
         assert_eq!(resp_body, payload);
@@ -12861,6 +13179,7 @@ mod tests {
                 tokenization_ms: None,
                 postprocessing_ms: None,
                 payload_fetch_ms: None,
+                worker_direct: false,
             },
             publisher::WorkResult {
                 work_item_id: "r1.1".to_string(),
@@ -12877,6 +13196,7 @@ mod tests {
                 tokenization_ms: None,
                 postprocessing_ms: None,
                 payload_fetch_ms: None,
+                worker_direct: false,
             },
         ];
         let items: Vec<serde_json::Value> = results

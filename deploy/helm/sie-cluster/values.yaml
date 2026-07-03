@@ -325,6 +325,61 @@ workers:
       tag: ""
       pullPolicy: IfNotPresent
 
+    # -- Default worker execution engine. `pytorch` renders the Python
+    # `sie-server` container. `candle` renders the Rust `sie-server-rust`
+    # native Candle worker container.
+    # Can be overridden per pool or per bundle lane.
+    engine: pytorch
+
+    rust:
+      image:
+        repository: ghcr.io/superlinked/sie-server-rust
+        # -- Base image tag, without the CUDA target suffix. Leave empty to use
+        # -- .Chart.AppVersion. For Candle pools, the template appends
+        # -- `-<cudaPlatform>-sm<computeCapability>` automatically.
+        tag: ""
+        # -- Exact image tag override. Use only for ad-hoc/perf images whose
+        # -- tag already includes the CUDA target suffix.
+        fullTag: ""
+        # -- CUDA platform segment used for the Rust Candle image suffix.
+        cudaPlatform: cuda12
+        # -- Fallback CUDA compute capability. Prefer the machine-profile map
+        # -- below, or per-pool `candle.cudaComputeCap`, so heterogeneous GPU
+        # -- fleets pull the correct compiled kernel image.
+        computeCapability: ""
+        # -- Default Rust Candle image target by resolved machine profile,
+        # -- gpuType, or pool key. The current release publishes the L4 target
+        # -- (`sie-server-rust:<version>-cuda12-sm89`) only. Add non-L4 entries
+        # -- here or set per-pool `candle.cudaComputeCap` only when that SM image
+        # -- is explicitly published.
+        computeCapabilityByMachineProfile:
+          l4: "89"
+          l4-spot: "89"
+          nvidia-l4: "89"
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+      candle:
+        batchBudget: 64
+        normalize: true
+        # -- Maximum concurrent forward passes allowed inside one loaded
+        # Candle model process. Default 1 preserves the conservative single
+        # forward path; raise during GPU tuning to test whether Candle can
+        # safely overlap same-model work without loading duplicate weights.
+        maxConcurrentForwards: 1
+        # -- Candle-native workers run the model directly from the
+        # worker-sidecar IPC batch. Keep the default conservative for
+        # BGE-M3: larger coalesce/batch limits can form ~16k-token
+        # groups on L4 and hurt p99 without improving throughput.
+        batcher:
+          coalesceMs: 3
+          maxBatchRequests: 12
+
     # -- Platform variant for worker images (e.g. "cuda12", "cpu")
     platform: cuda12
 
@@ -353,18 +408,6 @@ workers:
     # machine-profile/bundle lanes must eagerly load different models. An
     # explicit empty override disables inherited preloading for that lane.
     preloadModels: []
-
-    # -- Python ModelWorker passthrough mode. When `true` (and the Rust
-    # sidecar is enabled), the Python adapter process bypasses its internal
-    # BatchFormer / FCFS / adaptive controller; every IPC frame from
-    # the worker-sidecar is treated as a fully-formed GPU batch and runs
-    # as exactly one forward pass. In queue mode this keeps a single
-    # batcher in the system: the Rust scheduler. Set to `false` only
-    # for compatibility checks against Python-side batching.
-    # The chart only emits SIE_WORKER_PASSTHROUGH when the worker-sidecar
-    # is enabled; without a sidecar in front, passthrough would leave
-    # the pod with no batcher at all.
-    passthroughMode: true
 
     # -- Physical NATS queue pool consumed by workers in queue-routing mode.
     # The default baseline queue pool is `default`, so SDK calls like
@@ -486,15 +529,15 @@ workers:
     # -- worker-sidecar configuration
     # When enabled, a Rust worker-sidecar is added to every
     # worker Pod. The sidecar owns the NATS JetStream consumer and
-    # calls into the Python ``sie_server`` container over a Unix
-    # socket mounted on a shared emptyDir. The chart enforces (via a
+    # calls into the colocated adapter process over a Unix socket
+    # mounted on a shared emptyDir. The chart enforces (via a
     # template ``fail``) that ``workerSidecar.enabled`` requires
     # ``nats.enabled: true`` because the sidecar has no default
     # ``SIE_NATS_URL`` and refuses to start without one.
     workerSidecar:
       # -- Enable the worker-sidecar. This is the production
-      # data path (NATS -> Rust -> UDS IPC -> Python). The Python adapter process
-      # does not pull from NATS on its own, so queue-mode worker pools
+      # data path (NATS -> Rust sidecar -> UDS IPC -> adapter process).
+      # Adapter processes do not pull from NATS on their own, so queue-mode worker pools
       # require this sidecar to provide a JetStream consumer.
       enabled: true
       image:
@@ -513,7 +556,7 @@ workers:
       # -- Per-model-group batch concurrency cap for the dispatcher.
       # Leave empty to use the binary default (4).
       maxConcurrentBatches: ""
-      # -- Size of the Rust-to-Python IPC connection pool. Each slot is an
+      # -- Size of the sidecar-to-adapter IPC connection pool. Each slot is an
       # independent Unix-domain socket; concurrent batches check out a
       # slot, perform their round-trip, and return it to the pool.
       # Should be >= maxConcurrentBatches so the IPC layer is never
@@ -550,7 +593,7 @@ workers:
       # -- Worker-side config reconciliation against sie-config.
       # The sidecar already consumes live bundle-scoped NATS deltas; this
       # poller catches missed deltas by comparing /v1/configs/epoch and
-      # replaying /v1/configs/export through Python IPC.
+      # replaying /v1/configs/export through adapter IPC.
       configReconcile:
         enabled: true
         # -- Epoch poll cadence in milliseconds.
@@ -560,7 +603,7 @@ workers:
         # after the startup export.
         fullExportIntervalMs: 300000
       # -- K8s probes on the worker-sidecar.
-      # Disabled by default while the Python container's existing
+      # Disabled by default while the adapter container's existing
       # /healthz + /readyz remain the K8s contract.
       probes:
         enabled: false
@@ -578,17 +621,19 @@ workers:
           timeoutSeconds: 3
           failureThreshold: 3
       # -- Pipeline depth: how many IPC dispatches can be in-flight to
-      # Python concurrently. The Rust binary defaults to 2; making it
-      # explicit here so the helm chart documents production intent.
+      # the adapter process. The Rust sidecar binary defaults to 2;
+      # making it explicit here documents production intent.
       # 1 = strict serial dispatch (regression-bisect knob); 2 = one
-      # batch processing in Python while the next forms/ships in Rust;
-      # > 2 inflates per-batch latency without throughput gain because
-      # Python's executor is single-CUDA-stream.
+      # batch executing while the next forms/ships over IPC. For Python
+      # adapters, higher values mostly park frames behind the single
+      # model-worker executor. Candle uses the same single-resident-model
+      # contract and should be tuned by batch/coalesce depth first.
       # See `packages/sie_server_sidecar/src/dispatcher.rs::pipeline_depth`.
       pipelineDepth: 2
-      # -- BatchFormer tuning for queue-mode workers. These defaults
-      # keep Rust-side batch formation responsive while leaving the
-      # adapter to execute each IPC frame as one forward pass.
+      # -- Rust scheduler batcher tuning for queue-mode workers. These
+      # defaults keep sidecar-owned batch formation responsive while
+      # leaving the Python adapter process to execute each IPC frame as
+      # one forward pass.
       batcher:
         # -- Coalesce window ceiling in ms. Lower = more responsive
         # to inflow jitter and bounds tail latency when traffic is
@@ -598,10 +643,10 @@ workers:
         # headroom for short arrival bursts without unbounded
         # tail-batch growth.
         maxBatchRequests: 12
-      # -- FetchExpiryController tuning (the client-side batch-coalesce
-      # quantum that drives the NATS pull loop). The narrow 2/15/50
-      # window keeps queue-path coalescing bounded while still allowing
-      # short bursts to batch.
+      # -- FetchExpiryController tuning (the Rust sidecar pull-loop
+      # batch-coalesce quantum). The narrow 2/15/50 window keeps
+      # queue-path coalescing bounded while still allowing short bursts
+      # to batch.
       adaptive:
         # -- Quantum floor in ms (`SIE_ADAPTIVE_MIN_QUANTUM_MS`).
         minQuantumMs: 2
@@ -642,6 +687,8 @@ workers:
   #
   # Pool-level keys (shared across bundles on this hardware):
   #   enabled:         bool. Skip rendering the whole pool when false.
+  #   engine:          Optional runtime engine default for bundle lanes in this
+  #                    pool. `pytorch` (default) or `candle`.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
   #   gpu.product:     string. nvidia.com/gpu.product node-label match.
   #   gpuType:         GPU/node label used for node selection and display.
@@ -657,14 +704,30 @@ workers:
   #                    in this worker group. Overrides workers.common.preloadModels.
   #   queuePool:       string. Optional override of common.queuePool.
   #                    Defaults to `default` via workers.common.queuePool.
-  #   resources:       requests/limits for the Python ``worker``
-  #                    container (the GPU-bound forward-pass server).
+  #   resources:       requests/limits for the GPU-bound ``worker``
+  #                    container. For `engine: candle`, this is the Rust
+  #                    native worker image instead of Python.
   #   runtimeClassName: Optional override of common.runtimeClassName.
+  #   candle.modelId:  Primary Hugging Face model id loaded by the Rust Candle
+  #                    worker. Required when `engine: candle` unless
+  #                    `candle.modelIds` is set.
+  #   candle.modelIds: Optional list, or comma-separated string, of Hugging
+  #                    Face model ids loaded by the Rust worker. Defaults to
+  #                    `[candle.modelId]`.
+  #   candle.profile:  Optional catalog profile pinned to this Rust Candle
+  #                    adapter process. Leave empty for default-only native
+  #                    models; set to `candle` only for side-by-side profile
+  #                    variants such as `model:candle`.
+  #   candle.cudaComputeCap:
+  #                    Optional per-pool Rust Candle CUDA compute capability
+  #                    override. If omitted, the chart resolves it from
+  #                    workers.common.rust.image.computeCapabilityByMachineProfile.
   #   tolerations:     extra tolerations on top of the chart defaults.
   #
   # bundles: map keyed by bundle name (matches a bundle in sie_config;
   #   otherwise the sidecar refuses to start). Per-bundle keys:
   #     enabled:       bool, default true. Skip this bundle on this pool.
+  #     engine:        Optional runtime engine override for this bundle lane.
   #     imageBundle:   string. Optional image-tag bundle suffix override.
   #                    Set only when the logical bundle reuses another
   #                    bundle's image (e.g. `sglang-embedding` -> `sglang`).
@@ -678,6 +741,11 @@ workers:
   #
   # Each queuePool/machineProfile/bundle lane renders one StatefulSet +
   # KEDA ScaledObject + PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
+  #
+  # NOTE: `engine: candle` serves an explicit native model allowlist via
+  # `candle.modelId` or `candle.modelIds`. Multiple model ids can share a
+  # pool when GPU memory and startup budget allow it; use additional pools
+  # for different GPU shapes, batch settings, or profile pinning.
   pools:
 
     # L4 GPU
@@ -1482,6 +1550,90 @@ observability:
       # -- Install bundled Alloy. Can be enabled alone when forwarding to an
       # external Loki endpoint via alloy.logs.lokiUrl.
       install: false
+  tracing:
+    # -- Master switch for distributed tracing. OFF by default; when false the
+    # rendered chart is a byte-for-byte no-op (no env, no collector). Set true to
+    # inject the OTLP exporter env on the gateway and worker pods with one flag.
+    enabled: false
+    # -- OTLP gRPC endpoint (e.g. http://tempo:4317) that the gateway and workers
+    # export spans to. Point at your own Tempo/Jaeger/OTel-Collector. Leave empty
+    # and set collector.install=true or tempo.install=true to use a bundled target below.
+    endpoint: ""
+    # -- Head-based sampler. parentbased_traceidratio honors an inbound sampling
+    # decision from a propagated traceparent and samples new roots at samplerArg.
+    # The SDK default is 1.0 (100%), so the low ratio is set explicitly here.
+    sampler: parentbased_traceidratio
+    samplerArg: "0.05"
+    # -- Per-component OTEL_SERVICE_NAME shown in the trace backend. Defaults match
+    # each binary's built-in default where one exists.
+    serviceName:
+      gateway: sie-gateway
+      worker: sie-server
+      workerSidecar: sie-worker-sidecar
+    # -- Optional bundled OTLP collector (opt-in; mirrors the Loki/Alloy pattern).
+    # Never installed by default. When install=true, a minimal OTel Collector
+    # Deployment+Service+ConfigMap is rendered and `endpoint` above defaults to it.
+    collector:
+      install: false
+      image:
+        repository: otel/opentelemetry-collector-contrib
+        tag: "0.119.0"   # pin a recent real released tag; operator-overridable
+      # -- Downstream OTLP endpoint the bundled collector forwards spans to
+      # (e.g. Tempo/Jaeger). Leave empty to debug-log spans in the collector pod
+      # logs (handy for first-run verification).
+      exporterEndpoint: ""
+      # -- Disable TLS on the downstream OTLP exporter. Defaults to true for
+      # plaintext in-cluster backends; set false when exporterEndpoint targets a
+      # TLS-enabled collector (e.g. a managed Tempo/Jaeger over https).
+      exporterInsecure: true
+      resources: {}
+    tempo:
+      # -- Install bundled Tempo as an in-cluster trace backend. Off by default.
+      # When enabled without an explicit endpoint or bundled collector, traced
+      # pods export OTLP gRPC spans to http://tempo:4317.
+      install: false
+
+# -- Tempo trace backend (Tier 2 - optional)
+# Installed when observability.tracing.tempo.install=true.
+tempo:
+  # -- Force a predictable service name so OTLP exporters/Grafana can use
+  # static URLs regardless of the Helm release name.
+  fullnameOverride: tempo
+  tempo:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    server:
+      http_listen_port: 3200
+    receivers:
+      # grafana-community/tempo _ports.tpl reads these receiver keys without
+      # nil guards and only emits Service ports for non-empty endpoints. Keep
+      # unused receiver keys with empty endpoints to render safely and suppress
+      # ports; omitting/nulling them can break rendering or restore chart
+      # 0.0.0.0 defaults via Helm deep-merge.
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: ""
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: ""
+          thrift_binary:
+            endpoint: ""
+          thrift_compact:
+            endpoint: ""
+          thrift_http:
+            endpoint: ""
+  persistence:
+    enabled: true
+    size: "10Gi"
 
 # -- Loki log aggregation (Tier 2 - optional)
 # Installed when observability.logs.install=true or observability.logs.loki.install=true.

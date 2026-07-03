@@ -61,6 +61,10 @@ pub struct ConfigNotification {
     pub model_config: String,
     #[serde(default)]
     pub affected_bundles: Vec<String>,
+    #[serde(default)]
+    pub pool: Option<String>,
+    #[serde(default)]
+    pub bundle_pool_config_hashes: HashMap<String, HashMap<String, String>>,
 }
 
 pub struct NatsManager {
@@ -339,6 +343,11 @@ impl NatsManager {
                             notification.bundle_config_hash.clone(),
                         )]));
                 }
+                if !notification.bundle_pool_config_hashes.is_empty() {
+                    self.model_registry.install_bundle_pool_config_hashes(
+                        notification.bundle_pool_config_hashes.clone(),
+                    );
+                }
                 self.config_epoch.set_max(notification.epoch);
                 metrics::CONFIG_DELTAS
                     .with_label_values(&[kind, "applied"])
@@ -376,6 +385,11 @@ mod tests {
             profiles_added: vec!["default".to_string(), "fast".to_string()],
             model_config: "name: bge-m3\nprofiles: {}\n".to_string(),
             affected_bundles: vec!["default".to_string(), "premium".to_string()],
+            pool: Some("default".to_string()),
+            bundle_pool_config_hashes: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("default".to_string(), "pool-hash".to_string())]),
+            )]),
         };
 
         let json = serde_json::to_string(&notification).unwrap();
@@ -388,6 +402,15 @@ mod tests {
         assert_eq!(parsed.model_id, "BAAI/bge-m3");
         assert_eq!(parsed.profiles_added, vec!["default", "fast"]);
         assert_eq!(parsed.affected_bundles, vec!["default", "premium"]);
+        assert_eq!(parsed.pool.as_deref(), Some("default"));
+        assert_eq!(
+            parsed
+                .bundle_pool_config_hashes
+                .get("default")
+                .and_then(|hashes| hashes.get("default"))
+                .map(String::as_str),
+            Some("pool-hash")
+        );
     }
 
     #[test]
@@ -407,6 +430,8 @@ mod tests {
         assert!(parsed.profiles_added.is_empty());
         assert!(parsed.model_config.is_empty());
         assert!(parsed.affected_bundles.is_empty());
+        assert!(parsed.pool.is_none());
+        assert!(parsed.bundle_pool_config_hashes.is_empty());
     }
 
     #[test]
@@ -566,6 +591,8 @@ mod tests {
             profiles_added: Vec::new(),
             model_config: String::new(),
             affected_bundles: Vec::new(),
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
         manager.apply_notification(&notification).await;
         assert_eq!(
@@ -591,6 +618,8 @@ profiles:
 "#
             .to_string(),
             affected_bundles: vec!["default".to_string()],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
         manager.apply_notification(&notification_with_body).await;
         assert_eq!(
@@ -684,6 +713,11 @@ profiles:
 "#
             .to_string(),
             affected_bundles: vec!["default".to_string()],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("default".to_string(), "pool-hash3".to_string())]),
+            )]),
         };
 
         manager.apply_notification(&notification).await;
@@ -692,6 +726,10 @@ profiles:
         profiles.sort();
         assert_eq!(profiles, vec!["default".to_string(), "fast".to_string()]);
         assert_eq!(registry.compute_bundle_config_hash("default"), "hash3");
+        assert_eq!(
+            registry.compute_bundle_config_hash_for_pool("default", "default"),
+            "pool-hash3"
+        );
     }
 
     #[tokio::test]
@@ -728,6 +766,8 @@ profiles:
             profiles_added: vec![],
             model_config: "   \n\t".to_string(),
             affected_bundles: vec![],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
 
         manager.apply_notification(&notification).await;
@@ -768,6 +808,8 @@ profiles:
             profiles_added: vec![],
             model_config: "::: not valid yaml :::".to_string(),
             affected_bundles: vec![],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
 
         manager.apply_notification(&notification).await;
@@ -827,6 +869,8 @@ profiles:
             profiles_added: vec![],
             model_config: String::new(),
             affected_bundles: vec![],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
         manager.apply_notification(&notification).await;
         assert_eq!(epoch.get(), 42);
@@ -878,6 +922,8 @@ profiles:
             profiles_added: vec![],
             model_config: "::: not yaml :::".to_string(),
             affected_bundles: vec!["default".to_string()],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
         manager.apply_notification(&notification).await;
         assert_eq!(
@@ -936,6 +982,8 @@ profiles:
 "#
             .to_string(),
             affected_bundles: vec!["default".to_string()],
+            pool: None,
+            bundle_pool_config_hashes: HashMap::new(),
         };
         manager.apply_notification(&notification).await;
         assert_eq!(

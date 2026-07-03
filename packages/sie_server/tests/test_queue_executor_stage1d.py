@@ -232,7 +232,7 @@ class TestProcessScoreBatchRustOutputFraming:
         wr = WorkerResult(output=score_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_score = AsyncMock(return_value=fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -261,7 +261,7 @@ class TestProcessScoreBatchRustOutputFraming:
         assert score.item_ids == ["doc-a", "doc-b", "doc-c"]
         # ``float(np.float32(x))`` widening — Rust narrows back to f32
         # losslessly, and the production Python path uses the same
-        # widening too (see ``_process_single_score``).
+        # widening too (see ``_score_success_outcome``).
         assert score.scores == pytest.approx([0.1, 0.9, 0.5])
 
 

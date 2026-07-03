@@ -10,6 +10,7 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import extract_texts, validate_output_types
@@ -233,23 +234,8 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         )
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
-        """Build XLMRoberta-style position IDs for packed sequences.
-
-        XLMRoberta uses position IDs starting at padding_idx + 1, not 0.
-        This is critical for matching the padded model's output.
-        """
-        pos_list = []
-        for i in range(num_seqs):
-            seq_len = cu_seqlens[i + 1].item() - cu_seqlens[i].item()
-            # XLMRoberta positions: [padding_idx+1, padding_idx+2, ..., padding_idx+seq_len]
-            pos_list.append(
-                torch.arange(
-                    self._padding_idx + 1,
-                    self._padding_idx + 1 + seq_len,
-                    device=self._device,
-                )
-            )
-        return torch.cat(pos_list)
+        """Build XLMRoberta-style position IDs (each restarts at padding_idx + 1)."""
+        return build_position_ids(cu_seqlens, offset=self._padding_idx + 1)
 
     def _run_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Compute embeddings for packed input."""

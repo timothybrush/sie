@@ -155,6 +155,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Release images enable cloud-storage: object_store selects aws-lc-rs
+    // while NATS selects ring. Pick one provider before TLS clients start.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     init_tracing();
 
     let cli = Cli::parse();
@@ -214,16 +218,18 @@ async fn main() -> anyhow::Result<()> {
 
     if let Err(e) = run(config).await.context("server sidecar run loop") {
         error!(error = ?e, "sie-server-sidecar exited with error");
+        // Flush any pending OTLP spans before the hard exit.
+        sie_server_sidecar::observability::tracing::shutdown_tracing();
         std::process::exit(1);
     }
 
+    // Flush any pending OTLP spans before a clean exit.
+    sie_server_sidecar::observability::tracing::shutdown_tracing();
     Ok(())
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).json().init();
+    sie_server_sidecar::observability::tracing::init_tracing();
 }
 
 fn validate_lane_segment(name: &str, raw: String) -> anyhow::Result<String> {

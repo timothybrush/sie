@@ -23,6 +23,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::debug;
 
+#[cfg(feature = "cloud-storage")]
+use object_store::ObjectStoreExt;
+
 const OBJECT_STORE_SCHEMES: &[&str] = &["s3://", "gs://", "abfs://", "abfss://"];
 
 fn object_store_scheme(url: &str) -> Option<&'static str> {
@@ -443,6 +446,8 @@ pub async fn create_payload_store(
 mod tests {
     use super::*;
     #[cfg(feature = "cloud-storage")]
+    use object_store::ObjectStoreExt;
+    #[cfg(feature = "cloud-storage")]
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
@@ -637,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn object_store_get_accepts_full_ref_inside_prefix() {
         use object_store::path::Path;
-        use object_store::{ObjectStore, PutPayload};
+        use object_store::PutPayload;
 
         let memory = object_store::memory::InMemory::new();
         memory
@@ -677,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn object_store_get_accepts_azure_full_ref_inside_prefix() {
         use object_store::path::Path;
-        use object_store::{ObjectStore, PutPayload};
+        use object_store::PutPayload;
 
         let memory = object_store::memory::InMemory::new();
         memory
@@ -815,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn object_store_get_accepts_plain_key_under_configured_prefix() {
         use object_store::path::Path;
-        use object_store::{ObjectStore, PutPayload};
+        use object_store::PutPayload;
 
         let memory = object_store::memory::InMemory::new();
         memory

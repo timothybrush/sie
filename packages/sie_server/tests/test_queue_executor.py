@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import msgpack
 import numpy as np
 import pytest
+from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.types import WorkerResult
@@ -215,6 +216,154 @@ class TestProcessEncodeBatch:
         mock_encode.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_malformed_item_isolated_as_invalid_input(self) -> None:
+        """A typed-decode failure on one item in a sub-group is isolated as an
+        INVALID_INPUT outcome; the valid item in the same group still runs.
+        Regression for #1537 (queue path bypassed Item validation).
+        """
+        reg = _make_registry()
+        ex = QueueExecutor(reg)
+
+        async def fake_run_encode(**kwargs):
+            n = len(kwargs["items"])
+            return [{"dense": [0.0]} for _ in range(n)], RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new=AsyncMock(side_effect=fake_run_encode),
+        ) as mock_encode:
+            outcome = await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(
+                    model_id="test/model",
+                    items=[
+                        _encode_item(wiid="req-1.0", item={"text": "ok"}, item_index=0),
+                        # text must be str | None — an int is rejected at the seam.
+                        _encode_item(wiid="req-1.1", item={"text": 123}, item_index=1),
+                    ],
+                )
+            )
+
+        by_id = {o.work_item_id: o for o in outcome.outcomes}
+        assert by_id["req-1.0"].disposition == "publish_and_ack"
+        assert by_id["req-1.1"].disposition == "publish_error_and_ack"
+        assert by_id["req-1.1"].error_code == "INVALID_INPUT"
+        # The malformed item never reached inference; only the valid one did.
+        mock_encode.assert_awaited_once()
+        assert len(mock_encode.await_args.kwargs["items"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_merges_profile_runtime_options_into_adapter_call(self) -> None:
+        """Regression for #1489: the cluster worker path must merge the model
+        profile's ``adapter_options.runtime`` defaults (query_template,
+        default_instruction, …) into the options the adapter sees — the Rust
+        gateway publishes only raw SDK options, so the worker has to do the
+        merge that ``api.encode`` does for the single-server path.
+        """
+        config = ModelConfig.model_validate(
+            {
+                "sie_id": "test/instruct-embedder",
+                "hf_id": "test/instruct-embedder",
+                "inputs": {"text": True},
+                "tasks": {"encode": {"dense": {"dim": 8}}},
+                "max_sequence_length": 512,
+                "profiles": {
+                    "default": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter",
+                        "adapter_options": {
+                            "runtime": {
+                                "query_template": "Instruct: {instruction}\nQuery: {text}",
+                                "default_instruction": "Given a query, retrieve relevant passages",
+                                "normalize": True,
+                            },
+                        },
+                    },
+                },
+            }
+        )
+        reg = _make_registry()
+        reg.get_config.return_value = config
+        ex = QueueExecutor(reg)
+
+        captured: dict = {}
+
+        async def fake_run_encode(**kwargs):
+            captured.update(kwargs["options"])
+            n = len(kwargs["items"])
+            return [{"dense": [0.0]} for _ in range(n)], RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new=AsyncMock(side_effect=fake_run_encode),
+        ):
+            outcome = await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(
+                    model_id="test/model",
+                    items=[_encode_item(options={"is_query": True})],
+                )
+            )
+
+        assert outcome.outcomes[0].disposition == "publish_and_ack"
+        # The adapter must receive the profile's runtime template + instruction,
+        # not just the raw {"is_query": True} the SDK sent.
+        assert captured["query_template"] == "Instruct: {instruction}\nQuery: {text}"
+        assert captured["default_instruction"] == "Given a query, retrieve relevant passages"
+        assert captured["normalize"] is True
+        assert captured["is_query"] is True
+
+    @pytest.mark.asyncio
+    async def test_merges_non_default_profile_runtime_from_options(self) -> None:
+        """A queued request selects its profile via options["profile"] (the gateway
+        forwards raw SDK options; the wire profile_id is a hardcoded routing
+        placeholder), so the worker must resolve that profile's runtime defaults.
+        """
+        config = ModelConfig.model_validate(
+            {
+                "sie_id": "test/multi-profile-embedder",
+                "hf_id": "test/multi-profile-embedder",
+                "inputs": {"text": True},
+                "tasks": {"encode": {"dense": {"dim": 8}}},
+                "max_sequence_length": 512,
+                "profiles": {
+                    "default": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter",
+                        "adapter_options": {"runtime": {"query_template": "default: {text}"}},
+                    },
+                    "fast": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.sglang.embedding:SGLangEmbeddingAdapter",
+                        "adapter_options": {"runtime": {"query_template": "fast: {text}"}},
+                    },
+                },
+            }
+        )
+        reg = _make_registry()
+        reg.get_config.return_value = config
+        ex = QueueExecutor(reg)
+
+        captured: dict = {}
+
+        async def fake_run_encode(**kwargs):
+            captured.update(kwargs["options"])
+            return [{"dense": [0.0]} for _ in kwargs["items"]], RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new=AsyncMock(side_effect=fake_run_encode),
+        ):
+            await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(
+                    model_id="test/model",
+                    items=[_encode_item(options={"is_query": True, "profile": "fast"})],
+                )
+            )
+
+        # The non-default profile's runtime wins, and "profile" is consumed.
+        assert captured["query_template"] == "fast: {text}"
+        assert "profile" not in captured
+
+    @pytest.mark.asyncio
     async def test_model_evicted_naks_all(self) -> None:
         reg = _make_registry()
         reg.get_config.side_effect = KeyError("test/model")
@@ -246,6 +395,9 @@ class TestProcessEncodeBatch:
 
         assert len(outcome.outcomes) == 1
         assert outcome.outcomes[0].disposition == "publish_error_and_ack"
+        # Pin the literal lowercase wire value on purpose (not the
+        # _INFERENCE_ERROR_CODE constant): this guards the sidecar↔gateway
+        # contract so a change to the constant surfaces as a failure here.
         assert outcome.outcomes[0].error_code == "inference_error"
         assert "boom" in (outcome.outcomes[0].error or "")
 
@@ -422,7 +574,7 @@ class TestProcessScoreBatch:
         wr = WorkerResult(output=score_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_score = AsyncMock(return_value=fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -457,6 +609,57 @@ class TestProcessScoreBatch:
         assert o.raw_output.score.scores == pytest.approx([0.9, 0.1])
 
     @pytest.mark.asyncio
+    async def test_malformed_item_isolated_as_invalid_input(self) -> None:
+        """A typed-decode failure on the query item is isolated as INVALID_INPUT
+        while a sibling valid item still runs. Regression for #1537 (the score
+        path now decodes through the shared decode_item seam).
+        """
+        reg = _make_registry()
+        worker = AsyncMock()
+        fut: asyncio.Future[WorkerResult] = asyncio.Future()
+        fut.set_result(
+            WorkerResult(output=ScoreOutput(scores=np.array([0.9], dtype=np.float32)), timing=RequestTiming())
+        )
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
+        reg.start_worker = AsyncMock(return_value=worker)
+
+        ex = QueueExecutor(reg)
+        outcome = await ex.process_score_batch(
+            ProcessScoreBatchRequest(
+                model_id="test/model",
+                items=[
+                    ScoreBatchItem(
+                        work_item_id="req-1.0",
+                        request_id="req-1",
+                        item_index=0,
+                        total_items=1,
+                        timestamp=time.time(),
+                        query_item={"text": "q"},
+                        score_items=[{"text": "a", "id": "doc-a"}],
+                    ),
+                    # query_item.text must be str | None — an int is rejected at the seam.
+                    ScoreBatchItem(
+                        work_item_id="req-1.1",
+                        request_id="req-1",
+                        item_index=1,
+                        total_items=1,
+                        timestamp=time.time(),
+                        query_item={"text": 123},
+                        score_items=[{"text": "a", "id": "doc-a"}],
+                    ),
+                ],
+            )
+        )
+
+        by_id = {o.work_item_id: o for o in outcome.outcomes}
+        assert by_id["req-1.0"].disposition == "publish_and_ack"
+        assert by_id["req-1.1"].disposition == "publish_error_and_ack"
+        assert by_id["req-1.1"].error_code == "INVALID_INPUT"
+        assert worker.submit_score_preformed_batch.await_count == 1
+        requests = worker.submit_score_preformed_batch.await_args.args[0]
+        assert len(requests) == 1
+
+    @pytest.mark.asyncio
     async def test_multimodal_score_items_contribute_media_batch_cost(self) -> None:
         reg = _make_registry()
         worker = AsyncMock()
@@ -464,7 +667,7 @@ class TestProcessScoreBatch:
         wr = WorkerResult(output=score_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_score = AsyncMock(return_value=fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -485,7 +688,8 @@ class TestProcessScoreBatch:
             )
         )
 
-        prepared_items = worker.submit_score.await_args.kwargs["prepared_items"]
+        requests = worker.submit_score_preformed_batch.await_args.args[0]
+        prepared_items = requests[0].prepared_items
         assert prepared_items[0].cost == 5 + 1024
 
     @pytest.mark.asyncio
@@ -519,7 +723,7 @@ class TestProcessScoreBatch:
         worker = AsyncMock()
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_exception(RuntimeError("MPS backend out of memory"))
-        worker.submit_score = AsyncMock(return_value=fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -532,18 +736,17 @@ class TestProcessScoreBatch:
 
     @pytest.mark.asyncio
     async def test_records_ipc_batch_shape(self) -> None:
-        """Score submits one task per IPC item, so the fragmentation
-        metric must report sub_groups == items. Any deviation means
-        the queue executor changed its dispatch strategy without
-        updating the dashboard semantics.
-        """
+        """Compatible score IPC items stay in one preformed worker batch."""
         reg = _make_registry()
         worker = AsyncMock()
         score_output = ScoreOutput(scores=np.array([0.5], dtype=np.float32))
         wr = WorkerResult(output=score_output, timing=RequestTiming())
-        fut: asyncio.Future[WorkerResult] = asyncio.Future()
-        fut.set_result(wr)
-        worker.submit_score = AsyncMock(return_value=fut)
+        futures: list[asyncio.Future[WorkerResult]] = []
+        for _ in range(4):
+            fut: asyncio.Future[WorkerResult] = asyncio.Future()
+            fut.set_result(wr)
+            futures.append(fut)
+        worker.submit_score_preformed_batch = AsyncMock(return_value=futures)
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -571,7 +774,7 @@ class TestProcessScoreBatch:
         kwargs = mock_record.call_args.kwargs
         assert kwargs["endpoint"] == "score"
         assert kwargs["total_items"] == 4
-        assert kwargs["sub_group_sizes"] == [1, 1, 1, 1]
+        assert kwargs["sub_group_sizes"] == [4]
 
 
 # -----------------------------------------------------------------------------
@@ -590,7 +793,7 @@ class TestProcessExtractBatch:
         wr = WorkerResult(output=extract_output, timing=RequestTiming())
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_result(wr)
-        worker.submit_extract = AsyncMock(return_value=fut)
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -614,6 +817,58 @@ class TestProcessExtractBatch:
         assert outcome.outcomes[0].disposition == "publish_and_ack"
         inner = msgpack.unpackb(outcome.outcomes[0].result_msgpack, raw=False)
         assert "entities" in inner
+
+    @pytest.mark.asyncio
+    async def test_malformed_item_isolated_as_invalid_input(self) -> None:
+        """A typed-decode failure is isolated as INVALID_INPUT while a sibling
+        valid item still runs. Regression for #1537 (the extract path now
+        decodes through the shared decode_item seam).
+        """
+        reg = _make_registry()
+        worker = AsyncMock()
+        extract_output = ExtractOutput(
+            entities=[[{"text": "Alice", "label": "person", "score": 0.99, "start": 0, "end": 5}]]
+        )
+        fut: asyncio.Future[WorkerResult] = asyncio.Future()
+        fut.set_result(WorkerResult(output=extract_output, timing=RequestTiming()))
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
+        reg.start_worker = AsyncMock(return_value=worker)
+
+        ex = QueueExecutor(reg)
+        outcome = await ex.process_extract_batch(
+            ProcessExtractBatchRequest(
+                model_id="test/model",
+                items=[
+                    ExtractBatchItem(
+                        work_item_id="req-1.0",
+                        request_id="req-1",
+                        item_index=0,
+                        total_items=1,
+                        timestamp=time.time(),
+                        item={"text": "Alice works at Acme."},
+                        labels=["person"],
+                    ),
+                    # item.text must be str | None — an int is rejected at the seam.
+                    ExtractBatchItem(
+                        work_item_id="req-1.1",
+                        request_id="req-1",
+                        item_index=1,
+                        total_items=1,
+                        timestamp=time.time(),
+                        item={"text": 123},
+                        labels=["person"],
+                    ),
+                ],
+            )
+        )
+
+        by_id = {o.work_item_id: o for o in outcome.outcomes}
+        assert by_id["req-1.0"].disposition == "publish_and_ack"
+        assert by_id["req-1.1"].disposition == "publish_error_and_ack"
+        assert by_id["req-1.1"].error_code == "INVALID_INPUT"
+        assert worker.submit_extract_preformed_batch.await_count == 1
+        requests = worker.submit_extract_preformed_batch.await_args.args[0]
+        assert len(requests) == 1
 
     @pytest.mark.asyncio
     async def test_model_evicted_naks(self) -> None:
@@ -644,7 +899,7 @@ class TestProcessExtractBatch:
         worker = AsyncMock()
         fut: asyncio.Future[WorkerResult] = asyncio.Future()
         fut.set_exception(RuntimeError("CUDA out of memory"))
-        worker.submit_extract = AsyncMock(return_value=fut)
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=[fut])
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -659,14 +914,17 @@ class TestProcessExtractBatch:
 
     @pytest.mark.asyncio
     async def test_records_ipc_batch_shape(self) -> None:
-        """Extract is also per-item dispatch; same semantics as score."""
+        """Compatible extract IPC items stay in one preformed worker batch."""
         reg = _make_registry()
         worker = AsyncMock()
         extract_output = ExtractOutput(entities=[[]])
         wr = WorkerResult(output=extract_output, timing=RequestTiming())
-        fut: asyncio.Future[WorkerResult] = asyncio.Future()
-        fut.set_result(wr)
-        worker.submit_extract = AsyncMock(return_value=fut)
+        futures: list[asyncio.Future[WorkerResult]] = []
+        for _ in range(3):
+            fut: asyncio.Future[WorkerResult] = asyncio.Future()
+            fut.set_result(wr)
+            futures.append(fut)
+        worker.submit_extract_preformed_batch = AsyncMock(return_value=futures)
         reg.start_worker = AsyncMock(return_value=worker)
 
         ex = QueueExecutor(reg)
@@ -693,7 +951,7 @@ class TestProcessExtractBatch:
         kwargs = mock_record.call_args.kwargs
         assert kwargs["endpoint"] == "extract"
         assert kwargs["total_items"] == 3
-        assert kwargs["sub_group_sizes"] == [1, 1, 1]
+        assert kwargs["sub_group_sizes"] == [3]
 
 
 # -----------------------------------------------------------------------------

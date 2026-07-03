@@ -22,6 +22,7 @@ import os
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sie_server.core.adaptive_batching import (
@@ -134,6 +135,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class PreformedExtractRequest:
+    prepared_items: Sequence[HasCost]
+    items: list[Item]
+    labels: list[str] | None = None
+    output_schema: dict[str, Any] | None = None
+    instruction: str | None = None
+    options: dict[str, Any] | None = None
+    request_id: str | None = None
+    timing: RequestTiming | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreformedScoreRequest:
+    prepared_items: Sequence[HasCost]
+    query: Item
+    items: list[Item]
+    instruction: str | None = None
+    options: dict[str, Any] | None = None
+    request_id: str | None = None
+    timing: RequestTiming | None = None
+
+
 class ModelWorker:
     """Worker that batches and processes inference requests for a single model.
 
@@ -190,22 +214,12 @@ class ModelWorker:
         self._postprocessor_registry = postprocessor_registry
         self._registry_callbacks = registry_callbacks
 
-        # Pass-through mode: skip BatchFormer / FCFS / adaptive batching;
-        # every ``submit*`` becomes one GPU forward pass. Env var wins so we
-        # can flip it without redeploying with a new WorkerConfig. See the
-        # comment on ``WorkerConfig.passthrough_mode`` for the rationale and
-        # the cluster-wide alignment with the worker-sidecar's owner role.
-        env_passthrough = os.environ.get("SIE_WORKER_PASSTHROUGH", "").lower() in ("1", "true", "yes")
-        self._passthrough_mode = self._config.passthrough_mode or env_passthrough
-        # Async lock so concurrent passthrough submits serialise across the
-        # ``set_active_lora -> _process_batch`` pair. The single-thread
-        # inference executor would already serialise the GPU calls, but the
-        # adapter's active-LoRA state lives on the asyncio thread and would
-        # race otherwise (lora_A set, lora_B set, A's inference runs with B
-        # active). Held only for the synchronous ``set_active_lora`` and the
-        # ``await _process_batch`` body — the executor handoff itself does
-        # NOT extend this lock further than needed.
-        self._passthrough_lock = asyncio.Lock()
+        # Protect adapter-global state, especially active LoRA selection,
+        # across the direct HTTP batcher and the sidecar IPC pre-formed batch
+        # entrypoints. The inference executor serialises GPU work, but LoRA
+        # selection happens on the event-loop thread immediately before
+        # dispatch, so the set_lora -> forward pair must be atomic.
+        self._adapter_dispatch_lock = asyncio.Lock()
 
         # Initialize operation handlers (dependency injection point)
         if handlers is not None:
@@ -226,15 +240,13 @@ class ModelWorker:
             coalesce_ratio=self._config.coalesce_ratio,
         )
 
-        # Per-LoRA batchers: None = base model, "lora-name" = specific LoRA
-        # Each LoRA gets its own batcher for FCFS fairness. In passthrough
-        # mode the dict stays empty — the dispatcher path bypasses these
-        # entirely and the GPU batch is the IPC frame as it arrived. We
-        # still keep the field for shape-compat with code that reads
-        # ``self._batchers`` (e.g. shutdown, instrumentation).
-        self._batchers: dict[str | None, BatchFormer[HasCost, RequestMetadata]] = {}
-        if not self._passthrough_mode:
-            self._batchers[None] = BatchFormer(self._batch_config)  # Base model batcher
+        # Per-LoRA batchers: None = base model, "lora-name" = specific LoRA.
+        # Each LoRA gets its own batcher for FCFS fairness on the direct
+        # Python HTTP path. Sidecar IPC uses submit_preformed* below and
+        # bypasses these batchers explicitly.
+        self._batchers: dict[str | None, BatchFormer[HasCost, RequestMetadata]] = {
+            None: BatchFormer(self._batch_config)
+        }
 
         # Thread pool for running inference (doesn't block event loop)
         self._inference_executor = ThreadPoolExecutor(
@@ -242,13 +254,12 @@ class ModelWorker:
             thread_name_prefix="inference",
         )
 
-        # Adaptive batching controller (optional, off by default).
-        # Forced off in passthrough mode: there's no ``_process_loop`` to
-        # observe batch fill / latency feedback, and the sidecar runs its
-        # own adaptive batcher one IPC hop upstream. Competing controllers
-        # can make batch-size feedback oscillate.
+        # Adaptive batching controller (optional, off by default). It belongs
+        # to the direct Python HTTP path; sidecar IPC bypasses the process
+        # loop through submit_preformed* and therefore never steps this
+        # controller.
         ab = self._config.adaptive_batching
-        if ab.enabled and not self._passthrough_mode:
+        if ab.enabled:
             self._latency_tracker: LatencyTracker | None = LatencyTracker(
                 window_size=ab.window_size,
             )
@@ -357,10 +368,14 @@ class ModelWorker:
     # =========================================================================
 
     async def start(self) -> None:
-        """Start the background processing task.
+        """Mark the worker ready to accept requests.
 
         Should be called before submitting requests.
         Set SIE_INSTRUMENTATION=1 to enable detailed batch statistics.
+
+        The direct HTTP batching loop starts lazily on the first normal
+        ``submit*`` call. Sidecar IPC calls use ``submit_preformed*`` and do
+        not need a Python batch loop.
         """
         if self._running:
             return
@@ -372,22 +387,6 @@ class ModelWorker:
             logger.info("ModelWorker instrumentation enabled")
 
         self._running = True
-        # Passthrough mode owns its own dispatch path inside ``submit*`` —
-        # no background loop, no FCFS scheduling, no adaptive controller.
-        # We still flip ``_running`` so the existing ``stop()`` path works
-        # and ``_check_queue_capacity`` accepts work.
-        if self._passthrough_mode:
-            logger.info(
-                "ModelWorker started (passthrough mode: no internal batcher / "
-                "no _process_loop / no adaptive controller — every submit() is "
-                "one GPU forward pass)"
-            )
-            return
-
-        self._process_task = asyncio.create_task(
-            self._process_loop(),
-            name="model-worker-process",
-        )
         if self._adaptive_controller is not None:
             target_str = (
                 f"{self._adaptive_controller.target_p50_ms:.0f}ms"
@@ -593,6 +592,163 @@ class ModelWorker:
         # Score operations use base model batcher (no LoRA support for reranking)
         return await self._submit_to_batcher(prepared_items, metadata, None)
 
+    async def submit_preformed(
+        self,
+        prepared_items: Sequence[HasCost],
+        items: list[Item],
+        output_types: list[str],
+        *,
+        instruction: str | None = None,
+        is_query: bool = False,
+        options: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timing: RequestTiming | None = None,
+    ) -> asyncio.Future[WorkerResult]:
+        """Run a caller-formed encode batch directly.
+
+        Used by the worker-sidecar IPC path after Rust has already handled
+        queue pull, scheduling, batching, and adaptive control. Direct HTTP
+        callers should continue to use :meth:`submit` so local single-instance
+        serving retains Python batching.
+        """
+        self._check_running()
+
+        future, request_timing = self._create_future_and_timing(timing)
+        metadata = RequestMetadata(
+            future=future,
+            items=items,
+            output_types=output_types,
+            timing=request_timing,
+            instruction=instruction,
+            is_query=is_query,
+            options=options,
+            request_id=request_id,
+        )
+        lora = options.get("lora") if options else None
+        return await self._submit_preformed_batch(prepared_items, metadata, lora)
+
+    async def submit_extract_preformed(
+        self,
+        prepared_items: Sequence[HasCost],
+        items: list[Item],
+        *,
+        labels: list[str] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        instruction: str | None = None,
+        options: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timing: RequestTiming | None = None,
+    ) -> asyncio.Future[WorkerResult]:
+        """Run a caller-formed extract batch directly for sidecar IPC."""
+        self._check_running()
+
+        future, request_timing = self._create_future_and_timing(timing)
+        metadata = RequestMetadata(
+            future=future,
+            items=items,
+            timing=request_timing,
+            request_id=request_id,
+            operation="extract",
+            labels=labels,
+            output_schema=output_schema,
+            instruction=instruction,
+            options=options,
+        )
+        lora = options.get("lora") if options else None
+        return await self._submit_preformed_batch(prepared_items, metadata, lora)
+
+    async def submit_extract_preformed_batch(
+        self,
+        requests: Sequence[PreformedExtractRequest],
+        *,
+        lora: str | None,
+    ) -> list[asyncio.Future[WorkerResult]]:
+        """Run caller-formed extract requests as one sidecar IPC batch.
+
+        The caller has already decided the queue batch. We preserve that
+        grouping and let ``_process_batch`` split only on adapter config.
+        ``lora`` is explicit because adapter LoRA state is global for the
+        forward pass and must be homogeneous for the synthetic batch.
+        """
+        self._check_running()
+
+        entries: list[tuple[Sequence[HasCost], RequestMetadata]] = []
+        for req in requests:
+            future, request_timing = self._create_future_and_timing(req.timing)
+            entries.append(
+                (
+                    req.prepared_items,
+                    RequestMetadata(
+                        future=future,
+                        items=req.items,
+                        timing=request_timing,
+                        request_id=req.request_id,
+                        operation="extract",
+                        labels=req.labels,
+                        output_schema=req.output_schema,
+                        instruction=req.instruction,
+                        options=req.options,
+                    ),
+                )
+            )
+
+        return await self._submit_preformed_metadata_batch(entries, lora)
+
+    async def submit_score_preformed(
+        self,
+        prepared_items: Sequence[HasCost],
+        query: Item,
+        items: list[Item],
+        *,
+        instruction: str | None = None,
+        options: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timing: RequestTiming | None = None,
+    ) -> asyncio.Future[WorkerResult]:
+        """Run a caller-formed score batch directly for sidecar IPC."""
+        self._check_running()
+
+        future, request_timing = self._create_future_and_timing(timing)
+        metadata = RequestMetadata(
+            future=future,
+            items=items,
+            timing=request_timing,
+            request_id=request_id,
+            operation="score",
+            query=query,
+            instruction=instruction,
+            options=options,
+        )
+        return await self._submit_preformed_batch(prepared_items, metadata, None)
+
+    async def submit_score_preformed_batch(
+        self,
+        requests: Sequence[PreformedScoreRequest],
+    ) -> list[asyncio.Future[WorkerResult]]:
+        """Run caller-formed score requests as one sidecar IPC batch."""
+        self._check_running()
+
+        entries: list[tuple[Sequence[HasCost], RequestMetadata]] = []
+        for req in requests:
+            future, request_timing = self._create_future_and_timing(req.timing)
+            entries.append(
+                (
+                    req.prepared_items,
+                    RequestMetadata(
+                        future=future,
+                        items=req.items,
+                        timing=request_timing,
+                        request_id=req.request_id,
+                        operation="score",
+                        query=req.query,
+                        instruction=req.instruction,
+                        options=req.options,
+                    ),
+                )
+            )
+
+        return await self._submit_preformed_metadata_batch(entries, None)
+
     # =========================================================================
     # Internal Helpers
     # =========================================================================
@@ -623,12 +779,6 @@ class ModelWorker:
         if not self._running:
             msg = "ModelWorker is not running"
             raise RuntimeError(msg)
-        # In passthrough mode there is no queue to fill — every submit
-        # runs synchronously to GPU under the passthrough lock, so back-
-        # pressure happens at the lock acquisition rather than via a
-        # depth check. The worker-sidecar enforces the per-pod inflight cap.
-        if self._passthrough_mode:
-            return
         max_queue = self._config.max_queue_size
         if max_queue > 0:
             current_pending = self.pending_count
@@ -671,20 +821,38 @@ class ModelWorker:
         Returns:
             The future from metadata that will resolve to WorkerResult.
         """
-        if self._passthrough_mode:
-            return await self._submit_passthrough(prepared_items, metadata, lora)
-
         batcher = self._get_batcher(lora)
         await batcher.submit_many([(item, metadata) for item in prepared_items])
+        self._ensure_process_loop_started()
         return metadata.future
 
-    async def _submit_passthrough(
+    def _ensure_process_loop_started(self) -> None:
+        if self._process_task is None:
+            self._process_task = asyncio.create_task(
+                self._process_loop(),
+                name="model-worker-process",
+            )
+
+    def _check_running(self) -> None:
+        if not self._running:
+            msg = "ModelWorker is not running"
+            raise RuntimeError(msg)
+
+    async def _submit_preformed_batch(
         self,
         prepared_items: Sequence[HasCost],
         metadata: RequestMetadata,
         lora: str | None,
     ) -> asyncio.Future[WorkerResult]:
-        """Run the IPC frame as exactly one GPU forward pass.
+        await self._submit_preformed_metadata_batch([(prepared_items, metadata)], lora)
+        return metadata.future
+
+    async def _submit_preformed_metadata_batch(
+        self,
+        entries: Sequence[tuple[Sequence[HasCost], RequestMetadata]],
+        lora: str | None,
+    ) -> list[asyncio.Future[WorkerResult]]:
+        """Run a caller-formed batch without the internal BatchFormer.
 
         Builds a synthetic ``FormattedBatch`` directly from ``prepared_items``
         — bypassing the BatchFormer / FCFS / adaptive controller entirely
@@ -692,32 +860,48 @@ class ModelWorker:
         operation handlers, postprocessors and timing instrumentation all
         keep working unchanged.
 
-        Concurrency: held under ``_passthrough_lock`` so concurrent submits
+        Concurrency: held under ``_adapter_dispatch_lock`` so concurrent calls
         to different LoRAs cannot interleave the (``set_active_lora`` →
         ``_process_batch``) pair, which otherwise races on the adapter's
         active-LoRA state. The single-thread inference executor would
         already serialise the GPU work — the lock specifically protects
         the LoRA-set-then-forward atomicity.
         """
+        items_list: list[HasCost] = []
+        metadata_per_item: list[RequestMetadata] = []
+        futures: list[asyncio.Future[WorkerResult]] = []
+        total_cost = 0
+
         # Cost is a sequence-of-protocol read, no I/O — safe outside the lock.
-        items_list = list(prepared_items)
-        total_cost = sum(item.cost for item in items_list)
-        # ``_process_batch`` keys metadata identity by ``id(metadata)`` so a
-        # single shared metadata reference (one per request, N items) is
-        # fine; the existing ``_complete_requests`` only fires the future
-        # once all items have results regardless of how many slots share it.
-        metadata_per_item: list[RequestMetadata] = [metadata] * len(items_list)
+        for prepared_items, metadata in entries:
+            request_items = list(prepared_items)
+            if not request_items:
+                metadata.future.set_exception(ValueError("preformed request contains no prepared items"))
+                futures.append(metadata.future)
+                continue
+            items_list.extend(request_items)
+            total_cost += sum(item.cost for item in request_items)
+            # ``_process_batch`` keys metadata identity by ``id(metadata)`` so a
+            # single shared metadata reference (one per request, N items) is
+            # fine; the existing ``_complete_requests`` only fires the future
+            # once all items have results regardless of how many slots share it.
+            metadata_per_item.extend([metadata] * len(request_items))
+            futures.append(metadata.future)
+
+        if not items_list:
+            return futures
+
         synthetic_batch: FormattedBatch[HasCost, RequestMetadata] = FormattedBatch(
             items=items_list,
             metadata=metadata_per_item,
             total_cost=total_cost,
         )
 
-        async with self._passthrough_lock:
+        async with self._adapter_dispatch_lock:
             self._adapter.set_active_lora(lora)
             await self._process_batch(synthetic_batch)
 
-        return metadata.future
+        return futures
 
     # =========================================================================
     # Batch Processing
@@ -774,6 +958,42 @@ class ModelWorker:
                 # Return empty batch to exit gracefully
                 return None, FormattedBatch(items=[], metadata=[], total_cost=0), was_idle
 
+    async def _drain_active_batcher(self, active_lora: str | None) -> bool:
+        """Continuous-batching drain of ``active_lora``'s batcher.
+
+        Bounded to the backlog present at entry: a saturated LoRA whose
+        ``submit()`` coroutines keep refilling its own batcher during each GPU
+        forward pass would otherwise never let this loop exit, starving sibling
+        LoRAs / the base model (they are only re-examined once control returns
+        to ``_get_next_batch_fcfs``). Draining at most the entry backlog and
+        then returning restores the oldest-first FCFS fairness the docstring
+        there advertises. See #1606.
+
+        Returns True if any items were drained.
+        """
+        batcher = self._batchers.get(active_lora)
+        if batcher is None:
+            return False
+
+        # Snapshot the backlog at entry; items that arrive mid-drain wait for
+        # the next FCFS selection instead of extending the drain indefinitely.
+        # Cap every drain to the remaining budget so a batch formed late in the
+        # loop can't sweep in post-snapshot arrivals and overshoot the backlog.
+        drain_budget = batcher.pending_count
+        drained = False
+        while drain_budget > 0:
+            drain_batch = await batcher.try_drain(max_items=drain_budget)
+            if drain_batch is None or drain_batch.size == 0:
+                break
+            drained = True
+            drain_budget -= drain_batch.size
+            await self._process_batch(drain_batch)
+            if _HAS_BATCH_METRICS:
+                _label_name = self._model_name or "unknown"
+                GPU_BATCH_ITEMS.labels(model=_label_name).observe(drain_batch.size)
+                GPU_BATCH_TOKENS.labels(model=_label_name).observe(drain_batch.total_tokens)
+        return drained
+
     async def _process_loop(self) -> None:
         """Background loop that processes batches using FCFS across LoRAs."""
         logger.debug("Process loop started")
@@ -808,30 +1028,23 @@ class ModelWorker:
                     MODEL_LOOP_PENDING_AT_DISPATCH.labels(model=_label_name).observe(pending_after_pull)
                     MODEL_LOOP_PENDING_GAUGE.labels(model=_label_name).set(pending_after_pull)
 
-                # Set active LoRA before processing batch
-                # This allows adapters to switch to the correct LoRA adapter
-                self._adapter.set_active_lora(active_lora)
-
-                # Process the batch and track inference time
                 inference_start = time.monotonic()
-                await self._process_batch(batch)
-
-                # Continuous batching: immediately drain items that accumulated
-                # during GPU inference, bypassing the coalesce/timeout wait.
-                # This keeps the GPU saturated without re-entering the batch
-                # formation loop.
                 drained = False
-                batcher = self._batchers.get(active_lora)
-                while batcher is not None:
-                    drain_batch = await batcher.try_drain()
-                    if drain_batch is None or drain_batch.size == 0:
-                        break
-                    drained = True
-                    await self._process_batch(drain_batch)
-                    if _HAS_BATCH_METRICS:
-                        _label_name = self._model_name or "unknown"
-                        GPU_BATCH_ITEMS.labels(model=_label_name).observe(drain_batch.size)
-                        GPU_BATCH_TOKENS.labels(model=_label_name).observe(drain_batch.total_tokens)
+                async with self._adapter_dispatch_lock:
+                    # Set active LoRA before processing the batch and any
+                    # immediate drains. The lock also excludes sidecar
+                    # pre-formed batches from interleaving a different LoRA
+                    # selection between set_active_lora and adapter inference.
+                    self._adapter.set_active_lora(active_lora)
+
+                    # Process the batch and track inference time.
+                    await self._process_batch(batch)
+
+                    # Continuous batching: immediately drain items that accumulated
+                    # during GPU inference, bypassing the coalesce/timeout wait —
+                    # bounded to the backlog present at entry so a saturated LoRA
+                    # can't starve sibling LoRAs / the base model (#1606).
+                    drained = await self._drain_active_batcher(active_lora)
 
                 # Determine idle state for next iteration.
                 # Worker was busy if we drained items or processed a multi-item
@@ -871,19 +1084,18 @@ class ModelWorker:
                 if self._efficiency_tracker is not None:
                     self._efficiency_tracker.record(batch.total_cost, self._batch_config.max_batch_cost)
 
-                # Step adaptive controller after processing.
-                # Note: mutating _batch_config in-place is safe here because
-                # both assignments happen synchronously (no await between them)
-                # on the single event-loop thread.  BatchFormer reads these
-                # fields only under its own async lock, which cannot interleave
-                # with this synchronous block.
+                # Step the adaptive controller after processing. ``apply_step``
+                # owns the controller-output → _batch_config write-back (see
+                # AdaptiveBatchController); it is synchronous, so the in-place
+                # mutation stays safe against BatchFormer's async lock, which
+                # cannot interleave with it.
                 if self._adaptive_controller is not None and self._latency_tracker is not None:
                     observed_p50 = self._latency_tracker.p50()
                     fill_ratio = self._efficiency_tracker.mean_fill_ratio() if self._efficiency_tracker else None
                     prev_resets = self._adaptive_controller.starvation_resets
-                    new_wait, new_cost = self._adaptive_controller.step(observed_p50, fill_ratio, batch_size=batch.size)
-                    self._batch_config.max_batch_wait_ms = new_wait
-                    self._batch_config.max_batch_cost = new_cost
+                    new_wait, new_cost = self._adaptive_controller.apply_step(
+                        self._batch_config, observed_p50, fill_ratio, batch_size=batch.size
+                    )
 
                     if _HAS_BATCH_METRICS:
                         _label = self._model_name or "unknown"

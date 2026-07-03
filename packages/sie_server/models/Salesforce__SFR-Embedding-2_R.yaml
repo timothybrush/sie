@@ -22,6 +22,10 @@ profiles:
     adapter_options:
       loadtime:
         mem_fraction_static: 0.85
+        # Mistral-family last-token embedder: SGLang does not auto-append EOS for
+        # this architecture, so last-token pooling reads the wrong position and
+        # retrieval collapses (#1489). Append the model's own EOS at encode time.
+        append_eos: true
       runtime:
         pooling: last_token
         normalize: true

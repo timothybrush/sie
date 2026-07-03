@@ -9,9 +9,19 @@ from __future__ import annotations
 # defaults before our overrides land. Keep these two ``setdefault`` lines
 # as the very first executable statements after ``__future__``.
 import os
+import sys
 
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
+# hf-xet (HuggingFace's Xet download protocol) can hang indefinitely on Apple
+# Silicon — it does NOT honour HF_HUB_DOWNLOAD_TIMEOUT, so a stuck ``xet_get``
+# wedges model loads with no recovery (verified: bge-m3 load blocked forever in
+# ``huggingface_hub.file_download.xet_get`` on macOS). Disable Xet on macOS so
+# downloads use reliable HTTPS. CUDA/Linux keep Xet (faster, works there).
+# Override by exporting HF_HUB_DISABLE_XET=0.
+if sys.platform == "darwin":
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import hashlib
 import logging
@@ -192,8 +202,12 @@ def openapi_export(
     from sie_server.api.score import router as score_router
     from sie_server.api.ws import router as ws_router
 
-    # Build a lightweight FastAPI app with all routers but no lifespan
-    # (no GPU init, no model registry, no telemetry, no NATS)
+    # Build a lightweight FastAPI app for the PUBLISHED API surface — no lifespan (no GPU
+    # init, model registry, telemetry, or NATS). NOTE: the local-only convenience routes are
+    # intentionally excluded from the committed openapi.json — the native ``generate`` router
+    # and the ``openai_local`` router (/v1/chat/completions + /v1/rerank) are a single-node/dev
+    # surface mounted on the worker's own app, not part of the cluster API (the Rust gateway is
+    # the production OpenAPI authority). They still appear at runtime /docs on a local server.
     app_ = FastAPI(
         title="SIE Server",
         description="Search Inference Engine - GPU inference server for search workloads",
@@ -361,6 +375,17 @@ def serve(
 
     typer.echo(f"Models directory: {models_dir_resolved}")
     typer.echo(f"Device: {resolved_device}")
+    if resolved_device == "mps":
+        # Apple-Silicon banner: surface the one-command local OpenAI endpoint so the
+        # first-run experience points at the playground / docs / OpenAI base URL.
+        typer.echo("")
+        typer.echo("  Apple Silicon (Metal) — one local OpenAI-compatible endpoint:")
+        typer.echo(f"    →  Playground   http://localhost:{port}/")
+        typer.echo(f"    →  API docs     http://localhost:{port}/docs")
+        typer.echo(
+            f"    →  OpenAI base  http://localhost:{port}/v1   (embeddings · rerank; chat/completions with -b sglang)"
+        )
+        typer.echo("")
     if cluster_cache:
         typer.echo(f"Cluster cache: {cluster_cache}")
     if not hf_fallback:

@@ -20,6 +20,8 @@ def _setup_registry(
 
     for name, adapters in bundles.items():
         data = {"name": name, "priority": 10, "adapters": adapters}
+        if any(adapter.startswith("sie_server_rust.adapters.candle") for adapter in adapters):
+            data["engine"] = "candle"
         (bundles_dir / f"{name}.yaml").write_text(yaml.dump(data))
 
     if models:
@@ -259,6 +261,37 @@ class TestAddModelConfig:
         bundle = registry.resolve_bundle("sglang/model")
         assert bundle == "sglang"
 
+    def test_append_profile_creates_profile_variant_route(self) -> None:
+        registry, _ = _setup_registry(
+            self._root / "profile_variant",
+            bundles={
+                "default": ["sie_server.adapters.bert_flash"],
+                "candle": ["sie_server_rust.adapters.candle"],
+            },
+            models={"existing/model": "sie_server.adapters.bert_flash:B"},
+        )
+
+        created, skipped, bundles = registry.add_model_config(
+            {
+                "sie_id": "existing/model",
+                "profiles": {
+                    "candle": {
+                        "adapter_path": "sie_server_rust.adapters.candle:CandleEmbeddingAdapter",
+                        "max_batch_tokens": 8192,
+                    },
+                },
+            }
+        )
+
+        assert created == ["candle"]
+        assert skipped == []
+        assert set(bundles) == {"default", "candle"}
+        assert registry.resolve_bundle("existing/model") == "default"
+        assert registry.resolve_bundle("existing/model:candle") == "candle"
+        variant = registry.get_model_info("existing/model:candle")
+        assert variant is not None
+        assert variant.bundles == ["candle"]
+
 
 class TestGetFullConfig:
     """Covers the in-memory full-config snapshot used by `/v1/configs/export`
@@ -435,6 +468,36 @@ class TestComputeBundleConfigHash:
         h1 = registry.compute_bundle_config_hash("default")
         h2 = registry.compute_bundle_config_hash("default")
         assert h1 == h2
+
+    def test_hash_preserves_falsy_adapter_options(self) -> None:
+        with_false, _ = _setup_registry(self._root / "falsy_false")
+        with_false.add_model_config(
+            {
+                "sie_id": "m1",
+                "profiles": {
+                    "default": {
+                        "adapter_path": "sie_server.adapters.bert_flash:B",
+                        "max_batch_tokens": 1,
+                        "adapter_options": {"runtime": {"normalize": False, "truncate_to": 0}},
+                    }
+                },
+            }
+        )
+        without_options, _ = _setup_registry(self._root / "falsy_empty")
+        without_options.add_model_config(
+            {
+                "sie_id": "m1",
+                "profiles": {
+                    "default": {
+                        "adapter_path": "sie_server.adapters.bert_flash:B",
+                        "max_batch_tokens": 1,
+                        "adapter_options": {"runtime": {}},
+                    }
+                },
+            }
+        )
+
+        assert with_false.compute_bundle_config_hash("default") != without_options.compute_bundle_config_hash("default")
 
     def test_hash_scoped_to_bundle(self) -> None:
         registry, _ = _setup_registry(

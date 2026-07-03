@@ -872,6 +872,43 @@ def parse_encode_results(items: list[dict[str, Any]]) -> list[EncodeResult]:
     return results
 
 
+def validate_encode_result_count(results: list[EncodeResult], expected: int, model: str) -> None:
+    """Guard the encode contract: exactly one result per input item.
+
+    Encode is positional — callers rely on a 1:1 input↔output correspondence:
+    ``encode()`` returns ``results[0]`` for a single-item request, and batch
+    callers (e.g. the eval harness ``SIEEncoderWrapper``) reassemble embeddings
+    by index. The contract can break with an HTTP 200 whose ``items`` list is
+    *shorter* than the request: the gateway returns mixed-success batches as
+    ``200`` carrying only the successful items (a per-item server-side failure —
+    e.g. an input exceeding the model's ``max_sequence_length`` — is dropped from
+    the body, not surfaced as an error envelope). Without this check, that short
+    list flows into a positional access and raises a context-free
+    ``IndexError: list index out of range`` deep in a caller (issue #1526).
+
+    Raising a typed, actionable :class:`ServerError` here keeps the failure
+    legible — it names the model and the expected vs. returned counts instead of
+    a bare ``IndexError``. A common trigger is an input that exceeds the model's
+    ``max_sequence_length``.
+
+    Args:
+        results: Parsed encode results from the server response.
+        expected: Number of input items in the request.
+        model: Model name, for the error message.
+
+    Raises:
+        ServerError: If ``len(results) != expected``.
+    """
+    if len(results) != expected:
+        msg = (
+            f"Encode response desync for model {model!r}: server returned "
+            f"{len(results)} embedding(s) for {expected} input item(s); expected "
+            f"exactly one per input. An input may have failed server-side "
+            f"(e.g. exceeding the model's max_sequence_length) and been dropped from the batch."
+        )
+        raise ServerError(msg, code="ENCODE_RESULT_COUNT_MISMATCH")
+
+
 def parse_score_result(data: dict[str, Any]) -> ScoreResult:
     """Parse score response into ScoreResult TypedDict."""
     result: ScoreResult = {

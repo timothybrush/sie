@@ -18,10 +18,22 @@ profiles:
   default:
     max_batch_tokens: 16384
     compute_precision: bfloat16
-    adapter_path: sie_server.adapters.qwen2_flash:Qwen2FlashAdapter
+    # gte-Qwen2 is a decoder converted to BIDIRECTIONAL attention (config
+    # is_causal=false) with last-token pooling, served via its custom
+    # trust_remote_code modeling. The qwen2_flash adapter reimplements the
+    # forward with flash attention and cannot reproduce that recipe, collapsing
+    # retrieval to near-random (#1593). Use the sentence_transformer adapter,
+    # which runs the model's own forward + pooling (the official recipe).
+    adapter_path: sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter
     adapter_options:
       loadtime:
-        uses_legacy_transformers_cache: true
+        trust_remote_code: true
+        # gte-Qwen2's custom modeling uses the legacy (<4.54) transformers cache
+        # API (DynamicCache.get_usable_length), removed in the bundle's newer
+        # transformers. Disabling the KV cache skips that path (embeddings need
+        # no cache); mirrors the old uses_legacy_transformers_cache workaround.
+        config_kwargs:
+          use_cache: false
       runtime:
         pooling: last
         normalize: true

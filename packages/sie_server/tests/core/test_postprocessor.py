@@ -304,6 +304,109 @@ class TestMuveraPostprocessor:
         np.testing.assert_array_almost_equal(result_2d[1], [5.0, 6.0, 7.0, 8.0])
 
 
+class TestMuveraSameDimCountSketchGuard:
+    """Tests for the #1493 same-or-larger Count-Sketch guard.
+
+    A Count-Sketch is only ever a reduction; when ``final_projection_dim >=
+    intermediate_dim`` it is destructive (collapsed @muvera nDCG@10 to ~0.05).
+    The guard skips it and returns the unprojected intermediate FDE.
+    """
+
+    def test_guard_skips_same_dim_count_sketch(self) -> None:
+        """Same-dim count-sketch is skipped; target_dim == intermediate_dim."""
+        # The old buggy answerai config: reps=20, proj=8, token_dim=96 ->
+        # intermediate = 20 * 64 * 8 = 10240 == final_projection_dim.
+        config = MuveraConfig(
+            num_repetitions=20,
+            num_simhash_projections=6,
+            projection_dim=8,
+            final_projection_dim=10240,
+            seed=42,
+        )
+        pp = MuveraPostprocessor(token_dim=96, config=config)
+        assert config.intermediate_dim(token_dim=96) == 10240
+        assert pp.target_dim == 10240
+        assert pp._final_dim is None  # sketch skipped
+
+        # Equivalence: a no-sketch postprocessor (final=None) must produce the
+        # bit-identical FDE, proving Step 6 was skipped for the guarded config.
+        no_sketch_config = MuveraConfig(
+            num_repetitions=20,
+            num_simhash_projections=6,
+            projection_dim=8,
+            final_projection_dim=None,
+            seed=42,
+        )
+        no_sketch_pp = MuveraPostprocessor(token_dim=96, config=no_sketch_config)
+        assert no_sketch_pp.target_dim == 10240
+
+        rng = np.random.default_rng(42)
+        multivector = [rng.standard_normal((12, 96)).astype(np.float32)]
+
+        guarded = EncodeOutput(multivector=[mv.copy() for mv in multivector], batch_size=1)
+        unsketched = EncodeOutput(multivector=[mv.copy() for mv in multivector], batch_size=1)
+        pp.transform(guarded, is_query=False)
+        no_sketch_pp.transform(unsketched, is_query=False)
+
+        np.testing.assert_array_equal(guarded.dense, unsketched.dense)
+
+    def test_genuine_reduction_still_applies_count_sketch(self) -> None:
+        """A real reduction (final < intermediate) keeps the count-sketch."""
+        # reps=20, proj=8, token_dim=128 -> intermediate = 20 * 64 * 8 = 10240.
+        config = MuveraConfig(
+            num_repetitions=20,
+            num_simhash_projections=6,
+            projection_dim=8,
+            final_projection_dim=4096,
+            seed=42,
+        )
+        pp = MuveraPostprocessor(token_dim=128, config=config)
+        assert config.intermediate_dim(token_dim=128) == 10240
+        assert pp.target_dim == 4096
+        assert pp._final_dim == 4096  # sketch applied
+
+        multivector = [np.random.default_rng(7).standard_normal((10, 128)).astype(np.float32)]
+        output = EncodeOutput(multivector=multivector, batch_size=1)
+        pp.transform(output, is_query=False)
+        assert output.dense is not None
+        assert output.dense.shape == (1, 4096)
+
+    def test_separability_recovered_when_sketch_skipped(self) -> None:
+        """End-to-end sanity check: the guarded FDE ranks a near-duplicate doc
+        above an unrelated doc for the query.
+
+        This is a sanity check, not the regression guard. The load-bearing
+        proof that the same-dim sketch is skipped is the bit-exact equivalence
+        assertion in ``test_guard_skips_same_dim_count_sketch`` (which fails
+        pre-fix). The destructive sketch's damage shows up at corpus scale
+        (near-tied scores across thousands of docs), not on a single pair.
+        """
+        config = MuveraConfig(
+            num_repetitions=20,
+            num_simhash_projections=6,
+            projection_dim=8,
+            final_projection_dim=10240,  # same-dim -> guarded (skipped)
+            seed=42,
+        )
+        pp = MuveraPostprocessor(token_dim=96, config=config)
+
+        rng = np.random.default_rng(42)
+        query_tokens = rng.standard_normal((12, 96)).astype(np.float32)
+        dup_tokens = (query_tokens + rng.standard_normal((12, 96)).astype(np.float32) * 0.01).astype(np.float32)
+        unrelated_tokens = rng.standard_normal((20, 96)).astype(np.float32)
+
+        q_out = EncodeOutput(multivector=[query_tokens], batch_size=1)
+        dup_out = EncodeOutput(multivector=[dup_tokens], batch_size=1)
+        unrelated_out = EncodeOutput(multivector=[unrelated_tokens], batch_size=1)
+        pp.transform(q_out, is_query=True)
+        pp.transform(dup_out, is_query=False)
+        pp.transform(unrelated_out, is_query=False)
+
+        dup_score = float(q_out.dense[0] @ dup_out.dense[0])
+        unrelated_score = float(q_out.dense[0] @ unrelated_out.dense[0])
+        assert dup_score > unrelated_score
+
+
 class TestMuveraFDEProperties:
     """Tests for mathematical properties of MUVERA FDE."""
 
@@ -386,3 +489,80 @@ class TestMuveraFDEProperties:
         corr, _ = spearmanr(maxsim_scores, fde_scores)
         # MUVERA should preserve ranking reasonably well
         assert corr > 0.5, f"Expected positive correlation, got {corr}"
+
+
+class TestMuveraCenterTokens:
+    """Tests for the #1528 ``center_tokens`` fix.
+
+    A dominant shared DC component across a multivector's tokens makes SimHash
+    bucket them all into the same partitions, so the FDEs of different docs come
+    out near-identical (collapsed ranking) even though MaxSim stays healthy.
+    Subtracting the per-multivector mean token before partitioning removes the DC
+    component and partitions on the discriminative residual.
+    """
+
+    def test_default_is_off(self) -> None:
+        """center_tokens defaults False — existing configs/floors are unaffected."""
+        assert MuveraConfig().center_tokens is False
+
+    def test_flag_changes_fde_for_dc_heavy_multivector(self) -> None:
+        """For a DC-dominated multivector the centered FDE differs from uncentered."""
+        common = {"num_repetitions": 8, "projection_dim": None, "final_projection_dim": None, "seed": 42}
+        pp_off = MuveraPostprocessor(token_dim=16, config=MuveraConfig(**common, center_tokens=False))
+        pp_on = MuveraPostprocessor(token_dim=16, config=MuveraConfig(**common, center_tokens=True))
+
+        rng = np.random.default_rng(0)
+        dc = rng.standard_normal(16).astype(np.float32)
+        dc /= np.linalg.norm(dc)
+        mv = (3.0 * dc + 0.3 * rng.standard_normal((10, 16))).astype(np.float32)
+
+        off = EncodeOutput(multivector=[mv.copy()], batch_size=1)
+        on = EncodeOutput(multivector=[mv.copy()], batch_size=1)
+        pp_off.transform(off, is_query=False)
+        pp_on.transform(on, is_query=False)
+        assert not np.allclose(off.dense, on.dense)
+
+    def test_centering_separates_dc_dominated_docs(self) -> None:
+        """Load-bearing: two docs sharing a dominant DC direction but differing in
+        a small residual have near-tied FDEs without centering; centering pulls
+        their FDEs apart (lower pairwise cosine = separable ranking).
+        """
+        common = {
+            "num_repetitions": 20,
+            "num_simhash_projections": 6,
+            "projection_dim": None,
+            "final_projection_dim": None,
+            "seed": 42,
+        }
+        pp_off = MuveraPostprocessor(token_dim=32, config=MuveraConfig(**common, center_tokens=False))
+        pp_on = MuveraPostprocessor(token_dim=32, config=MuveraConfig(**common, center_tokens=True))
+
+        rng = np.random.default_rng(1)
+        dc = rng.standard_normal(32).astype(np.float32)
+        dc /= np.linalg.norm(dc)
+
+        def dc_doc(seed: int) -> np.ndarray:
+            # A dominant shared DC direction (15x) plus a small per-doc residual,
+            # then unit-normalized as the adapter does. The DC dominance is what
+            # tips SimHash into collapse (mirrors answerai's ~0.93 DC on real data).
+            r = np.random.default_rng(seed)
+            tokens = 15.0 * dc + 0.2 * r.standard_normal((12, 32)).astype(np.float32)
+            norms = np.linalg.norm(tokens, axis=1, keepdims=True)
+            return (tokens / norms).astype(np.float32)
+
+        doc_a, doc_b = dc_doc(11), dc_doc(22)
+
+        def fde_cos(pp: MuveraPostprocessor) -> float:
+            oa = EncodeOutput(multivector=[doc_a.copy()], batch_size=1)
+            ob = EncodeOutput(multivector=[doc_b.copy()], batch_size=1)
+            pp.transform(oa, is_query=False)
+            pp.transform(ob, is_query=False)
+            a, b = oa.dense[0], ob.dense[0]
+            return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+        cos_off = fde_cos(pp_off)
+        cos_on = fde_cos(pp_on)
+        # Without centering the DC component dominates -> near-tied FDEs.
+        assert cos_off > 0.85
+        # Centering removes it -> the two docs become clearly separable.
+        assert cos_on < cos_off - 0.2

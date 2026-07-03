@@ -232,6 +232,8 @@ class WorkerCapabilitiesRequest(msgspec.Struct):
 class WorkerCapabilitiesResponse(msgspec.Struct):
     has_generation_models: bool = False
     generation_models: list[str] = msgspec.field(default_factory=list)
+    supported_models: list[str] = msgspec.field(default_factory=list)
+    loaded_models: list[str] = msgspec.field(default_factory=list)
 
 
 class SignalGenerateCancelRequest(msgspec.Struct):
@@ -474,7 +476,7 @@ class ItemOutcome(msgspec.Struct):
     disposition: Disposition
     nak_delay_ms: int | None = None
     # Opaque msgpack bytes (what the SDK expects as WorkResult.result_msgpack).
-    # The executor produces this using the same path as the current pull loop.
+    # The executor produces this before handing settlement back to the sidecar.
     result_msgpack: bytes | None = None
     error: str | None = None
     error_code: str | None = None
@@ -529,6 +531,12 @@ class RunBatchItem(msgspec.Struct):
     encode: EncodeBatchItem | None = None
     score: ScoreBatchItem | None = None
     extract: ExtractBatchItem | None = None
+    # W3C trace context copied off the originating WorkItem by the Rust
+    # scheduler so the non-streaming worker loop can re-extract the
+    # gateway span and attach ``worker.run_batch`` as its child.
+    # ``None`` when the gateway didn't propagate a trace.
+    traceparent: str | None = None
+    tracestate: str | None = None
 
 
 class RunBatchRequest(msgspec.Struct):

@@ -526,6 +526,52 @@ app.kubernetes.io/component: mcp-edge
 {{- end }}
 
 {{/*
+Rust Candle worker image tag.
+
+Args (dict): root, poolName, pool, machineProfile.
+Returns the tag only. The caller prepends workers.common.rust.image.repository.
+*/}}
+{{- define "sie-cluster.rustWorker.imageTag" -}}
+{{- $root := .root -}}
+{{- $poolName := .poolName -}}
+{{- $pool := .pool -}}
+{{- $machineProfile := .machineProfile -}}
+{{- $rustImage := $root.Values.workers.common.rust.image -}}
+{{- $fullTag := default "" $rustImage.fullTag -}}
+{{- if $fullTag -}}
+{{- $fullTag -}}
+{{- else -}}
+{{- $tagBase := default $root.Chart.AppVersion $rustImage.tag -}}
+{{- $gpu := default dict $pool.gpu -}}
+{{- $gpuCount := int (default 0 $gpu.count) -}}
+{{- if eq $gpuCount 0 -}}
+{{- $tagBase -}}
+{{- else -}}
+{{- $cudaPlatform := default "cuda12" $rustImage.cudaPlatform -}}
+{{- $computeCap := default "" $rustImage.computeCapability -}}
+{{- $capByProfile := default dict $rustImage.computeCapabilityByMachineProfile -}}
+{{- if hasKey $capByProfile $machineProfile -}}
+{{- $computeCap = printf "%v" (index $capByProfile $machineProfile) -}}
+{{- end -}}
+{{- if and $pool.gpuType (hasKey $capByProfile $pool.gpuType) -}}
+{{- $computeCap = printf "%v" (index $capByProfile $pool.gpuType) -}}
+{{- end -}}
+{{- if hasKey $capByProfile $poolName -}}
+{{- $computeCap = printf "%v" (index $capByProfile $poolName) -}}
+{{- end -}}
+{{- $poolCandle := default dict $pool.candle -}}
+{{- if $poolCandle.cudaComputeCap -}}
+{{- $computeCap = printf "%v" $poolCandle.cudaComputeCap -}}
+{{- end -}}
+{{- if not $computeCap -}}
+{{- fail (printf "workers.pools.%s.engine=candle needs a Rust CUDA compute capability. Set workers.common.rust.image.computeCapabilityByMachineProfile[%q], workers.common.rust.image.computeCapability, or workers.pools.%s.candle.cudaComputeCap." $poolName $machineProfile $poolName) -}}
+{{- end -}}
+{{- printf "%s-%s-sm%s" $tagBase $cudaPlatform $computeCap -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 In-cluster URL the edge uses to reach the gateway (SIE_BASE_URL). Overridable
 via mcpEdge.clusterBaseUrl; otherwise the in-namespace gateway Service.
 */}}
@@ -535,6 +581,77 @@ via mcpEdge.clusterBaseUrl; otherwise the in-namespace gateway Service.
 {{- else -}}
 {{- printf "http://%s:%v" (include "sie-cluster.gateway.serviceName" .) .Values.gateway.service.port -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Tracing: effective OTLP endpoint.
+
+When the bundled collector is enabled and no explicit endpoint is set, the
+endpoint defaults to the bundled collector's in-cluster gRPC address. Otherwise,
+bundled Tempo is used when installed. The explicit
+.Values.observability.tracing.endpoint always wins (may be empty).
+
+Caller context: root (.) — the full Helm root context.
+*/}}
+{{- define "sie-cluster.tracing.endpoint" -}}
+{{- if .Values.observability.tracing.endpoint -}}
+{{- .Values.observability.tracing.endpoint -}}
+{{- else if .Values.observability.tracing.collector.install -}}
+{{- printf "http://%s-otel-collector:4317" (include "sie-cluster.fullname" .) -}}
+{{- else if .Values.observability.tracing.tempo.install -}}
+{{- "http://tempo:4317" -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Tracing: effective bundled collector downstream OTLP endpoint.
+
+The collector forwards to an explicit collector exporterEndpoint when set. If
+bundled Tempo is installed and no downstream endpoint is configured, the
+collector forwards to Tempo. Otherwise it returns empty so the collector debug
+exporter is used.
+
+Caller context: root (.) — the full Helm root context.
+*/}}
+{{- define "sie-cluster.tracing.collectorExporterEndpoint" -}}
+{{- if .Values.observability.tracing.collector.exporterEndpoint -}}
+{{- .Values.observability.tracing.collector.exporterEndpoint -}}
+{{- else if .Values.observability.tracing.tempo.install -}}
+{{- "http://tempo:4317" -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Tracing: OTLP exporter env block.
+
+Emits the five OTEL/SIE env vars required to activate distributed tracing on a
+container. Fails fast when tracing is enabled but no endpoint is resolvable.
+
+Args (dict): root — full Helm root context; serviceName — OTEL_SERVICE_NAME value.
+
+Rendered lines are indented by the call site (use nindent in the include call).
+*/}}
+{{- define "sie-cluster.tracing.env" -}}
+{{- $endpoint := include "sie-cluster.tracing.endpoint" .root -}}
+{{- if not $endpoint -}}
+{{- fail "observability.tracing.enabled=true requires observability.tracing.endpoint, observability.tracing.collector.install=true, or observability.tracing.tempo.install=true" -}}
+{{- end -}}
+- name: SIE_TRACING_ENABLED
+  value: "true"
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: {{ $endpoint | quote }}
+- name: OTEL_EXPORTER_OTLP_PROTOCOL
+  value: "grpc"
+- name: OTEL_SERVICE_NAME
+  value: {{ .serviceName | quote }}
+- name: OTEL_TRACES_SAMPLER
+  value: {{ .root.Values.observability.tracing.sampler | quote }}
+- name: OTEL_TRACES_SAMPLER_ARG
+  value: {{ .root.Values.observability.tracing.samplerArg | quote }}
 {{- end }}
 
 {{/*

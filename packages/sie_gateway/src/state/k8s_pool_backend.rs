@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease as K8sLease;
 use k8s_openapi::api::coordination::v1::LeaseSpec;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
+use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::Client;
-use rand::Rng;
+use rand::RngExt as _;
 use tracing::{debug, info, warn};
 
 use crate::types::pool::{Pool, PoolStatus};
@@ -264,8 +264,8 @@ impl K8sPoolBackend {
 
                     // Apply jitter: multiply delay by a random factor in [1 - jitter, 1 + jitter)
                     let jitter_factor = {
-                        let mut rng = rand::thread_rng();
-                        rng.gen_range((1.0 - CAS_JITTER_FRACTION)..(1.0 + CAS_JITTER_FRACTION))
+                        let mut rng = rand::rng();
+                        rng.random_range((1.0 - CAS_JITTER_FRACTION)..(1.0 + CAS_JITTER_FRACTION))
                     };
                     let sleep_ms = delay_ms * jitter_factor;
 
@@ -308,7 +308,7 @@ impl K8sPoolBackend {
     ) -> Result<(), String> {
         let api = self.lease_api();
         let name = Self::lease_name(pool_name);
-        let now = MicroTime(Utc::now());
+        let now = MicroTime(Timestamp::now());
 
         // Preserve the original acquireTime if the Lease already exists
         let acquire_time = match api.get(&name).await {
@@ -350,7 +350,7 @@ impl K8sPoolBackend {
     pub async fn renew_lease(&self, pool_name: &str) -> Result<(), String> {
         let api = self.lease_api();
         let name = Self::lease_name(pool_name);
-        let now = MicroTime(Utc::now());
+        let now = MicroTime(Timestamp::now());
 
         let labels = Self::pool_labels(pool_name);
 
@@ -416,7 +416,7 @@ impl K8sPoolBackend {
             .await
             .map_err(|e| format!("list Leases: {}", e))?;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut expired = Vec::new();
 
         for lease in leases.items {
@@ -450,7 +450,7 @@ impl K8sPoolBackend {
                 None => continue,
             };
 
-            let elapsed = now.signed_duration_since(last_dt).num_seconds();
+            let elapsed = now.as_second() - last_dt.as_second();
             if elapsed > duration_secs {
                 debug!(
                     pool = %pool_name,

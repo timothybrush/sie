@@ -89,6 +89,8 @@ struct ExportSnapshot {
     #[serde(default)]
     bundle_config_hashes: HashMap<String, String>,
     #[serde(default)]
+    bundle_pool_config_hashes: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
     models: Vec<ExportedModel>,
 }
 
@@ -454,6 +456,7 @@ impl BootstrapClient {
                 Ok(count) => {
                     applied = count;
                     registry.install_bundle_config_hashes(snapshot.bundle_config_hashes);
+                    registry.install_bundle_pool_config_hashes(snapshot.bundle_pool_config_hashes);
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to install authoritative config export");
@@ -783,6 +786,7 @@ mod tests {
             "epoch": 42,
             "generated_at": "2026-04-17T00:00:00Z",
             "bundle_config_hashes": {"default": "control-plane-hash"},
+            "bundle_pool_config_hashes": {"default": {"default": "control-plane-pool-hash"}},
             "models": [
                 {
                     "model_id": "test/model",
@@ -810,6 +814,10 @@ mod tests {
         assert_eq!(
             registry.compute_bundle_config_hash("default"),
             "control-plane-hash"
+        );
+        assert_eq!(
+            registry.compute_bundle_config_hash_for_pool("default", "default"),
+            "control-plane-pool-hash"
         );
         assert_eq!(
             registry.get_model_profile_names("test/model"),
@@ -1397,7 +1405,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/configs/bundles/bad-engine"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                "name: bad-engine\npriority: 10\nengine: candle\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+                "name: bad-engine\npriority: 10\nengine: future-engine\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
             ))
             .mount(&server)
             .await;
@@ -1408,7 +1416,7 @@ mod tests {
             BootstrapError::BadStatus { status, body, .. } => {
                 assert_eq!(status, 200);
                 assert!(body.contains("unknown bundle engine"));
-                assert!(body.contains("candle"));
+                assert!(body.contains("future-engine"));
             }
             other => panic!("expected BadStatus, got {:?}", other),
         }

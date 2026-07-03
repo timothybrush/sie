@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from sie_server.config.model import ModelConfig
+from sie_server.core.runtime_options import merge_runtime_options
 from sie_server.types.overflow_policy import VALID_OVERFLOW_POLICIES
 from sie_server.types.responses import ErrorCode
 
@@ -29,10 +30,10 @@ def resolve_runtime_options(
     Raises:
         HTTPException: 400 if profile name is invalid.
     """
-    profile_name = request_options.get("profile") if request_options else None
-
+    # Shared with the cluster queue worker (queue_executor) so both ingress
+    # paths produce the same effective options; see core.runtime_options.
     try:
-        resolved = config.resolve_profile(profile_name or "default")
+        merged = merge_runtime_options(config, request_options)
     except ValueError as e:
         span.set_attribute("error", "invalid_profile")
         raise HTTPException(
@@ -42,13 +43,6 @@ def resolve_runtime_options(
                 "message": str(e),
             },
         ) from e
-
-    # Start with profile runtime options
-    merged = dict(resolved.runtime)
-
-    # Merge request-level overrides (excluding the "profile" key itself)
-    if request_options:
-        merged |= {k: v for k, v in request_options.items() if k != "profile"}
 
     overflow_policy = merged.get("overflow_policy")
     if overflow_policy is not None and overflow_policy not in VALID_OVERFLOW_POLICIES:

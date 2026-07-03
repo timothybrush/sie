@@ -1,24 +1,25 @@
 //! OpenTelemetry tracer-provider setup for the gateway.
 //!
-//! All knobs are read from the standard OTel environment variables
-//! (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`,
-//! `OTEL_TRACES_SAMPLER`, …) — no SIE-specific env vars are
-//! introduced. The W3C [`TraceContextPropagator`] is installed
-//! globally even when no exporter is configured so that inbound
-//! `traceparent` headers still propagate through to the worker via
-//! the JetStream work envelope. Without an exporter the gateway
-//! itself records no spans, but the IDs continue to flow.
+//! The OTLP exporter is enabled only when `SIE_TRACING_ENABLED` is
+//! truthy and an OTLP endpoint is configured via
+//! `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`.
+//! The W3C [`TraceContextPropagator`] is installed globally regardless
+//! of that exporter gate so that inbound `traceparent` headers still
+//! propagate through to the worker via the JetStream work envelope.
+//! Without an exporter the gateway itself records no spans, but the IDs
+//! continue to flow.
 //!
 //! [`TraceContextPropagator`]: opentelemetry_sdk::propagation::TraceContextPropagator
 
 use std::env;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::Tracer;
+use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use opentelemetry_sdk::Resource;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -26,6 +27,15 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 /// Service name used when `OTEL_SERVICE_NAME` is not set.
 const DEFAULT_SERVICE_NAME: &str = "sie-gateway";
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+
+/// Bounded flush deadline (ms) so process exit can't stall on an unreachable collector.
+const TRACING_SHUTDOWN_TIMEOUT_MS: u64 = 3_000;
+
+/// True when the OTLP exporter/provider is installed (spans are recorded).
+pub fn exporter_enabled() -> bool {
+    TRACER_PROVIDER.get().is_some()
+}
 
 /// Initialise OpenTelemetry + tracing-subscriber for the gateway.
 ///
@@ -35,14 +45,14 @@ const DEFAULT_SERVICE_NAME: &str = "sie-gateway";
 ///      `opentelemetry::Context`. **Always runs**, even without
 ///      an exporter — propagation is the load-bearing piece for
 ///      worker-side correlation.
-///   2. If `OTEL_EXPORTER_OTLP_ENDPOINT` (or the trace-specific
-///      `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set, build a
-///      [`opentelemetry_sdk::trace::TracerProvider`] with the OTLP
-///      gRPC exporter, attach a
+///   2. If `SIE_TRACING_ENABLED` is truthy and `OTEL_EXPORTER_OTLP_ENDPOINT`
+///      (or the trace-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is
+///      set, build a [`opentelemetry_sdk::trace::SdkTracerProvider`] with
+///      the OTLP gRPC exporter, attach a
 ///      [`tracing_opentelemetry::OpenTelemetryLayer`] so existing
 ///      `tracing::*` spans become OTel spans, and set the provider
-///      as global. If not set, only the tracing-subscriber fmt
-///      layer is installed (legacy behaviour preserved).
+///      as global. Otherwise, only the tracing-subscriber fmt layer is
+///      installed while the propagator remains active.
 pub fn init_tracing(level: &str, json: bool) {
     // Idempotency guard. The subscriber's ``.init()`` panics on a
     // second call ("a global default trace dispatcher has already
@@ -61,10 +71,12 @@ pub fn init_tracing(level: &str, json: bool) {
     // (which runs the heavy adapter call) can continue the trace.
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let endpoint = env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .or_else(|_| env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
-        .ok()
-        .filter(|s| !s.is_empty());
+    let endpoint = if sie_tracing_enabled() {
+        cleaned_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .or_else(|| cleaned_env("OTEL_EXPORTER_OTLP_ENDPOINT"))
+    } else {
+        None
+    };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level_str = match level.to_lowercase().as_str() {
@@ -117,33 +129,49 @@ pub fn init_tracing(level: &str, json: bool) {
         tracing::info!(endpoint = %ep, "OpenTelemetry tracing initialized");
     } else {
         tracing::debug!(
-            "OTEL_EXPORTER_OTLP_ENDPOINT not set; W3C propagator installed (no exporter)"
+            "SIE_TRACING_ENABLED not truthy or OTLP endpoint not set; W3C propagator installed (no exporter)"
         );
     }
+}
+
+fn tracing_flag_set(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("true") || value == "1" || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn sie_tracing_enabled() -> bool {
+    let raw = env::var("SIE_TRACING_ENABLED").ok();
+    tracing_flag_set(raw.as_deref())
+}
+
+/// Read an env var, trimming surrounding whitespace and treating a
+/// whitespace-only value as absent so it can't shadow a valid fallback.
+fn cleaned_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn init_tracer(endpoint: &str) -> Result<Tracer, String> {
     let service_name =
         env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| DEFAULT_SERVICE_NAME.to_string());
 
-    let provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
-            Resource::new(vec![KeyValue::new("service.name", service_name)]),
-        ))
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
-        .map_err(|e| format!("install OTLP batch pipeline: {e}"))?;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|e| format!("build OTLP span exporter: {e}"))?;
 
+    let provider = SdkTracerProvider::builder()
+        .with_resource(Resource::builder().with_service_name(service_name).build())
+        .with_batch_exporter(exporter)
+        .build();
     let tracer = provider.tracer("sie-gateway");
-    // `install_batch` already sets the provider globally inside the
-    // 0.17 pipeline; ensure the *exact* provider we built is the one
-    // future `global::tracer(...)` calls see (no-op when identical).
-    global::set_tracer_provider(provider);
+    global::set_tracer_provider(provider.clone());
+    let _ = TRACER_PROVIDER.set(provider);
     Ok(tracer)
 }
 
@@ -152,5 +180,31 @@ fn init_tracer(endpoint: &str) -> Result<Tracer, String> {
 /// Called from `main.rs` on the way out so the OTLP exporter has a
 /// chance to drain its batch before the process exits.
 pub fn shutdown_tracing() {
-    global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        let _ = provider.shutdown_with_timeout(Duration::from_millis(TRACING_SHUTDOWN_TIMEOUT_MS));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exporter_enabled, tracing_flag_set};
+
+    #[test]
+    fn tracing_flag_set_accepts_only_positive_truthy_values() {
+        assert!(tracing_flag_set(Some("true")));
+        assert!(tracing_flag_set(Some("1")));
+        assert!(tracing_flag_set(Some("yes")));
+        assert!(tracing_flag_set(Some("TRUE")));
+        assert!(tracing_flag_set(Some(" true ")));
+
+        assert!(!tracing_flag_set(Some("false")));
+        assert!(!tracing_flag_set(Some("")));
+        assert!(!tracing_flag_set(Some("   ")));
+        assert!(!tracing_flag_set(None));
+    }
+
+    #[test]
+    fn exporter_enabled_is_false_before_exporter_init() {
+        assert!(!exporter_enabled());
+    }
 }

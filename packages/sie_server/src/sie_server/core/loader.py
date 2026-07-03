@@ -114,11 +114,16 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
 
     For each model config, non-default profiles become separate model entries
     named '{sie_id}:{profile_name}'. The variant entry is a copy of the base
-    config with the variant profile promoted to 'default'.
+    config with the variant profile promoted to 'default'. If a config omits
+    a default profile, the bare base model id is removed after variant expansion
+    so only explicit profile identities are routable.
     """
     variants: dict[str, ModelConfig] = {}
+    remove_base_names: list[str] = []
 
     for base_name, config in configs.items():
+        if "default" not in config.profiles:
+            remove_base_names.append(base_name)
         for profile_name, profile in config.profiles.items():
             if profile_name == "default":
                 continue
@@ -175,6 +180,9 @@ def _expand_profile_variants(configs: dict[str, ModelConfig]) -> None:
             variant_config._synthetic_profile_variant_source = (base_name, profile_name)
             variants[variant_id] = variant_config
             logger.info("Expanded profile '%s' as variant: %s", profile_name, variant_id)
+
+    for base_name in remove_base_names:
+        configs.pop(base_name, None)
 
     configs.update(variants)
 
@@ -316,8 +324,26 @@ def load_adapter(
         # Custom adapter: load from file path
         adapter_class = _import_custom_adapter(Path(module_path), class_name)
 
-    # Instantiate with config values
-    adapter_kwargs = _build_adapter_kwargs(config, default_compute_precision)
+    # Instantiate with config values. The engine-level default compute precision
+    # is fp32 off-CUDA (numerically safe on CPU/MPS for models we have not verified
+    # at lower precision); a model profile's explicit compute_precision still wins
+    # (e.g. curated Mac models opt into fp16 on MPS). On CUDA the engine default
+    # (typically fp16) is used unchanged. See adapters' dtype resolution for the
+    # matching honor-explicit-precision logic.
+    effective_default_precision: ComputePrecision = (
+        default_compute_precision if device.startswith("cuda") else "float32"
+    )
+    adapter_kwargs = _build_adapter_kwargs(config, effective_default_precision)
+
+    # MPS bfloat16 support is incomplete in torch and can HANG model load (verified:
+    # bge-m3 bf16 load wedges at ~1% CPU on Apple Silicon). fp16 is the MPS-verified
+    # path (parity 1.0 vs CPU-fp32 in benchmarks), so coerce any resolved bf16 -> fp16
+    # on MPS for every adapter. CUDA/CPU are untouched.
+    if device == "mps" and adapter_kwargs.get("compute_precision") == "bfloat16":
+        logger.info(
+            "Coercing compute_precision bfloat16 -> float16 for '%s' on MPS (MPS bf16 is unreliable)", config.name
+        )
+        adapter_kwargs["compute_precision"] = "float16"
 
     # Apply engine-level attention backend only when adapter supports it
     if attention_backend != "auto" and "attn_implementation" not in adapter_kwargs:

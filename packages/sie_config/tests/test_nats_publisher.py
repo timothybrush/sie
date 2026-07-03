@@ -133,10 +133,8 @@ class TestNatsPublisherPublish:
 
     @pytest.mark.asyncio
     async def test_publish_payload_matches_rust_contract(self) -> None:
-        """Each publish carries the full ConfigNotification shape expected by
-        ``sie_gateway/src/nats/manager.rs::ConfigNotification``: router_id,
-        bundle_id, epoch, bundle_config_hash, model_id, profiles_added,
-        model_config, affected_bundles.
+        """Each publish carries the ConfigNotification superset consumed by
+        the gateway and worker sidecars.
         """
         publisher = NatsPublisher()
         mock_nc = AsyncMock()
@@ -156,10 +154,12 @@ class TestNatsPublisherPublish:
             "bundle_id",
             "epoch",
             "bundle_config_hash",
+            "bundle_pool_config_hashes",
             "model_id",
             "profiles_added",
             "model_config",
             "affected_bundles",
+            "pool",
         }
         for call in mock_nc.publish.call_args_list:
             payload = json.loads(call.args[1].decode())
@@ -170,6 +170,8 @@ class TestNatsPublisherPublish:
             assert payload["router_id"] == publisher.router_id
             assert payload["model_config"] == "full yaml content"
             assert payload["affected_bundles"] == ["default", "sglang"]
+            assert payload["pool"] == "default"
+            assert payload["bundle_pool_config_hashes"] == {}
 
     @pytest.mark.asyncio
     async def test_publish_bundle_subject_carries_its_own_hash(self) -> None:
@@ -196,6 +198,34 @@ class TestNatsPublisherPublish:
         assert bundle_payloads["sie.config.models.default"]["bundle_config_hash"] == "hash1"
         assert bundle_payloads["sie.config.models.sglang"]["bundle_id"] == "sglang"
         assert bundle_payloads["sie.config.models.sglang"]["bundle_config_hash"] == "hash2"
+
+    @pytest.mark.asyncio
+    async def test_publish_payload_carries_pool_hashes_for_workers(self) -> None:
+        publisher = NatsPublisher()
+        mock_nc = AsyncMock()
+        mock_nc.is_connected = True
+        publisher._nc = mock_nc
+        publisher._connected = True
+        await publisher.publish_config_notification(
+            model_id="org/model",
+            profiles_added=["candle"],
+            affected_bundles=["candle"],
+            bundle_config_hashes={"candle": "global-hash"},
+            epoch=8,
+            model_config_yaml="yaml",
+            model_pool="Customer-A",
+            bundle_pool_config_hashes={
+                "candle": {
+                    "default": "default-hash",
+                    "customer-a": "tenant-hash",
+                }
+            },
+        )
+
+        payload = json.loads(mock_nc.publish.call_args_list[0].args[1].decode())
+        assert payload["pool"] == "customer-a"
+        assert payload["bundle_config_hash"] == "global-hash"
+        assert payload["bundle_pool_config_hashes"]["candle"]["customer-a"] == "tenant-hash"
 
     @pytest.mark.asyncio
     async def test_publish_all_payload_matches_paired_bundle_payload(self) -> None:

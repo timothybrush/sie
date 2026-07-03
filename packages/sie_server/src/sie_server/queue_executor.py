@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import msgpack
+import msgspec
 import yaml
 
 from sie_server.api.ws import compute_bundle_config_hash_cached
@@ -14,9 +16,11 @@ from sie_server.config.model import ModelConfig
 from sie_server.core.oom import is_oom_error
 from sie_server.core.prepared import ExtractPreparedItem
 from sie_server.core.registry import ModelRegistry
+from sie_server.core.runtime_options import merge_runtime_options
 from sie_server.core.score_cost import build_score_prepared_items
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.extract import ExtractHandler
+from sie_server.core.worker.model_worker import PreformedExtractRequest, PreformedScoreRequest
 from sie_server.ipc_types import (
     ApplyModelConfigRequest,
     ApplyModelConfigResponse,
@@ -41,10 +45,26 @@ from sie_server.ipc_types import (
     SparseOutput,
 )
 from sie_server.observability.metrics import record_ipc_batch_shape
-from sie_server.types.inputs import InvalidMediaError, Item
+from sie_server.types.inputs import InvalidMediaError, Item, decode_item
 from sie_server.types.responses import ErrorCode
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Queue-path wire error code
+# ---------------------------------------------------------------------------
+#
+# The queue / sidecar path publishes ``ItemOutcome.error_code`` as a lowercase
+# wire string the Rust gateway consumes. The gateway maps any worker code
+# outside its stable set to this same ``inference_error`` discriminator (see
+# ``stable_code`` in ``handlers/proxy.rs``), so this is the sidecar↔gateway
+# contract value — NOT the uppercase ``ErrorCode.INFERENCE_ERROR`` enum, which
+# is the *in-process HTTP* surface's generic-failure code. Keep it lowercase
+# and keep it here as the single definition every queue-path emitter shares;
+# do not "align" it to the HTTP enum or the gateway will fall through to its
+# generic arm with a mismatched code.
+_INFERENCE_ERROR_CODE: Final[str] = "inference_error"
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +385,13 @@ def _maybe_multivector_raw_output(
 # Wire formatting helpers
 # ---------------------------------------------------------------------------
 
-_NP_DTYPE_MAP = {"float32": "float32", "float16": "float16", "int8": "int8", "uint8": "binary"}
+# NOTE: uint8 maps to "uint8", NOT "binary". Bit-packed binary is detected by
+# the explicit ``is_binary`` shape-check (``arr.shape < dim``) at each call site,
+# which is the SOLE emitter of "binary"; a linear uint8 quantization keeps full
+# dimensionality so it must stay labelled "uint8" to match the HTTP path
+# (api/encode.py::_format_dense -> np_to_dtype). Mapping uint8->"binary" here
+# made the queue path disagree with HTTP for the same request. See #1603.
+_NP_DTYPE_MAP = {"float32": "float32", "float16": "float16", "int8": "int8", "uint8": "uint8"}
 
 
 def _wrap_encode_output(output: dict, config: Any) -> dict:
@@ -444,18 +470,6 @@ def _wrap_encode_output(output: dict, config: Any) -> dict:
         }
 
     return wrapped
-
-
-def _dict_to_item(d: dict) -> Item:
-    """Convert an SDK wire-format dict into a server-side Item struct.
-
-    The SDK ships ``content`` while the server expects ``text``; remap and
-    drop any unknown keys so the Item constructor does not raise.
-    """
-    if "content" in d and "text" not in d:
-        d = {**d, "text": d.pop("content")}
-    known = set(Item.__struct_fields__)
-    return Item(**{k: v for k, v in d.items() if k in known})
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +769,40 @@ class QueueExecutor:
             return budget
         return None
 
+    @staticmethod
+    def _options_key(options: dict[str, Any] | None) -> bytes:
+        return msgpack.packb(options, use_bin_type=True) if options else b""
+
+    @classmethod
+    def _score_sub_group_sizes(cls, items: list[ScoreBatchItem]) -> list[int]:
+        groups: dict[tuple[Any, ...], int] = {}
+        for bi in items:
+            key = (bi.instruction, cls._options_key(bi.options))
+            groups[key] = groups.get(key, 0) + 1
+        return list(groups.values())
+
+    @staticmethod
+    def _extract_lora(options: dict[str, Any] | None) -> str | None:
+        if not options:
+            return None
+        raw = options.get("lora")
+        if isinstance(raw, str) and raw:
+            return raw
+        return None
+
+    @classmethod
+    def _extract_sub_group_sizes(cls, items: list[ExtractBatchItem]) -> list[int]:
+        groups: dict[tuple[Any, ...], int] = {}
+        for bi in items:
+            key = (
+                cls._extract_lora(bi.options),
+                tuple(bi.labels) if bi.labels else None,
+                bi.instruction,
+                cls._options_key(bi.options),
+            )
+            groups[key] = groups.get(key, 0) + 1
+        return list(groups.values())
+
     # -- Encode ------------------------------------------------------------
 
     async def process_encode_batch(self, req: ProcessEncodeBatchRequest) -> BatchOutcome:
@@ -814,7 +862,21 @@ class QueueExecutor:
             (output_types_t, instruction, is_query, options_key, _profile_id, _bundle_hash) = group_key
             output_types = list(output_types_t)
             options = msgpack.unpackb(options_key, raw=False) if options_key else {}
-            server_items = [_dict_to_item(bi.item) for bi in group]
+            # Validate each item against the typed Item contract at the seam
+            # (parity with the HTTP path). A per-item decode failure is isolated
+            # as an INVALID_INPUT outcome so one malformed item cannot fail its
+            # whole sub-group. See decode_item / issue #1537.
+            good_group: list[EncodeBatchItem] = []
+            server_items: list[Item] = []
+            for bi in group:
+                try:
+                    server_items.append(decode_item(bi.item))
+                except (msgspec.ValidationError, InvalidMediaError) as decode_exc:
+                    outcomes[bi.work_item_id] = _inference_exception_outcome(bi, decode_exc)
+                    continue
+                good_group.append(bi)
+            if not good_group:
+                continue
             # Collect worker-sidecar prepared_tokens aligned with
             # ``server_items``. ``None`` per item is expected for the
             # v1 safety-rule skips (`is_query`, `instruction`,
@@ -826,7 +888,7 @@ class QueueExecutor:
             # for the hybrid policy. Whole-batch fallback only fires
             # on correctness-critical drift (tokenizer_id mismatch,
             # malformed wire shape).
-            prepared_tokens_per_item = [bi.prepared_tokens for bi in group]
+            prepared_tokens_per_item = [bi.prepared_tokens for bi in good_group]
             if not any(pt is not None for pt in prepared_tokens_per_item):
                 # Not a single fast-path candidate — pass None so the
                 # pipeline doesn't even bother looking up the
@@ -834,6 +896,16 @@ class QueueExecutor:
                 prepared_tokens_per_item = None
 
             try:
+                # The Rust gateway publishes only the raw SDK options to the
+                # queue, so — unlike the single-server HTTP path (api.encode) —
+                # profile ``adapter_options.runtime`` defaults (query_template,
+                # default_instruction, pooling, normalize, …) are not yet merged
+                # in. Merge them here so the adapter sees the same effective
+                # options regardless of ingress; without this, instruction-tuned
+                # embedders silently lose their query template on the cluster
+                # path (#1489). An unknown profile name raises ValueError, which
+                # the surrounding except turns into per-item failures.
+                options = merge_runtime_options(config, options)
                 formatted_outputs, timing = await EncodePipeline.run_encode(
                     registry=self._registry,
                     model=model_id,
@@ -844,9 +916,10 @@ class QueueExecutor:
                     is_query=is_query,
                     options=options,
                     prepared_tokens_per_item=prepared_tokens_per_item,
+                    preformed_batch=True,
                 )
 
-                if len(formatted_outputs) != len(group):
+                if len(formatted_outputs) != len(good_group):
                     # Output/input length mismatch means the adapter
                     # silently dropped items. Surface as a per-item error
                     # rather than publishing empty success results.
@@ -854,16 +927,16 @@ class QueueExecutor:
                         "Encode sub-batch for %s returned %d outputs for %d items — emitting per-item errors",
                         model_id,
                         len(formatted_outputs),
-                        len(group),
+                        len(good_group),
                     )
-                    for bi in group:
+                    for bi in good_group:
                         outcomes[bi.work_item_id] = _error_outcome(
                             bi,
-                            "inference_error",
+                            _INFERENCE_ERROR_CODE,
                             "adapter returned fewer outputs than items",
                         )
                 else:
-                    for idx, bi in enumerate(group):
+                    for idx, bi in enumerate(good_group):
                         raw_output: RawOutput | None = None
                         result_msgpack: bytes | None = None
                         # Dispatch by the single declared output type —
@@ -907,7 +980,7 @@ class QueueExecutor:
                         )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Encode sub-batch failed for model %s: %s", model_id, e)
-                for bi in group:
+                for bi in good_group:
                     outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
 
         return BatchOutcome(outcomes=[outcomes[bi.work_item_id] for bi in items])
@@ -915,157 +988,216 @@ class QueueExecutor:
     # -- Score -------------------------------------------------------------
 
     async def process_score_batch(self, req: ProcessScoreBatchRequest) -> BatchOutcome:
-        """Run a score batch — items are submitted concurrently so BatchFormer
-        can cross-batch them inside ``ModelWorker`` (same as the legacy path).
+        """Run score work items from the sidecar IPC path.
+
+        The worker-sidecar owns queue batching and scheduling. Python prepares
+        each score work item and executes it through ModelWorker's pre-formed
+        batch entrypoint so it does not re-enter the Python BatchFormer.
         """
-        import asyncio  # noqa: PLC0415
-
         model_id = req.model_id
+        if not req.items:
+            return BatchOutcome(outcomes=[])
 
-        # Score dispatches one task per IPC item; actual GPU batching
-        # happens below in BatchFormer. We still report
-        # sub_groups == items so the fragmentation dashboard panel
-        # treats all three endpoints uniformly (any deviation then
-        # becomes a signal that BatchFormer merged less than expected
-        # — surfaced via sie_gpu_batch_items in model_worker.py).
         record_ipc_batch_shape(
             model=model_id,
             endpoint="score",
             total_items=len(req.items),
-            sub_group_sizes=[1] * len(req.items),
+            sub_group_sizes=self._score_sub_group_sizes(req.items),
         )
 
-        tasks = [self._process_single_score(model_id, bi) for bi in req.items]
-        outcomes = await asyncio.gather(*tasks)
-        return BatchOutcome(outcomes=list(outcomes))
-
-    async def _process_single_score(self, model_id: str, bi: ScoreBatchItem) -> ItemOutcome:
         try:
             worker = await self._registry.start_worker(model_id)
         except (KeyError, RuntimeError) as e:
             logger.info("Model %s not available for score: %s — NAKing", model_id, e)
-            return _nak_outcome(bi)
+            return BatchOutcome(outcomes=[_nak_outcome(bi) for bi in req.items])
 
-        query_item = _dict_to_item(bi.query_item)
-        score_items = [_dict_to_item(it) for it in bi.score_items]
+        outcomes: dict[str, ItemOutcome] = {}
+        requests: list[PreformedScoreRequest] = []
+        request_context: list[tuple[ScoreBatchItem, list[Item]]] = []
 
-        try:
-            timing = RequestTiming()
+        for bi in req.items:
+            try:
+                query_item = decode_item(bi.query_item)
+                score_items = [decode_item(it) for it in bi.score_items]
 
-            timing.start_tokenization()
-            prepared_items = build_score_prepared_items(query_item, score_items)
-            timing.end_tokenization()
+                timing = RequestTiming()
+                timing.start_tokenization()
+                prepared_items = build_score_prepared_items(query_item, score_items)
+                timing.end_tokenization()
 
-            future = await worker.submit_score(
-                prepared_items=prepared_items,
-                query=query_item,
-                items=score_items,
-                instruction=bi.instruction,
-                options=bi.options or {},
-                timing=timing,
-            )
-            worker_result = await future
+                requests.append(
+                    PreformedScoreRequest(
+                        prepared_items=prepared_items,
+                        query=query_item,
+                        items=score_items,
+                        instruction=bi.instruction,
+                        options=bi.options or {},
+                        request_id=bi.request_id,
+                        timing=timing,
+                    )
+                )
+                request_context.append((bi, score_items))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Score preparation failed for %s: %s", bi.work_item_id, e)
+                outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
 
-            score_output = cast("Any", worker_result.output)
-            raw_scores = [float(score_output.scores[i]) for i in range(score_output.batch_size)]
-            item_ids: list[str] = [
-                (sid if (sid := score_items[i].id) is not None else f"item-{i}") for i in range(score_output.batch_size)
-            ]
+        if requests:
+            try:
+                futures = await worker.submit_score_preformed_batch(requests)
+                results = await asyncio.gather(*futures, return_exceptions=True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Score batch failed for model %s: %s", model_id, e)
+                for bi, _score_items in request_context:
+                    outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
+            else:
+                for (bi, score_items), result in zip(request_context, results, strict=True):
+                    if isinstance(result, BaseException):
+                        logger.warning("Score failed for %s: %s", bi.work_item_id, result)
+                        outcomes[bi.work_item_id] = _inference_exception_outcome(bi, result)
+                    else:
+                        outcomes[bi.work_item_id] = _score_success_outcome(
+                            bi,
+                            score_items,
+                            result,
+                        )
 
-            # Score output is always Rust-frameable: the Python and Rust
-            # sort/rank paths produce byte-identical results (see the
-            # parity test in ``test_queue_executor_stage1d.py``).
-            # Rust-side framing is unconditional for score; the Python-framed fallback
-            # sort+pack lives only as a doc-comment record of what
-            # ``sie_server_sidecar::output::build_score_payload`` mirrors.
-            raw_output: RawOutput | None = RawOutput(
-                score=ScoreOutputRaw(scores=raw_scores, item_ids=item_ids),
-            )
-            result_msgpack: bytes | None = None
-
-            return ItemOutcome(
-                work_item_id=bi.work_item_id,
-                request_id=bi.request_id,
-                item_index=bi.item_index,
-                disposition="publish_and_ack",
-                result_msgpack=result_msgpack,
-                raw_output=raw_output,
-                inference_ms=timing.inference_ms,
-                tokenization_ms=timing.tokenization_ms if timing.tokenization_ms > 0 else None,
-                postprocessing_ms=timing.postprocessing_ms if timing.postprocessing_ms > 0 else None,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Score failed for %s: %s", bi.work_item_id, e)
-            return _inference_exception_outcome(bi, e)
+        return BatchOutcome(outcomes=[outcomes[bi.work_item_id] for bi in req.items])
 
     # -- Extract -----------------------------------------------------------
 
     async def process_extract_batch(self, req: ProcessExtractBatchRequest) -> BatchOutcome:
-        """Run an extract batch — items submitted concurrently so BatchFormer can batch them."""
-        import asyncio  # noqa: PLC0415
-
+        """Run extract work items from the sidecar IPC path."""
         model_id = req.model_id
+        if not req.items:
+            return BatchOutcome(outcomes=[])
 
         record_ipc_batch_shape(
             model=model_id,
             endpoint="extract",
             total_items=len(req.items),
-            sub_group_sizes=[1] * len(req.items),
+            sub_group_sizes=self._extract_sub_group_sizes(req.items),
         )
 
-        tasks = [self._process_single_extract(model_id, bi) for bi in req.items]
-        outcomes = await asyncio.gather(*tasks)
-        return BatchOutcome(outcomes=list(outcomes))
-
-    async def _process_single_extract(self, model_id: str, bi: ExtractBatchItem) -> ItemOutcome:
         try:
             worker = await self._registry.start_worker(model_id)
         except (KeyError, RuntimeError) as e:
             logger.info("Model %s not available for extract: %s — NAKing", model_id, e)
-            return _nak_outcome(bi)
+            return BatchOutcome(outcomes=[_nak_outcome(bi) for bi in req.items])
 
-        server_item = _dict_to_item(bi.item)
+        outcomes: dict[str, ItemOutcome] = {}
+        grouped_requests: dict[str | None, list[PreformedExtractRequest]] = {}
+        grouped_context: dict[str | None, list[ExtractBatchItem]] = {}
 
-        try:
-            timing = RequestTiming()
-            timing.start_tokenization()
-            char_count = len(server_item.text) if server_item.text else 0
-            prepared_items = [ExtractPreparedItem(cost=char_count, original_index=0)]
-            timing.end_tokenization()
+        for bi in req.items:
+            try:
+                server_item = decode_item(bi.item)
 
-            future = await worker.submit_extract(
-                prepared_items=prepared_items,
-                items=[server_item],
-                labels=bi.labels,
-                output_schema=bi.output_schema,
-                instruction=bi.instruction,
-                options=bi.options or {},
-                timing=timing,
-            )
-            worker_result = await future
+                timing = RequestTiming()
+                timing.start_tokenization()
+                char_count = len(server_item.text) if server_item.text else 0
+                prepared_items = [ExtractPreparedItem(cost=char_count, original_index=0)]
+                timing.end_tokenization()
 
-            extraction_results = ExtractHandler.format_output(cast("Any", worker_result.output))
-            if not extraction_results:
-                # Adapter returned no results for a single-item request —
-                # surface as an error instead of silently publishing an
-                # empty object (which the client would parse as "success
-                # with no fields").
-                return _error_outcome(bi, "inference_error", "adapter returned no extraction results")
-            result_msgpack = msgpack.packb(extraction_results[0], use_bin_type=True)
+                lora = self._extract_lora(bi.options)
+                grouped_requests.setdefault(lora, []).append(
+                    PreformedExtractRequest(
+                        prepared_items=prepared_items,
+                        items=[server_item],
+                        labels=bi.labels,
+                        output_schema=bi.output_schema,
+                        instruction=bi.instruction,
+                        options=bi.options or {},
+                        request_id=bi.request_id,
+                        timing=timing,
+                    )
+                )
+                grouped_context.setdefault(lora, []).append(bi)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Extract preparation failed for %s: %s", bi.work_item_id, e)
+                outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
 
-            return ItemOutcome(
-                work_item_id=bi.work_item_id,
-                request_id=bi.request_id,
-                item_index=bi.item_index,
-                disposition="publish_and_ack",
-                result_msgpack=result_msgpack,
-                inference_ms=timing.inference_ms,
-                tokenization_ms=timing.tokenization_ms if timing.tokenization_ms > 0 else None,
-                postprocessing_ms=timing.postprocessing_ms if timing.postprocessing_ms > 0 else None,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Extract failed for %s: %s", bi.work_item_id, e)
-            return _inference_exception_outcome(bi, e)
+        for lora, requests_for_lora in grouped_requests.items():
+            context = grouped_context[lora]
+            try:
+                futures = await worker.submit_extract_preformed_batch(requests_for_lora, lora=lora)
+                results = await asyncio.gather(*futures, return_exceptions=True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Extract batch failed for model %s: %s", model_id, e)
+                for bi in context:
+                    outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
+            else:
+                for bi, result in zip(context, results, strict=True):
+                    if isinstance(result, BaseException):
+                        logger.warning("Extract failed for %s: %s", bi.work_item_id, result)
+                        outcomes[bi.work_item_id] = _inference_exception_outcome(bi, result)
+                    else:
+                        outcomes[bi.work_item_id] = _extract_success_outcome(bi, result)
+
+        return BatchOutcome(outcomes=[outcomes[bi.work_item_id] for bi in req.items])
+
+
+def _score_success_outcome(
+    bi: ScoreBatchItem,
+    score_items: list[Item],
+    worker_result: Any,
+) -> ItemOutcome:
+    score_output = worker_result.output
+    raw_scores = [float(score_output.scores[i]) for i in range(score_output.batch_size)]
+    item_ids: list[str] = [
+        (sid if (sid := score_items[i].id) is not None else f"item-{i}") for i in range(score_output.batch_size)
+    ]
+
+    # Score output is always Rust-frameable: the Python and Rust
+    # sort/rank paths produce byte-identical results (see the
+    # parity test in ``test_queue_executor_stage1d.py``).
+    # Rust-side framing is unconditional for score; the Python-framed fallback
+    # sort+pack lives only as a doc-comment record of what
+    # ``sie_server_sidecar::output::build_score_payload`` mirrors.
+    raw_output: RawOutput | None = RawOutput(
+        score=ScoreOutputRaw(scores=raw_scores, item_ids=item_ids),
+    )
+    result_msgpack: bytes | None = None
+
+    return ItemOutcome(
+        work_item_id=bi.work_item_id,
+        request_id=bi.request_id,
+        item_index=bi.item_index,
+        disposition="publish_and_ack",
+        result_msgpack=result_msgpack,
+        raw_output=raw_output,
+        inference_ms=worker_result.timing.inference_ms,
+        tokenization_ms=worker_result.timing.tokenization_ms if worker_result.timing.tokenization_ms > 0 else None,
+        postprocessing_ms=worker_result.timing.postprocessing_ms
+        if worker_result.timing.postprocessing_ms > 0
+        else None,
+    )
+
+
+def _extract_success_outcome(
+    bi: ExtractBatchItem,
+    worker_result: Any,
+) -> ItemOutcome:
+    extraction_results = ExtractHandler.format_output(worker_result.output)
+    if not extraction_results:
+        # Adapter returned no results for a single-item request —
+        # surface as an error instead of silently publishing an
+        # empty object (which the client would parse as "success
+        # with no fields").
+        return _error_outcome(bi, "inference_error", "adapter returned no extraction results")
+    result_msgpack = msgpack.packb(extraction_results[0], use_bin_type=True)
+
+    return ItemOutcome(
+        work_item_id=bi.work_item_id,
+        request_id=bi.request_id,
+        item_index=bi.item_index,
+        disposition="publish_and_ack",
+        result_msgpack=result_msgpack,
+        inference_ms=worker_result.timing.inference_ms,
+        tokenization_ms=worker_result.timing.tokenization_ms if worker_result.timing.tokenization_ms > 0 else None,
+        postprocessing_ms=worker_result.timing.postprocessing_ms
+        if worker_result.timing.postprocessing_ms > 0
+        else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1099,9 +1231,11 @@ def _inference_exception_outcome(
 ) -> ItemOutcome:
     if is_oom_error(exc):
         return _oom_nak_outcome(bi)
-    if isinstance(exc, InvalidMediaError):
+    if isinstance(exc, (InvalidMediaError, msgspec.ValidationError)):
+        # A typed-decode failure (decode_item) or a media contract violation;
+        # both surface as INVALID_INPUT (HTTP 400), matching the HTTP path.
         return _error_outcome(bi, ErrorCode.INVALID_INPUT.value, str(exc))
-    return _error_outcome(bi, "inference_error", str(exc))
+    return _error_outcome(bi, _INFERENCE_ERROR_CODE, str(exc))
 
 
 def _error_outcome(bi: EncodeBatchItem | ScoreBatchItem | ExtractBatchItem, code: str, message: str) -> ItemOutcome:
@@ -1122,8 +1256,6 @@ def _default_nak_delay_s() -> float:
     redelivery behaviour is consistent across either side choosing the
     fallback.
     """
-    import os  # noqa: PLC0415
-
     return float(os.environ.get("SIE_NAK_DELAY_S", "5.0"))
 
 

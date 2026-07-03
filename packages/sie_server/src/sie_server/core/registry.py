@@ -43,6 +43,7 @@ from sie_server.core.pool_isolation import (
 )
 from sie_server.core.postprocessor_registry import PostprocessorRegistry
 from sie_server.core.preprocessor_registry import PreprocessorRegistry
+from sie_server.core.residency import EvictionResult
 from sie_server.core.worker import ModelWorker
 from sie_server.core.worker.types import AdaptiveBatchingParams
 from sie_server.observability.metrics import record_idle_eviction
@@ -106,6 +107,29 @@ def _model_config_semantic_hash(config: ModelConfig) -> str:
 
 def _model_configs_semantically_equal(left: ModelConfig | None, right: ModelConfig) -> bool:
     return left is not None and _model_config_semantic_hash(left) == _model_config_semantic_hash(right)
+
+
+def _is_python_runtime_adapter(adapter_path: str) -> bool:
+    return not adapter_path.startswith("sie_server_rust.")
+
+
+def _adapter_load_required_bytes(adapter: ModelAdapter, memory_manager: MemoryManager) -> int | None:
+    """Return an adapter-provided load-headroom estimate, if any."""
+    stats = memory_manager.get_stats()
+    if stats.total_bytes <= 0:
+        return None
+
+    try:
+        required = adapter.load_required_memory_bytes(
+            device_type=stats.device_type,
+            device_total_bytes=stats.total_bytes,
+        )
+    except Exception:
+        logger.exception("adapter.load_required_memory_bytes() raised; falling back to pressure-only eviction")
+        return None
+    if isinstance(required, bool) or not isinstance(required, int) or required <= 0:
+        return None
+    return min(required, stats.total_bytes)
 
 
 class ModelRegistry:
@@ -407,17 +431,16 @@ class ModelRegistry:
         else:
             self._configs = all_configs
 
-        if self._pool_name is not None:
-            before_count = len(self._configs)
-            self._configs = {name: config for name, config in self._configs.items() if self.accepts_config_pool(config)}
-            filtered_count = before_count - len(self._configs)
-            if filtered_count:
-                logger.info(
-                    "Pool filter applied for SIE_POOL=%s: %d/%d models available",
-                    self._pool_name,
-                    len(self._configs),
-                    before_count,
-                )
+        before_count = len(self._configs)
+        self._configs = {name: config for name, config in self._configs.items() if self.accepts_config_pool(config)}
+        filtered_count = before_count - len(self._configs)
+        if filtered_count:
+            logger.info(
+                "Model config filter applied for SIE_POOL=%s: %d/%d models available",
+                self._pool_name or "<unset>",
+                len(self._configs),
+                before_count,
+            )
 
         # Pool isolation. With the post-filter set in hand,
         # reject mixed generation/non-generation pools loudly. The
@@ -677,10 +700,19 @@ class ModelRegistry:
             msg = _ERR_MODEL_NOT_LOADED.format(name=name)
             raise KeyError(msg)
 
-        # Update LRU tracking - this model was recently used
-        self._memory_manager.touch(name)
-
+        # ``get`` is a pure read: it does not update LRU. Request hot paths call
+        # ``touch_lru`` explicitly after obtaining the adapter (see #1541).
         return self._loaded[name].adapter
+
+    def touch_lru(self, name: str) -> None:
+        """Mark a loaded model as recently used for LRU eviction.
+
+        :meth:`get` is a pure read and does not update LRU; request hot paths
+        call this explicitly after obtaining the adapter so the model is
+        protected from eviction. No-op for a model that is not loaded.
+        """
+        if name in self._loaded:
+            self._memory_manager.touch(name)
 
     def load(self, name: str, device: str) -> ModelAdapter:
         """Load a model onto a device.
@@ -716,6 +748,25 @@ class ModelRegistry:
 
         # Instantiate the adapter with device-aware fallback selection
         adapter = self._loader.instantiate_adapter(name, config, model_dir, device)
+
+        required_load_bytes = _adapter_load_required_bytes(adapter, self._memory_manager)
+        while self._memory_manager.should_evict_for_load(required_load_bytes):
+            lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+            if lru_model is None:
+                break
+
+            stats = self._memory_manager.get_stats()
+            logger.info(
+                "Pre-load eviction: %.2f GB free, %.2f GB required, %.1f%% used "
+                "(threshold %.1f%%); evicting '%s' before loading '%s'",
+                stats.available_gb,
+                (required_load_bytes or 0) / (1024**3),
+                stats.usage_ratio * 100,
+                self._memory_manager.pressure_threshold_pct,
+                lru_model,
+                name,
+            )
+            self.unload(lru_model)
 
         # Try to load onto device, with OOM retry
         try:
@@ -758,7 +809,7 @@ class ModelRegistry:
 
         This method:
         - Serializes all load/unload operations via an async lock
-        - Proactively evicts LRU models if memory pressure is high before loading
+        - Proactively evicts LRU models if memory pressure or load headroom requires it
         - Runs the blocking load in a thread pool to avoid blocking the event loop
         - Falls back to OOM-triggered eviction if load still fails (fragmentation)
         - On-demand config discovery: rescans models_dir if model not found
@@ -791,28 +842,13 @@ class ModelRegistry:
                 msg = f"Model '{name}' is currently being unloaded"
                 raise RuntimeError(msg)
 
-            # Pre-load eviction: evict LRU non-pinned models until below pressure threshold
-            while self._memory_manager.check_pressure():
-                lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
-                if lru_model is None:
-                    break  # No non-pinned models to evict, proceed with load attempt
-
-                stats = self._memory_manager.get_stats()
-                logger.info(
-                    "Pre-load eviction: memory %.1f%% > %.1f%% threshold, evicting '%s' before loading '%s'",
-                    stats.usage_ratio * 100,
-                    self._memory_manager.pressure_threshold_pct,
-                    lru_model,
-                    name,
-                )
-                await self._do_unload(lru_model)
+            config = self._configs[name]
 
             # Mark as loading before starting (visible to WebSocket status)
             self._loading.add(name)
             load_start = time.monotonic()
 
             try:
-                config = self._configs[name]
                 model_dir = self._model_dirs.get(name, Path())
 
                 # Ensure weights are cached BEFORE instantiation. This
@@ -824,6 +860,41 @@ class ModelRegistry:
 
                 # Instantiate adapter (in thread pool, post-download timeout applies)
                 adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, device)
+
+                required_load_bytes = _adapter_load_required_bytes(adapter, self._memory_manager)
+
+                # Pre-load eviction: evict LRU non-pinned models until current pressure
+                # and any adapter-provided load headroom requirement are satisfied.
+                while self._memory_manager.should_evict_for_load(required_load_bytes):
+                    lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+                    if lru_model is None:
+                        break  # No non-pinned models to evict, proceed with load attempt
+
+                    if lru_model not in self._loaded:
+                        # Belt-and-braces: a MemoryManager entry with no matching
+                        # ``_loaded`` model is a ghost (see #1600). ``_do_unload``
+                        # would no-op on it, so drop the stale accounting entry and
+                        # re-evaluate rather than spin. The ``_do_unload`` finally
+                        # normally prevents ghosts; this guards any other source.
+                        logger.warning(
+                            "Evictor found ghost '%s' (in memory manager, not loaded); dropping stale entry",
+                            lru_model,
+                        )
+                        self._memory_manager.unregister_model(lru_model)
+                        continue
+
+                    stats = self._memory_manager.get_stats()
+                    logger.info(
+                        "Pre-load eviction: %.2f GB free, %.2f GB required, %.1f%% used "
+                        "(threshold %.1f%%); evicting '%s' before loading '%s'",
+                        stats.available_gb,
+                        (required_load_bytes or 0) / (1024**3),
+                        stats.usage_ratio * 100,
+                        self._memory_manager.pressure_threshold_pct,
+                        lru_model,
+                        name,
+                    )
+                    await self._do_unload(lru_model)
 
                 try:
                     # Load onto device (loader handles main thread vs executor)
@@ -1092,30 +1163,42 @@ class ModelRegistry:
             del self._loaded[name]
             device = loaded.device
 
-            # Some adapters (e.g. the SGLang generation adapter) hold an
-            # async HTTP client to a subprocess. ``unload()`` is sync and
-            # can only fire-and-forget the client close, which races the
-            # subprocess termination on the next line — the close could be
-            # cut off before its connections drain, leaking fds / wedging
-            # on a half-open socket. When the adapter exposes an awaitable
-            # ``aclose_client``, drive it to completion HERE (we're on the
-            # event loop) so the client is fully closed against the still-
-            # live subprocess before ``unload()`` terminates it.
-            aclose_client = getattr(loaded.adapter, "aclose_client", None)
-            if aclose_client is not None:
+            # Once removed from ``_loaded`` above, the model is committed-gone
+            # from the registry's view, so its MemoryManager entry MUST be
+            # dropped even if adapter teardown below raises. Otherwise the
+            # model becomes a "ghost" — absent from ``_loaded`` but still
+            # counted in ``_models`` — that ``get_lru_model`` keeps
+            # re-selecting while ``_do_unload`` no-ops on it: a no-yield spin
+            # under ``_load_lock`` that starves the whole event loop. See #1600.
+            try:
+                # Some adapters (e.g. the SGLang generation adapter) hold an
+                # async HTTP client to a subprocess. ``unload()`` is sync and
+                # can only fire-and-forget the client close, which races the
+                # subprocess termination on the next line — the close could be
+                # cut off before its connections drain, leaking fds / wedging
+                # on a half-open socket. When the adapter exposes an awaitable
+                # ``aclose_client``, drive it to completion HERE (we're on the
+                # event loop) so the client is fully closed against the still-
+                # live subprocess before ``unload()`` terminates it.
+                aclose_client = getattr(loaded.adapter, "aclose_client", None)
+                if aclose_client is not None:
+                    try:
+                        await aclose_client()
+                    except Exception:  # noqa: BLE001 - close is best-effort
+                        logger.warning("aclose_client() failed during unload of '%s'", name, exc_info=True)
+
+                # Adapter.unload() handles gc.collect + empty_cache
+                loaded.adapter.unload()
+            finally:
+                # Always run, even if adapter teardown above raised, so a
+                # failed unload can never leave a ghost behind (#1600).
                 try:
-                    await aclose_client()
-                except Exception:  # noqa: BLE001 - close is best-effort
-                    logger.warning("aclose_client() failed during unload of '%s'", name, exc_info=True)
-
-            # Adapter.unload() handles gc.collect + empty_cache
-            loaded.adapter.unload()
-
-            # Unregister tokenizer, preprocessor, and clear metrics
-            self._loader.unregister(name, device)
-
-            # Unregister from memory manager
-            self._memory_manager.unregister_model(name)
+                    # Unregister tokenizer, preprocessor, and clear metrics
+                    self._loader.unregister(name, device)
+                except Exception:  # noqa: BLE001 - best-effort; must not skip below
+                    logger.warning("loader.unregister failed during unload of '%s'", name, exc_info=True)
+                # Unregister from memory manager (a plain dict-pop; never raises)
+                self._memory_manager.unregister_model(name)
 
             # Freeing memory makes any prior OOM-class load failure on a
             # *sibling* model retryable; clear those records so the next
@@ -1236,8 +1319,7 @@ class ModelRegistry:
             removed = ", ".join(sorted(removed_ids))
             msg = f"cannot synchronously remove model config(s): {removed}; use add_config_async"
             raise RuntimeError(msg)
-        for expanded_config in expanded.values():
-            self._apply_config_entry(expanded_config, model_dir)
+        self._apply_config_entry(config, model_dir)
         self._loader.update_configs(self._configs)
         return updated_ids | removed_ids
 
@@ -1254,15 +1336,17 @@ class ModelRegistry:
                         if model_id in self._loaded:
                             await self._do_unload(model_id)
                         self._drop_config_entry(model_id)
-            for expanded_config in expanded.values():
-                self._apply_config_entry(expanded_config, model_dir)
+            self._apply_config_entry(config, model_dir)
             self._loader.update_configs(self._configs)
             return updated_ids | removed_ids
 
     def _prepare_config_update(self, config: ModelConfig) -> tuple[dict[str, ModelConfig], set[str], set[str]]:
         expanded = expand_profile_variants([config])
         updated_ids = set(expanded)
-        removed_ids = self._synthetic_profile_variant_ids_for_base(config.sie_id) - updated_ids
+        previously_materialized = self._synthetic_profile_variant_ids_for_base(config.sie_id)
+        if config.sie_id in self._configs:
+            previously_materialized.add(config.sie_id)
+        removed_ids = previously_materialized - updated_ids
         return expanded, updated_ids, removed_ids
 
     def _preflight_config_update(
@@ -1300,14 +1384,9 @@ class ModelRegistry:
         self._config_version += 1
 
     def _add_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
-        if not self.accepts_config_pool(config):
-            if config.sie_id in self._configs:
-                del self._configs[config.sie_id]
-                self._loader.update_configs(self._configs)
-                self._failed.pop(config.sie_id, None)
-                self._config_version += 1
-            return
-        self._validate_config_entry(config, self._configs)
+        for expanded_config in expand_profile_variants([config]).values():
+            if self.accepts_config_pool(expanded_config):
+                self._validate_config_entry(expanded_config, self._configs)
         self._apply_config_entry(config, model_dir)
 
     def _validate_config_entry(self, config: ModelConfig, existing_configs: dict[str, ModelConfig]) -> None:
@@ -1329,25 +1408,42 @@ class ModelRegistry:
         validate_no_legacy_scalar_lora_id(name=config.sie_id, config=config)
 
     def _apply_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
-        if not self.accepts_config_pool(config):
-            if config.sie_id in self._configs:
-                self._drop_config_entry(config.sie_id)
+        base_id = (
+            config.synthetic_profile_variant_source[0]
+            if config.synthetic_profile_variant_source is not None
+            else config.sie_id
+        )
+        expanded_configs = {
+            name: expanded_config
+            for name, expanded_config in expand_profile_variants([config]).items()
+            if self.accepts_config_pool(expanded_config)
+        }
+        if not expanded_configs:
+            stale_ids = {base_id} | self._synthetic_profile_variant_ids_for_base(base_id)
+            for stale_id in sorted(stale_ids):
+                self._drop_config_entry(stale_id)
             return
-        self._configs[config.sie_id] = config
+        stale_ids = ({base_id} | self._synthetic_profile_variant_ids_for_base(base_id)) - set(expanded_configs)
+        for stale_id in sorted(stale_ids):
+            self._drop_config_entry(stale_id)
+        self._configs.update(expanded_configs)
         if self._model_filter is not None:
-            self._model_filter.add(config.sie_id)
+            self._model_filter.update(expanded_configs)
         if model_dir is not None:
-            self._model_dirs[config.sie_id] = model_dir
+            for name in expanded_configs:
+                self._model_dirs[name] = model_dir
         # A config update is operator intent that may have fixed the
         # underlying issue (e.g. pinned a working revision, dropped a
         # broken adapter option). Clear any sticky failure so the next
         # request retries with the new config.
-        self._failed.pop(config.sie_id, None)
+        for name in expanded_configs:
+            self._failed.pop(name, None)
         self._config_version += 1
         # The config for an already-pinned model may have just arrived at runtime
         # (default Helm workers receive configs via the sidecar after a pin was
         # recorded). Eager-load it now so the pin actually keeps it resident.
-        self._maybe_schedule_pinned_load(config.sie_id)
+        for name in expanded_configs:
+            self._maybe_schedule_pinned_load(name)
 
     async def replace_configs_async(
         self,
@@ -1424,9 +1520,13 @@ class ModelRegistry:
 
     def accepts_config_pool(self, config: ModelConfig) -> bool:
         if self._pool_name is None:
-            return True
-        config_pool = (config.pool or "default").strip().lower()
-        return config_pool == self._pool_name
+            pool_matches = True
+        else:
+            config_pool = (config.pool or "default").strip().lower()
+            pool_matches = config_pool == self._pool_name
+        if not pool_matches:
+            return False
+        return _is_python_runtime_adapter(config.resolve_profile("default").adapter_path)
 
     def get_model_info(self, name: str) -> dict[str, Any]:
         """Get information about a model.
@@ -1557,7 +1657,7 @@ class ModelRegistry:
         """
         return is_oom_error(error)
 
-    async def evict_lru_excluding(self, exclude_name: str, *, timeout_s: float = 5.0) -> bool:
+    async def evict_lru_excluding(self, exclude_name: str, *, timeout_s: float = 5.0) -> EvictionResult:
         """Evict the LRU model that is not ``exclude_name``.
 
         Used by the per-worker OOM recovery executor to free GPU memory by
@@ -1585,9 +1685,10 @@ class ModelRegistry:
                 giving up.
 
         Returns:
-            True if a sibling model was actually unloaded; False if there
-            was no eligible candidate, the lock could not be acquired in
-            time, or the eviction itself failed.
+            An :class:`EvictionResult` reporting which outcome occurred —
+            ``EVICTED`` when a sibling was unloaded, or ``NO_CANDIDATE`` /
+            ``LOCK_TIMEOUT`` / ``UNLOAD_FAILED`` for the three formerly
+            conflated failure modes.
         """
         lock = self._get_load_lock()
         try:
@@ -1598,7 +1699,7 @@ class ModelRegistry:
                 timeout_s,
                 exclude_name,
             )
-            return False
+            return EvictionResult.LOCK_TIMEOUT
 
         try:
             # Walk LRU order and pick the first that is not ``exclude_name``,
@@ -1622,9 +1723,9 @@ class ModelRegistry:
                     await self._do_unload(candidate)
                 except Exception:
                     logger.exception("OOM recovery: failed to evict '%s'", candidate)
-                    return False
-                return True
-            return False
+                    return EvictionResult.UNLOAD_FAILED
+                return EvictionResult.EVICTED
+            return EvictionResult.NO_CANDIDATE
         finally:
             lock.release()
 
@@ -1842,6 +1943,17 @@ class ModelRegistry:
                                 "Memory pressure detected but no non-pinned models to evict, skipping",
                             )
                             break
+
+                        if lru_model not in self._loaded:
+                            # Belt-and-braces ghost guard (see #1600): drop a
+                            # stale MemoryManager entry with no ``_loaded``
+                            # model instead of spinning on a no-op _do_unload.
+                            logger.warning(
+                                "Memory monitor found ghost '%s' (not loaded); dropping stale entry",
+                                lru_model,
+                            )
+                            self._memory_manager.unregister_model(lru_model)
+                            continue
 
                         stats = self._memory_manager.get_stats()
                         logger.info(

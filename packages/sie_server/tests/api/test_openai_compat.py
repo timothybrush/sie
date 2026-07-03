@@ -1,7 +1,7 @@
 """Tests for OpenAI-compatible embeddings endpoint."""
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sie_server.api.openai_compat import router as openai_router
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
+from sie_server.core.oom import ResourceExhausted, ResourceExhaustedError
 from sie_server.core.registry import ModelRegistry
 
 
@@ -276,3 +277,44 @@ class TestOpenAIResponseFormat:
         data = response.json()
         indices = [item["index"] for item in data["data"]]
         assert indices == [0, 1, 2, 3]
+
+
+class TestOpenAIEmbeddingsOom:
+    """/v1/embeddings must map OOM to 503 RESOURCE_EXHAUSTED + Retry-After
+    (OpenAI envelope), matching the native endpoints so the SDK auto-retries
+    instead of treating it as a terminal 500. See #1604.
+    """
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("CUDA out of memory. Tried to allocate 2 GiB"),
+            ResourceExhaustedError(
+                "Resource exhausted: CUDA out of memory",
+                marker=ResourceExhausted(operation="encode", attempts=4, original_message="CUDA out of memory"),
+            ),
+        ],
+        ids=["raw-cuda-oom", "wrapped-resource-exhausted"],
+    )
+    def test_embeddings_oom_maps_to_503_resource_exhausted(
+        self, client: TestClient, mock_registry: MagicMock, failure: BaseException
+    ) -> None:
+        # engine_config=None → oom_retry_after_from_registry falls back to the
+        # module default (5), same as the native OOM test.
+        mock_registry.engine_config = None
+
+        with patch(
+            "sie_server.api.openai_compat.EncodePipeline.run_encode",
+            new_callable=AsyncMock,
+            side_effect=failure,
+        ):
+            response = client.post(
+                "/v1/embeddings",
+                json={"model": "text-embedding-3-small", "input": "hello"},
+            )
+
+        assert response.status_code == 503, response.text
+        assert response.headers.get("Retry-After") == "5"
+        error = response.json()["detail"]["error"]
+        assert error["code"] == "RESOURCE_EXHAUSTED"
+        assert error["type"] == "server_error"

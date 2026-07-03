@@ -67,7 +67,7 @@ Key options:
       --k8s-port <PORT>          K8s worker port (default: 8080)
   -l, --log-level <LEVEL>        Log level (default: info)
       --json-logs                Enable structured JSON logging
-      --health-mode <MODE>       Worker health transport (supported: ws; default: ws)
+      --health-mode <MODE>       Worker health transport (supported: ws, nats; default: ws)
       --bundles-dir <PATH>       Bundles directory
       --models-dir <PATH>        Models directory
 
@@ -99,7 +99,7 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_NATS_CONFIG_TRUST_ANY_PRODUCER` | `false` | Disable producer validation entirely (dev/local only). `main` emits a startup audit warning when on |
 | `SIE_LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `SIE_LOG_JSON` | `false` | Structured JSON logging (for Loki) |
-| `SIE_GATEWAY_REQUEST_TIMEOUT` | `30.0` | Request timeout in seconds |
+| `SIE_GATEWAY_REQUEST_TIMEOUT` | `120.0` | Non-generation queue result wait timeout in seconds |
 | `SIE_GATEWAY_MAX_STREAM_PENDING` | `50000` | Max pending stream items per JetStream work stream |
 | `SIE_GATEWAY_DEFAULT_MAX_TOKENS` | `1024` | Output-token cap applied to `/v1/chat/completions` requests that omit both `max_completion_tokens` and `max_tokens`. OpenAI treats the field as optional, so the gateway defaults rather than rejecting — generic clients (Open WebUI) rely on this |
 | `SIE_GATEWAY_ENABLE_POOLS` | `false` | Enable pool management |
@@ -158,7 +158,7 @@ Common behaviors:
 - `404` for unknown models once the in-memory registry has bootstrapped from `sie-config` (fast-fail; avoids queueing requests for typo'd model ids)
 - `503` + `Retry-After` + `X-SIE-Error-Code: PROVISIONING` on scale-from-zero, whether or not `X-SIE-MACHINE-PROFILE` was set (records pending demand for KEDA)
 - `503` + `Retry-After` for no-consumer or backpressure publish failures
-- `503` + `X-SIE-Error-Code: MODEL_LOADING` + `Retry-After: 5` for queue result timeouts (typically a worker cold-loading the target model). SDK clients with `wait_for_capacity=True` retry under the existing `provision_timeout_s` budget.
+- `504` + `X-SIE-Error-Code: GATEWAY_TIMEOUT` + `Retry-After: 5` on non-generation queue routes when a queued request was published but no worker result reached the gateway before `SIE_GATEWAY_REQUEST_TIMEOUT`. Generation routes use their own streaming/direct-dispatch timeout contract. Worker-emitted `MODEL_LOADING` remains a separate retryable `503 MODEL_LOADING` signal.
 - `503` + `X-SIE-Error-Code: RESOURCE_EXHAUSTED` + `Retry-After: 5` when every item in a batch fails with the same retryable code (`RESOURCE_EXHAUSTED` from worker-side OOM recovery exhaustion, `MODEL_LOADING` from a worker still warming up). The SDK auto-retries with bounded exponential backoff. Mixed batches keep returning `500 all_items_failed` with per-item `code` fields in the response body so callers can see which items hit which failure mode.
 
 The same gateway-owned OpenAPI contract is available at runtime via `GET /openapi.json` and as a committed static artifact at `packages/sie_gateway/openapi.json`. Regenerate it with `mise run openapi` before committing API-surface changes.

@@ -10,12 +10,14 @@ than a retryable ``MODEL_LOADING``.
 
 from __future__ import annotations
 
+import tempfile
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sie_sdk.exceptions import GatedModelError
+from sie_server.adapters.sglang import _server as sglang_server
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.load_errors import (
     LoadErrorClass,
@@ -82,6 +84,18 @@ class TestClassifyLoadError:
         assert result.error_class is LoadErrorClass.OOM
         assert result.cooldown_s is not None
         assert not result.is_permanent
+
+    def test_sglang_startup_error_with_oom_log_is_oom(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w+") as output_file:
+            output_file.write("torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB\n")
+            output_file.flush()
+
+            exc = sglang_server.startup_failure_error(output_file)
+            result = classify_load_error(exc)
+
+        assert result.error_class is LoadErrorClass.OOM
+        assert result.cooldown_s is not None
+        assert "Tried to allocate" not in str(exc)
 
     def test_connection_error_is_network_with_cooldown(self) -> None:
         result = classify_load_error(ConnectionError("dns failure"))

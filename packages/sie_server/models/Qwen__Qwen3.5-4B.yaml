@@ -123,6 +123,11 @@ profiles:
     kv_budget_tokens: 7168
     adapter_options:
       loadtime:
+        # Apple-Silicon (MLX) repo served by the MLX subprocess backend. On
+        # non-CUDA devices SGLangGenerationAdapter.create_for_device swaps to
+        # MLXGenerationAdapter, which reads this. Ignored on CUDA (SGLang
+        # swallows it via **kwargs). 4-bit MLX quant ≈ 120 tok/s on M-series.
+        mlx_repo: mlx-community/Qwen3.5-4B-4bit
         # Empirical floor on L4 — anything lower OOMs at model load.
         mem_fraction_static: 0.90
         served_model_name: Qwen/Qwen3.5-4B

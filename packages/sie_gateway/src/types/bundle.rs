@@ -2,21 +2,19 @@ use serde::{Deserialize, Serialize};
 
 /// Recognised execution engines for the ``engine`` bundle field.
 ///
-/// We only ship one engine today (the Python ``sie_server`` adapter
-/// image). The plumbing — ``X-SIE-Engine`` header,
-/// ``resolve_bundle_with_engine``, ``WorkItem.engine`` — is kept
-/// alive as the contract for re-introducing a second engine later;
-/// for now there is exactly one valid value here.
+/// `pytorch` is the Python ``sie_server`` adapter image. `candle` is
+/// the Rust ``sie-server-rust`` worker process backed by native Candle
+/// execution.
 ///
 /// Mirrors ``sie_config.model_registry.KNOWN_ENGINES`` on the Python
 /// side. Drift is a quiet mis-routing footgun, so both ends are kept
 /// in lock-step.
-pub const KNOWN_ENGINES: &[&str] = &["pytorch"];
+pub const KNOWN_ENGINES: &[&str] = &["pytorch", "candle"];
 
 /// Default engine when a bundle YAML omits the field. Same as the
-/// only entry in ``KNOWN_ENGINES`` today; kept as a separate
-/// constant so the asymmetric "default vs known" contract still
-/// reads cleanly when a second engine lands.
+/// Python worker path. Kept as a separate constant so the asymmetric
+/// "default vs known" contract reads cleanly as more native engines
+/// land.
 pub const DEFAULT_ENGINE: &str = "pytorch";
 
 #[allow(dead_code)]
@@ -30,7 +28,7 @@ pub struct BundleConfig {
     #[serde(default)]
     pub default: bool,
     /// Execution engine the bundle's worker image speaks. Today
-    /// only ``"pytorch"`` (the Python adapter image) is recognised;
+    /// ``"pytorch"`` and ``"candle"`` are recognised;
     /// see ``KNOWN_ENGINES`` for the load-time check. Defaults to
     /// ``"pytorch"`` for back-compat with pre-engine bundle YAMLs.
     #[serde(default = "default_engine")]
@@ -74,8 +72,7 @@ pub struct BundleInfo {
     pub adapters: Vec<String>,
     /// See [`BundleConfig::engine`] — surfaced in routing logs,
     /// metrics, and the published ``WorkItem.engine`` so workers
-    /// can verify they speak the right engine. Today only
-    /// ``"pytorch"`` is recognised (see ``KNOWN_ENGINES``).
+    /// can verify they speak the right engine.
     #[allow(dead_code)]
     pub engine: String,
 }
@@ -95,6 +92,7 @@ pub struct BundleInfo {
 pub fn engine_adapter_prefixes(engine: &str) -> &'static [&'static str] {
     match engine {
         "pytorch" => &["sie_server.adapters."],
+        "candle" => &["sie_server_rust.adapters.candle"],
         _ => &[],
     }
 }
@@ -137,18 +135,20 @@ default: true
             engine_adapter_prefixes("pytorch"),
             &["sie_server.adapters."]
         );
+        assert_eq!(
+            engine_adapter_prefixes("candle"),
+            &["sie_server_rust.adapters.candle"]
+        );
         // Unknown engine → empty slice. Caller is expected to have
         // already rejected the bundle by checking ``KNOWN_ENGINES``.
-        assert!(engine_adapter_prefixes("candle").is_empty());
+        assert!(engine_adapter_prefixes("future-engine").is_empty());
         assert!(engine_adapter_prefixes("unknown").is_empty());
     }
 
     #[test]
-    fn test_known_engines_only_pytorch() {
+    fn test_known_engines_include_candle() {
         // Lock-step parity with sie_config.model_registry.KNOWN_ENGINES.
-        // Today there's exactly one engine; this assertion catches
-        // drift at PR review time when a second engine is added.
-        assert_eq!(KNOWN_ENGINES, &["pytorch"]);
+        assert_eq!(KNOWN_ENGINES, &["pytorch", "candle"]);
     }
 
     #[test]

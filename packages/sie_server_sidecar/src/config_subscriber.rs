@@ -7,7 +7,7 @@
 //! worker-sidecar and forwards the validated YAML to Python over IPC so the
 //! adapter-local `ModelRegistry` changes in the process that serves inference.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -19,10 +19,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
-use crate::health_publisher::SharedBundleConfigHash;
+use crate::health_publisher::{SharedBundleConfigHash, SharedLoadedModels};
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::ipc_types::{
-    ApplyModelConfigRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
+    ApplyModelConfigRequest, ReadinessState, ReplaceModelConfigsRequest,
+    ReplaceModelConfigsResponse,
 };
 use crate::metrics::MetricsRegistry;
 use crate::shutdown::Shutdown;
@@ -32,6 +33,7 @@ pub const MAX_MODEL_CONFIG_BYTES: usize = 1_048_576;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const MAX_ACCEPTED_BUNDLE_HASHES: usize = 64;
+const DEFAULT_MODEL_POOL: &str = "default";
 
 /// Default publisher allowlist. Matches the gateway config subscriber.
 pub const DEFAULT_TRUSTED_PRODUCERS: &[&str] = &["sie-config"];
@@ -40,6 +42,7 @@ pub const DEFAULT_TRUSTED_PRODUCERS: &[&str] = &["sie-config"];
 pub struct ConfigApplyState {
     epoch: AtomicU64,
     bundle_config_hash: SharedBundleConfigHash,
+    loaded_models: SharedLoadedModels,
     accepted_bundle_config_hashes: RwLock<VecDeque<String>>,
     /// Serializes Python registry mutations from live NATS deltas and export
     /// replay so an older snapshot cannot clobber a newer live apply.
@@ -55,6 +58,7 @@ impl ConfigApplyState {
         Self {
             epoch: AtomicU64::new(0),
             bundle_config_hash: Arc::new(RwLock::new(initial_bundle_config_hash)),
+            loaded_models: Arc::new(RwLock::new(Vec::new())),
             accepted_bundle_config_hashes: RwLock::new(accepted_bundle_config_hashes),
             apply_lock: Mutex::new(()),
         }
@@ -66,6 +70,10 @@ impl ConfigApplyState {
 
     pub fn bundle_config_hash(&self) -> SharedBundleConfigHash {
         Arc::clone(&self.bundle_config_hash)
+    }
+
+    pub fn loaded_models(&self) -> SharedLoadedModels {
+        Arc::clone(&self.loaded_models)
     }
 
     pub fn current_bundle_config_hash(&self) -> String {
@@ -118,6 +126,40 @@ impl ConfigApplyState {
             .write()
             .expect("bundle config hash lock poisoned");
         *guard = hash;
+    }
+
+    pub fn set_loaded_models<I>(&self, models: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut deduped: Vec<String> = models
+            .into_iter()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .collect();
+        deduped.sort();
+        deduped.dedup();
+        let mut guard = self
+            .loaded_models
+            .write()
+            .expect("loaded models lock poisoned");
+        *guard = deduped;
+    }
+
+    pub fn record_loaded_model(&self, model_id: &str) {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .loaded_models
+            .write()
+            .expect("loaded models lock poisoned");
+        if guard.iter().any(|known| known == model_id) {
+            return;
+        }
+        guard.push(model_id.to_string());
+        guard.sort();
     }
 
     fn remember_bundle_hash(&self, hash: &str) {
@@ -190,6 +232,8 @@ pub struct ConfigNotification {
     pub epoch: u64,
     pub bundle_config_hash: String,
     #[serde(default)]
+    pub bundle_pool_config_hashes: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
     pub model_id: String,
     #[serde(default)]
     pub profiles_added: Vec<String>,
@@ -197,6 +241,8 @@ pub struct ConfigNotification {
     pub model_config: String,
     #[serde(default)]
     pub affected_bundles: Vec<String>,
+    #[serde(default)]
+    pub pool: Option<String>,
 }
 
 fn env_bool(name: &str) -> bool {
@@ -232,10 +278,12 @@ pub fn trusted_producers_from_env() -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct ConfigSubscriberOptions {
     pub trusted_producers: Vec<String>,
+    pub pool: String,
 }
 
 struct SubscriberRuntime {
     bundle: String,
+    pool: String,
     trusted_producers: Vec<String>,
     ipc: Arc<IpcClient>,
     state: Arc<ConfigApplyState>,
@@ -272,6 +320,47 @@ fn notification_targets_bundle(notification: &ConfigNotification, bundle: &str) 
     notification.bundle_id == bundle
 }
 
+fn normalize_pool_name(raw: &str) -> String {
+    let pool = raw.trim().to_ascii_lowercase();
+    if pool.is_empty() {
+        DEFAULT_MODEL_POOL.to_string()
+    } else {
+        pool
+    }
+}
+
+fn notification_targets_pool(notification: &ConfigNotification, pool: &str) -> bool {
+    let Some(notification_pool) = notification.pool.as_deref() else {
+        // Legacy sie-config payloads did not carry pool metadata; preserve
+        // the old "bundle-only" apply behavior during mixed-version rollouts.
+        return true;
+    };
+    normalize_pool_name(notification_pool) == normalize_pool_name(pool)
+}
+
+fn notification_bundle_hash_for_pool(notification: &ConfigNotification, pool: &str) -> String {
+    let normalized_pool = normalize_pool_name(pool);
+    match notification
+        .bundle_pool_config_hashes
+        .get(&notification.bundle_id)
+    {
+        Some(pool_hashes) => pool_hashes
+            .get(&normalized_pool)
+            .cloned()
+            .unwrap_or_default(),
+        None => notification.bundle_config_hash.clone(),
+    }
+}
+
+pub(crate) fn advertised_bundle_hash(
+    control_plane_hash: Option<&str>,
+    worker_applied_hash: &str,
+) -> String {
+    control_plane_hash
+        .unwrap_or(worker_applied_hash)
+        .to_string()
+}
+
 fn notification_is_stale(epoch: u64, current_epoch: u64) -> bool {
     epoch < current_epoch || (epoch == current_epoch && epoch != 0)
 }
@@ -299,6 +388,60 @@ fn retryable_ipc_error(e: &IpcError) -> bool {
         IpcError::Timeout => true,
         _ => false,
     }
+}
+
+fn requires_eager_model_ready(bundle_id: &str) -> bool {
+    bundle_id.trim() == "candle"
+}
+
+async fn ensure_candle_model_ready_if_needed(
+    ipc: &Arc<IpcClient>,
+    bundle_id: &str,
+    model_id: &str,
+    epoch: u64,
+) -> Result<(), IpcError> {
+    if !requires_eager_model_ready(bundle_id) {
+        return Ok(());
+    }
+
+    match ipc.ensure_model_ready(model_id).await {
+        Ok(resp) if resp.state == ReadinessState::Ready => {
+            info!(
+                model = %model_id,
+                epoch,
+                "worker-config: Candle model ready after config apply"
+            );
+            Ok(())
+        }
+        Ok(resp) => {
+            warn!(
+                model = %model_id,
+                epoch,
+                state = ?resp.state,
+                "worker-config: Candle model not ready after config apply; retrying"
+            );
+            Err(IpcError::Timeout)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn ensure_candle_models_ready_if_needed(
+    ipc: &Arc<IpcClient>,
+    bundle_id: &str,
+    model_ids: &[String],
+    epoch: u64,
+) -> Result<Vec<String>, IpcError> {
+    if !requires_eager_model_ready(bundle_id) {
+        return Ok(model_ids.to_vec());
+    }
+
+    let mut ready_models = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        ensure_candle_model_ready_if_needed(ipc, bundle_id, model_id, epoch).await?;
+        ready_models.push(model_id.clone());
+    }
+    Ok(ready_models)
 }
 
 fn next_retry_delay(current: Duration) -> Duration {
@@ -336,6 +479,7 @@ pub fn spawn(
 
         let runtime = SubscriberRuntime {
             bundle,
+            pool: options.pool,
             trusted_producers: options.trusted_producers,
             ipc,
             state,
@@ -431,7 +575,43 @@ pub(crate) async fn apply_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.apply_model_config(req.clone()).await {
-            Ok(resp) => return Ok(Some(resp)),
+            Ok(resp) => {
+                match ensure_candle_model_ready_if_needed(&ipc, &req.bundle_id, model_id, epoch)
+                    .await
+                {
+                    Ok(()) => return Ok(Some(resp)),
+                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
+                        attempt = attempt.saturating_add(1);
+                        if attempt == 1
+                            || attempt == 5
+                            || attempt == 30
+                            || attempt.is_multiple_of(120)
+                        {
+                            warn!(
+                                model = %model_id,
+                                epoch,
+                                attempt,
+                                retry_delay_ms = retry_delay.as_millis() as u64,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after apply; retrying"
+                            );
+                        } else {
+                            debug!(
+                                model = %model_id,
+                                epoch,
+                                attempt,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting"
+                            );
+                        }
+                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
+                            return Ok(None);
+                        }
+                        retry_delay = next_retry_delay(retry_delay);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -472,7 +652,49 @@ pub(crate) async fn replace_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.replace_model_configs(req.clone()).await {
-            Ok(resp) => return Ok(Some(resp)),
+            Ok(mut resp) => {
+                match ensure_candle_models_ready_if_needed(
+                    &ipc,
+                    &req.bundle_id,
+                    &resp.applied_models,
+                    epoch,
+                )
+                .await
+                {
+                    Ok(ready_models) => {
+                        resp.applied_models = ready_models;
+                        return Ok(Some(resp));
+                    }
+                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
+                        attempt = attempt.saturating_add(1);
+                        if attempt == 1
+                            || attempt == 5
+                            || attempt == 30
+                            || attempt.is_multiple_of(120)
+                        {
+                            warn!(
+                                epoch,
+                                attempt,
+                                retry_delay_ms = retry_delay.as_millis() as u64,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after replace; retrying"
+                            );
+                        } else {
+                            debug!(
+                                epoch,
+                                attempt,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after replace"
+                            );
+                        }
+                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
+                            return Ok(None);
+                        }
+                        retry_delay = next_retry_delay(retry_delay);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -567,6 +789,20 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
         return;
     }
 
+    if !notification_targets_pool(&notification, runtime.pool.as_str()) {
+        debug!(
+            notification_bundle = %notification.bundle_id,
+            worker_bundle = %bundle,
+            notification_pool = ?notification.pool,
+            worker_pool = %runtime.pool,
+            epoch = notification.epoch,
+            model = %notification.model_id,
+            "worker-config: skipping notification for another pool"
+        );
+        record_delta(metrics, kind, "skipped_pool");
+        return;
+    }
+
     if notification.model_config.len() > MAX_MODEL_CONFIG_BYTES {
         warn!(
             model = %notification.model_id,
@@ -604,7 +840,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
         bundle_id: notification.bundle_id.clone(),
         model_id: notification.model_id.clone(),
         epoch: notification.epoch,
-        bundle_config_hash: notification.bundle_config_hash.clone(),
+        bundle_config_hash: notification_bundle_hash_for_pool(&notification, runtime.pool.as_str()),
         profiles_added: notification.profiles_added.clone(),
         model_config: notification.model_config.clone(),
     };
@@ -645,25 +881,31 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
         return;
     }
 
-    let applied_bundle_hash = resp.bundle_config_hash.clone();
+    let control_plane_hash =
+        notification_bundle_hash_for_pool(&notification, runtime.pool.as_str());
+    let advertised_hash =
+        advertised_bundle_hash(Some(control_plane_hash.as_str()), &resp.bundle_config_hash);
 
-    if !notification.bundle_config_hash.is_empty()
+    if !control_plane_hash.is_empty()
         && !resp.bundle_config_hash.is_empty()
-        && notification.bundle_config_hash != resp.bundle_config_hash
+        && control_plane_hash != resp.bundle_config_hash
     {
         warn!(
             model = %notification.model_id,
             epoch = notification.epoch,
-            advertised_hash = %notification.bundle_config_hash,
+            advertised_hash = %control_plane_hash,
             applied_hash = %resp.bundle_config_hash,
-            "worker-config: Python registry hash differs from control-plane hash; advertising Python-applied hash"
+            "worker-config: Python registry hash differs from control-plane hash; advertising control-plane hash"
         );
         record_delta(metrics, kind, "hash_mismatch");
     } else {
         record_delta(metrics, kind, "applied");
     }
 
-    state.mark_applied(notification.epoch, applied_bundle_hash);
+    state.mark_applied(notification.epoch, advertised_hash);
+    if requires_eager_model_ready(&notification.bundle_id) {
+        state.record_loaded_model(&notification.model_id);
+    }
     metrics.config_epoch.set(notification.epoch as i64);
 }
 
@@ -701,15 +943,63 @@ mod tests {
             bundle_id: "default".into(),
             epoch: 1,
             bundle_config_hash: "h".into(),
+            bundle_pool_config_hashes: HashMap::new(),
             model_id: "m".into(),
             profiles_added: vec![],
             model_config: "x".into(),
             affected_bundles: vec![],
+            pool: None,
         };
         assert!(notification_targets_bundle(&notification, "default"));
         assert!(!notification_targets_bundle(&notification, "other"));
         notification.affected_bundles.push("other".into());
         assert!(!notification_targets_bundle(&notification, "other"));
+    }
+
+    #[test]
+    fn notification_targets_pool_and_selects_pool_hash() {
+        let notification = ConfigNotification {
+            producer_id: "sie-config".into(),
+            bundle_id: "candle".into(),
+            epoch: 1,
+            bundle_config_hash: "global-hash".into(),
+            bundle_pool_config_hashes: HashMap::from([(
+                "candle".to_string(),
+                HashMap::from([
+                    ("default".to_string(), "default-hash".to_string()),
+                    ("customer-a".to_string(), "tenant-hash".to_string()),
+                ]),
+            )]),
+            model_id: "m".into(),
+            profiles_added: vec![],
+            model_config: "x".into(),
+            affected_bundles: vec!["candle".into()],
+            pool: Some("Customer-A".into()),
+        };
+
+        assert!(notification_targets_pool(&notification, "customer-a"));
+        assert!(!notification_targets_pool(&notification, "default"));
+        assert_eq!(
+            notification_bundle_hash_for_pool(&notification, "customer-a"),
+            "tenant-hash"
+        );
+    }
+
+    #[test]
+    fn advertised_bundle_hash_prefers_control_plane_value() {
+        assert_eq!(
+            advertised_bundle_hash(Some("control-hash"), "worker-hash"),
+            "control-hash"
+        );
+        assert_eq!(advertised_bundle_hash(Some(""), "worker-hash"), "");
+        assert_eq!(advertised_bundle_hash(None, "worker-hash"), "worker-hash");
+    }
+
+    #[test]
+    fn eager_model_ready_is_candle_specific() {
+        assert!(requires_eager_model_ready("candle"));
+        assert!(!requires_eager_model_ready("default"));
+        assert!(!requires_eager_model_ready("sglang"));
     }
 
     #[test]
@@ -728,6 +1018,9 @@ mod tests {
         assert_eq!(parsed.producer_id, "sie-config-0");
         assert_eq!(parsed.bundle_id, "default");
         assert_eq!(parsed.epoch, 3);
+        assert!(parsed.bundle_pool_config_hashes.is_empty());
+        assert!(parsed.pool.is_none());
+        assert!(notification_targets_pool(&parsed, "customer-a"));
     }
 
     #[test]
@@ -772,6 +1065,25 @@ mod tests {
         assert!(state.mark_export_reconciled(4, Some(String::new()), false));
         assert_eq!(state.epoch(), 4);
         assert_eq!(state.bundle_config_hash().read().unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn loaded_models_are_deduped_and_sorted() {
+        let state = ConfigApplyState::new("initial".into());
+        state.record_loaded_model("model/b");
+        state.record_loaded_model("model/a");
+        state.record_loaded_model("model/b");
+
+        assert_eq!(
+            state.loaded_models().read().unwrap().as_slice(),
+            ["model/a".to_string(), "model/b".to_string()]
+        );
+
+        state.set_loaded_models(vec!["model/d".into(), "".into(), " model/c ".into()]);
+        assert_eq!(
+            state.loaded_models().read().unwrap().as_slice(),
+            ["model/c".to_string(), "model/d".to_string()]
+        );
     }
 
     #[test]

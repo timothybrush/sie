@@ -1,7 +1,9 @@
 //! NATS subject helpers — model-id normalisation + extraction.
 //!
-//! Work subject format:
-//! `sie.work.{pool_name}.{machine_profile}.{bundle}.{normalized_model_id}`.
+//! Work subject formats:
+//! `sie.work.{pool_name}.{machine_profile}.{bundle}.{normalized_model_id}`
+//! and direct-dispatch
+//! `sie.work.{pool_name}.{machine_profile}.{bundle}.{normalized_model_id}.{worker_id}`.
 
 /// Subject token index of the normalized model id
 /// (`sie.work.<POOL>.<MACHINE>.<BUNDLE>.<MODEL>`).
@@ -9,6 +11,9 @@ const MODEL_TOKEN_INDEX: usize = 5;
 
 /// Minimum number of dot-delimited tokens a valid work subject must have.
 const MIN_SUBJECT_PARTS: usize = 6;
+
+/// Exact token count for worker-direct work subjects.
+const DIRECT_WORK_SUBJECT_PARTS: usize = 7;
 
 /// Inverse of [`normalize_model_id`]. Best-effort: `__` → `/`, `_dot_` → `.`.
 pub fn denormalize_model_id(normalized: &str) -> String {
@@ -31,6 +36,14 @@ pub fn extract_model_id(subject: &str) -> Option<String> {
         return None;
     }
     Some(denormalize_model_id(parts[MODEL_TOKEN_INDEX]))
+}
+
+/// True when the subject addresses one concrete worker rather than the pool.
+pub fn is_worker_direct_work_subject(subject: &str) -> bool {
+    let parts: Vec<&str> = subject.split('.').collect();
+    parts.len() == DIRECT_WORK_SUBJECT_PARTS
+        && parts.first() == Some(&"sie")
+        && parts.get(1) == Some(&"work")
 }
 
 /// True iff the two NATS subject filters share at least one concrete
@@ -118,6 +131,22 @@ mod tests {
         assert_eq!(extract_model_id("sie.work"), None);
         assert_eq!(extract_model_id("sie.work.model"), None);
         assert_eq!(extract_model_id("sie.work.default.l4.default"), None);
+    }
+
+    #[test]
+    fn worker_direct_subject_detection_requires_worker_token() {
+        assert!(!is_worker_direct_work_subject(
+            "sie.work.default.rtx6000.default.BAAI__bge-m3"
+        ));
+        assert!(is_worker_direct_work_subject(
+            "sie.work.default.rtx6000.default.BAAI__bge-m3.worker-1"
+        ));
+        assert!(!is_worker_direct_work_subject(
+            "sie.work.default.rtx6000.default.BAAI__bge-m3.worker-1.extra"
+        ));
+        assert!(!is_worker_direct_work_subject(
+            "other.work.default.rtx6000.default.BAAI__bge-m3.worker-1"
+        ));
     }
 
     // ----- subjects_overlap ---------------------------------------------------

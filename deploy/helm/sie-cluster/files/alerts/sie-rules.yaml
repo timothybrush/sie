@@ -82,14 +82,11 @@ groups:
         #   - upstream_model_loading         — worker WorkResult unanimous
         #                                      MODEL_LOADING (model still
         #                                      warming up).
-        #   - upstream_timeout_model_loading — gateway-synthesised 503 +
-        #                                      MODEL_LOADING when the
-        #                                      result-await timeout fires
-        #                                      (typically while a worker
-        #                                      cold-loads the target model
-        #                                      on demand).
+        #   - upstream_timeout_model_loading — legacy gateway-synthesised
+        #                                      503 + MODEL_LOADING timeout
+        #                                      reason from older releases.
         #
-        # All three are auto-retried by the SDK under the SDK's
+        # These are auto-retried by the SDK under the SDK's
         # ``provision_timeout_s`` / ``max_oom_retries`` budgets — see
         # ``packages/sie_sdk/src/sie_sdk/client/_shared.py``. Operators
         # still see these events via the dedicated informational alerts
@@ -111,7 +108,7 @@ groups:
           severity: warning
         annotations:
           summary: "SIE non-retryable error rate > 5%"
-          description: "{{ $value | humanizePercentage }} of requests are failing with non-retryable errors (excludes RESOURCE_EXHAUSTED, MODEL_LOADING, and upstream_lora_loading which the SDK auto-retries)."
+          description: "{{ $value | humanizePercentage }} of requests are failing with non-retryable errors (excludes RESOURCE_EXHAUSTED, MODEL_LOADING, legacy upstream_timeout_model_loading, and upstream_lora_loading retry signals)."
 
       - alert: SIEHighLatency
         expr: histogram_quantile(0.95, sum by (le) (rate(sie_gateway_request_latency_seconds_bucket[5m]))) > 5

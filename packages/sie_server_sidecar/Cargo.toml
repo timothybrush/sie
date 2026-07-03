@@ -1,6 +1,6 @@
 [package]
 name = "sie-server-sidecar"
-version = "0.6.14"
+version = "0.6.15"
 edition = "2021"
 description = "SIE worker sidecar: NATS JetStream consumer, scheduler, IPC client, and GPU-independent prep for sie-server pods."
 
@@ -43,10 +43,21 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
+# OpenTelemetry tracing — versions kept in lockstep with the gateway
+# (`packages/sie_gateway/Cargo.toml`). OTel breaks compat across minor
+# versions, so bumping requires updating all four lines together.
+# `opentelemetry-http` is intentionally omitted: the sidecar extracts
+# trace context from the work-envelope W3C strings, not HTTP headers.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
+
 async-trait = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Metrics server (matches gateway)
 prometheus = { version = "0.14", features = ["process"] }
@@ -55,7 +66,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
 # Cloud payload store backends (opt-in, same shape as gateway)
-object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.14", optional = true, features = ["aws", "gcp", "azure"] }
 url = { version = "2", optional = true }
 
 # HF fast-tokenizers. Used by `src/tokenize/` to verify the
@@ -64,7 +75,7 @@ url = { version = "2", optional = true }
 # inside the sidecar. Blake3 hashes the canonical bytes
 # for the `tokenizer_id` drift check the adapter populates on
 # `EnsureModelReady`.
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 blake3 = "1"
 
 # NOTE: This crate has no GPU-side dependencies. The sidecar talks to

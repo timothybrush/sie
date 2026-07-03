@@ -238,6 +238,8 @@ class NatsPublisher:
         bundle_config_hashes: dict[str, str],
         epoch: int,
         model_config_yaml: str,
+        model_pool: str = "default",
+        bundle_pool_config_hashes: dict[str, dict[str, str]] | None = None,
     ) -> None:
         """Publish config change notifications to NATS.
 
@@ -249,9 +251,10 @@ class NatsPublisher:
 
         worker-sidecar containers consume the bundle-scoped subject. The same
         payload shape goes to both subjects so every subscriber sees the full
-        set of fields that ``sie_gateway`` expects
+        set of fields that ``sie_gateway`` and worker sidecars expect
         (``router_id``, ``bundle_id``, ``epoch``, ``bundle_config_hash``,
-        ``model_id``, ``profiles_added``, ``model_config``, ``affected_bundles``).
+        ``model_id``, ``profiles_added``, ``model_config``,
+        ``affected_bundles``, ``pool``, ``bundle_pool_config_hashes``).
         See ``packages/sie_gateway/src/nats/manager.rs::ConfigNotification``.
 
         Args:
@@ -261,6 +264,8 @@ class NatsPublisher:
             bundle_config_hashes: Dict of bundle_id -> new hash for each affected bundle.
             epoch: The new epoch value after this mutation.
             model_config_yaml: Full model config YAML content.
+            model_pool: Canonical pool assignment for the changed model.
+            bundle_pool_config_hashes: Nested bundle_id -> pool -> hash map.
 
         Raises:
             RuntimeError: If NATS is not connected.
@@ -287,6 +292,8 @@ class NatsPublisher:
             raise ValueError(msg)
 
         nc = cast("nats.NATS", self._nc)
+        normalized_pool = model_pool.strip().lower() or "default"
+        pool_hashes = bundle_pool_config_hashes or {}
 
         # Publish each bundle delta individually, collecting failures
         # rather than short-circuiting on the first exception. If we
@@ -306,6 +313,8 @@ class NatsPublisher:
                 "profiles_added": profiles_added,
                 "model_config": model_config_yaml,
                 "affected_bundles": affected_bundles,
+                "pool": normalized_pool,
+                "bundle_pool_config_hashes": pool_hashes,
             }
             encoded = orjson.dumps(payload)
 

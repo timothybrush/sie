@@ -1,9 +1,9 @@
 """Saturation hysteresis state machine.
 
-The routing rollout surfaces a boolean ``saturated`` flag on the worker's status
-payload (WS ``/ws/status`` and, when ``SIE_HEALTH_NATS=1``, also on
-``sie.health.{worker_id}``). The gateway uses this to exclude the
-worker from the HRW direct-dispatch ring.
+The routing rollout surfaces a boolean ``saturated`` flag on the worker status
+payload. The sidecar publishes that status over ``sie.health.{worker_id}`` in
+queue-mode deployments, and the gateway uses it to exclude the worker from the
+HRW direct-dispatch ring.
 
 The flag is governed by a two-threshold hysteresis to avoid thrashing
 under oscillation around a single setpoint:
@@ -14,11 +14,10 @@ under oscillation around a single setpoint:
   (default 70%), at which point it flips back to ``False``.
 
 The state machine is intentionally pure (no I/O, no clock) so it can be
-unit-tested in isolation; the call sites in ``nats_pull_loop`` and
-``api/ws.py`` drive it from the existing in-flight counter.
-
-The admission-control rollout swaps the input from ``in_flight / max_batch_requests``
-to ``kv_reserved / kv_budget`` — the state machine itself stays the same.
+unit-tested in isolation; status publishers drive it from the active saturation
+signal for their pool. Non-generation pools use an in-flight/capacity ratio,
+while generation pools use ``kv_reserved / kv_budget`` — the state machine
+itself stays the same.
 """
 
 from __future__ import annotations

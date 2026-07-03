@@ -11,6 +11,7 @@ from torch import nn
 from torch.nn import functional
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters._utils import validate_output_types
@@ -236,23 +237,8 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
     # score() and score_pairs() are provided by BGEM3ScoreMixin.
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
-        """Build XLMRoberta-style position IDs for packed sequences.
-
-        XLMRoberta uses position IDs starting at padding_idx + 1, not 0.
-        This is critical for matching the padded model's output.
-        """
-        pos_list = []
-        for i in range(num_seqs):
-            seq_len = cu_seqlens[i + 1].item() - cu_seqlens[i].item()
-            # XLMRoberta positions: [padding_idx+1, padding_idx+2, ..., padding_idx+seq_len]
-            pos_list.append(
-                torch.arange(
-                    self._padding_idx + 1,
-                    self._padding_idx + 1 + seq_len,
-                    device=self._device,
-                )
-            )
-        return torch.cat(pos_list)
+        """Build XLMRoberta-style position IDs (each restarts at padding_idx + 1)."""
+        return build_position_ids(cu_seqlens, offset=self._padding_idx + 1)
 
     def _run_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Compute embeddings for packed input."""
@@ -332,15 +318,17 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
         """Compute requested embeddings from the model output."""
         normalize = normalize if normalize is not None else self._normalize
         results: dict[str, Any] = {}
-        num_seqs = len(seq_lengths)
 
         if "dense" in output_types:
-            # Extract CLS token from each sequence
-            cls_embeddings = []
-            for i in range(num_seqs):
-                start = cu_seqlens[i].item()
-                cls_embeddings.append(hidden[start])
-            dense_vecs = torch.stack(cls_embeddings)
+            # Extract the CLS token (first token) of each packed sequence in a
+            # single vectorized gather. The CLS positions are exactly the
+            # per-sequence start offsets, i.e. ``cu_seqlens[:-1]``. The previous
+            # per-sequence ``cu_seqlens[i].item()`` loop forced one
+            # cudaStreamSynchronize per sequence (N device round-trips per
+            # encode) that serialized the otherwise-pipelined batch; this gathers
+            # the same rows with zero syncs. Mirrors qwen2_flash's CLS gather.
+            # See #1605.
+            dense_vecs = hidden[cu_seqlens[:-1].long()]
             if normalize:
                 dense_vecs = functional.normalize(dense_vecs, p=2, dim=-1)
             results["dense"] = dense_vecs

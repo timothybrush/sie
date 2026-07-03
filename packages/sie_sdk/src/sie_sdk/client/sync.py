@@ -108,6 +108,7 @@ from ._shared import (
     retry_after_or_default,
     sse_chunk_error,
     sse_headers,
+    validate_encode_result_count,
 )
 from ._sse import iter_sse_payloads
 from .errors import (
@@ -961,8 +962,7 @@ class SIEClient:
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
                 ``503 PROVISIONING`` (scale-from-zero provisioning);
-                ``504`` (defense-in-depth for older gateways that haven't yet
-                mapped upstream timeouts to ``503 MODEL_LOADING``); local
+                ``504`` gateway result timeouts for idempotent queue paths; local
                 ``httpx`` read/connect/pool timeouts; and transient
                 mid-flight transport errors (``RemoteProtocolError``,
                 ``ReadError``, ``WriteError`` — peer severed the connection
@@ -1237,13 +1237,10 @@ class SIEClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. A cold-start request that triggers a
-            # worker-side on-demand model load will typically exceed the
-            # gateway's per-request timeout on the first call; treat that
-            # the same as MODEL_LOADING and retry under the existing
-            # provision_timeout_s budget.
+            # Handle 504 (gateway timeout): queued work was published, but the
+            # gateway did not receive a worker result before its deadline.
+            # Encode/score/extract are idempotent, so callers that opted into
+            # wait_for_capacity can retry within provision_timeout_s.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
@@ -1277,6 +1274,10 @@ class SIEClient:
 
         # Parse results and inject timing into each
         results = parse_encode_results(response_data["items"])
+        # Guard the 1:1 input↔output contract before any positional access
+        # (``results[0]`` below, or batch reassembly in callers). A desynced
+        # count otherwise surfaces as a context-free ``IndexError`` (#1526).
+        validate_encode_result_count(results, len(items_list), model)
         if timing:
             for result in results:
                 result["timing"] = timing
@@ -1630,8 +1631,7 @@ class SIEClient:
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
                 ``503 PROVISIONING`` (scale-from-zero provisioning);
-                ``504`` (defense-in-depth for older gateways that haven't yet
-                mapped upstream timeouts to ``503 MODEL_LOADING``); local
+                ``504`` gateway result timeouts for idempotent queue paths; local
                 ``httpx`` read/connect/pool timeouts; and transient
                 mid-flight transport errors (``RemoteProtocolError``,
                 ``ReadError``, ``WriteError`` — peer severed the connection
@@ -1822,13 +1822,10 @@ class SIEClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. A cold-start request that triggers a
-            # worker-side on-demand model load will typically exceed the
-            # gateway's per-request timeout on the first call; treat that
-            # the same as MODEL_LOADING and retry under the existing
-            # provision_timeout_s budget.
+            # Handle 504 (gateway timeout): queued work was published, but the
+            # gateway did not receive a worker result before its deadline.
+            # Encode/score/extract are idempotent, so callers that opted into
+            # wait_for_capacity can retry within provision_timeout_s.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:
@@ -2461,8 +2458,7 @@ class SIEClient:
             wait_for_capacity: When True (default), auto-retry transient "not
                 enough capacity yet" responses under ``provision_timeout_s`` —
                 ``503 PROVISIONING`` (scale-from-zero provisioning);
-                ``504`` (defense-in-depth for older gateways that haven't yet
-                mapped upstream timeouts to ``503 MODEL_LOADING``); local
+                ``504`` gateway result timeouts for idempotent queue paths; local
                 ``httpx`` read/connect/pool timeouts; and transient
                 mid-flight transport errors (``RemoteProtocolError``,
                 ``ReadError``, ``WriteError`` — peer severed the connection
@@ -2687,13 +2683,10 @@ class SIEClient:
                     )
                     continue
 
-            # Handle 504 (gateway timeout) — defense-in-depth for older
-            # gateways that don't yet map an upstream timeout to
-            # 503 + MODEL_LOADING. A cold-start request that triggers a
-            # worker-side on-demand model load will typically exceed the
-            # gateway's per-request timeout on the first call; treat that
-            # the same as MODEL_LOADING and retry under the existing
-            # provision_timeout_s budget.
+            # Handle 504 (gateway timeout): queued work was published, but the
+            # gateway did not receive a worker result before its deadline.
+            # Encode/score/extract are idempotent, so callers that opted into
+            # wait_for_capacity can retry within provision_timeout_s.
             if response.status_code == HTTP_GATEWAY_TIMEOUT and wait_for_capacity:
                 elapsed = time.monotonic() - start_time
                 if elapsed < timeout:

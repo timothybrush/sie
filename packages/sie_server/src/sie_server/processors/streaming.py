@@ -1,7 +1,7 @@
 """Streaming processor for generation work items.
 
-The ``StreamingProcessor`` is the gen-only branch behind the
-``MessageProcessor`` seam introduced in ``NatsPullLoop._process_messages``.
+The ``StreamingProcessor`` is the gen-only branch behind the sidecar IPC
+``MessageProcessor`` path.
 
 The streaming rollout (this revision) drives the adapter as an async iterator:
 
@@ -13,7 +13,7 @@ The streaming rollout (this revision) drives the adapter as an async iterator:
 - on the iterator's terminal yield, publish a ``{done: true}`` chunk
   with ``usage`` / ``finish_reason`` / ``ttft_ms`` and ACK the JetStream
   work message
-- on cancel (set externally by ``NatsPullLoop`` from the cluster-scope
+- on cancel (signaled by the worker-sidecar from the cluster-scope
   ``cancel.>`` subscription), close the iterator, flush a terminal
   ``{finish_reason: "cancelled", done: true}`` chunk, and ACK
 - on sustained transport failure (>3 publish errors within 1s, or per-
@@ -659,7 +659,7 @@ class StreamingProcessor:
         self._registry = registry
         self._worker_id = worker_id
         # request_id → {attempt_id → asyncio.Event} for in-flight generations.
-        # The NatsPullLoop's cancel-subscription listener calls
+        # The worker-sidecar's cancel-subscription listener calls
         # ``signal_cancel(request_id)`` when a cancel.* message arrives, which
         # sets EVERY attempt's event for that request_id. The cluster-scope
         # subscription is on ``cancel.>``; this map is the actual filter.
@@ -746,9 +746,9 @@ class StreamingProcessor:
     async def prewarm_grammars_for_model(self, model_id: str) -> None:
         """Compile and cache ``tasks.generate.prewarm_grammars`` for ``model_id``.
 
-        Called once per generation model at worker boot (from
-        :class:`NatsPullLoop.start`), after the registry knows the config
-        but before the pool subscription dispatches request-shape work.
+        Called once per generation model at worker boot through
+        ``IpcServer`` after the registry knows the config but before the
+        sidecar dispatches request-shape work.
         The cache key shape mirrors :meth:`_ensure_grammar_ready` exactly
         so a request hitting one of the prewarmed grammars takes the
         cache-hit branch.
@@ -1141,7 +1141,7 @@ class StreamingProcessor:
             _metrics.GENERATION_KV_RESERVED_TOKENS.labels(model=model_id).set(self._reserved)
             _metrics.GENERATION_IN_FLIGHT.labels(model=model_id).dec()
 
-    # -- Cancel registration (called by NatsPullLoop's cancel subscriber) ----
+    # -- Cancel registration (called by the sidecar cancel subscriber) --------
 
     def _register_cancel(self, request_id: str, attempt_id: str, event: asyncio.Event) -> None:
         """Register a per-attempt cancel handle.
@@ -1170,7 +1170,7 @@ class StreamingProcessor:
 
         Sets the cancel event for EVERY live attempt of ``request_id`` so a
         single cancel reaches all concurrent attempts (BUG 2/7). The
-        ``request_id``-only signature is unchanged for ``nats_pull_loop``.
+        ``request_id``-only signature is the sidecar IPC cancel contract.
 
         H9 — when no attempt is registered yet (the cancel arrived before
         the work-item pull / decode-start), write a TTL'd tombstone so the
@@ -1233,11 +1233,9 @@ class StreamingProcessor:
     def in_flight_count(self) -> int:
         """Number of generate requests currently being processed by this worker.
 
-        Drives the saturation gate's ``in_flight / capacity`` fraction
-        in :meth:`NatsPullLoop.update_saturation`. Counts *requests*,
-        not fetched batches — the pull loop's
-        ``_in_flight_tasks`` is per-batch and dramatically understates
-        concurrency under fan-in load.
+        Drives the saturation gate's ``in_flight / capacity`` fraction.
+        Counts *requests*, not fetched batches; per-batch accounting
+        dramatically understates concurrency under fan-in load.
         """
         return len(self._in_flight_cancels)
 
@@ -1363,7 +1361,7 @@ class StreamingProcessor:
         # H9 — cancel tombstone check.
         #
         # If the gateway's first-chunk fallback cancelled this request_id
-        # BEFORE this worker's pull loop registered the in-flight handle,
+        # BEFORE this worker process registered the in-flight handle,
         # ``signal_cancel`` left a tombstone behind. The pool-republished
         # attempt is already in flight (or has completed) on another worker;
         # decoding here would burn GPU/KV/billing for a request the client
@@ -2439,6 +2437,7 @@ class StreamingProcessor:
 
     async def _ensure_loaded(self, model_id: str) -> Any:
         if self._registry.is_loaded(model_id):
+            self._registry.touch_lru(model_id)
             return self._registry.get(model_id)
         device = self._registry.device
         return await self._registry.load_async(model_id, device)

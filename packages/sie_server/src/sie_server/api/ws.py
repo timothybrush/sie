@@ -4,14 +4,15 @@ import asyncio
 import functools
 import getpass
 import hashlib
-import json
 import logging
 import os
 import time
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
+import orjson
 import yaml
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sie_sdk.types import (
@@ -25,7 +26,6 @@ from sie_sdk.types import (
     ModelConfig as SDKModelConfig,
 )
 
-from sie_server.config.model import ModelConfig as ServerModelConfig
 from sie_server.core.batcher import BatchConfig
 from sie_server.core.gpu_health import gpu_is_healthy_async
 from sie_server.core.readiness import is_ready
@@ -33,10 +33,11 @@ from sie_server.observability.gpu import get_gpu_metrics
 from sie_server.observability.prometheus import collect_prometheus_metrics
 
 if TYPE_CHECKING:
+    from sie_server.config.model import ModelConfig as ServerModelConfig
     from sie_server.core.registry import ModelRegistry
 
 
-class StatusPullLoop(Protocol):
+class StatusQueueRuntime(Protocol):
     worker_id: str
 
     def update_saturation(self) -> bool:
@@ -194,67 +195,108 @@ def _bundle_adapter_modules(bundle_id: str) -> frozenset[str]:
     return frozenset(str(adapter) for adapter in adapters if adapter)
 
 
-def _is_hash_falsy(value: object) -> bool:
-    if value is None:
-        return True
-    if value is False:
-        return True
-    if isinstance(value, int | float) and value == 0:
-        return True
-    return isinstance(value, str | list | tuple | dict) and len(value) == 0
-
-
-def _canonical_adapter_options_for_hash(adapter_options: dict[str, Any] | None) -> dict[str, Any] | None:
-    if isinstance(adapter_options, dict) and not any(not _is_hash_falsy(value) for value in adapter_options.values()):
+def _adapter_module(adapter_path: str | None) -> str | None:
+    if not adapter_path:
         return None
-    return adapter_options
+    return adapter_path.split(":", maxsplit=1)[0]
 
 
-def _profile_adapter_options_for_hash(profile: Any) -> dict[str, Any] | None:
-    if "adapter_options" not in getattr(profile, "model_fields_set", set()):
-        return None
-    adapter_options = profile.adapter_options
-    option_fields = getattr(adapter_options, "model_fields_set", set())
-    raw: dict[str, Any] = {}
-    if "loadtime" in option_fields:
-        raw["loadtime"] = dict(adapter_options.loadtime)
-    if "runtime" in option_fields:
-        raw["runtime"] = dict(adapter_options.runtime)
-    return _canonical_adapter_options_for_hash(raw)
+def _profile_value(profile: object, field: str, default: Any = None) -> Any:
+    if isinstance(profile, dict):
+        return cast("dict[str, Any]", profile).get(field, default)
+    return getattr(profile, field, default)
 
 
-def _resolved_profile_for_hash(config: ServerModelConfig, profile_name: str) -> dict[str, Any]:
-    def resolve(name: str, seen: set[str]) -> dict[str, Any]:
-        if name in seen:
-            msg = f"Profile '{name}' has an inheritance cycle"
+def _copy_mapping(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in cast("Mapping[object, Any]", value).items()}
+    return {}
+
+
+def _profile_adapter_options_parts(profile: object) -> tuple[dict[str, Any], dict[str, Any]]:
+    adapter_options = _profile_value(profile, "adapter_options")
+    if adapter_options is None:
+        return {}, {}
+    if isinstance(adapter_options, dict):
+        options = cast("dict[str, Any]", adapter_options)
+        return (
+            _copy_mapping(options.get("loadtime")),
+            _copy_mapping(options.get("runtime")),
+        )
+    return (
+        _copy_mapping(getattr(adapter_options, "loadtime", None)),
+        _copy_mapping(getattr(adapter_options, "runtime", None)),
+    )
+
+
+def _compact_adapter_options_for_hash(
+    loadtime: dict[str, Any],
+    runtime: dict[str, Any],
+) -> dict[str, dict[str, Any]] | None:
+    adapter_options: dict[str, dict[str, Any]] = {}
+    if loadtime:
+        adapter_options["loadtime"] = loadtime
+    if runtime:
+        adapter_options["runtime"] = runtime
+    return adapter_options or None
+
+
+def _resolved_profile_for_hash(config: object, profile_name: str, seen: set[str] | None = None) -> dict[str, object]:
+    """Resolve one profile into the canonical fields used by bundle_config_hash."""
+    profiles_raw = _profile_value(config, "profiles")
+    if not isinstance(profiles_raw, dict):
+        msg = "Model config profiles must be a mapping"
+        raise ValueError(msg)
+    profiles = cast("dict[str, object]", profiles_raw)
+
+    if profile_name not in profiles:
+        msg = f"Profile '{profile_name}' referenced via extends does not exist"
+        raise ValueError(msg)
+
+    if seen is None:
+        seen = set()
+    if profile_name in seen:
+        msg = f"Profile '{profile_name}' has cyclic extends references"
+        raise ValueError(msg)
+    seen.add(profile_name)
+
+    profile = profiles[profile_name]
+    parent_name = _profile_value(profile, "extends")
+    if isinstance(parent_name, str) and parent_name:
+        if parent_name not in profiles:
+            msg = f"Profile '{parent_name}' referenced via extends does not exist"
             raise ValueError(msg)
-        seen.add(name)
-
-        profile = config.profiles.get(name)
-        if profile is None:
-            msg = f"Profile '{name}' referenced via extends does not exist"
-            raise ValueError(msg)
-        if profile.extends:
-            resolved = resolve(profile.extends, seen)
+        resolved = _resolved_profile_for_hash(config, parent_name, seen)
+        inherited_options = resolved.get("adapter_options")
+        if isinstance(inherited_options, dict):
+            options = cast("dict[str, Any]", inherited_options)
+            loadtime = _copy_mapping(options.get("loadtime"))
+            runtime = _copy_mapping(options.get("runtime"))
         else:
-            resolved = {
-                "adapter_path": None,
-                "max_batch_tokens": None,
-                "compute_precision": None,
-                "adapter_options": None,
-            }
+            loadtime = {}
+            runtime = {}
+    else:
+        resolved = {
+            "adapter_path": None,
+            "max_batch_tokens": None,
+            "compute_precision": None,
+            "adapter_options": None,
+        }
+        loadtime = {}
+        runtime = {}
 
-        if profile.adapter_path is not None:
-            resolved["adapter_path"] = profile.adapter_path
-        if profile.max_batch_tokens is not None:
-            resolved["max_batch_tokens"] = profile.max_batch_tokens
-        if profile.compute_precision is not None:
-            resolved["compute_precision"] = profile.compute_precision
-        if "adapter_options" in getattr(profile, "model_fields_set", set()):
-            resolved["adapter_options"] = _profile_adapter_options_for_hash(profile)
-        return resolved
+    for field in ("adapter_path", "max_batch_tokens", "compute_precision"):
+        value = _profile_value(profile, field)
+        if value is not None:
+            resolved[field] = value
 
-    return resolve(profile_name, set())
+    child_loadtime, child_runtime = _profile_adapter_options_parts(profile)
+    if child_loadtime:
+        loadtime = child_loadtime
+    if child_runtime:
+        runtime = child_runtime
+    resolved["adapter_options"] = _compact_adapter_options_for_hash(loadtime, runtime)
+    return resolved
 
 
 def _is_synthetic_profile_variant(config: ServerModelConfig, configs: dict[str, ServerModelConfig]) -> bool:
@@ -263,6 +305,27 @@ def _is_synthetic_profile_variant(config: ServerModelConfig, configs: dict[str, 
         return False
     base_model, profile = source
     return bool(base_model in configs and profile and config.sie_id == f"{base_model}:{profile}")
+
+
+def _model_has_bundle_adapter(config: ServerModelConfig, bundle_adapters: frozenset[str]) -> bool:
+    return any(
+        (module := _adapter_module(config.resolve_profile(profile_name).adapter_path)) is not None
+        and module in bundle_adapters
+        for profile_name in config.profiles
+    )
+
+
+def _profile_matches_bundle(
+    config: ServerModelConfig,
+    profile_name: str,
+    bundle_adapters: frozenset[str],
+) -> bool:
+    module = _adapter_module(config.resolve_profile(profile_name).adapter_path)
+    return module is not None and module in bundle_adapters
+
+
+def _profile_config_for_hash(config: ServerModelConfig, profile_name: str) -> dict[str, object | None]:
+    return _resolved_profile_for_hash(config, profile_name)
 
 
 def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
@@ -287,31 +350,39 @@ def _compute_bundle_config_hash(registry: ModelRegistry, bundle_id: str) -> str:
     # both sides hash [{"sie_id": name, "profiles": [{name, config}]}]
     # where config contains resolved routable fields: adapter_path,
     # max_batch_tokens, compute_precision, adapter_options.
-    items = []
-    bundle_adapter_set = _bundle_adapter_modules(bundle_id)
+    bundle_adapters = _bundle_adapter_modules(bundle_id)
+    items_by_model: dict[str, dict[str, dict[str, object | None]]] = {}
     for config in sorted(configs.values(), key=lambda c: c.sie_id):
         if _is_synthetic_profile_variant(config, configs):
             continue
+        if not _model_has_bundle_adapter(config, bundle_adapters):
+            continue
 
-        profiles_for_hash = []
-        for pname in sorted(config.profiles.keys()):
-            profile_dict = _resolved_profile_for_hash(config, pname)
-            adapter_path = profile_dict.get("adapter_path")
-            if adapter_path:
-                module_path = str(adapter_path).split(":", maxsplit=1)[0]
-                if module_path not in bundle_adapter_set:
-                    continue
-            profile_dict = {
-                "adapter_path": profile_dict.get("adapter_path"),
-                "max_batch_tokens": profile_dict.get("max_batch_tokens"),
-                "compute_precision": profile_dict.get("compute_precision"),
-                "adapter_options": profile_dict.get("adapter_options"),
-            }
-            profiles_for_hash.append({"name": pname, "config": profile_dict})
-        items.append({"sie_id": config.sie_id, "profiles": profiles_for_hash})
+        base_id = config.sie_id
+        profile_name_map = {pname: pname for pname in config.profiles}
+        if config.synthetic_profile_variant_source is not None:
+            base_id, variant_profile = config.synthetic_profile_variant_source
+            profile_name_map = {"default": variant_profile}
 
-    serialized = json.dumps(items, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode()).hexdigest()
+        profiles_for_model = items_by_model.setdefault(base_id, {})
+        for pname in sorted(profile_name_map):
+            if not _profile_matches_bundle(config, pname, bundle_adapters):
+                continue
+            profiles_for_model[profile_name_map[pname]] = _profile_config_for_hash(config, pname)
+
+    items = []
+    for model_id in sorted(items_by_model):
+        profiles = items_by_model[model_id]
+        if not profiles:
+            continue
+        profiles_for_hash = [{"name": pname, "config": profiles[pname]} for pname in sorted(profiles)]
+        items.append({"sie_id": model_id, "profiles": profiles_for_hash})
+
+    if not items:
+        return ""
+
+    serialized = orjson.dumps(items, option=orjson.OPT_SORT_KEYS)
+    return hashlib.sha256(serialized).hexdigest()
 
 
 # Cache of bundle config hashes. Populated by _compute_bundle_config_hash
@@ -350,7 +421,7 @@ def compute_bundle_config_hash_cached(registry: ModelRegistry, bundle_id: str) -
 
 async def build_status_message(
     registry: ModelRegistry,
-    pull_loop: StatusPullLoop | None = None,
+    queue_runtime: StatusQueueRuntime | None = None,
 ) -> WorkerStatusMessage:
     """Build the complete status message.
 
@@ -407,16 +478,14 @@ async def build_status_message(
 
     # Worker name (== worker_id used by direct-dispatch routing).
     #
-    # The pull loop owns the canonical resolution
-    # (``SIE_WORKER_ID > HOSTNAME > POD_NAME > uuid4``); we mirror that
-    # value here so the gateway's WorkerRegistry keys its dispatch
+    # The queue runtime owns the canonical worker identity; we mirror that
+    # value here so the gateway's WorkerRegistry keys its direct-dispatch
     # subject (``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{name}``)
-    # on the *same*
-    # identifier the worker is subscribed to. Falling back to the
-    # legacy ``HOSTNAME``/``POD_NAME`` lookup when the pull loop is
-    # absent keeps the non-queue path working unchanged.
-    if pull_loop is not None and hasattr(pull_loop, "worker_id"):
-        worker_name = pull_loop.worker_id
+    # on the same identifier the worker is subscribed to. Falling back to the
+    # env lookup when the queue runtime is absent keeps standalone/direct
+    # server status working unchanged.
+    if queue_runtime is not None and hasattr(queue_runtime, "worker_id"):
+        worker_name = queue_runtime.worker_id
     else:
         worker_name = os.environ.get("SIE_WORKER_ID") or os.environ.get("HOSTNAME") or os.environ.get("POD_NAME", "")
 
@@ -434,12 +503,11 @@ async def build_status_message(
     else:
         max_batch_requests = BatchConfig().max_batch_requests
 
-    # Ask the pull loop for its latched saturation flag. The
-    # pull loop owns the SaturationGate state machine; we drive an
-    # update here so the WS-emitted snapshot matches whatever the
-    # optional NATS health publisher sees on the same tick. Falls
-    # back to False when the pull loop is not present (eg. tests
-    # using `build_status_message` standalone).
+    # Ask the optional queue runtime for its latched saturation flag when
+    # it exposes one. After the Python pull-loop deletion, the app wires
+    # the IPC server here primarily for canonical worker identity; that
+    # object has no local view of Rust queue pressure, so saturation falls
+    # back to False unless a richer runtime supplies update_saturation().
     #
     # Admission-control note: the underlying ratio changed semantics. On
     # generation pools (where a ``kv_budget_tokens`` is configured)
@@ -448,10 +516,9 @@ async def build_status_message(
     # it still reads ``in_flight / aggregate_max_batch_requests``.
     # The boolean ``saturated`` is unchanged for consumers, but
     # downstream alerts that previously assumed the pre-admission fraction
-    # should be aware of the switch — see
-    # :meth:`NatsPullLoop.update_saturation`.
-    if pull_loop is not None and hasattr(pull_loop, "update_saturation"):
-        saturated = bool(pull_loop.update_saturation())
+    # should be aware of the switch.
+    if queue_runtime is not None and hasattr(queue_runtime, "update_saturation"):
+        saturated = bool(queue_runtime.update_saturation())
     else:
         saturated = False
 
@@ -496,15 +563,15 @@ async def websocket_status(websocket: WebSocket) -> None:
 
     # Get registry from app state
     registry: ModelRegistry = websocket.app.state.registry
-    # Feed `build_status_message` the pull loop so it can
-    # populate the `saturated` flag. May be absent in stripped-down
-    # test apps; the helper handles `None` defensively.
-    pull_loop = getattr(websocket.app.state, "nats_pull_loop", None)
+    # Feed `build_status_message` the optional queue runtime so it can
+    # populate the `saturated` flag. May be absent in stripped-down test apps;
+    # the helper handles `None` defensively.
+    queue_runtime = getattr(websocket.app.state, "queue_runtime", None)
 
     try:
         while True:
             # Build and send status
-            status = await build_status_message(registry, pull_loop=pull_loop)
+            status = await build_status_message(registry, queue_runtime=queue_runtime)
             await websocket.send_json(status)
 
             # Wait 200ms before next update

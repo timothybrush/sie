@@ -30,6 +30,7 @@ class EncodePipeline:
         options: dict[str, Any],
         prepared_tokens_per_item: list[PreparedTokens | None] | None = None,
         response_output_types: list[str] | None = None,
+        preformed_batch: bool = False,
     ) -> tuple[list[dict[str, Any]], RequestTiming]:
         """Main entry point: preprocess then execute encoding.
 
@@ -46,6 +47,11 @@ class EncodePipeline:
         (e.g. muvera asks the adapter for ``multivector`` while the postprocessor
         adds ``dense``); the response must then be filtered by the user-requested
         types, not the translated adapter types. Defaults to ``output_types``.
+
+        ``preformed_batch=True`` is the worker-sidecar IPC path: Rust has
+        already formed the batch, so the Python worker must execute it directly
+        rather than submit it to the local BatchFormer again. Direct HTTP leaves
+        this false and keeps Python-side batching for single-instance serving.
         """
         timing = RequestTiming()
 
@@ -62,7 +68,8 @@ class EncodePipeline:
         if prepared_batch is not None:
             # Batched worker path
             worker = await registry.start_worker(model)
-            future = await worker.submit(
+            submit = worker.submit_preformed if preformed_batch else worker.submit
+            future = await submit(
                 prepared_items=prepared_batch.items,
                 items=items,
                 output_types=output_types,
@@ -77,6 +84,7 @@ class EncodePipeline:
             # Direct adapter call (no batching) - run in thread to avoid blocking event loop
             encode_handler = EncodeHandler(model, registry.postprocessor_registry)
             adapter = registry.get(model)
+            registry.touch_lru(model)
             timing.start_inference()
             encode_output = await asyncio.to_thread(
                 encode_handler.encode,

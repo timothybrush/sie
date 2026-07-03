@@ -56,7 +56,7 @@ class _IdempotencyState:
         completed response bytes — no loop-bound primitives in it — so
         carrying it forward is what lets `TestClient` (which spins up a
         fresh `asyncio` loop per request) still observe prior results.
-    -   `lock` and every `asyncio.Event` in `in_flight` are loop-bound
+    -   `lock` and every `_IdempotencyInFlight.event` are loop-bound
         and must be rebuilt any time the running loop changes. We do
         this lazily in `_get_idempotency_state`: when the running loop
         doesn't match `_loop`, we swap `lock` for a fresh one and drop
@@ -69,7 +69,7 @@ class _IdempotencyState:
     def __init__(self) -> None:
         self.cache: OrderedDict[str, tuple[int, str, str]] = OrderedDict()
         self.lock = asyncio.Lock()
-        self.in_flight: dict[str, asyncio.Event] = {}
+        self.in_flight: dict[str, _IdempotencyInFlight] = {}
         self._loop = asyncio.get_running_loop()
 
     def rebind_to_current_loop(self) -> None:
@@ -89,6 +89,18 @@ class _IdempotencyState:
     def clear(self) -> None:
         self.cache.clear()
         self.in_flight.clear()
+
+
+class _IdempotencyInFlight:
+    """Loop-bound state for one in-flight idempotent write."""
+
+    __slots__ = ("event", "exception", "payload_hash", "succeeded")
+
+    def __init__(self, payload_hash: str) -> None:
+        self.event = asyncio.Event()
+        self.exception: BaseException | None = None
+        self.payload_hash = payload_hash
+        self.succeeded = False
 
 
 # Per-app write lock is stored on `app.state._config_write_lock` and
@@ -313,7 +325,7 @@ def _require_model_registry(request: Request) -> ModelRegistry:
 
 @router.get("/models")
 async def list_models(request: Request) -> dict[str, Any]:
-    """List all registered model IDs with their profiles and source."""
+    """List routable model/profile identities with their profiles and source."""
     _check_read_auth(request)
     model_registry = _require_model_registry(request)
     config_store: ConfigStore | None = getattr(request.app.state, "config_store", None)
@@ -321,9 +333,10 @@ async def list_models(request: Request) -> dict[str, Any]:
     api_models = set(await asyncio.to_thread(config_store.list_models)) if config_store else set()
 
     models = []
-    for model_name in model_registry.list_models():
-        profile_names = sorted(model_registry.get_model_profile_names(model_name))
-        source = "api" if model_name in api_models else "filesystem"
+    for model_name in model_registry.list_serving_models():
+        profile_names = sorted(model_registry.get_route_profile_names(model_name))
+        catalog_model_name = model_registry.get_catalog_model_name(model_name)
+        source = "api" if catalog_model_name in api_models else "filesystem"
         models.append(
             {
                 "model_id": model_name,
@@ -402,16 +415,41 @@ async def add_model(request: Request) -> Response:
     body_hash = hashlib.sha256(body).hexdigest()
     idem = _get_idempotency_state(request.app.state) if idempotency_key else None
     if idempotency_key and idem is not None:
-        # Track whether we already waited on an in-flight event. If we
-        # did, and the subsequent cache lookup misses (the original
-        # request's entry was LRU-evicted in the meantime), we must NOT
-        # re-execute the write — that would double-apply the config and
-        # bump the epoch twice. Return a synthesized 200 "already
-        # processed" response instead; the idempotency contract says
-        # "never execute twice for the same key", it says nothing about
-        # guaranteeing the original body is still replayable.
-        already_waited = False
+        # Track the in-flight record we waited on. A cache miss after
+        # waiting can mean either "successful response was evicted" or
+        # "the owner failed/cancelled before caching"; only the former
+        # may synthesize success.
+        waited_in_flight: _IdempotencyInFlight | None = None
+        owner_in_flight: _IdempotencyInFlight | None = None
         while True:
+            if waited_in_flight is not None:
+                if waited_in_flight.exception is not None:
+                    if isinstance(waited_in_flight.exception, asyncio.CancelledError):
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "error": "idempotent_inflight_cancelled",
+                                "idempotency_key": idempotency_key,
+                                "message": (
+                                    "The prior in-flight request with this Idempotency-Key was cancelled "
+                                    "before it completed. Retry the request to execute it."
+                                ),
+                            },
+                        ) from waited_in_flight.exception
+                    raise waited_in_flight.exception
+                if not waited_in_flight.succeeded:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": "idempotent_inflight_aborted",
+                            "idempotency_key": idempotency_key,
+                            "message": (
+                                "The prior in-flight request with this Idempotency-Key ended without "
+                                "a completed response. Retry the request to execute it."
+                            ),
+                        },
+                    )
+
             async with idem.lock:
                 cached = idem.cache.get(idempotency_key)
                 if cached is not None:
@@ -429,37 +467,62 @@ async def add_model(request: Request) -> Response:
                         status_code=cached_status,
                         media_type="application/json",
                     )
-                in_flight_event = idem.in_flight.get(idempotency_key)
-                if in_flight_event is None:
-                    if already_waited:
-                        # Woken by a completer but the response was
-                        # evicted before we grabbed the lock. Replay-safe
-                        # synthesized response: tell the caller the write
-                        # was already applied and they should trust the
-                        # prior success. Not 200-from-cache because we
-                        # can't echo created_profiles faithfully — the
-                        # caller should re-read GET /v1/configs/models/{id}
-                        # if they need the post-state.
-                        return Response(
-                            content=orjson.dumps(
-                                {
-                                    "error": "idempotent_replay_evicted",
-                                    "idempotency_key": idempotency_key,
-                                    "message": (
-                                        "A prior request with this Idempotency-Key completed successfully, "
-                                        "but its cached response was evicted. The write was applied exactly once; "
-                                        "query GET /v1/configs/models/{id} to see the current state."
-                                    ),
-                                }
-                            ).decode(),
-                            status_code=200,
-                            media_type="application/json",
-                        )
+                if waited_in_flight is not None:
+                    # Woken by a completer but the response was evicted
+                    # before we grabbed the lock. This waiter belongs to
+                    # that completed owner, not to any later same-key
+                    # retry that may have started after eviction.
+                    return Response(
+                        content=orjson.dumps(
+                            {
+                                "error": "idempotent_replay_evicted",
+                                "idempotency_key": idempotency_key,
+                                "message": (
+                                    "A prior request with this Idempotency-Key completed successfully, "
+                                    "but its cached response was evicted. The write was applied exactly once; "
+                                    "query GET /v1/configs/models/{id} to see the current state."
+                                ),
+                            }
+                        ).decode(),
+                        status_code=200,
+                        media_type="application/json",
+                    )
+                in_flight = idem.in_flight.get(idempotency_key)
+                if in_flight is None:
                     # Genuinely first request for this key.
-                    idem.in_flight[idempotency_key] = asyncio.Event()
+                    owner_in_flight = _IdempotencyInFlight(body_hash)
+                    idem.in_flight[idempotency_key] = owner_in_flight
                     break
-            already_waited = True
-            await in_flight_event.wait()
+                if body_hash != in_flight.payload_hash:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "idempotency_mismatch",
+                            "message": "Idempotency-Key reused with different payload.",
+                        },
+                    )
+            waited_in_flight = in_flight
+            await in_flight.event.wait()
+
+    cancellation_deferred = False
+
+    async def _await_committed(awaitable: Any) -> Any:
+        """Finish post-commit awaits even if the request task is cancelled."""
+        nonlocal cancellation_deferred
+        task = asyncio.ensure_future(awaitable)
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is None or not current_task.cancelling():
+                    raise
+                cancellation_deferred = True
+                while current_task.cancelling():
+                    current_task.uncancel()
+                if task.done():
+                    return task.result()
+
     try:
         try:
             config = yaml.safe_load(body.decode())
@@ -633,7 +696,7 @@ async def add_model(request: Request) -> Response:
                 config_yaml = yaml.dump(merged_config, default_flow_style=False, sort_keys=False)
 
                 # Disk write BEFORE registry mutation.
-                await asyncio.to_thread(config_store.write_model, model_id, config_yaml)
+                await _await_committed(asyncio.to_thread(config_store.write_model, model_id, config_yaml))
 
             # 4. Commit to in-memory registry now that disk is durable.
             #    Validation already ran above; this call is expected to
@@ -673,7 +736,7 @@ async def add_model(request: Request) -> Response:
             # 5. Increment epoch atomically. This is a read-modify-write
             #    on `ConfigStore`, so it MUST stay inside `write_lock`.
             if config_store and created_profiles:
-                epoch = await asyncio.to_thread(config_store.increment_epoch)
+                epoch = await _await_committed(asyncio.to_thread(config_store.increment_epoch))
 
             # Refresh the `sie_config_models_total` gauge now that the
             # registry has been mutated. Cheap (in-memory dict scan)
@@ -681,7 +744,9 @@ async def add_model(request: Request) -> Response:
             # one that corresponds to the epoch we just bumped.
             if created_profiles:
                 total = len(model_registry.list_models())
-                api_count = len(await asyncio.to_thread(config_store.list_models)) if config_store else 0
+                api_count = 0
+                if config_store:
+                    api_count = len(await _await_committed(asyncio.to_thread(config_store.list_models)))
                 sie_metrics.update_models_gauge(
                     api_count=api_count,
                     filesystem_count=max(total - api_count, 0),
@@ -694,18 +759,27 @@ async def add_model(request: Request) -> Response:
             bundle_config_hashes = {}
             for bundle_id in affected_bundles:
                 bundle_config_hashes[bundle_id] = model_registry.compute_bundle_config_hash(bundle_id)
+            all_bundle_pool_config_hashes = model_registry.compute_bundle_pool_config_hashes()
+            bundle_pool_config_hashes = {
+                bundle_id: all_bundle_pool_config_hashes.get(bundle_id, {}) for bundle_id in affected_bundles
+            }
+            model_pool = model_registry.get_model_pool_name(model_id)
 
             nats_publish_failed = False
             partial_publish_failed_bundles: list[str] = []
             if nats_publisher and nats_publisher.connected and created_profiles:
                 try:
-                    await nats_publisher.publish_config_notification(
-                        model_id=model_id,
-                        profiles_added=created_profiles,
-                        affected_bundles=affected_bundles,
-                        bundle_config_hashes=bundle_config_hashes,
-                        epoch=epoch,
-                        model_config_yaml=config_yaml,
+                    await _await_committed(
+                        nats_publisher.publish_config_notification(
+                            model_id=model_id,
+                            profiles_added=created_profiles,
+                            affected_bundles=affected_bundles,
+                            bundle_config_hashes=bundle_config_hashes,
+                            epoch=epoch,
+                            model_config_yaml=config_yaml,
+                            model_pool=model_pool,
+                            bundle_pool_config_hashes=bundle_pool_config_hashes,
+                        )
                     )
                 except PartialPublishError as e:
                     logger.exception(
@@ -734,9 +808,10 @@ async def add_model(request: Request) -> Response:
                 "nats_publish_failed: Config persisted but NATS notification failed. Workers may not be updated."
             )
 
+        profile_bundles = model_registry.get_model_profile_bundles(model_id, set(created_profiles))
         routable_bundles_by_profile = {}
         for profile_name in created_profiles:
-            routable_bundles_by_profile[profile_name] = affected_bundles
+            routable_bundles_by_profile[profile_name] = profile_bundles.get(profile_name, [])
 
         status_code = 201 if created_profiles else 200
         response_body: dict[str, Any] = {
@@ -751,22 +826,31 @@ async def add_model(request: Request) -> Response:
         response_json = orjson.dumps(response_body).decode()
 
         if idempotency_key and idem is not None:
-            async with idem.lock:
+            await _await_committed(idem.lock.acquire())
+            try:
                 idem.cache[idempotency_key] = (status_code, response_json, body_hash)
                 idem.cache.move_to_end(idempotency_key)
                 while len(idem.cache) > _MAX_IDEMPOTENCY_CACHE_SIZE:
                     idem.cache.popitem(last=False)
-                event = idem.in_flight.pop(idempotency_key, None)
-                if event is not None:
-                    event.set()
+                if owner_in_flight is not None:
+                    owner_in_flight.succeeded = True
+                    if idem.in_flight.get(idempotency_key) is owner_in_flight:
+                        idem.in_flight.pop(idempotency_key, None)
+                    owner_in_flight.event.set()
+            finally:
+                idem.lock.release()
 
-    except Exception:
+    except (Exception, asyncio.CancelledError) as e:
         # Clean up in-flight marker on any error so waiters aren't stuck forever
-        if idempotency_key and idem is not None:
-            async with idem.lock:
-                event = idem.in_flight.pop(idempotency_key, None)
-                if event is not None:
-                    event.set()
+        if idempotency_key and idem is not None and owner_in_flight is not None:
+            await _await_committed(idem.lock.acquire())
+            try:
+                owner_in_flight.exception = e
+                if idem.in_flight.get(idempotency_key) is owner_in_flight:
+                    idem.in_flight.pop(idempotency_key, None)
+                owner_in_flight.event.set()
+            finally:
+                idem.lock.release()
         raise
 
     # Emit audit log
@@ -779,6 +863,9 @@ async def add_model(request: Request) -> Response:
         latency_ms=round(elapsed_ms, 2),
         body_bytes=len(body),
     )
+
+    if cancellation_deferred:
+        raise asyncio.CancelledError
 
     return Response(
         content=response_json,
@@ -876,6 +963,7 @@ async def list_bundles(request: Request) -> dict[str, Any]:
         bundles.append(
             {
                 "bundle_id": info.name,
+                "engine": info.engine,
                 "priority": info.priority,
                 "adapter_count": len(info.adapters),
                 "source": "filesystem",
@@ -900,6 +988,7 @@ async def get_bundle(request: Request, bundle_id: str) -> Response:
 
     data = {
         "name": info.name,
+        "engine": info.engine,
         "priority": info.priority,
         "source": "filesystem",
         "adapters": info.adapters,
@@ -992,40 +1081,43 @@ async def export_snapshot(request: Request) -> Response:
 
         models = []
         for model_name in model_registry.list_models():
-            model_info = model_registry.get_model_info(model_name)
-            raw_yaml = (await asyncio.to_thread(config_store.read_model, model_name)) if config_store else None
-
-            if raw_yaml is None:
-                raw_yaml = await asyncio.to_thread(_load_filesystem_yaml, model_registry.models_dir, model_name)
-
-            if raw_yaml:
-                try:
-                    model_config = yaml.safe_load(raw_yaml) or {"sie_id": model_name}
-                except yaml.YAMLError:
-                    model_config = None
+            full_config = model_registry.get_full_config(model_name)
+            if config_store is None and full_config:
+                model_config = full_config
+                raw_yaml = yaml.dump(full_config, default_flow_style=False, sort_keys=False)
             else:
-                model_config = None
+                raw_yaml = (await asyncio.to_thread(config_store.read_model, model_name)) if config_store else None
 
-            # Fall back to the registry's in-memory merged config whenever
-            # we don't have authoritative raw YAML on disk. This covers
-            # no-ConfigStore deployments (default) and API-added models,
-            # both of which previously exported as `{"sie_id": ...}` and
-            # caused a fresh gateway's bootstrap to drop all profiles.
-            if not model_config or not model_config.get("profiles"):
-                full = model_registry.get_full_config(model_name)
-                if full:
-                    model_config = full
-                    if not raw_yaml:
-                        raw_yaml = yaml.dump(full, default_flow_style=False, sort_keys=False)
-                elif not model_config:
-                    model_config = {"sie_id": model_name}
+                if raw_yaml is None:
+                    raw_yaml = await asyncio.to_thread(_load_filesystem_yaml, model_registry.models_dir, model_name)
+
+                if raw_yaml:
+                    try:
+                        model_config = yaml.safe_load(raw_yaml) or {"sie_id": model_name}
+                    except yaml.YAMLError:
+                        model_config = None
+                        raw_yaml = None
+                else:
+                    model_config = None
+
+                # Fall back to the registry's in-memory merged config whenever
+                # we don't have authoritative raw YAML on disk. This covers
+                # API-added models and broken raw YAML without collapsing to
+                # `{"sie_id": ...}` during gateway bootstrap.
+                if not model_config or not model_config.get("profiles"):
+                    if full_config:
+                        model_config = full_config
+                        raw_yaml = yaml.dump(full_config, default_flow_style=False, sort_keys=False)
+                    elif not model_config:
+                        model_config = {"sie_id": model_name}
 
             models.append(
                 {
                     "model_id": model_name,
                     "model_config": model_config,
                     "raw_yaml": raw_yaml,
-                    "affected_bundles": model_info.bundles if model_info else [],
+                    "affected_bundles": model_registry.get_model_export_bundles(model_name),
+                    "pool": model_registry.get_model_pool_name(model_name),
                 }
             )
 
@@ -1033,12 +1125,14 @@ async def export_snapshot(request: Request) -> Response:
             bundle_id: model_registry.compute_bundle_config_hash(bundle_id)
             for bundle_id in model_registry.list_bundles()
         }
+        bundle_pool_config_hashes = model_registry.compute_bundle_pool_config_hashes()
 
     snapshot = {
         "snapshot_version": 1,
         "epoch": epoch,
         "generated_at": datetime.now(UTC).isoformat(),
         "bundle_config_hashes": bundle_config_hashes,
+        "bundle_pool_config_hashes": bundle_pool_config_hashes,
         "models": models,
     }
     return Response(content=orjson.dumps(snapshot), media_type="application/json")

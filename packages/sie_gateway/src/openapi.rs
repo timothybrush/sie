@@ -2142,6 +2142,7 @@ pub struct BundleConfigsResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BundleConfigSummary {
     pub bundle_id: String,
+    pub engine: String,
     pub priority: i32,
     pub adapter_count: usize,
     pub source: String,
@@ -2151,6 +2152,7 @@ pub struct BundleConfigSummary {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BundleConfigDocument {
     pub name: String,
+    pub engine: String,
     pub priority: i32,
     pub source: String,
     pub adapters: Vec<String>,
@@ -2641,7 +2643,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_document_advertises_engine_header_on_inference_paths() {
+    fn openapi_document_does_not_advertise_engine_header_on_inference_paths() {
         let spec = serde_json::to_value(openapi_document()).unwrap();
         for path in [
             "/v1/encode/{model}",
@@ -2653,10 +2655,10 @@ mod tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("{path} must document parameters"));
             assert!(
-                parameters.iter().any(|p| p["name"]
+                !parameters.iter().any(|p| p["name"]
                     .as_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case("x-sie-engine"))),
-                "{path} must document X-SIE-Engine"
+                "{path} must not advertise X-SIE-Engine; normal routing uses model profile variants"
             );
         }
     }

@@ -70,7 +70,10 @@ class PreparedItem[T: Payload]:
 
     Attributes:
         payload: Modality-specific preprocessed data.
-        cost: Batching budget consumed (tokens for text, 1 for images).
+        cost: Per-modality batching budget in modality-native units (text =
+            token count, image = 1, tiled vision = tile count). NOT comparable
+            across modalities; the BatchFormer sum is only meaningful within
+            one modality. See docs/adr/0004.
         original_index: Position in original request for result reordering.
     """
 

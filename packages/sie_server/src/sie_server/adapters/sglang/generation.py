@@ -166,6 +166,37 @@ def _tail_file(path: str, *, max_lines: int = 200) -> str:
     return "".join(lines[-max_lines:])
 
 
+# Kwargs the MLX adapter understands. The non-CUDA swap (``create_for_device``)
+# projects the SGLang constructor kwargs onto this set and DROPS everything else
+# — the CUDA/SGLang-only flags (mem_fraction_static, speculative, attention_backend,
+# grammar_backend, reasoning_parser, tool_call_parser, lora_paths, disable_cuda_graph,
+# extra_launch_args, extra_env, guard, compute_precision, …) that the MLX backend
+# has no concept of.
+_MLX_PASSTHROUGH_KWARGS = frozenset(
+    {
+        "model_name_or_path",
+        "mlx_repo",
+        "max_seq_length",
+        "default_sampling",
+        "stop_tokens",
+        "served_model_name",
+        "trust_remote_code",
+        "startup_timeout_s",
+    }
+)
+
+
+def _translate_to_mlx_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Project SGLang adapter kwargs onto the MLX adapter's constructor.
+
+    Keeps only the engine-agnostic knobs the MLX backend uses; drops the
+    CUDA/SGLang-only flags (which the MLX adapter would otherwise silently
+    swallow via ``**kwargs``). ``mlx_repo`` comes from the model YAML's
+    ``adapter_options.loadtime`` and selects the MLX-quantized repo to serve.
+    """
+    return {k: v for k, v in kwargs.items() if k in _MLX_PASSTHROUGH_KWARGS}
+
+
 class SGLangGenerationAdapter(GenerationAdapter):
     """Streaming SGLang generation adapter.
 
@@ -345,6 +376,27 @@ class SGLangGenerationAdapter(GenerationAdapter):
 
     # -- Lifecycle -----------------------------------------------------------
 
+    @classmethod
+    def create_for_device(cls, device: str, **kwargs: Any) -> GenerationAdapter:
+        """Device-aware factory: SGLang on CUDA, MLX (Apple Silicon) elsewhere.
+
+        SGLang is CUDA-only, so on a non-CUDA device (a Mac's ``mps``/``cpu``)
+        the generation path is served by the MLX subprocess adapter instead.
+        Unsuffixed generation models therefore "just work" on a Mac without
+        ``:mac`` profile variants. Importing this module on a Mac is safe —
+        ``sglang`` is only ever invoked as a subprocess, never imported at
+        module top level — so this swap runs without sglang installed.
+        """
+        if device.startswith("cuda"):
+            return cls(**kwargs)
+        from sie_server.adapters.mlx.generation import MLXGenerationAdapter
+
+        logger.info(
+            "Non-CUDA device %r: serving generation via the MLX (Apple-Silicon) backend instead of SGLang",
+            device,
+        )
+        return MLXGenerationAdapter(**_translate_to_mlx_kwargs(kwargs))
+
     def load(self, device: str) -> None:
         self._device = device
         device_index = _server.parse_device_index(device)
@@ -466,7 +518,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
                 logger.error("SGLang startup log tail:\n%s", _tail_file(str(log_path)))
             _server.terminate_process(self._process)
             self._process = None
-            raise RuntimeError(_server.ERR_SERVER_STARTUP)
+            raise _server.startup_failure_error(self._output_file)
 
         # Best-effort runtime verification that the
         # ``--grammar-backend`` flag actually took effect. SGLang's
@@ -778,6 +830,14 @@ class SGLangGenerationAdapter(GenerationAdapter):
     def memory_footprint(self) -> int:
         # SGLang pre-allocates in the subprocess; let the registry measure GPU.
         return 0
+
+    def load_required_memory_bytes(self, *, device_type: str, device_total_bytes: int) -> int | None:
+        """Return SGLang's startup reservation requirement for load staging."""
+        return _server.estimate_load_required_memory_bytes(
+            device_type=device_type,
+            device_total_bytes=device_total_bytes,
+            mem_fraction_static=self._mem_fraction_static,
+        )
 
     # -- Inference -----------------------------------------------------------
 

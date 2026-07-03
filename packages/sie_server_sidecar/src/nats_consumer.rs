@@ -32,9 +32,9 @@ const DEFAULT_MAX_ACK_PENDING: i64 = 1000;
 const DEFAULT_STREAM_MAX_AGE_SECS: u64 = 1_800;
 const STREAM_MAX_MSGS: i64 = 100_000;
 
-/// Env-overridable `max_deliver`. Mirrors Python's `SIE_MAX_DELIVER`
-/// (default 20). With the default 30s ACK wait, this gives a 600s retry
-/// envelope before a message hits the DLQ.
+/// Env-overridable `max_deliver`, wired to the worker-sidecar by Helm
+/// as `SIE_MAX_DELIVER` (default 20). With the default 30s ACK wait,
+/// this gives a 600s retry envelope before a message hits the DLQ.
 fn max_deliver() -> i64 {
     std::env::var("SIE_MAX_DELIVER")
         .ok()
@@ -43,8 +43,8 @@ fn max_deliver() -> i64 {
         .unwrap_or(DEFAULT_MAX_DELIVER)
 }
 
-/// Env-overridable stream `max_age`. Mirrors Python's
-/// `SIE_STREAM_MAX_AGE_S` (default 1800). Should be >
+/// Env-overridable stream `max_age`, wired to the worker-sidecar by
+/// Helm as `SIE_STREAM_MAX_AGE_S` (default 1800). Should be >
 /// `max_deliver * ack_wait` so messages remain inspectable after DLQ.
 fn stream_max_age_secs() -> u64 {
     std::env::var("SIE_STREAM_MAX_AGE_S")

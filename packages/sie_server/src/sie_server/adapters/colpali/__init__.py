@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._multivector import maxsim_scores
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ComputePrecision
 from sie_server.core.inference_output import EncodeOutput
@@ -550,20 +551,11 @@ class ColPaliAdapter(BaseAdapter):
             is_query=False,
         )
 
-        # Compute MaxSim for each document
-        scores = []
+        # MaxSim: per query token, max over doc patches, summed over query tokens.
         query_tensor = torch.from_numpy(query_vecs).to(self._device)
-
         assert doc_output.multivector is not None
-        for doc_vecs in doc_output.multivector:
-            doc_tensor = torch.from_numpy(doc_vecs).to(self._device)
-
-            # MaxSim: for each query token, find max similarity with any doc patch
-            sim = torch.matmul(query_tensor, doc_tensor.T)
-            maxsim_score = sim.max(dim=-1).values.sum().item()
-            scores.append(maxsim_score)
-
-        return scores
+        doc_tensors = [torch.from_numpy(d).to(self._device) for d in doc_output.multivector]
+        return maxsim_scores(query_tensor, doc_tensors)
 
     def _validate_output_types(self, output_types: list[str]) -> None:
         """Validate that output types are supported."""

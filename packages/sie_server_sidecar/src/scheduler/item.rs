@@ -107,6 +107,22 @@ impl SchedulerItem {
             Self::Extract(x) => RunBatchItem::extract(x),
         }
     }
+
+    /// Same as [`Self::into_run_batch_item`] but additionally copies the
+    /// W3C trace context (`traceparent` / `tracestate`) off the
+    /// originating [`WorkItem`] onto the produced [`RunBatchItem`]. The
+    /// per-op constructors have no `WorkItem` access, so the trace
+    /// context is plumbed here — at the dispatch site where the batch's
+    /// items are zipped back together with their metadata — so the
+    /// Python non-streaming worker loop can re-extract the gateway span
+    /// and attach `worker.run_batch` as its child.
+    #[must_use]
+    pub fn into_run_batch_item_with_trace(self, wi: &WorkItem) -> RunBatchItem {
+        let mut rbi = self.into_run_batch_item();
+        rbi.traceparent = wi.traceparent.clone();
+        rbi.tracestate = wi.tracestate.clone();
+        rbi
+    }
 }
 
 impl HasCost for SchedulerItem {
@@ -159,6 +175,9 @@ pub struct SchedulerMeta {
     /// [`crate::publisher::Timings`] and on the `payload_fetch_seconds`
     /// histogram.
     pub fetch_ms: f64,
+    /// True when this item was pulled from a worker-specific direct-dispatch
+    /// subject rather than the pool subject.
+    pub worker_direct: bool,
     /// When the dispatcher enqueued this item into the scheduler.
     /// Used only for queue-age telemetry; the engine's FCFS pick is
     /// driven by its own `head_ns` atomic (see
@@ -170,10 +189,22 @@ impl SchedulerMeta {
     /// Construct the standard triple stamped with `Instant::now`.
     #[must_use]
     pub fn new(wi: WorkItem, msg: Message, fetch_ms: f64) -> Self {
+        Self::new_with_worker_direct(wi, msg, fetch_ms, false)
+    }
+
+    /// Construct metadata with an explicit delivery-origin marker.
+    #[must_use]
+    pub fn new_with_worker_direct(
+        wi: WorkItem,
+        msg: Message,
+        fetch_ms: f64,
+        worker_direct: bool,
+    ) -> Self {
         Self {
             wi,
             msg,
             fetch_ms,
+            worker_direct,
             submitted_at: Instant::now(),
         }
     }
@@ -188,6 +219,7 @@ impl std::fmt::Debug for SchedulerMeta {
             .field("wi_work_item_id", &self.wi.work_item_id)
             .field("wi_request_id", &self.wi.request_id)
             .field("fetch_ms", &self.fetch_ms)
+            .field("worker_direct", &self.worker_direct)
             .field("submitted_at", &self.submitted_at)
             .finish_non_exhaustive()
     }
@@ -374,6 +406,68 @@ mod tests {
         assert!(rbi.encode.is_some());
         assert!(rbi.score.is_none());
         assert!(rbi.extract.is_none());
+    }
+
+    #[test]
+    fn into_run_batch_item_with_trace_copies_trace_context() {
+        let mut wi = sample_work_item();
+        wi.traceparent = Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into());
+        wi.tracestate = Some("vendor=opaque".into());
+
+        let rbi = SchedulerItem::Encode(encode_item(0, None)).into_run_batch_item_with_trace(&wi);
+
+        assert_eq!(
+            rbi.traceparent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+        );
+        assert_eq!(rbi.tracestate.as_deref(), Some("vendor=opaque"));
+        // The op/payload plumbing must still be intact.
+        assert_eq!(rbi.op, "encode");
+        assert!(rbi.encode.is_some());
+    }
+
+    #[test]
+    fn into_run_batch_item_with_trace_defaults_to_none() {
+        let wi = sample_work_item();
+        let rbi = SchedulerItem::Encode(encode_item(0, None)).into_run_batch_item_with_trace(&wi);
+        assert!(rbi.traceparent.is_none());
+        assert!(rbi.tracestate.is_none());
+    }
+
+    fn sample_work_item() -> WorkItem {
+        WorkItem {
+            work_item_id: "r.0".into(),
+            request_id: "r".into(),
+            item_index: 0,
+            total_items: 1,
+            operation: "encode".into(),
+            model_id: "BAAI/bge-m3".into(),
+            profile_id: String::new(),
+            engine: String::new(),
+            pool_name: "l4".into(),
+            admission_pool: "l4".into(),
+            machine_profile: "l4-spot".into(),
+            item: None,
+            payload_ref: None,
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: None,
+            output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+            bundle_config_hash: String::new(),
+            router_id: "r1".into(),
+            reply_subject: "_INBOX.r1.r".into(),
+            traceparent: None,
+            tracestate: None,
+            timestamp: 0.0,
+        }
     }
 
     // ---- LoraKey from options ----

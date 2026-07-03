@@ -29,6 +29,8 @@ from sie_server.core.preprocessor.base import get_image_executor
 from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
+    from PIL import Image as PILImage
+
     from sie_server.config.model import ModelConfig
     from sie_server.types.inputs import Item
 
@@ -37,6 +39,22 @@ logger = logging.getLogger(__name__)
 # Constants for NemoColEmbed preprocessing (from NVIDIA's code)
 _SIGLIP_MEAN = (0.5, 0.5, 0.5)
 _SIGLIP_STD = (0.5, 0.5, 0.5)
+
+
+def _load_rgb(media: object) -> PILImage.Image:
+    """Decode a wire image input into an RGB PIL image.
+
+    Centralizes the ``PILImage.open(io.BytesIO(media_bytes(...)))`` + RGB-convert
+    idiom that every vision preprocessor repeated. ``media_bytes`` raises
+    ``InvalidMediaError`` (-> 400 INVALID_INPUT) on a non-bytes payload rather
+    than hitting a raw ``TypeError`` deep in the decode. See issue #1540.
+    """
+    from PIL import Image as PILImage  # deferred: PIL is an optional dependency
+
+    img = PILImage.open(io.BytesIO(media_bytes(media, kind="image")))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
 
 def _find_closest_aspect_ratio(
@@ -231,7 +249,6 @@ class NemoColEmbedPreprocessor:
             PreparedBatch with NemoColEmbedPayload items.
         """
         import torch
-        from PIL import Image as PILImage
 
         prepared_items: list[PreparedItem[NemoColEmbedPayload]] = []
         total_cost = 0
@@ -243,12 +260,8 @@ class NemoColEmbedPreprocessor:
 
             # Load image from bytes
             img_input = item.images[0]
-            pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+            pil_img = _load_rgb(img_input)
             original_size = pil_img.size
-
-            # Convert to RGB if needed
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
 
             # Dynamic tiling
             image_tiles = _dynamic_preprocess(
@@ -518,20 +531,14 @@ class Florence2Preprocessor:
         Returns:
             PreparedItem or None if item has no images.
         """
-        from PIL import Image as PILImage
-
         if not item.images:
             logger.warning("Florence2Preprocessor: item %d has no images", index)
             return None
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        # Convert to RGB if needed
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         # Process through Florence-2 processor (CPU-bound, releases GIL)
         inputs = self._processor(
@@ -712,20 +719,14 @@ class DonutPreprocessor:
         Returns:
             PreparedItem or None if item has no images.
         """
-        from PIL import Image as PILImage
-
         if not item.images:
             logger.warning("DonutPreprocessor: item %d has no images", index)
             return None
 
         # Load image from bytes - PIL releases GIL during decode
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        # Convert to RGB if needed
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         # Process image through Donut processor (CPU-bound, releases GIL)
         pixel_values = self._processor(pil_img, return_tensors="pt").pixel_values.squeeze(0)
@@ -924,18 +925,13 @@ class LightOnOCRPreprocessor:
         Returns:
             PreparedItem or None if item has no images.
         """
-        from PIL import Image as PILImage
-
         if not item.images:
             logger.warning("LightOnOCRPreprocessor: item %d has no images", index)
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         inputs = self._processor(
             text=text,
@@ -1105,18 +1101,13 @@ class GlmOcrPreprocessor:
         Returns:
             PreparedItem or None if item has no images.
         """
-        from PIL import Image as PILImage
-
         if not item.images:
             logger.warning("GlmOcrPreprocessor: item %d has no images", index)
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         text = instruction or self._user_text
         messages = [
@@ -1283,8 +1274,6 @@ class DetectionPreprocessor:
         Returns:
             PreparedItem or None if item has no images.
         """
-        from PIL import Image as PILImage
-
         if not item.images:
             logger.warning("DetectionPreprocessor: item %d has no images", index)
             return None
@@ -1293,12 +1282,8 @@ class DetectionPreprocessor:
         # Load image from bytes - PIL releases GIL during decode. media_bytes
         # raises InvalidMediaError (-> 400 INVALID_INPUT) on a non-bytes payload
         # rather than silently dropping the item or hitting a raw TypeError.
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img, kind="image")))
+        pil_img = _load_rgb(img)
         original_size = (pil_img.width, pil_img.height)
-
-        # Convert to RGB if needed
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         # Run image_processor to produce tensor (resize, normalize)
         # This is the expensive part (~23ms, 94% of preprocessing)
@@ -1464,18 +1449,14 @@ class PaddleOCRVLPreprocessor:
         index: int,
         text: str,
     ) -> PreparedItem[PaddleOCRVLPayload] | None:
-        from PIL import Image as PILImage
 
         if not item.images:
             logger.warning("PaddleOCRVLPreprocessor: item %d has no images", index)
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         inputs = self._processor(
             text=text,
@@ -1637,18 +1618,14 @@ class MinerUVLPreprocessor:
         index: int,
         text: str,
     ) -> PreparedItem[MinerUVLPayload] | None:
-        from PIL import Image as PILImage
 
         if not item.images:
             logger.warning("MinerUVLPreprocessor: item %d has no images", index)
             return None
 
         img_input = item.images[0]
-        pil_img = PILImage.open(io.BytesIO(media_bytes(img_input, kind="image")))
+        pil_img = _load_rgb(img_input)
         original_size = (pil_img.width, pil_img.height)
-
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
 
         inputs = self._processor(
             text=text,

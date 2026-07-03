@@ -21,13 +21,15 @@ import numpy as np
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from sie_server.api.helpers import extract_request_context
+from sie_server.api.helpers import extract_request_context, oom_retry_after_from_registry
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.core.encode_pipeline import EncodePipeline
+from sie_server.core.oom import is_oom_error
 from sie_server.core.worker import QueueFullError
 from sie_server.observability.metrics import record_request
 from sie_server.observability.tracing import tracer
 from sie_server.types.inputs import Item
+from sie_server.types.responses import ErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +417,33 @@ async def create_embeddings(
                 },
             ) from e
         except Exception as e:
+            if is_oom_error(e):
+                # Transient memory pressure (worker ResourceExhaustedError after
+                # recovery is exhausted, or a raw CUDA/MPS OOM). Mirror the
+                # native endpoints' 503 RESOURCE_EXHAUSTED + Retry-After — in the
+                # OpenAI envelope — so the SDK auto-retries instead of treating
+                # it as a terminal 500. See #1604.
+                logger.warning("Embeddings OOM for model %s, returning 503 RESOURCE_EXHAUSTED: %s", model, e)
+                span.set_attribute("error", "resource_exhausted")
+                record_request(
+                    model=model,
+                    endpoint="embeddings",
+                    status="error",
+                    request_id=ctx.request_id,
+                    api_key=ctx.api_key,
+                    queue_depth=ctx.queue_depth,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "error": {
+                            "code": ErrorCode.RESOURCE_EXHAUSTED.value,
+                            "message": f"Embeddings temporarily unavailable due to resource pressure: {e}",
+                            "type": "server_error",
+                        }
+                    },
+                    headers={"Retry-After": str(oom_retry_after_from_registry(registry))},
+                ) from e
             logger.exception("Inference error for model %s", model)
             span.set_attribute("error", "inference_error")
             record_request(

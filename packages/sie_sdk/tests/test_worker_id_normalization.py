@@ -4,8 +4,8 @@ The gateway (Rust) publishes direct-dispatch work items to
 ``sie.work.{pool}.{machine_profile}.{bundle}.{model}.{worker_id}`` and
 applies its ``normalize_model_id`` to the worker_id before publishing. The Python SDK
 helpers (``work_worker_subject``, ``work_worker_stream_subjects``,
-``work_worker_stream_name``, ``work_worker_consumer_name``) and the worker
-init (``NatsPullLoop.__init__``) now route worker IDs through
+``work_worker_stream_name``, ``work_worker_consumer_name``) and the worker-sidecar
+startup path now route worker IDs through
 :func:`sie_sdk.queue_types.normalize_worker_id`, which delegates to
 ``normalize_model_id`` for byte-identical output.
 
@@ -73,9 +73,8 @@ def test_normalize_worker_id_rejects_empty(raw: str) -> None:
     The previous helper silently substituted the literal string
     ``"worker"`` for an empty input, which collided durable JetStream
     consumers across processes when env vars were missing. Empty input
-    is now a hard error — :class:`NatsPullLoop.__init__` falls back to
-    ``uuid4().hex`` and logs the failure explicitly rather than letting
-    a silent substitution propagate.
+    is now a hard error; worker startup must choose an explicit fallback
+    identity rather than letting a silent substitution propagate.
     """
     with pytest.raises(ValueError, match="empty"):
         normalize_worker_id(raw)

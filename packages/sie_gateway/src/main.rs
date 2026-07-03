@@ -129,6 +129,10 @@ async fn main() {
             bundles_dir,
             models_dir,
         } => {
+            // Release images enable cloud-storage: object_store selects aws-lc-rs
+            // while NATS/Kubernetes select ring. Pick one provider before TLS clients start.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
             // Load config from env vars
             let mut cfg = Config::load();
 

@@ -7,6 +7,7 @@ from sie_server.observability.tracing import (
     get_current_trace_id,
     is_tracing_enabled,
     setup_tracing,
+    shutdown_tracing,
     tracer,
 )
 
@@ -46,6 +47,16 @@ class TestIsTracingEnabled:
         with patch.dict(os.environ, {"SIE_TRACING_ENABLED": "false"}):
             assert is_tracing_enabled() is False
 
+    def test_enabled_with_whitespace_padding(self) -> None:
+        """A whitespace-padded truthy value should still enable tracing."""
+        with patch.dict(os.environ, {"SIE_TRACING_ENABLED": " true "}):
+            assert is_tracing_enabled() is True
+
+    def test_disabled_with_whitespace_only(self) -> None:
+        """A whitespace-only value should be treated as unset (disabled)."""
+        with patch.dict(os.environ, {"SIE_TRACING_ENABLED": "   "}):
+            assert is_tracing_enabled() is False
+
 
 class TestSetupTracing:
     """Tests for setup_tracing function."""
@@ -79,10 +90,57 @@ class TestSetupTracing:
 
             # Should instrument the app
             mock_instrumentor.instrument_app.assert_called_once_with(mock_app)
-            # Should create exporter
-            mock_exporter.assert_called_once()
+            # Should create exporter with a bounded per-request timeout (seconds)
+            mock_exporter.assert_called_once_with(endpoint="http://localhost:4317", timeout=3.0)
             # Should set tracer provider
             mock_trace.set_tracer_provider.assert_called_once()
+
+    def test_noop_when_enabled_without_endpoint(self) -> None:
+        """setup_tracing should no-op when the flag is set without an endpoint."""
+        mock_app = MagicMock()
+
+        with (
+            patch.dict(os.environ, {"SIE_TRACING_ENABLED": "true"}, clear=True),
+            patch("opentelemetry.instrumentation.fastapi.FastAPIInstrumentor") as mock_instrumentor,
+        ):
+            setup_tracing(mock_app)
+
+            mock_instrumentor.instrument_app.assert_not_called()
+
+    def test_noop_when_endpoint_whitespace_only(self) -> None:
+        """A whitespace-only endpoint should be treated as absent (no instrumentation)."""
+        mock_app = MagicMock()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"SIE_TRACING_ENABLED": "true", "OTEL_EXPORTER_OTLP_ENDPOINT": "   "},
+                clear=True,
+            ),
+            patch("opentelemetry.instrumentation.fastapi.FastAPIInstrumentor") as mock_instrumentor,
+        ):
+            setup_tracing(mock_app)
+
+            mock_instrumentor.instrument_app.assert_not_called()
+
+
+class TestShutdownTracing:
+    """Tests for shutdown_tracing function."""
+
+    def test_noop_when_not_setup(self) -> None:
+        """shutdown_tracing should be a no-op (no error) when no provider is retained."""
+        with patch("sie_server.observability.tracing._provider", None):
+            shutdown_tracing()  # should not raise
+
+    def test_shuts_down_and_clears_provider(self) -> None:
+        """shutdown_tracing should shut the retained provider down, then clear the handle."""
+        mock_provider = MagicMock()
+        with patch("sie_server.observability.tracing._provider", mock_provider):
+            shutdown_tracing()
+            # The handle is cleared after the first call, so a second call is a no-op.
+            shutdown_tracing()
+
+            mock_provider.shutdown.assert_called_once()
 
 
 class TestGetCurrentTraceId:

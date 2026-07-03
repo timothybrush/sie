@@ -188,17 +188,13 @@ data:
             #   - upstream_model_loading: worker is cold-loading the
             #     target model on demand (explicit MODEL_LOADING result).
             #     The SDK retries under `provision_timeout_s`.
-            #   - upstream_timeout_model_loading: gateway-synthesised
-            #     MODEL_LOADING when the result-await timeout fires (most
-            #     commonly during the same cold-load case as above, but
-            #     observed via the timeout instead of an explicit result).
-            #     SDK retries with the same budget.
+            #   - upstream_timeout_model_loading: legacy gateway-synthesised
+            #     MODEL_LOADING timeout reason from older releases.
             #   - upstream_lora_loading: worker is loading a LoRA adapter
             #     on demand. SDK retries with LORA_LOADING budget.
             # Genuine "the gateway is dropping requests because the pool
-            # is undersized" signals (timeout/capacity/no_workers other
-            # than the cold-load timeout) still drive scale-up via this
-            # trigger.
+            # is undersized" signals (timeout/capacity/no_workers) still
+            # drive scale-up via this trigger.
             #
             # Note on regex anchoring: PromQL ``=~`` / ``!~`` are RE2 with
             # implicit full-string anchors. The list below matches

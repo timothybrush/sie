@@ -1,0 +1,25 @@
+sie_id: thenlper/gte-large
+hf_id: thenlper/gte-large
+inputs:
+  text: true
+  image: false
+  audio: false
+  video: false
+tasks:
+  encode:
+    dense:
+      dim: 1024
+    sparse: null
+    multivector: null
+  score: null
+  extract: null
+max_sequence_length: 512
+profiles:
+  candle:
+    max_batch_tokens: 16384
+    compute_precision: null
+    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
+    adapter_options:
+      runtime:
+        pooling: mean
+        normalize: true

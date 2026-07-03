@@ -317,7 +317,7 @@ mod tests {
 
 #[cfg(test)]
 mod route_tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -384,6 +384,11 @@ mod route_tests {
             "name: default\nadapters:\n  - module\ndefault: true\n",
         )
         .unwrap();
+        std::fs::write(
+            bundles_dir.path().join("candle.yaml"),
+            "name: candle\npriority: 30\nengine: candle\nadapters:\n  - sie_server_rust.adapters.candle\n",
+        )
+        .unwrap();
 
         let config = Arc::new(test_config(
             bundles_dir.path().to_str().unwrap(),
@@ -413,6 +418,74 @@ mod route_tests {
             "default".to_string(),
             ProfileConfig {
                 adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        state
+            .model_registry
+            .add_model_config(ModelConfig {
+                name: model_id.to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                tasks: None,
+                max_sequence_length: None,
+            })
+            .unwrap();
+    }
+
+    fn seed_candle_variant_model(state: &AppState, model_id: &str) {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            ProfileConfig {
+                adapter_path: Some("module:Adapter".to_string()),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        profiles.insert(
+            "candle".to_string(),
+            ProfileConfig {
+                adapter_path: Some(
+                    "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
+                ),
+                max_batch_tokens: Some(4096),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        state
+            .model_registry
+            .add_model_config(ModelConfig {
+                name: model_id.to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                tasks: None,
+                max_sequence_length: None,
+            })
+            .unwrap();
+    }
+
+    fn seed_profile_only_candle_model(state: &AppState, model_id: &str) {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "candle".to_string(),
+            ProfileConfig {
+                adapter_path: Some(
+                    "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
+                ),
                 max_batch_tokens: Some(4096),
                 compute_precision: None,
                 adapter_options: None,
@@ -636,6 +709,82 @@ mod route_tests {
         assert!(data[0]["created"].is_i64());
         // Native shape still present (SDK consumers depend on it).
         assert_eq!(body["models"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_models_advertises_profile_variants() {
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_candle_variant_model(&state, "acme/embed");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        let native_ids: BTreeSet<&str> = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            native_ids,
+            BTreeSet::from(["acme/embed", "acme/embed:candle"])
+        );
+
+        let openai_ids: BTreeSet<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            openai_ids,
+            BTreeSet::from(["acme/embed", "acme/embed:candle"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_models_advertises_profile_only_candle_models_as_variants() {
+        let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
+        seed_profile_only_candle_model(&state, "acme/candle-only");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        let native_ids: BTreeSet<&str> = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(native_ids, BTreeSet::from(["acme/candle-only:candle"]));
+
+        let openai_ids: BTreeSet<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(openai_ids, BTreeSet::from(["acme/candle-only:candle"]));
     }
 
     #[tokio::test]

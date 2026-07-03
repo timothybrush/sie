@@ -271,14 +271,14 @@ class TestModelConfig:
                 profiles={"default": ProfileConfig(adapter_path="mod:Cls", max_batch_tokens=1)},
             )
 
-    def test_missing_default_profile_rejected(self) -> None:
-        """Model without default profile is rejected."""
-        with pytest.raises(ValidationError, match=r"default"):
+    def test_empty_profiles_rejected(self) -> None:
+        """Model config must define at least one profile."""
+        with pytest.raises(ValidationError, match=r"profiles"):
             ModelConfig(
-                sie_id="no-default",
+                sie_id="no-profiles",
                 hf_id="org/model",
                 tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
-                profiles={"custom": ProfileConfig(adapter_path="mod:Cls", max_batch_tokens=8192)},
+                profiles={},
             )
 
     def test_default_profile_needs_adapter_path(self) -> None:
@@ -533,6 +533,23 @@ class TestModelConfigProfiles:
         assert "default" in config.profiles
         assert "fast" in config.profiles
         assert config.profiles["fast"].extends == "default"
+
+    def test_model_can_be_profile_only_without_default(self) -> None:
+        """Profile-only configs are valid and expose explicit variants only."""
+        config = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/model",
+            tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+            profiles={
+                "candle": ProfileConfig(
+                    adapter_path="sie_server_rust.adapters.candle:CandleEmbeddingAdapter",
+                    max_batch_tokens=8192,
+                ),
+            },
+        )
+
+        assert set(config.profiles) == {"candle"}
+        assert config.resolve_profile("candle").adapter_path == "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
 
     def test_resolve_default_profile(self) -> None:
         """resolve_profile returns ResolvedProfile for default."""

@@ -374,7 +374,17 @@ impl WorkerRegistry {
         admitted_worker_names: Option<&HashSet<String>>,
     ) -> Vec<WorkerState> {
         let snap = self.snapshot.load();
-        snap.all_healthy
+        // Narrow to the lane's bundle via the `by_bundle` index (O(N_bundle))
+        // instead of scanning the whole-cluster `all_healthy` list
+        // (O(N_cluster)) — mirroring `lazy_lane_workers_for_matching`, which
+        // already does this on the same request. Every worker in the bucket
+        // already has this bundle, so the `w.bundle` predicate is dropped.
+        // See #1607.
+        let bundle_lower = bundle.to_lowercase();
+        let Some(candidates) = snap.by_bundle.get(&bundle_lower) else {
+            return Vec::new();
+        };
+        candidates
             .iter()
             .filter(|w| {
                 !w.saturated
@@ -382,7 +392,6 @@ impl WorkerRegistry {
                     && !w.machine_profile.is_empty()
                     && w.pool_name.eq_ignore_ascii_case(pool)
                     && w.machine_profile.eq_ignore_ascii_case(machine_profile)
-                    && w.bundle.eq_ignore_ascii_case(bundle)
                     && bundle_config_hash_matches(&w.bundle_config_hash, bundle_config_hash)
                     && w.models.iter().any(|m| m.eq_ignore_ascii_case(model))
             })
@@ -1301,6 +1310,40 @@ mod tests {
         // An unknown base id still finds nothing.
         assert!(reg
             .dispatch_workers_for("unknown/model:fast", "default", "l4-spot", "default", "")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_workers_for_scopes_by_bundle() {
+        // Two workers, same model/pool/profile but DIFFERENT bundles. The
+        // by_bundle-indexed lookup (#1607) must stay equivalent to the old
+        // `w.bundle` predicate: dispatch for one bundle returns only that
+        // bundle's worker, and an empty bundle bucket returns nothing.
+        let reg = registry();
+
+        let mut a = make_msg(true);
+        a.name = "wa".into();
+        a.pool_name = "default".into();
+        a.bundle = "bundle-a".into();
+        reg.update_worker("http://wa:8080", a).await;
+
+        let mut b = make_msg(true);
+        b.name = "wb".into();
+        b.pool_name = "default".into();
+        b.bundle = "bundle-b".into();
+        reg.update_worker("http://wb:8080", b).await;
+
+        let a_only = reg.dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "bundle-a", "");
+        assert_eq!(a_only.len(), 1);
+        assert_eq!(a_only[0].name, "wa");
+
+        let b_only = reg.dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "bundle-b", "");
+        assert_eq!(b_only.len(), 1);
+        assert_eq!(b_only[0].name, "wb");
+
+        // A bundle with no workers hits the by_bundle miss path → empty.
+        assert!(reg
+            .dispatch_workers_for("BAAI/bge-m3", "default", "l4-spot", "bundle-c", "")
             .is_empty());
     }
 

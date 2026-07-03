@@ -24,8 +24,8 @@ profiles:
         muvera_config:
           num_repetitions: 40
           num_simhash_projections: 6
-          projection_dim: null
-          final_projection_dim: 10240
+          projection_dim: 8
+          final_projection_dim: null
         token_dim: 128
         normalize: true
         query_max_length: 32

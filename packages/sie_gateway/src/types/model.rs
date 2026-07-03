@@ -453,8 +453,14 @@ impl CanonicalProfile {
 /// (null, `false`, `0`, `0.0`, `""`, empty array, empty object). Otherwise
 /// returns `Some(opts)` unchanged.
 fn canonicalize_adapter_options(opts: serde_json::Value) -> Option<serde_json::Value> {
-    if let serde_json::Value::Object(ref map) = opts {
-        let all_falsy = map.values().all(|v| match v {
+    if let serde_json::Value::Object(map) = opts {
+        let compact: serde_json::Map<String, serde_json::Value> = map
+            .into_iter()
+            .filter(
+                |(_, value)| !matches!(value, serde_json::Value::Object(inner) if inner.is_empty()),
+            )
+            .collect();
+        let all_falsy = compact.values().all(|v| match v {
             serde_json::Value::Null => true,
             serde_json::Value::Bool(b) => !*b,
             serde_json::Value::Number(n) => {
@@ -469,6 +475,7 @@ fn canonicalize_adapter_options(opts: serde_json::Value) -> Option<serde_json::V
         if all_falsy {
             return None;
         }
+        return Some(serde_json::Value::Object(compact));
     }
     Some(opts)
 }
@@ -534,34 +541,95 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_profile_python_falsy_parity() {
-        // Config service uses Python `not any(values)` which treats 0,
-        // 0.0, "", [], {}, None, False as empty. Gateway must match or
-        // `compute_bundle_config_hash` diverges and every worker in the
-        // affected bundle sits in `pending_workers` forever. Regression
-        // for the bug where gateway-side canonicalization only stripped
-        // null/false.
-        let cases = vec![
-            serde_json::json!({"x": 0}),
-            serde_json::json!({"x": 0.0}),
-            serde_json::json!({"x": ""}),
-            serde_json::json!({"x": []}),
-            serde_json::json!({"x": {}}),
-            serde_json::json!({"x": null, "y": false, "z": 0}),
-        ];
-        for opts in cases {
-            let profile = ProfileConfig {
+    fn test_canonical_profile_drops_empty_nested_option_maps() {
+        let profile = ProfileConfig {
+            adapter_path: Some("mod:A".into()),
+            max_batch_tokens: None,
+            compute_precision: None,
+            adapter_options: Some(serde_json::json!({
+                "loadtime": {},
+                "runtime": {"pooling": "cls"}
+            })),
+            extends: None,
+        };
+        let canonical = CanonicalProfile::from_profile(&profile);
+        assert_eq!(
+            canonical.adapter_options,
+            Some(serde_json::json!({"runtime": {"pooling": "cls"}}))
+        );
+    }
+
+    #[test]
+    fn test_canonical_profile_conformance_vectors() {
+        // Generic flat canonicalizer: strip an options map to None when every
+        // value is falsy (0, 0.0, "", [], {}, None, False) and drop empty nested
+        // maps. The config service must match or `compute_bundle_config_hash`
+        // diverges and every worker in the affected bundle sits in
+        // `pending_workers` forever. These vectors are shared with the sie_config
+        // and sie_server Python suites — see
+        // `conformance/bundle_config_hash/canonical_profile_falsy_vectors.json`
+        // — so all three implementations stay in lockstep (#1542). The
+        // `transform` cases pin the loadtime/runtime compaction that real
+        // profiles use, which the worker's structured canonicalizer also honors.
+        let raw = include_str!(
+            "../../../../conformance/bundle_config_hash/canonical_profile_falsy_vectors.json"
+        );
+        let vectors: serde_json::Value = serde_json::from_str(raw).expect("valid conformance JSON");
+
+        let canonicalize = |opts: &serde_json::Value| {
+            CanonicalProfile::from_profile(&ProfileConfig {
                 adapter_path: Some("mod:A".into()),
                 max_batch_tokens: None,
                 compute_precision: None,
                 adapter_options: Some(opts.clone()),
                 extends: None,
-            };
-            let canonical = CanonicalProfile::from_profile(&profile);
+            })
+            .adapter_options
+        };
+
+        for case in vectors["strip_to_none"]
+            .as_array()
+            .expect("strip_to_none array")
+        {
+            let opts = &case["adapter_options"];
+            let name = case["name"].as_str().unwrap_or("?");
             assert!(
-                canonical.adapter_options.is_none(),
-                "Expected falsy-only options {opts:?} to be stripped to None for Python parity"
+                canonicalize(opts).is_none(),
+                "case {name}: expected falsy-only options {opts:?} to strip to None"
             );
+        }
+
+        for case in vectors["keep_unchanged"]
+            .as_array()
+            .expect("keep_unchanged array")
+        {
+            let opts = &case["adapter_options"];
+            let name = case["name"].as_str().unwrap_or("?");
+            let got = canonicalize(opts);
+            assert_eq!(
+                got.as_ref(),
+                Some(opts),
+                "case {name}: expected meaningful options to be kept unchanged"
+            );
+        }
+
+        for case in vectors["transform"].as_array().expect("transform array") {
+            let opts = &case["adapter_options"];
+            let name = case["name"].as_str().unwrap_or("?");
+            let expected = &case["expected"];
+            let got = canonicalize(opts);
+            if expected.is_null() {
+                assert!(
+                    got.is_none(),
+                    "case {name}: expected {opts:?} to canonicalize to None"
+                );
+            } else {
+                assert_eq!(
+                    got.as_ref(),
+                    Some(expected),
+                    "case {name}: unexpected canonicalization of {opts:?}"
+                );
+            }
         }
     }
 

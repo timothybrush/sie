@@ -82,8 +82,10 @@ class TestRegistryMemoryManagerIntegration:
         assert "test" not in registry.memory_manager.loaded_models
 
     @patch("sie_server.core.model_loader.load_adapter")
-    def test_get_touches_model_for_lru(self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock) -> None:
-        """Getting a model's adapter updates LRU tracking."""
+    def test_touch_lru_updates_model_and_get_is_pure(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """touch_lru() marks a model recently used; get() is a pure read (#1541)."""
         mock_load_adapter.side_effect = [mock_adapter_factory(), mock_adapter_factory()]
 
         registry = ModelRegistry()
@@ -97,12 +99,16 @@ class TestRegistryMemoryManagerIntegration:
         # Initially model-a is LRU (loaded first)
         assert registry.memory_manager.get_lru_model() == "model-a"
 
-        # Access model-a, now model-b should be LRU
+        # get() is a pure read — it must NOT change LRU order.
         registry.get("model-a")
+        assert registry.memory_manager.get_lru_model() == "model-a"
+
+        # touch_lru(model-a) makes model-b the LRU.
+        registry.touch_lru("model-a")
         assert registry.memory_manager.get_lru_model() == "model-b"
 
-        # Access model-b, now model-a should be LRU again
-        registry.get("model-b")
+        # touch_lru(model-b) makes model-a the LRU again.
+        registry.touch_lru("model-b")
         assert registry.memory_manager.get_lru_model() == "model-a"
 
     @patch("sie_server.core.model_loader.load_adapter")

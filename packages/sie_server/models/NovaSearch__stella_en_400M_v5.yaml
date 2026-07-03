@@ -29,5 +29,6 @@ profiles:
         pooling: mean
         normalize: true
         query_template: |-
-          Instruct: Given a web search query, retrieve relevant passages that answer the query.
+          Instruct: {instruction}
           Query: {text}
+        default_instruction: Given a web search query, retrieve relevant passages that answer the query.

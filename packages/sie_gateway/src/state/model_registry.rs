@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -382,7 +383,11 @@ impl ModelRegistry {
         config: &ModelConfig,
     ) -> Result<Vec<ModelEntry>, String> {
         let base_entry = Self::model_entry_from_config(config)?;
-        let mut entries = vec![base_entry.clone()];
+        let mut entries = if base_entry.profile_names.contains("default") {
+            vec![base_entry.clone()]
+        } else {
+            Vec::new()
+        };
         let mut profile_names: Vec<String> = base_entry.profile_names.iter().cloned().collect();
         profile_names.sort();
         for profile_name in profile_names {
@@ -392,6 +397,11 @@ impl ModelRegistry {
             Self::validate_profile_name(&profile_name)?;
             let profile_config =
                 Self::resolved_profile_from_profiles(&config.profiles, &profile_name)?;
+            let info_extras = Self::narrow_info_extras_to_profile(
+                &base_entry.info_extras,
+                &profile_name,
+                &profile_config,
+            );
             let mut variant_profile_names = HashSet::new();
             variant_profile_names.insert("default".to_string());
             let mut variant_profile_configs = HashMap::new();
@@ -411,10 +421,7 @@ impl ModelRegistry {
                 adapter_modules: variant_adapters,
                 profile_names: variant_profile_names,
                 profile_configs: variant_profile_configs,
-                info_extras: Self::narrow_info_extras_to_profile(
-                    &base_entry.info_extras,
-                    &profile_name,
-                ),
+                info_extras,
             });
         }
 
@@ -427,10 +434,13 @@ impl ModelRegistry {
     /// adapters configured for *its* profile. Without this narrowing,
     /// the variant inherits the union and the lora_adapter gate accepts
     /// adapters that are only configured on a sibling profile (M10 bug).
-    /// All other capability fields stay the same.
+    /// Native Rust variants also narrow the advertised output surface to the
+    /// adapter class (`dense` for embeddings, `score` for rerankers)
+    /// because the base model may carry PyTorch-only capabilities.
     fn narrow_info_extras_to_profile(
         base: &ModelInfoExtras,
         profile_name: &str,
+        profile_config: &CanonicalProfile,
     ) -> ModelInfoExtras {
         let mut narrowed = base.clone();
         // Clear the per-variant routing hint. A variant entry IS a concrete
@@ -460,31 +470,42 @@ impl ModelRegistry {
                 narrowed.profile_lora_adapters = Some(single);
             }
         }
+        Self::narrow_native_outputs_to_profile(&mut narrowed, profile_config);
         narrowed
+    }
+
+    fn narrow_native_outputs_to_profile(
+        extras: &mut ModelInfoExtras,
+        profile_config: &CanonicalProfile,
+    ) {
+        let Some(adapter_path) = profile_config.adapter_path.as_deref() else {
+            return;
+        };
+        if !adapter_path.starts_with("sie_server_rust.adapters.candle") {
+            return;
+        }
+        if !extras.outputs.iter().any(|name| name == "dense") {
+            return;
+        }
+        extras.outputs = vec!["dense".to_string()];
+        extras.dims.retain(|name, _| name == "dense");
     }
 
     fn model_entry_from_config(config: &ModelConfig) -> Result<ModelEntry, String> {
         let info_extras = crate::types::model::ModelInfoExtras::from_model_config(config);
         let model_name = config.name.clone();
         let pool = Self::normalize_model_pool(config.pool.as_deref())?;
-        let mut adapter_modules: HashSet<String> = HashSet::new();
         let mut profile_names: HashSet<String> = HashSet::new();
         let mut profile_configs: HashMap<String, CanonicalProfile> = HashMap::new();
 
         for profile_name in config.profiles.keys() {
             profile_names.insert(profile_name.clone());
-            if let Some(adapter_path) =
-                Self::effective_adapter_path_from_profiles(&config.profiles, profile_name)
-            {
-                if let Some(module) = Self::adapter_module_from_path(adapter_path) {
-                    adapter_modules.insert(module);
-                }
-            }
             profile_configs.insert(
                 profile_name.clone(),
                 Self::resolved_profile_from_profiles(&config.profiles, profile_name)?,
             );
         }
+        let adapter_modules = Self::base_route_adapter_modules_from_profiles(&config.profiles);
 
         Ok(ModelEntry {
             name: model_name,
@@ -525,7 +546,11 @@ impl ModelRegistry {
     fn expand_model_entry_into_profile_variants(
         base_entry: &ModelEntry,
     ) -> Result<Vec<ModelEntry>, String> {
-        let mut entries = vec![base_entry.clone()];
+        let mut entries = if base_entry.profile_names.contains("default") {
+            vec![base_entry.clone()]
+        } else {
+            Vec::new()
+        };
         let mut profile_names: Vec<String> = base_entry.profile_names.iter().cloned().collect();
         profile_names.sort();
         for profile_name in profile_names {
@@ -545,6 +570,11 @@ impl ModelRegistry {
             else {
                 return Err(Self::profile_resolution_error(&profile_name));
             };
+            let info_extras = Self::narrow_info_extras_to_profile(
+                &base_entry.info_extras,
+                &profile_name,
+                &profile_config,
+            );
             let mut variant_profile_names = HashSet::new();
             variant_profile_names.insert("default".to_string());
             let mut variant_profile_configs = HashMap::new();
@@ -564,10 +594,7 @@ impl ModelRegistry {
                 adapter_modules: variant_adapters,
                 profile_names: variant_profile_names,
                 profile_configs: variant_profile_configs,
-                info_extras: Self::narrow_info_extras_to_profile(
-                    &base_entry.info_extras,
-                    &profile_name,
-                ),
+                info_extras,
             });
         }
 
@@ -626,9 +653,10 @@ impl ModelRegistry {
             if profile.compute_precision.is_some() {
                 resolved.compute_precision = profile.compute_precision.clone();
             }
-            if profile.adapter_options.is_some() {
-                resolved.adapter_options = profile.adapter_options.clone();
-            }
+            resolved.adapter_options = ModelRegistry::merge_adapter_options(
+                resolved.adapter_options,
+                profile.adapter_options.clone(),
+            );
             resolved.extends = None;
             Some(resolved)
         }
@@ -706,18 +734,60 @@ impl ModelRegistry {
         if profile.compute_precision.is_some() {
             resolved.compute_precision = profile.compute_precision.clone();
         }
-        if profile.adapter_options.is_some() {
-            resolved.adapter_options = profile.adapter_options.clone();
-        }
+        resolved.adapter_options =
+            Self::merge_adapter_options(resolved.adapter_options, profile.adapter_options.clone());
         Some(resolved)
     }
 
-    fn adapter_modules_from_entry_profiles(entry: &ModelEntry) -> HashSet<String> {
-        entry
-            .profile_names
-            .iter()
-            .filter_map(|profile_name| Self::effective_adapter_path_from_entry(entry, profile_name))
-            .filter_map(Self::adapter_module_from_path)
+    fn merge_adapter_options(
+        parent: Option<serde_json::Value>,
+        child: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let Some(child_value) = child else {
+            return parent;
+        };
+
+        let serde_json::Value::Object(child_map) = child_value else {
+            return Some(child_value);
+        };
+
+        let mut merged = match parent {
+            Some(serde_json::Value::Object(parent_map)) => parent_map,
+            Some(_) | None => serde_json::Map::new(),
+        };
+
+        for (key, value) in child_map {
+            if matches!(key.as_str(), "loadtime" | "runtime") {
+                if !matches!(&value, serde_json::Value::Object(map) if map.is_empty()) {
+                    merged.insert(key, value);
+                }
+                continue;
+            }
+            merged.insert(key, value);
+        }
+
+        Some(serde_json::Value::Object(merged))
+    }
+
+    fn base_route_adapter_modules_from_profiles(
+        profiles: &HashMap<String, crate::types::model::ProfileConfig>,
+    ) -> HashSet<String> {
+        if !profiles.contains_key("default") {
+            return HashSet::new();
+        }
+        Self::effective_adapter_path_from_profiles(profiles, "default")
+            .and_then(Self::adapter_module_from_path)
+            .into_iter()
+            .collect()
+    }
+
+    fn base_route_adapter_modules_from_entry(entry: &ModelEntry) -> HashSet<String> {
+        if !entry.profile_names.contains("default") {
+            return HashSet::new();
+        }
+        Self::effective_adapter_path_from_entry(entry, "default")
+            .and_then(Self::adapter_module_from_path)
+            .into_iter()
             .collect()
     }
 
@@ -795,10 +865,9 @@ impl ModelRegistry {
     /// list for `model` is intersected with bundles whose
     /// `BundleInfo.engine` matches before applying the existing
     /// `(priority, name)` sort. This is what implements the
-    /// `X-SIE-Engine` header at the proxy layer; today only
-    /// `"pytorch"` is recognised so the filter is effectively a
-    /// no-op, but the plumbing is preserved for the day a second
-    /// engine lands.
+    /// `X-SIE-Engine` header at the proxy layer. This remains an
+    /// operator/debug override; normal routing should select the bundle
+    /// through model/profile compatibility.
     ///
     /// `engine_filter = None` is the back-compat path used by callers
     /// that don't care about engine selection.
@@ -1131,6 +1200,38 @@ impl ModelRegistry {
         self.snapshot.store(Arc::new(snap));
     }
 
+    pub fn install_bundle_pool_config_hashes(
+        &self,
+        hashes: HashMap<String, HashMap<String, String>>,
+    ) {
+        if hashes.is_empty() {
+            return;
+        }
+
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (**self.snapshot.load()).clone();
+        for (bundle_name, pool_hashes) in hashes {
+            if !snap.bundles.contains_key(&bundle_name) {
+                continue;
+            }
+            for (pool_name, hash) in pool_hashes {
+                let pool_name = pool_name.trim().to_lowercase();
+                let pool_name = if pool_name.is_empty() {
+                    DEFAULT_MODEL_POOL.to_string()
+                } else {
+                    pool_name
+                };
+                let key = (bundle_name.clone(), pool_name);
+                if hash.is_empty() {
+                    snap.bundle_pool_config_hashes.remove(&key);
+                } else {
+                    snap.bundle_pool_config_hashes.insert(key, hash);
+                }
+            }
+        }
+        self.snapshot.store(Arc::new(snap));
+    }
+
     /// Compute the config hash for a bundle (expensive: sort + JSON + SHA-256).
     /// Called during reload() and add_model_config() to pre-populate the cache.
     fn hash_bundle_config(
@@ -1169,10 +1270,7 @@ impl ModelRegistry {
         models: &HashMap<String, ModelEntry>,
     ) -> HashMap<(String, String), String> {
         let mut pools_by_bundle: HashMap<String, HashSet<String>> = HashMap::new();
-        for (model_name, entry) in models {
-            if Self::is_synthetic_profile_variant(model_name, models) {
-                continue;
-            }
+        for entry in models.values() {
             let pool = Self::entry_pool_name(entry).to_string();
             for bundle in &entry.bundles {
                 pools_by_bundle
@@ -1225,8 +1323,17 @@ impl ModelRegistry {
         model_names.sort();
 
         for model_name in model_names {
-            if Self::is_synthetic_profile_variant(model_name, models) {
-                continue;
+            let synthetic_variant = Self::synthetic_profile_variant_parts(model_name, models);
+            if let Some((base_name, _)) = synthetic_variant {
+                if models
+                    .get(base_name)
+                    .is_some_and(|base_entry| base_entry.bundles.iter().any(|b| b == bundle_id))
+                {
+                    // The base entry already carries all profiles compatible with this
+                    // bundle. Only hash synthetic variants when they are the sole
+                    // routing identity for this bundle, e.g. `model:candle`.
+                    continue;
+                }
             }
 
             let model_entry = &models[model_name];
@@ -1236,6 +1343,13 @@ impl ModelRegistry {
             {
                 continue;
             }
+
+            let (hash_model_name, variant_profile_name) =
+                if let Some((base_name, profile_name)) = synthetic_variant {
+                    (base_name, Some(profile_name))
+                } else {
+                    (model_name.as_str(), None)
+                };
             if !model_entry.bundles.contains(&bundle_id.to_string()) {
                 continue;
             }
@@ -1284,14 +1398,28 @@ impl ModelRegistry {
 
                     let mut profile = BTreeMap::new();
                     profile.insert("config", serde_json::to_value(config).unwrap());
-                    profile.insert("name", serde_json::Value::String(pname.clone()));
+                    let profile_name_for_hash = if pname == "default" {
+                        variant_profile_name.unwrap_or(pname.as_str())
+                    } else {
+                        pname.as_str()
+                    };
+                    profile.insert(
+                        "name",
+                        serde_json::Value::String(profile_name_for_hash.to_string()),
+                    );
                     profiles_for_hash.push(profile);
                 }
+            }
+            if profiles_for_hash.is_empty() {
+                continue;
             }
 
             let mut item = BTreeMap::new();
             item.insert("profiles", serde_json::to_value(profiles_for_hash).unwrap());
-            item.insert("sie_id", serde_json::Value::String(model_name.clone()));
+            item.insert(
+                "sie_id",
+                serde_json::Value::String(hash_model_name.to_string()),
+            );
             items.push(serde_json::to_value(item).unwrap());
         }
 
@@ -1302,17 +1430,22 @@ impl ModelRegistry {
         let serialized = serde_json::to_string(&items).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(serialized.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            write!(&mut hex, "{byte:02x}").expect("write to String cannot fail");
+        }
+        hex
     }
 
-    fn is_synthetic_profile_variant(
-        model_name: &str,
+    fn synthetic_profile_variant_parts<'a>(
+        model_name: &'a str,
         models: &HashMap<String, ModelEntry>,
-    ) -> bool {
+    ) -> Option<(&'a str, &'a str)> {
         model_name
             .rsplit_once(':')
-            .is_some_and(|(base_model_name, profile_name)| {
-                !profile_name.is_empty() && models.contains_key(base_model_name)
+            .filter(|(base_model_name, profile_name)| {
+                !profile_name.is_empty() && models.contains_key(*base_model_name)
             })
     }
 
@@ -1577,7 +1710,7 @@ impl ModelRegistry {
                     Self::resolved_profile_from_profiles(&merged_profiles, pname)?,
                 );
             }
-            existing.adapter_modules = Self::adapter_modules_from_entry_profiles(existing);
+            existing.adapter_modules = Self::base_route_adapter_modules_from_entry(existing);
             Self::merge_model_info_extras(&mut existing.info_extras, &config, &merged_profiles);
         } else {
             // New model
@@ -1601,7 +1734,9 @@ impl ModelRegistry {
                     name: sie_id.clone(),
                     pool: incoming_pool,
                     bundles: Vec::new(),
-                    adapter_modules: new_adapter_modules,
+                    adapter_modules: Self::base_route_adapter_modules_from_profiles(
+                        &config.profiles,
+                    ),
                     profile_names,
                     profile_configs,
                     info_extras,
@@ -1629,6 +1764,10 @@ impl ModelRegistry {
             for name in old_variants {
                 snap.models.remove(&name);
                 snap.model_names_lower.remove(&name.to_lowercase());
+            }
+            if !base_entry.profile_names.contains("default") {
+                snap.models.remove(sie_id);
+                snap.model_names_lower.remove(&sie_id.to_lowercase());
             }
 
             for mut entry in Self::expand_model_entry_into_profile_variants(&base_entry)? {
@@ -2050,9 +2189,17 @@ profiles:
   default:
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
     max_batch_tokens: 8192
+    adapter_options:
+      loadtime:
+        trust_remote_code: false
+      runtime:
+        normalize: false
   a100-40gb:
     extends: default
     max_batch_tokens: 32768
+    adapter_options:
+      runtime:
+        normalize: true
 "#,
         )
         .unwrap();
@@ -2083,6 +2230,104 @@ profiles:
             Some("sie_server.adapters.sglang.generation:SGLangGenerationAdapter")
         );
         assert_eq!(default_profile.max_batch_tokens, Some(32768));
+        assert_eq!(
+            default_profile.adapter_options,
+            Some(serde_json::json!({
+                "loadtime": {"trust_remote_code": false},
+                "runtime": {"normalize": true},
+            }))
+        );
+    }
+
+    #[test]
+    fn test_reload_profile_only_model_exposes_variant_without_base_route() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("candle.yaml"),
+            "name: candle\npriority: 20\nadapters:\n  - sie_server_rust.adapters.candle\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("org__profile-only.yaml"),
+            r#"
+sie_id: org/profile-only
+profiles:
+  experimental:
+    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
+    max_batch_tokens: 8192
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        assert!(!registry.model_exists("org/profile-only"));
+        assert!(registry.model_exists("org/profile-only:experimental"));
+        assert_eq!(
+            registry.list_models(),
+            vec!["org/profile-only:experimental".to_string()]
+        );
+        assert!(registry.resolve_bundle("org/profile-only", None).is_err());
+        assert_eq!(
+            registry
+                .resolve_bundle("org/profile-only:experimental", None)
+                .unwrap(),
+            "candle"
+        );
+    }
+
+    #[test]
+    fn test_add_profile_only_model_exposes_variant_without_base_route() {
+        use crate::types::model::{ModelConfig, ProfileConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("candle.yaml"),
+            "name: candle\npriority: 20\nadapters:\n  - sie_server_rust.adapters.candle\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "experimental".to_string(),
+            ProfileConfig {
+                adapter_path: Some(
+                    "sie_server_rust.adapters.candle:CandleEmbeddingAdapter".to_string(),
+                ),
+                max_batch_tokens: Some(8192),
+                compute_precision: None,
+                adapter_options: None,
+                extends: None,
+            },
+        );
+        registry
+            .add_model_config(ModelConfig {
+                name: "org/profile-only".to_string(),
+                adapter_module: None,
+                default_bundle: None,
+                pool: None,
+                profiles,
+                inputs: None,
+                tasks: None,
+                max_sequence_length: None,
+            })
+            .unwrap();
+
+        assert!(!registry.model_exists("org/profile-only"));
+        assert!(registry.model_exists("org/profile-only:experimental"));
+        assert_eq!(
+            registry.list_models(),
+            vec!["org/profile-only:experimental".to_string()]
+        );
+        assert!(registry.resolve_bundle("org/profile-only", None).is_err());
+        assert_eq!(
+            registry
+                .resolve_bundle("org/profile-only:experimental", None)
+                .unwrap(),
+            "candle"
+        );
     }
 
     #[test]
@@ -2154,6 +2399,79 @@ profiles:
             .lora_adapters_for_profile("default")
             .map(|v| v.iter().any(|s| s == "a1"))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_candle_profile_variant_narrows_outputs_to_dense() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.rope_flash\n",
+        )
+        .unwrap();
+        fs::write(
+            bundles_dir.join("candle.yaml"),
+            "name: candle\npriority: 30\nengine: candle\nadapters:\n  - sie_server_rust.adapters.candle\n",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("acme__hybrid.yaml"),
+            r#"
+sie_id: acme/hybrid
+tasks:
+  encode:
+    dense:
+      dim: 768
+    sparse:
+      dim: 30522
+    multivector:
+      dim: 128
+  score: {}
+profiles:
+  default:
+    adapter_path: sie_server.adapters.rope_flash:RoPEFlashAdapter
+    max_batch_tokens: 8192
+  candle:
+    adapter_path: sie_server_rust.adapters.candle:CandleEmbeddingAdapter
+    max_batch_tokens: 8192
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let base = registry.get_model_info("acme/hybrid").unwrap();
+        assert_eq!(
+            base.bundles,
+            vec!["default".to_string()],
+            "base model routes through the default profile adapter"
+        );
+        assert_eq!(
+            base.info_extras.outputs,
+            vec![
+                "dense".to_string(),
+                "sparse".to_string(),
+                "multivector".to_string(),
+                "score".to_string(),
+            ],
+            "base entry preserves the full model-level capability surface"
+        );
+
+        let variant = registry.get_model_info("acme/hybrid:candle").unwrap();
+        assert_eq!(variant.info_extras.outputs, vec!["dense".to_string()]);
+        assert_eq!(variant.info_extras.dims.get("dense"), Some(&768));
+        assert!(!variant.info_extras.dims.contains_key("sparse"));
+        assert!(!variant.info_extras.dims.contains_key("multivector"));
+        assert_eq!(
+            registry.resolve_bundle("acme/hybrid:candle", None).unwrap(),
+            "candle",
+            "profile variant routes through its own adapter without X-SIE-Engine"
+        );
+        assert_eq!(
+            registry
+                .resolve_bundle_with_engine("acme/hybrid:candle", None, Some("candle"))
+                .unwrap(),
+            "candle"
+        );
     }
 
     #[test]
@@ -3286,6 +3604,62 @@ profiles:
     }
 
     #[test]
+    fn test_compute_bundle_config_hash_includes_candle_profile_variant() {
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            r#"
+name: default
+priority: 10
+adapters:
+  - sie_server.adapters.bert_flash
+"#,
+        )
+        .unwrap();
+        fs::write(
+            bundles_dir.join("candle.yaml"),
+            r#"
+name: candle
+priority: 30
+engine: candle
+adapters:
+  - sie_server_rust.adapters.candle
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            models_dir.join("bge-m3.yaml"),
+            r#"
+name: BAAI/bge-m3
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.bert_flash:BertFlashAdapter"
+    max_batch_tokens: 4096
+  candle:
+    adapter_path: "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
+    max_batch_tokens: 2048
+    adapter_options:
+      runtime:
+        pooling: cls
+        normalize: true
+"#,
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        let candle_hash = registry.compute_bundle_config_hash("candle");
+        let candle_pool_hash = registry.compute_bundle_config_hash_for_pool("candle", "default");
+
+        assert!(registry.model_exists("BAAI/bge-m3:candle"));
+        assert!(!candle_hash.is_empty());
+        assert_eq!(candle_hash.len(), 64);
+        assert_eq!(candle_pool_hash, candle_hash);
+        assert_ne!(candle_hash, registry.compute_bundle_config_hash("default"));
+    }
+
+    #[test]
     fn test_install_bundle_config_hashes_overrides_local_hash() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
 
@@ -3441,7 +3815,6 @@ profiles:
     // ---------------------------------------------------------------
     // engine field. These tests pin the wire shape and validation
     // contract so a future refactor can't quietly drop the field.
-    // Today only ``"pytorch"`` is recognised — see ``KNOWN_ENGINES``.
     // ---------------------------------------------------------------
 
     #[test]
@@ -3487,13 +3860,7 @@ profiles:
     }
 
     #[test]
-    fn test_resolve_bundle_with_engine_filter_passes_through_for_only_engine() {
-        // Today there's exactly one engine in ``KNOWN_ENGINES``
-        // (``"pytorch"``), so the engine-filter codepath must be a
-        // no-op for any pytorch-backed bundle: with or without the
-        // filter, the same bundle resolves. Re-introduce a
-        // multi-engine version of this test when a second engine
-        // lands.
+    fn test_resolve_bundle_with_engine_filter_selects_matching_engine() {
         let (_dir, bundles_dir, models_dir) = create_test_dirs();
         fs::write(
             bundles_dir.join("default.yaml"),
@@ -3506,12 +3873,25 @@ adapters:
         )
         .unwrap();
         fs::write(
+            bundles_dir.join("candle.yaml"),
+            r#"
+name: candle
+priority: 30
+engine: candle
+adapters:
+  - sie_server_rust.adapters.candle
+"#,
+        )
+        .unwrap();
+        fs::write(
             models_dir.join("bert.yaml"),
             r#"
 name: example/bert
 profiles:
   default:
     adapter_path: "sie_server.adapters.bert_flash:Adapter"
+  candle:
+    adapter_path: "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
 "#,
         )
         .unwrap();
@@ -3525,6 +3905,23 @@ profiles:
             .resolve_bundle_with_engine("example/bert", None, Some("pytorch"))
             .unwrap();
         assert_eq!(filtered, "default");
+
+        assert!(
+            registry
+                .resolve_bundle_with_engine("example/bert", None, Some("candle"))
+                .is_err(),
+            "base model routing should follow the default profile, not the engine override"
+        );
+
+        let candle = registry
+            .resolve_bundle("example/bert:candle", None)
+            .unwrap();
+        assert_eq!(candle, "candle");
+
+        let candle_with_engine = registry
+            .resolve_bundle_with_engine("example/bert:candle", None, Some("candle"))
+            .unwrap();
+        assert_eq!(candle_with_engine, "candle");
     }
 
     #[test]

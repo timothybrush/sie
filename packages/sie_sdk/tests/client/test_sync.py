@@ -288,6 +288,48 @@ class TestEncode:
             assert result["multivector"].shape == (3, 128)
             client.close()
 
+    def test_encode_single_item_empty_items_raises_server_error(self) -> None:
+        """An empty ``items`` list for a single input must raise an actionable
+        ``ServerError`` rather than a bare ``IndexError`` from ``results[0]`` (#1526).
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = msgpack.packb({"model": "e5-mistral", "items": []}, use_bin_type=True)
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            with pytest.raises(ServerError) as excinfo:
+                client.encode("e5-mistral", {"text": "a very long document"})
+            # Actionable: names the model and the expected vs. returned counts.
+            assert "e5-mistral" in str(excinfo.value)
+            assert "0 embedding(s) for 1 input item(s)" in str(excinfo.value)
+            assert excinfo.value.code == "ENCODE_RESULT_COUNT_MISMATCH"
+            client.close()
+
+    def test_encode_batch_short_items_raises_server_error(self) -> None:
+        """A batch whose response drops an item (desync) raises ``ServerError`` with
+        counts instead of silently returning fewer embeddings than inputs (#1526).
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = msgpack.packb(
+            {
+                "model": "e5-mistral",
+                # Two inputs sent, one embedding returned.
+                "items": [{"dense": {"dims": 4, "dtype": "float32", "values": np.array([1.0, 2.0, 3.0, 4.0])}}],
+            },
+            use_bin_type=True,
+        )
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            with pytest.raises(ServerError) as excinfo:
+                client.encode("e5-mistral", [{"text": "short"}, {"text": "over-length doc"}])
+            assert "1 embedding(s) for 2 input item(s)" in str(excinfo.value)
+            client.close()
+
 
 class TestErrorHandling:
     """Tests for error handling."""

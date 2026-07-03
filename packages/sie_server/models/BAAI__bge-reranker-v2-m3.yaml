@@ -13,7 +13,11 @@ max_sequence_length: 8192
 profiles:
   default:
     max_batch_tokens: 16384
-    compute_precision: null
+    # fp16 is explicit (not null) so the Mac torch-MPS fallback runs fp16
+    # (≈1.24 GB vs 3.21 GB fp32, Pearson 0.9997 vs CPU-fp32 — benchmarked). On
+    # CUDA this is unchanged: the engine default is already fp16, so null
+    # resolved to fp16 there anyway. On CPU the cross-encoder ignores it (fp32).
+    compute_precision: float16
     adapter_path: sie_server.adapters.bert_flash_cross_encoder:BertFlashCrossEncoderAdapter
     adapter_options:
       loadtime: {}

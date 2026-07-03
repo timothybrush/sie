@@ -49,6 +49,9 @@
             },
             "type": "array"
           },
+          "engine": {
+            "type": "string"
+          },
           "name": {
             "type": "string"
           },
@@ -62,6 +65,7 @@
         },
         "required": [
           "name",
+          "engine",
           "priority",
           "source",
           "adapters"
@@ -81,6 +85,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "engine": {
+            "type": "string"
+          },
           "priority": {
             "format": "int32",
             "type": "integer"
@@ -91,6 +98,7 @@
         },
         "required": [
           "bundle_id",
+          "engine",
           "priority",
           "adapter_count",
           "source",
@@ -2997,7 +3005,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.14"
+    "version": "0.6.15"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3841,18 +3849,6 @@
             }
           },
           {
-            "description": "Explicit engine routing override",
-            "in": "header",
-            "name": "X-SIE-Engine",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
             "description": "Client SDK version for skew warnings",
             "in": "header",
             "name": "X-SIE-SDK-Version",
@@ -4139,18 +4135,6 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "Explicit engine routing override",
-            "in": "header",
-            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -4477,18 +4461,6 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "Explicit engine routing override",
-            "in": "header",
-            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [
@@ -5616,18 +5588,6 @@
             "description": "Explicit pool routing override",
             "in": "header",
             "name": "X-SIE-Pool",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "Explicit engine routing override",
-            "in": "header",
-            "name": "X-SIE-Engine",
             "required": false,
             "schema": {
               "type": [

@@ -18,10 +18,16 @@ The key optimization is cost-sorted sub-batching:
 - Each sub-batch contains similar-cost items
 - This minimizes padding waste within each sub-batch
 
-Cost semantics vary by modality:
+Cost semantics vary by modality (modality-native units):
 - Text: cost = token count
 - Images: cost = 1 per image (fixed dimensions)
+- Vision (tiled): cost = tile count (1-N per image)
 - Audio: cost = sample_count / chunk_size
+
+These units are NOT commensurable across modalities, so ``total_cost`` is only
+meaningful within a single modality (the common case — a model's batch is
+single-modality). See docs/adr/0004 for why cost is kept modality-native
+rather than unified onto a canonical unit.
 """
 
 from __future__ import annotations
@@ -367,7 +373,7 @@ class BatchFormer[I: HasCost, T]:
         effective_ms = min(batch_remaining_ms, coalesce_remaining_ms)
         return effective_ms / 1000  # Convert to seconds
 
-    def _extract_batch(self) -> FormattedBatch[I, T]:
+    def _extract_batch(self, max_items: int | None = None) -> FormattedBatch[I, T]:
         """Extract an optimal sub-batch from pending requests.
 
         Algorithm:
@@ -376,6 +382,13 @@ class BatchFormer[I: HasCost, T]:
         3. Keep remaining requests for next get_batch() call
 
         This minimizes padding waste by grouping similar-cost sequences.
+
+        Args:
+            max_items: Optional hard cap on the number of items taken, on top of
+                the cost/request limits. Used by ``try_drain`` to bound a
+                continuous-batch drain to a caller-held snapshot budget so
+                post-snapshot arrivals are not swept in ahead of the next FCFS
+                selection. See #1606.
         """
         # Track why batch was triggered (must check BEFORE extracting items)
         was_full = self._batch_is_full()
@@ -396,6 +409,10 @@ class BatchFormer[I: HasCost, T]:
         hit_request_limit = False
 
         for request in self._pending:
+            # Respect an explicit per-extract item cap (a drain-fairness bound)
+            # before anything else, so post-snapshot arrivals stay queued.
+            if max_items is not None and take_count >= max_items:
+                break
             # Would this item push us over the cost limit?
             # Always take at least one item (handles single large requests)
             if batch_cost + request.item.cost > self._config.max_batch_cost:
@@ -455,7 +472,7 @@ class BatchFormer[I: HasCost, T]:
             return self._extract_batch()
         return None
 
-    async def try_drain(self) -> FormattedBatch[I, T] | None:
+    async def try_drain(self, max_items: int | None = None) -> FormattedBatch[I, T] | None:
         """Drain accumulated items immediately, bypassing batch timeout.
 
         Used by the process loop after inference completes to immediately
@@ -463,13 +480,18 @@ class BatchFormer[I: HasCost, T]:
         "continuous batching" optimization — items that waited during
         inference don't need to wait an additional batch formation window.
 
+        Args:
+            max_items: Optional cap on how many items this drain may take, so a
+                caller draining a snapshot backlog does not sweep in items that
+                arrived mid-drain. See #1606.
+
         Returns:
             FormattedBatch if items were pending, None otherwise.
         """
         async with self._lock:
             if not self._pending:
                 return None
-            return self._extract_batch()
+            return self._extract_batch(max_items=max_items)
 
 
 def collate_batch(

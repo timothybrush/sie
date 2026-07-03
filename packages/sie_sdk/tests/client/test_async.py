@@ -259,6 +259,37 @@ class TestAsyncEncode:
         assert len(results) == 2
         await client.close()
 
+    @pytest.mark.asyncio
+    async def test_encode_single_item_empty_items_raises_server_error(self) -> None:
+        """Empty ``items`` for a single input raises ``ServerError`` not ``IndexError`` (#1526)."""
+        resp = _make_msgpack_response({"model": "e5-mistral", "items": []})
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(return_value=resp)  # type: ignore
+        with pytest.raises(ServerError) as excinfo:
+            await client.encode("e5-mistral", {"text": "a very long document"})
+        assert "e5-mistral" in str(excinfo.value)
+        assert "0 embedding(s) for 1 input item(s)" in str(excinfo.value)
+        assert excinfo.value.code == "ENCODE_RESULT_COUNT_MISMATCH"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_encode_batch_short_items_raises_server_error(self) -> None:
+        """A batch response that drops an item raises ``ServerError`` with counts (#1526)."""
+        resp = _make_msgpack_response(
+            {
+                "model": "e5-mistral",
+                "items": [{"dense": {"dims": 4, "dtype": "float32", "values": np.array([1.0, 2.0, 3.0, 4.0])}}],
+            }
+        )
+
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(return_value=resp)  # type: ignore
+        with pytest.raises(ServerError) as excinfo:
+            await client.encode("e5-mistral", [{"text": "short"}, {"text": "over-length doc"}])
+        assert "1 embedding(s) for 2 input item(s)" in str(excinfo.value)
+        await client.close()
+
 
 class TestAsyncListModels:
     """Tests for async list_models() method."""

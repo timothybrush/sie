@@ -62,6 +62,98 @@ class TestModelRegistry:
         assert registry.has_model("test-model")
         assert registry.get_config("test-model") == config
 
+    def test_add_config_expands_profile_variants(self) -> None:
+        """Programmatic config updates expose non-default profile aliases."""
+        registry = ModelRegistry()
+
+        config = _make_config(name="test-model", hf_id="org/test")
+        config.profiles["fast"] = ProfileConfig(
+            adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+            max_batch_tokens=8192,
+        )
+
+        registry.add_config(config)
+
+        assert registry.has_model("test-model:fast")
+        variant = registry.get_config("test-model:fast")
+        assert set(variant.profiles) == {"default"}
+        assert variant.profiles["default"].adapter_path == (
+            "sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter"
+        )
+
+    def test_add_config_omits_bare_model_without_default_profile(self) -> None:
+        """Profile-only configs expose only explicit variant aliases."""
+        registry = ModelRegistry()
+
+        config = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/test",
+            tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+            profiles={
+                "fast": ProfileConfig(
+                    adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+                    max_batch_tokens=8192,
+                )
+            },
+        )
+
+        registry.add_config(config)
+
+        assert not registry.has_model("test-model")
+        assert registry.has_model("test-model:fast")
+        variant = registry.get_config("test-model:fast")
+        assert set(variant.profiles) == {"default"}
+        assert variant.profiles["default"].adapter_path == (
+            "sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter"
+        )
+
+    def test_python_registry_filters_rust_only_profile_variants(self) -> None:
+        """The Python worker must not advertise Rust-only adapter routes."""
+        registry = ModelRegistry()
+
+        config = _make_config(name="test-model", hf_id="org/test")
+        config.profiles["candle"] = ProfileConfig(
+            adapter_path="sie_server_rust.adapters.candle:CandleEmbeddingAdapter",
+            max_batch_tokens=8192,
+        )
+
+        registry.add_config(config)
+
+        assert registry.has_model("test-model")
+        assert not registry.has_model("test-model:candle")
+
+    @pytest.mark.asyncio
+    async def test_add_config_async_drops_stale_bare_and_profile_variants(self) -> None:
+        """Authoritative profile removal must stop serving stale route ids."""
+        registry = ModelRegistry()
+
+        config = _make_config(name="test-model", hf_id="org/test")
+        config.profiles["fast"] = ProfileConfig(
+            adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+            max_batch_tokens=8192,
+        )
+        registry.add_config(config)
+        assert registry.has_model("test-model")
+        assert registry.has_model("test-model:fast")
+
+        profile_only = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/test",
+            tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+            profiles={
+                "fast": ProfileConfig(
+                    adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+                    max_batch_tokens=8192,
+                )
+            },
+        )
+
+        changed = await registry.add_config_async(profile_only)
+
+        assert changed == {"test-model", "test-model:fast"}
+        assert not registry.has_model("test-model")
+        assert registry.has_model("test-model:fast")
+
     def test_load_from_directory(self, tmp_path: Path) -> None:
         """Can load configs from directory."""
         # Create flat YAML config file
@@ -82,6 +174,43 @@ profiles:
 
         assert registry.has_model("my-model")
         assert registry.get_config("my-model").tasks.encode.dense.dim == 384
+
+    def test_load_from_directory_filters_rust_only_variants(self, tmp_path: Path) -> None:
+        """Filesystem catalog loading keeps Rust-only profiles out of Python routes."""
+        (tmp_path / "mixed-model.yaml").write_text("""
+sie_id: mixed-model
+hf_id: org/mixed-model
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  default:
+    adapter_path: "sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter"
+    max_batch_tokens: 8192
+  candle:
+    adapter_path: "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
+    max_batch_tokens: 8192
+""")
+        (tmp_path / "candle-only.yaml").write_text("""
+sie_id: candle-only
+hf_id: org/candle-only
+tasks:
+  encode:
+    dense:
+      dim: 384
+profiles:
+  candle:
+    adapter_path: "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
+    max_batch_tokens: 8192
+""")
+
+        registry = ModelRegistry(models_dir=tmp_path)
+
+        assert registry.has_model("mixed-model")
+        assert not registry.has_model("mixed-model:candle")
+        assert not registry.has_model("candle-only")
+        assert not registry.has_model("candle-only:candle")
 
     def test_cloud_models_dir_maps_cached_configs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cloud models_dir maps each model to the cache directory (flat YAML structure)."""

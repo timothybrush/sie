@@ -280,6 +280,7 @@ pub async fn get_bundle_configs(State(state): State<Arc<AppState>>) -> impl Into
 
             json!({
                 "bundle_id": info.name,
+                "engine": info.engine,
                 "priority": info.priority,
                 "adapter_count": info.adapters.len(),
                 "source": "gateway-registry",
@@ -320,6 +321,7 @@ pub async fn get_bundle_config(
 
     let doc = json!({
         "name": info.name,
+        "engine": info.engine,
         "priority": info.priority,
         "source": "gateway-registry",
         "adapters": info.adapters,
@@ -607,6 +609,7 @@ mod tests {
         let bundles = parsed["bundles"].as_array().unwrap();
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0]["bundle_id"], "default");
+        assert_eq!(bundles[0]["engine"], "pytorch");
         assert_eq!(bundles[0]["source"], "gateway-registry");
     }
 
@@ -629,6 +632,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = String::from_utf8(body_bytes(response).await).unwrap();
         assert!(body.contains("name: default"));
+        assert!(body.contains("engine: pytorch"));
         assert!(body.contains("source: gateway-registry"));
     }
 

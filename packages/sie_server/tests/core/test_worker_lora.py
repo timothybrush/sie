@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -198,3 +198,39 @@ class TestModelWorkerLoRABatching:
 
         finally:
             await worker.stop()
+
+
+class TestDrainActiveBatcherFairness:
+    """The continuous-batching drain must be bounded to the backlog present at
+    entry, so a saturated LoRA that keeps refilling its own batcher cannot loop
+    forever and starve sibling LoRAs / the base model. See #1606.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drain_is_bounded_by_entry_backlog(self) -> None:
+        worker = ModelWorker(MagicMock(), WorkerConfig())
+        worker._process_batch = AsyncMock()  # don't run real inference
+
+        # A batcher whose try_drain ALWAYS returns a size-1 batch simulates a
+        # LoRA refilling itself during every forward pass. Unbounded, this loops
+        # forever; bounded by the entry backlog it stops after pending_count.
+        entry_backlog = 5
+        drain_batch = MagicMock()
+        drain_batch.size = 1
+        drain_batch.total_tokens = 1
+
+        batcher = MagicMock()
+        batcher.pending_count = entry_backlog
+        batcher.try_drain = AsyncMock(return_value=drain_batch)
+        worker._batchers = {"A": batcher}
+
+        # wait_for is a safety net: if the bound regressed, fail (not hang).
+        drained = await asyncio.wait_for(worker._drain_active_batcher("A"), timeout=2.0)
+
+        assert drained is True
+        assert worker._process_batch.await_count == entry_backlog
+
+    @pytest.mark.asyncio
+    async def test_drain_noop_when_batcher_absent(self) -> None:
+        worker = ModelWorker(MagicMock(), WorkerConfig())
+        assert await worker._drain_active_batcher("no-such-lora") is False

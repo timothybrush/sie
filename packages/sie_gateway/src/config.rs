@@ -123,6 +123,15 @@ fn env_float(key: &str, fallback: f64) -> f64 {
         .unwrap_or(fallback)
 }
 
+fn env_finite_float(key: &str, fallback: f64) -> f64 {
+    let value = env_float(key, fallback);
+    assert!(
+        value.is_finite(),
+        "{key} must be a finite floating point value"
+    );
+    value
+}
+
 fn env_u64(key: &str, fallback: u64) -> u64 {
     env::var(key)
         .ok()
@@ -341,7 +350,7 @@ impl Config {
                 || env_bool("SIE_GATEWAY_POLLING_WATCHER"),
             multi_router: env_bool("SIE_MULTI_ROUTER"),
 
-            request_timeout: env_float("SIE_GATEWAY_REQUEST_TIMEOUT", 30.0),
+            request_timeout: env_finite_float("SIE_GATEWAY_REQUEST_TIMEOUT", 120.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
             stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 1_800),
 
@@ -476,33 +485,46 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old: Vec<(&str, Option<String>)> =
             vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
         for (k, v) in vars {
             env::set_var(k, v);
         }
-        f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         for (k, old_val) in old {
             match old_val {
                 Some(v) => env::set_var(k, v),
                 None => env::remove_var(k),
             }
         }
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn without_env<F: FnOnce()>(keys: &[&str], f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, env::var(k).ok())).collect();
         for k in keys {
             env::remove_var(k);
         }
-        f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         for (k, old_val) in old {
-            if let Some(v) = old_val {
-                env::set_var(k, v);
+            match old_val {
+                Some(v) => env::set_var(k, v),
+                None => env::remove_var(k),
             }
+        }
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 
@@ -808,6 +830,30 @@ mod tests {
         without_env(&["SIE_CONFIG_SERVICE_URL"], || {
             let cfg = Config::load();
             assert!(cfg.config_service_url.is_none());
+        });
+    }
+
+    #[test]
+    fn test_request_timeout_default_is_120_seconds() {
+        without_env(&["SIE_GATEWAY_REQUEST_TIMEOUT"], || {
+            let cfg = Config::load();
+            assert!((cfg.request_timeout - 120.0).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn test_request_timeout_from_env() {
+        with_env(&[("SIE_GATEWAY_REQUEST_TIMEOUT", "45.5")], || {
+            let cfg = Config::load();
+            assert!((cfg.request_timeout - 45.5).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "SIE_GATEWAY_REQUEST_TIMEOUT must be a finite floating point value")]
+    fn test_request_timeout_rejects_non_finite_env() {
+        with_env(&[("SIE_GATEWAY_REQUEST_TIMEOUT", "NaN")], || {
+            let _ = Config::load();
         });
     }
 

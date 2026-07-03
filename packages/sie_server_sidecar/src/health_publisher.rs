@@ -28,10 +28,10 @@
 //!   gate on the local [`Readiness`] state so the heartbeat agrees
 //!   with `/readyz`.
 //!
-//! `loaded_models` and the GPU memory fields are informational. The
-//! sidecar mirrors the adapter-owned loaded-model list from the IPC
-//! heartbeat so gateway model/capacity views reflect the live worker
-//! registry without adding a second probe path.
+//! `loaded_models` and the GPU memory fields are mostly informational, but
+//! the gateway also uses `loaded_models` as the per-model dispatch readiness
+//! signal. Backends that need explicit residency, such as Candle, must only
+//! publish models here after their readiness handshake has made them serveable.
 //!
 //! [`WorkerStatusMessage`]: https://github.com/search?q=WorkerStatusMessage+repo%3Asie-internal
 //! [`resolve_queue_route`]: https://github.com/search?q=resolve_queue_route+repo%3Asie-internal
@@ -98,7 +98,8 @@ pub struct HealthPublisherConfig {
     /// model registry epoch. Updated by the config subscriber after a
     /// successful Python registry apply.
     pub bundle_config_hash: SharedBundleConfigHash,
-    /// Last loaded-model list observed from the Python IPC heartbeat.
+    /// Models the colocated adapter reports as loaded or configured for
+    /// this runtime. Updated by config apply/reconcile paths.
     pub loaded_models: SharedLoadedModels,
     /// How often to publish. Defaults to [`DEFAULT_PUBLISH_INTERVAL`].
     pub interval: Duration,
@@ -376,14 +377,15 @@ mod tests {
     fn payload_reads_updated_loaded_models() {
         let c = cfg();
         {
-            let mut loaded_models = c.loaded_models.write().unwrap();
-            *loaded_models = vec!["BAAI/bge-m3".into()];
+            let mut models = c.loaded_models.write().unwrap();
+            *models = vec!["model/a".into(), "model/b".into()];
         }
-
         let json: serde_json::Value =
             serde_json::from_slice(&encode_payload(&c, true, false).unwrap()).unwrap();
-
-        assert_eq!(json["loaded_models"], serde_json::json!(["BAAI/bge-m3"]));
+        assert_eq!(
+            json["loaded_models"],
+            serde_json::json!(["model/a", "model/b"])
+        );
     }
 
     #[test]

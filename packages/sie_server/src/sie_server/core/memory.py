@@ -3,7 +3,8 @@
 Device-agnostic memory monitoring and LRU tracking for CUDA, MPS, and CPU.
 
 Memory management behavior:
-- Reactive LRU eviction without static VRAM budgets
+- Proactive and reactive LRU eviction without static VRAM budgets
+- Before load, evict when current pressure or requested load headroom requires it
 - Try to load model → If OOM, evict LRU model and retry
 - After each batch, check memory usage; evict if above threshold
 """
@@ -129,15 +130,25 @@ class MPSMemoryTracker(DeviceMemoryTracker):
         # Get current allocated memory on MPS
         used = torch.mps.current_allocated_memory()
 
-        # MPS uses unified memory - get system memory as total
-        # Note: This is the full system memory, not a dedicated GPU budget
-        try:
-            import psutil
+        # MPS uses unified memory. Prefer Metal's recommended working-set size as the
+        # budget so LRU eviction can actually fire (using full system RAM as `total`
+        # means the 0.95 threshold is almost never crossed on unified memory). Fall
+        # back to system RAM, then a fixed 32GB, if the API is unavailable.
+        total = 0
+        recommended = getattr(torch.mps, "recommended_max_memory", None)
+        if callable(recommended):
+            try:
+                total = int(recommended())
+            except (RuntimeError, ValueError):
+                total = 0
+        if not total:
+            try:
+                import psutil
 
-            total = psutil.virtual_memory().total
-        except ImportError:
-            # Fallback: assume 32GB if psutil not available
-            total = 32 * (1024**3)
+                total = psutil.virtual_memory().total
+            except ImportError:
+                # Fallback: assume 32GB if psutil not available
+                total = 32 * (1024**3)
 
         return MemoryStats(used_bytes=used, total_bytes=total, device_type="mps")
 

@@ -11,6 +11,7 @@ from sie_server.core.oom import (
     OomRecoveryStats,
     ResourceExhaustedError,
 )
+from sie_server.core.residency import EvictionResult
 from sie_server.core.worker.oom_recovery import BatchExecutor, ConfigGroup
 from sie_server.observability.metrics import (
     OOM_BATCH_SPLITS,
@@ -114,7 +115,7 @@ async def test_eviction_path() -> None:
     stats = OomRecoveryStats()
 
     registry = AsyncMock()
-    registry.evict_lru_excluding = AsyncMock(return_value=True)
+    registry.evict_lru_excluding = AsyncMock(return_value=EvictionResult.EVICTED)
 
     executor = BatchExecutor(model_name="m", registry=registry, config=config, stats=stats)
 
@@ -150,7 +151,7 @@ async def test_eviction_no_candidate_falls_through() -> None:
     stats = OomRecoveryStats()
 
     registry = AsyncMock()
-    registry.evict_lru_excluding = AsyncMock(return_value=False)
+    registry.evict_lru_excluding = AsyncMock(return_value=EvictionResult.NO_CANDIDATE)
 
     executor = BatchExecutor(model_name="m", registry=registry, config=config, stats=stats)
 
@@ -364,7 +365,7 @@ async def test_prometheus_counters_fire_for_evict_and_split_actions() -> None:
     )
     stats = OomRecoveryStats()
     registry = AsyncMock()
-    registry.evict_lru_excluding = AsyncMock(return_value=True)
+    registry.evict_lru_excluding = AsyncMock(return_value=EvictionResult.EVICTED)
     executor = BatchExecutor(model_name="prom-evict-split", registry=registry, config=config, stats=stats)
 
     group, _ = _make_group(2)

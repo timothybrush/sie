@@ -4,8 +4,8 @@ description: >-
   SIE (Search Inference Engine) Kubernetes deployment with gateway, GPU workers,
   and observability
 type: application
-version: 0.6.14  # x-release-please-version
-appVersion: v0.6.14  # x-release-please-version
+version: 0.6.15  # x-release-please-version
+appVersion: v0.6.15  # x-release-please-version
 keywords:
   - inference
   - embedding
@@ -42,6 +42,11 @@ dependencies:
     version: 0.10.x
     repository: https://grafana.github.io/helm-charts
     condition: observability.logs.install,observability.logs.alloy.install
+  # grafana/tempo was deprecated and moved to grafana-community/tempo.
+  - name: tempo
+    version: 2.2.3
+    repository: https://grafana-community.github.io/helm-charts
+    condition: observability.tracing.tempo.install
   - name: kubernetes-event-exporter
     version: 3.6.3
     repository: oci://registry-1.docker.io/bitnamicharts

@@ -29,6 +29,8 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sie_server.adapter_call_loop import handle_run_batch
+from sie_server.ipc_types import BatchOutcome, EncodeBatchItem, RunBatchItem, RunBatchRequest
 from sie_server.processors.streaming import StreamingProcessor
 
 # A well-known W3C traceparent value, taken verbatim from the W3C
@@ -39,6 +41,12 @@ from sie_server.processors.streaming import StreamingProcessor
 EXAMPLE_TRACE_ID_HEX = "0af7651916cd43dd8448eb211c80319c"
 EXAMPLE_PARENT_SPAN_HEX = "b7ad6b7169203331"
 EXAMPLE_TRACEPARENT = f"00-{EXAMPLE_TRACE_ID_HEX}-{EXAMPLE_PARENT_SPAN_HEX}-01"
+
+# A second, distinct trace context used to exercise the run_batch fan-in
+# path (two items from two different client requests in one batch).
+EXAMPLE_TRACE_ID_HEX_2 = "1bf0762027de54ee9559fc322d91420d"
+EXAMPLE_PARENT_SPAN_HEX_2 = "c8be7c8270314442"
+EXAMPLE_TRACEPARENT_2 = f"00-{EXAMPLE_TRACE_ID_HEX_2}-{EXAMPLE_PARENT_SPAN_HEX_2}-01"
 
 
 _MODULE_EXPORTER: InMemorySpanExporter | None = None
@@ -248,3 +256,205 @@ async def test_worker_span_is_root_when_envelope_omits_traceparent(
     assert matching, "worker.streaming_processor span must still emit without traceparent"
     # No parent — the worker becomes the root of its own trace.
     assert matching[0].parent is None
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming worker loop (``handle_run_batch``) trace propagation.
+#
+# Mirrors the streaming assertions above: the gateway serialises its span
+# into each work item's ``traceparent`` / ``tracestate``, the Rust
+# scheduler copies those onto the wire ``RunBatchItem`` s, and
+# ``handle_run_batch`` re-extracts them so ``worker.run_batch`` attaches to
+# the gateway span instead of rooting a fresh trace.
+# ---------------------------------------------------------------------------
+
+
+def _make_encode_run_batch_item(
+    *,
+    traceparent: str | None,
+    tracestate: str | None = None,
+    work_item_id: str = "r.0",
+    request_id: str = "r",
+    item_index: int = 0,
+) -> RunBatchItem:
+    """Build an encode ``RunBatchItem`` with a populated encode payload.
+
+    The encode payload must be present (``_dispatch_encode`` reads
+    ``ri.encode``) so dispatch reaches the stubbed executor instead of
+    rejecting the item as invalid.
+    """
+    return RunBatchItem(
+        op="encode",
+        work_item_id=work_item_id,
+        request_id=request_id,
+        item_index=item_index,
+        encode=EncodeBatchItem(
+            work_item_id=work_item_id,
+            request_id=request_id,
+            item_index=item_index,
+            total_items=1,
+            timestamp=0.0,
+            item={"text": "hello"},
+        ),
+        traceparent=traceparent,
+        tracestate=tracestate,
+    )
+
+
+def _make_run_batch_executor() -> MagicMock:
+    """A ``QueueExecutor`` stub whose per-op dispatch is a trivial no-op.
+
+    ``process_encode_batch`` returns an empty :class:`BatchOutcome` so no
+    model is loaded — the test only exercises the trace-context boundary
+    in ``handle_run_batch``, not the encode pipeline.
+    """
+    executor = MagicMock()
+    executor.process_encode_batch = AsyncMock(return_value=BatchOutcome(outcomes=[]))
+    return executor
+
+
+def _run_batch_span(in_memory_exporter: InMemorySpanExporter) -> Any:
+    spans = in_memory_exporter.get_finished_spans()
+    matching = [s for s in spans if s.name == "worker.run_batch"]
+    assert matching, f"worker.run_batch span not emitted; saw {[s.name for s in spans]}"
+    return matching[0]
+
+
+@pytest.mark.asyncio
+async def test_run_batch_span_is_child_of_single_context(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A single-context batch's span attaches to the gateway span.
+
+    This is the acceptance criterion: a ``/v1/encode`` request carrying a
+    ``traceparent`` produces a ``worker.run_batch`` span whose ``trace_id``
+    equals the gateway trace_id and whose parent is the gateway span — not
+    a fresh root.
+    """
+    executor = _make_run_batch_executor()
+    req = RunBatchRequest(
+        model_id="test/model",
+        batch_id=7,
+        lora_key="",
+        total_cost=1,
+        items=[_make_encode_run_batch_item(traceparent=EXAMPLE_TRACEPARENT)],
+    )
+
+    await handle_run_batch(executor, req)
+
+    span = _run_batch_span(in_memory_exporter)
+    assert format(span.context.trace_id, "032x") == EXAMPLE_TRACE_ID_HEX, (
+        "run_batch span did not inherit the gateway's trace_id; extraction is broken"
+    )
+    assert span.parent is not None, "run_batch span has no parent — propagation produced a root"
+    assert format(span.parent.span_id, "016x") == EXAMPLE_PARENT_SPAN_HEX, (
+        "run_batch span's parent_span_id does not match the gateway span_id from the wire item"
+    )
+    assert not span.links, "single-context batch must not emit fan-in links"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_span_attributes_include_sie_batch_metadata(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """Span carries the batch metadata attributes operators build dashboards on."""
+    executor = _make_run_batch_executor()
+    req = RunBatchRequest(
+        model_id="test/model",
+        batch_id=7,
+        lora_key="",
+        total_cost=1,
+        items=[_make_encode_run_batch_item(traceparent=EXAMPLE_TRACEPARENT)],
+    )
+
+    await handle_run_batch(executor, req)
+
+    span = _run_batch_span(in_memory_exporter)
+    attrs = dict(span.attributes or {})
+    assert attrs.get("sie.model") == "test/model"
+    assert attrs.get("sie.batch_id") == 7
+    assert attrs.get("sie.op") == "encode"
+    assert attrs.get("sie.adapter") == "run_batch"
+    assert attrs.get("sie.batch_size") == 1
+
+
+@pytest.mark.asyncio
+async def test_run_batch_span_fan_in_links_distinct_contexts(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A fan-in batch parents to the first context and links the rest.
+
+    Two items carrying two DISTINCT traceparents land in one batch: the
+    span is a child of the first and carries exactly one OTel link to the
+    second so the fan-in is visible in the trace graph.
+    """
+    executor = _make_run_batch_executor()
+    req = RunBatchRequest(
+        model_id="test/model",
+        batch_id=11,
+        lora_key="",
+        total_cost=2,
+        items=[
+            _make_encode_run_batch_item(
+                traceparent=EXAMPLE_TRACEPARENT, work_item_id="a.0", request_id="a", item_index=0
+            ),
+            _make_encode_run_batch_item(
+                traceparent=EXAMPLE_TRACEPARENT_2, work_item_id="b.0", request_id="b", item_index=1
+            ),
+        ],
+    )
+
+    await handle_run_batch(executor, req)
+
+    span = _run_batch_span(in_memory_exporter)
+    # Child of the FIRST distinct context.
+    assert format(span.context.trace_id, "032x") == EXAMPLE_TRACE_ID_HEX
+    assert span.parent is not None
+    assert format(span.parent.span_id, "016x") == EXAMPLE_PARENT_SPAN_HEX
+    # Exactly one link, pointing at the SECOND distinct context.
+    assert len(span.links) == 1, f"expected one fan-in link, got {len(span.links)}"
+    link_ctx = span.links[0].context
+    assert format(link_ctx.trace_id, "032x") == EXAMPLE_TRACE_ID_HEX_2
+    assert format(link_ctx.span_id, "016x") == EXAMPLE_PARENT_SPAN_HEX_2
+
+
+@pytest.mark.asyncio
+async def test_run_batch_span_is_root_without_traceparent(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A batch with no trace context still emits a (root) span, no crash."""
+    executor = _make_run_batch_executor()
+    req = RunBatchRequest(
+        model_id="test/model",
+        batch_id=3,
+        lora_key="",
+        total_cost=1,
+        items=[_make_encode_run_batch_item(traceparent=None)],
+    )
+
+    await handle_run_batch(executor, req)
+
+    span = _run_batch_span(in_memory_exporter)
+    assert span.parent is None, "run_batch span should be a root when no traceparent is present"
+    assert not span.links
+
+
+@pytest.mark.asyncio
+async def test_run_batch_span_is_root_when_traceparent_malformed(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A malformed traceparent opens a root span and no fan-in links."""
+    executor = _make_run_batch_executor()
+    req = RunBatchRequest(
+        model_id="test/model",
+        batch_id=13,
+        lora_key="",
+        total_cost=1,
+        items=[_make_encode_run_batch_item(traceparent="not-a-valid-traceparent")],
+    )
+
+    await handle_run_batch(executor, req)
+
+    span = _run_batch_span(in_memory_exporter)
+    assert span.parent is None, "run_batch span should be a root when traceparent is malformed"
+    assert not span.links
