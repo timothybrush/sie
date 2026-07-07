@@ -5,7 +5,7 @@ description = "Taxonomy classification example for SIE"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "chromadb>=0.4",
+    "chromadb>=1.5.9",
     "polars>=1.40.0",
     "python-dotenv>=1.2.2",
     "sie-sdk==0.2.0",
