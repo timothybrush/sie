@@ -97,6 +97,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         default_instruction: str | None = None,
         forward_kwargs: dict[str, Any] | None = None,
         uses_legacy_transformers_cache: bool = False,
+        use_model_encode: bool = False,
         dense_dim: int | None = None,
     ) -> None:
         r"""Initialize the adapter.
@@ -134,6 +135,14 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             uses_legacy_transformers_cache: If True, disable the KV cache after
                 loading by setting model.config.use_cache = False. Required for
                 models that use the legacy transformers cache API (pre-4.54).
+            use_model_encode: If True, delegate encoding to the checkpoint's own
+                ``model.encode(prompts, instruction=...)`` method instead of the
+                generic tokenize/forward/pool pipeline. For models whose recipe
+                is not reproducible generically — e.g. NV-Embed-v2's instruction
+                prepend + EOS append, right padding, and internal
+                latent-attention pooling with instruction tokens masked out
+                (#1692). The query/doc template's prefix (everything before
+                ``{text}``) is rendered and passed as the ``instruction``.
             dense_dim: Catalog-declared dense embedding dimension. If provided,
                 validated against the loaded model's hidden size.
         """
@@ -150,6 +159,7 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         self._default_instruction = default_instruction
         self._forward_kwargs = forward_kwargs or {}
         self._uses_legacy_transformers_cache = uses_legacy_transformers_cache
+        self._use_model_encode = use_model_encode
         self._configured_dense_dim = dense_dim
 
         self._model: PreTrainedModel | None = None
@@ -296,6 +306,17 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
             )
             raise ValueError(msg)
 
+        if self._use_model_encode:
+            return self._encode_via_model(
+                items,
+                instruction,
+                is_query=is_query,
+                query_template=query_template,
+                doc_template=doc_template,
+                default_instruction=default_instruction,
+                normalize=normalize,
+            )
+
         texts = self._format_texts(
             items,
             instruction,
@@ -382,6 +403,70 @@ class PyTorchEmbeddingAdapter(PEFTLoRAMixin, BaseAdapter):
         if unsupported:
             msg = f"Unsupported output types: {unsupported}. This model only supports 'dense'."
             raise ValueError(msg)
+
+    def _encode_via_model(
+        self,
+        items: list[Item],
+        instruction: str | None,
+        *,
+        is_query: bool,
+        query_template: str | None,
+        doc_template: str | None,
+        default_instruction: str | None,
+        normalize: bool,
+    ) -> EncodeOutput:
+        r"""Delegate the whole batch to the checkpoint's own ``encode()``.
+
+        Models like NV-Embed-v2 ship an ``encode(prompts, instruction=...)``
+        that reproduces their published recipe end-to-end: instruction
+        prepend + EOS append, right padding, and internal latent-attention
+        pooling with instruction tokens masked out of the mean. The generic
+        tokenize/forward/pool pipeline cannot reproduce that (calling the
+        forward without ``pool_mask`` yields the *unpooled* latent sequence
+        — the #1692 fidelity gap), so this path hands the raw texts and the
+        rendered template prefix to the model and only normalizes on top.
+        """
+        model_encode = getattr(self._model, "encode", None)
+        if not callable(model_encode):
+            msg = (
+                f"use_model_encode is set but {type(self._model).__name__} has no "
+                "callable .encode() — remove the option or fix the checkpoint."
+            )
+            raise RuntimeError(msg)
+
+        template = query_template if is_query else doc_template
+        if template:
+            if not template.endswith("{text}"):
+                msg = (
+                    "use_model_encode requires a '<prefix>{text}'-shaped template "
+                    f"(the prefix is passed as the model's instruction); got {template!r}"
+                )
+                raise ValueError(msg)
+            instr = instruction or default_instruction or ""
+            prefix = template.format(instruction=instr, text="")
+        else:
+            # Mirror _format_texts' no-template fallback: a caller-provided
+            # instruction is still honored (model.encode prepends and masks it).
+            prefix = instruction or ""
+
+        texts = []
+        for item in items:
+            if item.text is None:
+                raise ValueError(ERR_REQUIRES_TEXT.format(adapter_name="PyTorchEmbeddingAdapter"))
+            texts.append(item.text)
+
+        with torch.inference_mode():
+            embeddings = model_encode(texts, instruction=prefix, max_length=self._max_seq_length)
+            if normalize:
+                embeddings = functional.normalize(embeddings, p=2, dim=-1)
+
+        embeddings_np = embeddings.float().cpu().numpy()
+        return EncodeOutput(
+            dense=embeddings_np,
+            batch_size=len(items),
+            is_query=is_query,
+            dense_dim=self._dense_dim,
+        )
 
     def _format_texts(
         self,

@@ -125,9 +125,11 @@ autoscaling:
 The gateway exposes `sie_gateway_pending_demand{pool="...",machine_profile="...",bundle="..."}`
 when requests arrive for queue lanes with no available workers. KEDA uses this
 to trigger scale-up even when there are 0 workers (and thus no worker metrics).
-For `X-SIE-Pool` requests that omit `X-SIE-MACHINE-PROFILE`, the gateway can
-emit a lane-specific signal only when the registered pool spec contains exactly
-one machine profile. Multi-profile tenant pools should send both headers.
+For gpu-agnostic cold requests, including `X-SIE-Pool` requests that omit
+`X-SIE-MACHINE-PROFILE`, the gateway emits concrete lane signals for every
+machine profile the backing pool can provision. Multi-profile pools therefore
+wake candidate lanes from zero without relying on an empty `machine_profile`
+label that KEDA cannot match.
 
 ### Scaling Metrics
 

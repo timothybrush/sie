@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
@@ -9,6 +10,7 @@ from torch.nn import functional
 from sie_server.adapters._flash_base import FlashBaseAdapter
 from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._multivector import maxsim_scores_batched
+from sie_server.adapters._pylate_dense import apply_dense_chain, load_pylate_dense_chain
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters._utils import apply_rotary_pos_emb, grouped_score_pairs, validate_output_types
@@ -17,8 +19,6 @@ from sie_server.core.inference_output import EncodeOutput, ScoreOutput
 from sie_server.types.inputs import Item
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import numpy as np
     from transformers import PreTrainedTokenizerFast
 
@@ -34,19 +34,33 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     """ColBERT adapter for ModernBERT with RoPE and Flash Attention 2 varlen.
 
     This adapter eliminates padding waste by packing sequences and using
-    flash_attn_varlen_func. Supports ModernBERT architecture with Rotary
-    Position Embeddings and Matryoshka dimension truncation.
+    flash_attn_varlen_func. Mirrors the ModernBERT forward faithfully:
+    local/global attention alternation (per-layer sliding window + rope theta),
+    final_norm, and the trained pylate Dense chain when the checkpoint ships
+    one (falling back to Matryoshka truncation otherwise). See #1680.
 
     Works with ModernBERT-based ColBERT models (GTE-ModernColBERT, Reason-ModernColBERT,
     mxbai-edge-colbert).
     """
 
     fallback_adapter_path: ClassVar[str | None] = "colbert:ColBERTAdapter"
+    # Align the fallback with this adapter's faithful serving of the ModernBERT
+    # ColBERT trio: no query expansion (their checkpoints set
+    # do_query_expansion: false), no document punctuation skiplist (this flash
+    # path applies none), and the flash default max_seq_length (ColBERTAdapter
+    # defaults to 512). Applies ONLY to fallback instances created for models
+    # configured with this adapter, never to models whose YAML names
+    # colbert:ColBERTAdapter directly.
+    fallback_kwargs_overrides: ClassVar[dict[str, Any]] = {
+        "query_expansion": False,
+        "doc_punctuation_skiplist": False,
+        "max_seq_length": 8192,
+    }
 
     spec = AdapterSpec(
         inputs=("text",),
         outputs=("multivector", "score"),
-        unload_fields=("_model", "_tokenizer"),
+        unload_fields=("_model", "_tokenizer", "_dense_chain"),
     )
 
     def __init__(
@@ -96,6 +110,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._model: Any = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
         self._device: str | None = None
+        self._dense_chain: list[torch.Tensor] | None = None
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -109,7 +124,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         if not device.startswith("cuda"):
             raise RuntimeError(_ERR_CPU_NOT_SUPPORTED)
 
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoModel
 
         self._device = device
         dtype = self._resolve_dtype()
@@ -121,10 +136,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             dtype,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            self._model_name_or_path,
-            trust_remote_code=True,
-        )
+        self._tokenizer = self._load_tokenizer()
 
         # Load model with eager attention - we handle flash attention manually
         self._model = AutoModel.from_pretrained(
@@ -136,11 +148,52 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._model.to(device)
         self._model.eval()
 
+        self._dense_chain = load_pylate_dense_chain(
+            self._model_name_or_path,
+            hidden_size=self._model.config.hidden_size,
+            token_dim=self._token_dim,
+            device=self._device,
+            dtype=dtype,
+        )
+        if self._dense_chain is None:
+            logger.warning(
+                "No usable pylate Dense chain for %s; using backbone truncation. "
+                "If this checkpoint ships Dense modules (e.g. partial weight cache), embeddings are degraded.",
+                self._model_name_or_path,
+            )
+
         logger.info(
-            "ColBERT ModernBERT: hidden=%d, token_dim=%d (Matryoshka truncation)",
+            "ColBERT ModernBERT: hidden=%d, token_dim=%d, dense_chain=%s",
             self._model.config.hidden_size,
             self._token_dim,
+            None if self._dense_chain is None else [tuple(w.shape) for w in self._dense_chain],
         )
+
+    def _load_tokenizer(self) -> PreTrainedTokenizerFast:
+        """Load the tokenizer, tolerating checkpoints saved by newer transformers.
+
+        Some ModernBERT ColBERT checkpoints (e.g. topk-io/Iso-ModernColBERT) are
+        saved by transformers>=5 and declare a tokenizer_class this transformers
+        version cannot resolve (e.g. "TokenizersBackend"). These ship a standard
+        fast tokenizer, so fall back to PreTrainedTokenizerFast, which is
+        byte-equivalent to AutoTokenizer for the fast-tokenizer checkpoints this
+        adapter serves.
+        """
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+        try:
+            return AutoTokenizer.from_pretrained(
+                self._model_name_or_path,
+                trust_remote_code=True,
+            )
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "AutoTokenizer could not resolve the tokenizer class for %s (%s); "
+                "falling back to PreTrainedTokenizerFast",
+                self._model_name_or_path,
+                exc,
+            )
+            return PreTrainedTokenizerFast.from_pretrained(self._model_name_or_path)
 
     def _resolve_dtype(self) -> torch.dtype:
         """Resolve compute dtype (default: bfloat16)."""
@@ -150,6 +203,18 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             "float32": torch.float32,
         }
         return dtype_map.get(self._compute_precision, torch.bfloat16)
+
+    def _project(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the trained pylate Dense chain if available, then Matryoshka-truncate
+        to token_dim. Dimension-preserving: output is always token_dim wide.
+
+        The trailing truncation is the whole projection when the chain is absent
+        and a no-op when it is present (the chain loader guarantees the chain
+        ends at token_dim).
+        """
+        if self._dense_chain is not None:
+            hidden = apply_dense_chain(hidden, self._dense_chain)
+        return hidden[:, : self._token_dim]
 
     def encode(
         self,
@@ -213,14 +278,30 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             # Run embeddings
             hidden = self._run_embeddings(input_ids_packed)
 
-            # Get RoPE cos/sin values
-            cos, sin = self._compute_rope(position_ids_packed)
+            # Pre-compute RoPE cos/sin for global and local layers
+            global_cos, global_sin = self._compute_rope(position_ids_packed, use_global=True)
+            local_cos, local_sin = self._compute_rope(position_ids_packed, use_global=False)
 
             # Run transformer layers with flash attention and RoPE
-            hidden = self._run_transformer_flash(hidden, cu_seqlens, max_seqlen, total_tokens, cos, sin)
+            hidden = self._run_transformer_flash(
+                hidden,
+                cu_seqlens,
+                max_seqlen,
+                total_tokens,
+                global_cos,
+                global_sin,
+                local_cos,
+                local_sin,
+            )
 
-            # Matryoshka truncation: take first token_dim dimensions
-            hidden = hidden[:, : self._token_dim]
+            # Apply final layer norm (ModernBERT has a final_norm after all layers);
+            # the trained Dense projection was fit on final-normed activations.
+            if hasattr(self._model, "final_norm"):
+                hidden = self._model.final_norm(hidden)
+
+            # Apply the trained pylate Dense chain (if the checkpoint ships one)
+            # then Matryoshka-truncate to token_dim; see #1680.
+            hidden = self._project(hidden)
 
             # L2 normalize
             if self._normalize:
@@ -298,27 +379,40 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         """Build position IDs for packed sequences."""
         return build_position_ids(cu_seqlens)
 
-    def _compute_rope(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_rope(
+        self,
+        position_ids: torch.Tensor,
+        *,
+        use_global: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute RoPE cos/sin values for packed positions.
+
+        ModernBERT uses different rope_theta values for global vs local attention
+        layers: ``global_rope_theta`` (default 160000) for global layers and
+        ``local_rope_theta`` (default 10000) for local (sliding-window) layers.
+
+        Args:
+            position_ids: Packed position IDs [total_tokens].
+            use_global: If True, use global_rope_theta; otherwise local_rope_theta.
 
         Returns:
             cos, sin tensors of shape [total_tokens, head_dim].
         """
         head_dim = self._model.config.hidden_size // self._model.config.num_attention_heads
+        cfg = self._model.config
 
-        # ModernBERT uses rope_theta for base frequency
-        base = getattr(self._model.config, "rope_theta", 160000.0)
+        if use_global:
+            base = getattr(cfg, "global_rope_theta", getattr(cfg, "rope_theta", 160000.0))
+        else:
+            base = getattr(cfg, "local_rope_theta", getattr(cfg, "rope_theta", 10000.0))
+
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=self._device).float() / head_dim))
 
-        # Compute sin/cos for all positions
         pos = position_ids.float()
         freqs = torch.outer(pos, inv_freq)  # [total_tokens, head_dim/2]
         emb = torch.cat([freqs, freqs], dim=-1)  # [total_tokens, head_dim]
 
-        cos = emb.cos()
-        sin = emb.sin()
-
-        return cos.to(self._resolve_dtype()), sin.to(self._resolve_dtype())
+        return emb.cos().to(self._resolve_dtype()), emb.sin().to(self._resolve_dtype())
 
     def _run_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Compute embeddings for packed input (no position embeddings - RoPE in attention)."""
@@ -339,22 +433,37 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         total_tokens: int,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        global_cos: torch.Tensor,
+        global_sin: torch.Tensor,
+        local_cos: torch.Tensor,
+        local_sin: torch.Tensor,
     ) -> torch.Tensor:
         """Run transformer layers using flash_attn_varlen_func with RoPE.
 
-        ModernBERT uses pre-norm architecture with local/global attention patterns.
-        We use global attention for all layers (no window restriction).
+        ModernBERT uses pre-norm architecture with local/global attention
+        patterns.  Every ``global_attn_every_n_layers``-th layer (0-indexed)
+        uses full (global) attention with ``global_rope_theta``; the remaining
+        layers use sliding-window (local) attention of size
+        ``local_attention`` with ``local_rope_theta``.
         """
         from flash_attn import flash_attn_varlen_func
 
-        num_heads = self._model.config.num_attention_heads
-        hidden_size = self._model.config.hidden_size
+        cfg = self._model.config
+        num_heads = cfg.num_attention_heads
+        hidden_size = cfg.hidden_size
         head_dim = hidden_size // num_heads
         softmax_scale = 1.0 / (head_dim**0.5)
 
-        for layer in self._model.layers:
+        global_every_n = getattr(cfg, "global_attn_every_n_layers", 1)
+        local_window = getattr(cfg, "local_attention", -1)
+        # flash_attn_varlen_func expects window_size as (left, right) tuple
+        window = (local_window // 2, local_window // 2) if local_window > 0 else (-1, -1)
+
+        for layer_idx, layer in enumerate(self._model.layers):
+            is_global = (layer_idx % global_every_n == 0) if global_every_n > 1 else True
+            cos = global_cos if is_global else local_cos
+            sin = global_sin if is_global else local_sin
+
             # Pre-attention norm (ModernBERT is pre-norm)
             normed_hidden = layer.attn_norm(hidden)
 
@@ -365,11 +474,15 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             key = qkv[:, 1]
             value = qkv[:, 2]
 
-            # Apply RoPE to Q and K
+            # Apply RoPE to Q and K (using layer-appropriate theta)
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-            # Flash attention with variable-length sequences
-            # Note: We use global attention (no window_size) for simplicity
+            # Flash attention — global layers use full attention,
+            # local layers use sliding window
+            attn_kwargs: dict[str, Any] = {}
+            if not is_global and local_window > 0:
+                attn_kwargs["window_size"] = window
+
             attn_out = flash_attn_varlen_func(
                 query,
                 key,
@@ -380,6 +493,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 max_seqlen_k=max_seqlen,
                 causal=False,
                 softmax_scale=softmax_scale,
+                **attn_kwargs,
             )
             attn_out = attn_out.reshape(total_tokens, hidden_size)
 

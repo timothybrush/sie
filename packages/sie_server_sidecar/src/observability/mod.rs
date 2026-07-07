@@ -1,7 +1,7 @@
 //! Sidecar-side observability: OTLP tracing + W3C Trace Context.
 //!
 //! The sidecar sits on the queue hop between the gateway and the
-//! Python worker. It owns the OpenTelemetry tracer-provider setup, the
+//! backend worker. It owns the OpenTelemetry tracer-provider setup, the
 //! global W3C propagator install, and the helpers for extracting the
 //! inbound gateway context off the work envelope plus injecting the
 //! `sidecar.dispatch` span's context onto the IPC `RunBatchItem`s.

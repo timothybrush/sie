@@ -1,5 +1,9 @@
 sie_id: nvidia/NV-Embed-v2
-hf_id: Hyukkyu/nv-embed-v2  # works with newer transformers version
+# Mirror of nvidia/NV-Embed-v2 with transformers-5.x compatibility patches in
+# modeling_nvembed.py (DynamicCache API, rotary position_embeddings). Verified
+# 2026-07-06: weight files sha-identical to nvidia/NV-Embed-v2, configuration
+# identical, modeling diff is compat-only; latent-attention stack intact (#1692).
+hf_id: Hyukkyu/nv-embed-v2
 inputs:
   text: true
   image: false
@@ -24,5 +28,19 @@ profiles:
         trust_remote_code: true
         uses_legacy_transformers_cache: true
         attn_implementation: eager
+        # NV-Embed-v2's defining feature is latent-attention pooling with
+        # instruction-masked mean + EOS append + right padding — none of which
+        # the generic tokenize/forward/pool pipeline reproduces (calling the
+        # forward without pool_mask returns the UNPOOLED latent sequence, which
+        # was then last-token pooled: NFCorpus -17%, #1692). Delegate to the
+        # checkpoint's own encode(prompts, instruction=...) instead. The
+        # checkpoint's sentence-transformers chain is NOT an option: it predates
+        # ST 5.x, whose Transformer module requires last_hidden_state in the
+        # forward output while NVEmbedModel returns only sentence_embeddings.
+        use_model_encode: true
       runtime:
         normalize: true
+        # Official NV-Embed query recipe; documents are encoded raw (no prefix).
+        # The rendered prefix is passed as the model's `instruction`, so
+        # is_mask_instruction excludes it from the pooling mean.
+        query_template: "Instruct: {instruction}\nQuery: {text}"

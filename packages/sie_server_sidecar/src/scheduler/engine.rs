@@ -6,7 +6,7 @@
 //! but **only the scheduling half** — admission, per-LoRA batch
 //! formation, FCFS fairness, and the adaptive-controller step after
 //! each batch. The forward pass + adapter I/O still happen
-//! Python-side; this module decides *which batch* to dispatch and
+//! backend-side; this module decides *which batch* to dispatch and
 //! *when*, then hands it off.
 //!
 //! ## Routing

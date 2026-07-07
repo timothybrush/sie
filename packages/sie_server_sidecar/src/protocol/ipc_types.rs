@@ -266,9 +266,9 @@ pub struct EnsureModelReadyResponse {
 /// `sie.config.models.<bundle>` subscriber.
 ///
 /// Rust owns the NATS subscription, producer validation, epoch gating, and
-/// health hash publication. Python owns schema validation and mutation of the
-/// adapter-local `ModelRegistry`, so the actual registry write remains in the
-/// process that serves inference.
+/// health hash publication. The colocated backend owns schema validation and
+/// mutation of its local registry/catalog, so the actual registry write remains
+/// in the process that serves inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyModelConfigRequest {
     pub bundle_id: String,
@@ -320,9 +320,9 @@ pub struct ReplaceModelConfigsResponse {
 /// worker. The sidecar polls the pool's `PoolSpec.pinned_models` (the single
 /// source of truth, set via the `/v1/pools` API or
 /// `SIE_GATEWAY_STATIC_QUEUE_POOLS`) and pushes it here on change. `models`
-/// carries gateway-canonical ids (bare `sie_id` or `sie_id:profile`); Python
-/// normalizes them. The set is authoritative and REPLACES the worker's current
-/// pinned set.
+/// carries gateway-canonical ids (bare `sie_id` or `sie_id:profile`); the
+/// backend normalizes them. The set is authoritative and REPLACES the worker's
+/// current pinned set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetPinnedModelsRequest {
     pub models: Vec<String>,
@@ -371,7 +371,7 @@ pub struct GenerateEvent {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerCapabilitiesRequest {
-    // No fields: the method asks Python to describe its local registry.
+    // No fields: the method asks the backend to describe its local registry.
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

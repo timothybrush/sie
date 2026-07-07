@@ -38,3 +38,25 @@ def build_position_ids(cu_seqlens: torch.Tensor, *, offset: int = 0) -> torch.Te
     seq_starts = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1])
     positions = positions - seq_starts
     return positions + offset if offset else positions
+
+
+def mean_pool_packed(hidden: torch.Tensor, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
+    """Mean-pool each sequence of a varlen-packed hidden-state tensor.
+
+    ``hidden`` is the flat ``[total_tokens, dim]`` output of a flash encoder;
+    ``cu_seqlens`` (shape ``[num_seqs + 1]``) marks the packed sequence
+    boundaries. Returns ``[num_seqs, dim]`` — each row the mean of one
+    sequence's token vectors.
+
+    This is the exact per-sequence loop the ``*_flash`` embedding adapters
+    (nomic / rope / qwen2 / xlm_roberta) each carried inline, relocated here
+    unchanged so a pooling fix lands once. Behaviour is bit-identical to the
+    inline loops (same slice + ``mean(dim=0)`` + ``stack``); it is intentionally
+    NOT vectorized so no adapter's numerics shift.
+    """
+    mean_embeddings = []
+    for i in range(num_seqs):
+        start = cu_seqlens[i].item()
+        end = cu_seqlens[i + 1].item()
+        mean_embeddings.append(hidden[start:end].mean(dim=0))
+    return torch.stack(mean_embeddings)

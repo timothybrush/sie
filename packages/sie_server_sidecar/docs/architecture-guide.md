@@ -3,12 +3,12 @@
 `packages/sie_server_sidecar` contains the Rust queue runtime used by
 sidecar-enabled SIE worker pods.
 
-The sidecar runs next to `sie-server` in the same worker pod. It consumes NATS
-JetStream work, talks to the Python adapter over Unix-domain-socket IPC, and
-publishes results back to NATS Core.
+The sidecar runs next to a SIE backend in the same worker pod. It consumes NATS
+JetStream work, talks to the backend over Unix-domain-socket IPC, and publishes
+results back to NATS Core.
 
 ```text
-gateway -> NATS JetStream -> worker-sidecar -> UDS IPC -> sie-server adapter
+gateway -> NATS JetStream -> worker-sidecar -> UDS IPC -> worker backend
                                       |
                                       +-> NATS Core reply subject
 ```
@@ -58,7 +58,7 @@ Encode, score, and extract queue traffic follows this path:
 6. The sidecar calls `EnsureModelReady` over IPC.
 7. The scheduler batches compatible items by operation and LoRA key.
 8. The sidecar sends scheduled batches over IPC with `RunBatch`.
-9. Python returns per-item outcomes.
+9. The backend returns per-item outcomes.
 10. The sidecar publishes a `WorkResult` to the reply subject.
 11. The sidecar ACKs the JetStream message after successful reply publication.
 
@@ -126,7 +126,7 @@ polls `GET /v1/pools` before pulling from the pool stream or the
 worker-specific direct-dispatch stream. It may pull when its physical `SIE_POOL` is
 admitted directly, or when at least one assigned logical pool is backed by that
 same queue; each work item is then checked against its `admission_pool` before
-Python IPC. The gateway normally direct-dispatches capped logical batch work to
+backend IPC. The gateway normally direct-dispatches capped logical batch work to
 an assigned worker, so unassigned peers do not spend the item's JetStream
 delivery budget. Work items rejected by this per-item logical gate are still
 NAKed and counted in `sie_worker_pool_admission_naks_total` as a defensive
@@ -142,7 +142,7 @@ Source: [`pool_admission.rs`](../src/pool_admission.rs).
 ## Generation
 
 Generation work uses `ProcessGenerate` over IPC. The sidecar passes the
-msgpack-encoded `WorkItem` to Python and handles streaming IPC events.
+msgpack-encoded `WorkItem` to the backend and handles streaming IPC events.
 
 The gateway streaming path selects either a pool subject or a worker-specific
 subject. Worker-specific routing uses HRW over eligible workers. The gateway
@@ -150,7 +150,7 @@ stores a pool fallback subject for streaming work and uses it for republish
 paths such as NAK handling and first-chunk timeout handling.
 
 The sidecar subscribes to `cancel.>`. Subjects shaped as
-`cancel.{router_id}.{request_id}` are forwarded to Python through
+`cancel.{router_id}.{request_id}` are forwarded to the backend through
 `SignalGenerateCancel`.
 
 Source: [`lib.rs`](../src/lib.rs), [`dispatcher.rs`](../src/dispatcher.rs),
@@ -204,8 +204,8 @@ request count, coalescing windows, adaptive pull timing, and model-specific
 scheduler state. Oversize items flush alone. Per-item outcomes are published
 without dropping the rest of the batch.
 
-Routing remains gateway-owned. The sidecar has no local active-model allowlist
-for queue routing.
+Routing remains gateway-owned. The sidecar does not keep a separate local
+active-model routing list.
 
 Source: [`scheduler/`](../src/scheduler/), [`latency.rs`](../src/latency.rs),
 and [`dispatcher.rs`](../src/dispatcher.rs).
@@ -221,12 +221,12 @@ The sidecar performs GPU-independent preparation and framing:
 - dense, sparse, multivector, score, and generated-output framing;
 - `msgpack_numpy` sentinel-compatible payload handling.
 
-Python retokenizes when prepared tokens are absent or the tokenizer hash does
-not match. Score pair construction stays in Python. Extract tokenization stays
-in Python.
+The backend retokenizes when prepared tokens are absent or the tokenizer hash
+does not match. Score pair construction stays backend-owned. Extract
+tokenization stays backend-owned.
 
 Large generation and vision payloads are fetched from payload storage and
-inlined before `ProcessGenerate`, so Python receives a self-contained msgpack
+inlined before `ProcessGenerate`, so the backend receives a self-contained msgpack
 work item.
 
 Source: [`prep/`](../src/prep/), [`tokenize/`](../src/tokenize/),
@@ -245,7 +245,7 @@ The sidecar HTTP server exposes:
 Readiness state is shared with the NATS health publisher. The health publisher
 emits worker identity, bundle, machine profile, readiness, and the current
 bundle config hash. It also mirrors the latest `loaded_models` list reported by
-the Python IPC heartbeat so gateway pool/model gauges reflect live residency in
+the backend IPC heartbeat so gateway pool/model gauges reflect live residency in
 NATS health mode.
 
 Source: [`metrics.rs`](../src/metrics.rs),
@@ -261,13 +261,13 @@ sie.config.models.{bundle}
 ```
 
 Each notification is checked for trusted producer, bundle, epoch, and payload
-size. Accepted deltas are forwarded to Python through `ApplyModelConfig`.
-Python returns the applied bundle config hash. The sidecar stores that hash in
-`ConfigApplyState`.
+size. Accepted deltas are forwarded to the colocated backend through
+`ApplyModelConfig`. The backend returns the applied bundle config hash. The
+sidecar stores that hash in `ConfigApplyState`.
 
 When `SIE_CONFIG_SERVICE_URL` is configured, the export reconciler fetches
 `/v1/configs/epoch` and `/v1/configs/export` from `sie-config`. Bundle-relevant
-exports are sent to Python through `ReplaceModelConfigs`.
+exports are sent to the backend through `ReplaceModelConfigs`.
 
 Export reconciliation skips unchanged periodic exports. Exports older than the
 local epoch are skipped unless the reconciler is handling an epoch-rewind
@@ -279,7 +279,7 @@ config hash for the resolved pool and bundle. The dispatcher compares that hash
 with the current local hash and the accepted recent-hash window before
 `EnsureModelReady`. Unknown hashes are NAKed.
 
-Live config apply updates model configuration in the colocated Python registry.
+Live config apply updates model configuration in the colocated backend registry/catalog.
 It does not update adapter code or bundle definitions inside the running worker
 image.
 

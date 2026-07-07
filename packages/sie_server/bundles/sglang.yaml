@@ -72,6 +72,16 @@ deps:
   llguidance:
     version: '>=0.7.11,<0.8.0'
     marker: sys_platform == 'linux'
+  # ``sglang==0.5.10.post1`` metadata requires ``flash-attn-4>=4.0.0b4``, which
+  # is pre-release-only — and PyPI's ``flash-attn-4`` also carries a stable
+  # ``0.0.1`` placeholder that disables uv's only-pre-releases allowance, so
+  # resolving sglang without an explicit fa4 specifier is unsatisfiable
+  # (#1684). The explicit pre-release pin re-enables pre-releases for exactly
+  # this package. Runtime-inert: sglang defaults to its flashinfer backend and
+  # never selects fa4 unless asked; the package only has to be importable.
+  flash-attn-4:
+    version: '==4.0.0b19'
+    marker: sys_platform == 'linux'
   # Apple Silicon (Metal) generation. SGLang is CUDA-only, so on macOS the
   # SGLangGenerationAdapter.create_for_device swap serves generation via Apple's
   # MLX (mlx_lm.server) instead — this makes the same bundle resolve correctly on

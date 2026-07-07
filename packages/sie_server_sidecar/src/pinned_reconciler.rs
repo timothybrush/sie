@@ -3,8 +3,8 @@
 //! The gateway owns the pinned-model set per logical pool (`PoolSpec.pinned_models`,
 //! set via the `/v1/pools` API or `SIE_GATEWAY_STATIC_QUEUE_POOLS`). This
 //! module polls that source of truth on a timer, computes the union of pins for
-//! logical pools that currently assign this worker, and pushes it to the Python
-//! worker over IPC on change, so the worker eager-loads pinned models and
+//! logical pools that currently assign this worker, and pushes it to the backend
+//! over IPC on change, so the worker eager-loads pinned models and
 //! excludes them from eviction.
 //!
 //! It is deliberately decoupled from the pool admission gate: a deployment may
@@ -13,7 +13,7 @@
 //! whenever a gateway URL is configured, independent of admission.
 //!
 //! There is no gateway push channel for pool changes, so delivery is poll-based
-//! (mirroring `config_reconciler`). The Python `set_pinned_models` mutator is
+//! (mirroring `config_reconciler`). The backend `set_pinned_models` mutator is
 //! idempotent, so a redundant push is harmless; we still suppress no-op pushes
 //! via change detection.
 

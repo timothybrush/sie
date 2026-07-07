@@ -27,7 +27,17 @@ _Arch = Literal["bert", "roberta", "distilbert"]
 
 
 def _has_flash_attn() -> bool:
-    return importlib.util.find_spec("flash_attn") is not None
+    # A bare find_spec check is not enough: the pre-release flash-attn-4
+    # package installs a `flash_attn` stub without `flash_attn_varlen_func`,
+    # which would route us onto the flash path only to crash at encode time
+    # (see #1685 / the 824c2ec09 worker-image incident). Require the symbol.
+    if importlib.util.find_spec("flash_attn") is None:
+        return False
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except Exception:  # noqa: BLE001 — any broken stub means "no flash"
+        return False
+    return True
 
 
 class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):

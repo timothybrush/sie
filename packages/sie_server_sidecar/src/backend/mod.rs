@@ -154,7 +154,7 @@ pub trait InferenceBackend: Send + Sync {
     ///
     /// A backend that serves every model (like [`PythonIpcBackend`])
     /// returns `true` unconditionally. A specialised backend returns
-    /// `true` only for its allow-list.
+    /// `true` only for models in its responsibility set.
     fn supports(&self, model_id: &str) -> bool;
 
     /// Ensure the model is loaded (or kick off a load) and report

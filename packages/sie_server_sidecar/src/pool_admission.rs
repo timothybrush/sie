@@ -3,7 +3,7 @@
 //! The gateway owns pool assignment. The sidecar polls `/v1/pools`, opens its
 //! physical JetStream consumer only when the physical pool or at least one
 //! backed logical pool assigns this worker, then checks every work item's
-//! `admission_pool` before Python IPC so direct NATS publishes cannot bypass
+//! `admission_pool` before backend IPC so direct NATS publishes cannot bypass
 //! the gateway's admission decision.
 
 use std::collections::HashSet;

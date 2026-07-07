@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import torch
+from safetensors.torch import save_file
 from sie_server.adapters.colbert import ColBERTAdapter
 from sie_server.adapters.colbert_modernbert_flash import ColBERTModernBERTFlashAdapter
 from sie_server.adapters.colbert_rotary_flash import ColBERTRotaryFlashAdapter
@@ -12,6 +17,35 @@ from sie_server.types.inputs import Item
 
 # Create a random generator for tests
 _RNG = np.random.default_rng(42)
+
+
+@pytest.fixture
+def stub_chain_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep load-path unit tests offline: ColBERTAdapter.load() probes the pylate
+    Dense chain, which would hf_hub_download modules.json for fake model IDs.
+    """
+    monkeypatch.setattr("sie_server.adapters.colbert.load_pylate_dense_chain", lambda *_args, **_kwargs: None)
+
+
+def _write_chain_checkpoint(root: Path) -> str:
+    """Write a local pylate-style checkpoint with a single Dense module 384->64."""
+    root.mkdir(parents=True, exist_ok=True)
+    modules = [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Dense", "type": "pylate.models.Dense.Dense"},
+    ]
+    (root / "modules.json").write_text(json.dumps(modules))
+    dense_dir = root / "1_Dense"
+    dense_dir.mkdir()
+    config = {
+        "in_features": 384,
+        "out_features": 64,
+        "bias": False,
+        "activation_function": "torch.nn.modules.linear.Identity",
+    }
+    (dense_dir / "config.json").write_text(json.dumps(config))
+    save_file({"linear.weight": torch.randn(64, 384)}, str(dense_dir / "model.safetensors"))
+    return str(root)
 
 
 class TestColBERTAdapter:
@@ -59,6 +93,7 @@ class TestColBERTAdapter:
         mock_model_class: MagicMock,
         mock_config_class: MagicMock,
         adapter: ColBERTAdapter,
+        stub_chain_loader: None,
     ) -> None:
         """CPU device loads with eager attention (no flash attention required)."""
         mock_config = MagicMock()
@@ -81,6 +116,237 @@ class TestColBERTAdapter:
         mock_model_class.from_pretrained.assert_called_once()
         call_kwargs = mock_model_class.from_pretrained.call_args
         assert call_kwargs.kwargs["attn_implementation"] == "eager"
+
+    def test_should_use_native_mode_modernbert(self, adapter: ColBERTAdapter) -> None:
+        """ModernBERT auto-detects native mode (the manual flash loop is BERT-only)."""
+        assert adapter._should_use_native_mode(SimpleNamespace(model_type="modernbert")) is True
+        assert adapter._should_use_native_mode(SimpleNamespace(model_type="bert")) is False
+        # Sharp edge: the explicit override check runs FIRST and wins over the
+        # ModernBERT autodetection.
+        adapter._use_native_attention = False
+        assert adapter._should_use_native_mode(SimpleNamespace(model_type="modernbert")) is False
+
+    @patch("transformers.AutoConfig")
+    @patch("transformers.AutoModel")
+    @patch("transformers.AutoTokenizer")
+    def test_native_load_without_flash_attn_uses_sdpa(
+        self,
+        mock_tokenizer_class: MagicMock,
+        mock_model_class: MagicMock,
+        mock_config_class: MagicMock,
+        adapter: ColBERTAdapter,
+        stub_chain_loader: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Native mode on CUDA without flash-attn loads with sdpa instead of crashing."""
+        mock_config = MagicMock()
+        mock_config.hidden_size = 384
+        mock_config.model_type = "modernbert"
+        mock_config_class.from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 384
+        mock_model.named_modules.return_value = []
+        mock_model.linear = torch.nn.Linear(384, 128)  # keep the projection probe offline
+        mock_model_class.from_pretrained.return_value = mock_model
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.mask_token_id = 103
+        mock_tokenizer.vocab = {}
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+
+        monkeypatch.setattr("sie_server.core.inference.is_flash_attention_available", lambda _device=None: False)
+
+        adapter.load("cuda")
+
+        call_kwargs = mock_model_class.from_pretrained.call_args
+        assert call_kwargs.kwargs["attn_implementation"] == "sdpa"
+
+    @patch("transformers.AutoConfig")
+    @patch("transformers.AutoModel")
+    @patch("transformers.AutoTokenizer")
+    def test_native_load_with_flash_attn_uses_flash_attention_2(
+        self,
+        mock_tokenizer_class: MagicMock,
+        mock_model_class: MagicMock,
+        mock_config_class: MagicMock,
+        adapter: ColBERTAdapter,
+        stub_chain_loader: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Native mode with flash-attn available is bit-unchanged: flash_attention_2."""
+        mock_config = MagicMock()
+        mock_config.hidden_size = 384
+        mock_config.model_type = "modernbert"
+        mock_config_class.from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 384
+        mock_model.named_modules.return_value = []
+        mock_model.linear = torch.nn.Linear(384, 128)  # keep the projection probe offline
+        mock_model_class.from_pretrained.return_value = mock_model
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.mask_token_id = 103
+        mock_tokenizer.vocab = {}
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+
+        monkeypatch.setattr("sie_server.core.inference.is_flash_attention_available", lambda _device=None: True)
+
+        adapter.load("cuda")
+
+        call_kwargs = mock_model_class.from_pretrained.call_args
+        assert call_kwargs.kwargs["attn_implementation"] == "flash_attention_2"
+
+    @patch("transformers.AutoConfig")
+    @patch("transformers.AutoModel")
+    @patch("transformers.AutoTokenizer")
+    def test_chain_probe_wins_over_projection_probes(
+        self,
+        mock_tokenizer_class: MagicMock,
+        mock_model_class: MagicMock,
+        mock_config_class: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A checkpoint shipping a Dense chain uses it; the legacy probes must not run."""
+        mock_config = MagicMock()
+        mock_config.hidden_size = 384
+        mock_config_class.from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 384
+        mock_model.named_modules.return_value = []
+        mock_model.linear = torch.nn.Linear(384, 128)  # the legacy probe would pick this
+        mock_model_class.from_pretrained.return_value = mock_model
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.mask_token_id = 103
+        mock_tokenizer.vocab = {}
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+
+        adapter = ColBERTAdapter(_write_chain_checkpoint(tmp_path / "ckpt"), token_dim=64)
+        adapter.load("cpu")
+
+        assert adapter._dense_chain is not None
+        assert [tuple(w.shape) for w in adapter._dense_chain] == [(64, 384)]
+        assert adapter._linear is None
+        assert adapter._actual_token_dim == 64
+
+    @patch("transformers.AutoConfig")
+    @patch("transformers.AutoModel")
+    @patch("transformers.AutoTokenizer")
+    def test_no_chain_falls_through_to_existing_probes(
+        self,
+        mock_tokenizer_class: MagicMock,
+        mock_model_class: MagicMock,
+        mock_config_class: MagicMock,
+        adapter: ColBERTAdapter,
+        stub_chain_loader: None,
+    ) -> None:
+        """Without a chain (no modules.json), _find_projection_layer runs as before."""
+        mock_config = MagicMock()
+        mock_config.hidden_size = 384
+        mock_config_class.from_pretrained.return_value = mock_config
+
+        linear = torch.nn.Linear(384, 128)
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 384
+        mock_model.named_modules.return_value = []
+        mock_model.linear = linear
+        mock_model_class.from_pretrained.return_value = mock_model
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.mask_token_id = 103
+        mock_tokenizer.vocab = {}
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+
+        adapter.load("cpu")
+
+        assert adapter._dense_chain is None
+        assert adapter._linear is linear
+        assert adapter._actual_token_dim == 128
+
+    def test_encode_native_nonexpanded_query_drops_pad_rows(self) -> None:
+        """Without expansion, PAD rows must not leak into query multivectors; the
+        expansion path still keeps ALL rows (MASK tokens are semantic).
+        """
+        adapter = ColBERTAdapter("test-model", skip_special_tokens=False, query_expansion=False)
+        adapter._device = "cpu"
+        adapter._actual_token_dim = 8
+
+        hidden = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(2, 4, 8) + 1.0
+
+        class _FakeBatch(dict):
+            def to(self, _device: str) -> _FakeBatch:
+                return self
+
+        batch = _FakeBatch(
+            input_ids=torch.tensor([[1, 2, 3, 4], [1, 2, 0, 0]]),
+            attention_mask=torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),
+        )
+        adapter._tokenizer = MagicMock(return_value=batch)
+        adapter._model = MagicMock(return_value=SimpleNamespace(last_hidden_state=hidden))
+
+        out = adapter._encode_native(["q one two", "q"], max_length=4, use_expansion=False, is_query=True)
+        assert out[0].shape[0] == 4  # all real tokens kept
+        assert out[1].shape[0] == 2  # PAD rows dropped
+
+        out_expanded = adapter._encode_native(["q one two", "q"], max_length=4, use_expansion=True, is_query=True)
+        assert out_expanded[0].shape[0] == 4
+        assert out_expanded[1].shape[0] == 4  # expansion keeps all rows
+
+    def test_fallback_kwargs_overrides_disable_expansion_and_skiplist(self) -> None:
+        """The flash adapter's fallback overrides align ColBERTAdapter with the flash
+        path (no expansion, no doc skiplist, matching max length) without changing
+        the defaults of directly-configured ColBERTAdapter models.
+        """
+        yaml_kwargs = {"model_name_or_path": "x", "token_dim": 64, "skip_special_tokens": False}
+        merged = {**yaml_kwargs, **ColBERTModernBERTFlashAdapter.fallback_kwargs_overrides}
+        fallback = ColBERTAdapter(**merged)
+        assert fallback._query_expansion is False
+        assert fallback._doc_punctuation_skiplist is False
+        assert fallback._max_seq_length == 8192
+        assert fallback._doc_max_length == 8192  # doc_max_length defaults to max_seq_length
+
+        plain = ColBERTAdapter("x")
+        assert plain._query_expansion is True
+        assert plain._doc_punctuation_skiplist is True
+        assert plain._max_seq_length == 512
+
+    @patch("transformers.AutoConfig")
+    @patch("transformers.AutoModel")
+    @patch("transformers.AutoTokenizer")
+    def test_skiplist_disabled_builds_empty_skiplist(
+        self,
+        mock_tokenizer_class: MagicMock,
+        mock_model_class: MagicMock,
+        mock_config_class: MagicMock,
+        stub_chain_loader: None,
+    ) -> None:
+        """doc_punctuation_skiplist=False leaves the skiplist empty; default builds it."""
+        mock_config = MagicMock()
+        mock_config.hidden_size = 384
+        mock_config_class.from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 384
+        mock_model.named_modules.return_value = []
+        mock_model.linear = torch.nn.Linear(384, 128)  # keep the projection probe offline
+        mock_model_class.from_pretrained.return_value = mock_model
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.mask_token_id = 103
+        mock_tokenizer.vocab = {}
+        mock_tokenizer.encode.return_value = [42]
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+
+        disabled = ColBERTAdapter("test-colbert-model", doc_punctuation_skiplist=False)
+        disabled.load("cpu")
+        assert disabled._doc_skiplist_ids == set()
+
+        enabled = ColBERTAdapter("test-colbert-model")
+        enabled.load("cpu")
+        assert 42 in enabled._doc_skiplist_ids
 
     def test_validate_output_types(self, adapter: ColBERTAdapter) -> None:
         """Only multivector output type is supported."""

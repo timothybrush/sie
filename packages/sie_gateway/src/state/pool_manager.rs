@@ -692,21 +692,38 @@ impl PoolManager {
         )
     }
 
-    /// Return the pool's only configured machine profile, if the spec is
-    /// unambiguous across both requirements (`gpus`) and admission caps
-    /// (`gpu_caps`). Used by cold queue routing when a caller pins only a
-    /// pool: the NATS subject still needs a concrete machine-profile token so
-    /// KEDA can observe `pending_demand{pool,machine_profile,bundle}`.
-    pub async fn single_machine_profile_for_pool(&self, pool_name: &str) -> Option<String> {
-        let pools = self.pools.read().await;
-        let key = pool_key_for_name(&pools, pool_name)?;
-        let pool = pools.get(&key)?;
-        let profiles = machine_profiles_for_pool(pool);
-        if profiles.len() == 1 {
-            profiles.into_iter().next()
-        } else {
-            None
+    /// Every machine profile the pool can provision, sorted for a
+    /// deterministic emit order. Used to fan pending demand across all cold
+    /// lanes when a gpu-agnostic request cannot name a single profile: a
+    /// pool serves every bundle from every profile it declares, so any of
+    /// them may end up running the work, and KEDA must be able to observe
+    /// `pending_demand{pool,machine_profile,bundle}` on each. Empty when the
+    /// pool is unknown.
+    pub async fn demand_profiles_for_pool(&self, pool_name: &str) -> Vec<String> {
+        {
+            let pools = self.pools.read().await;
+            if let Some(key) = pool_key_for_name(&pools, pool_name) {
+                if let Some(pool) = pools.get(&key) {
+                    let mut profiles = machine_profiles_for_pool(pool);
+                    profiles.sort();
+                    return profiles;
+                }
+            }
         }
+        // The default pool is implicit (never stored in `pools`): its cold
+        // lanes are the cluster's configured machine profiles. Lowercased to
+        // match the KEDA `machine_profile` label the chart renders.
+        if normalize_pool_name(pool_name) == DEFAULT_POOL_NAME {
+            let mut profiles: Vec<String> = self
+                .configured_profiles
+                .iter()
+                .map(|p| p.to_lowercase())
+                .collect();
+            profiles.sort();
+            profiles.dedup();
+            return profiles;
+        }
+        Vec::new()
     }
 
     pub async fn queue_pool_for_pool(&self, pool_name: &str) -> Option<String> {
@@ -1107,7 +1124,7 @@ fn known_queue_pool_from_names(static_pool_names: &HashSet<String>, name: &str) 
 
 /// Deduplicated, lowercased machine-profile set for a pool, taken from the
 /// union of `spec.gpus` (requirements) and `spec.gpu_caps` (admission caps).
-/// This is the same set `single_machine_profile_for_pool` collapses to one;
+/// This is the same set `demand_profiles_for_pool` fans pending demand across;
 /// the warm-floor emitter keeps all of them so each lane gets its own
 /// `sie_gateway_pool_warm_floor` series.
 pub(crate) fn machine_profiles_for_pool(pool: &Pool) -> Vec<String> {

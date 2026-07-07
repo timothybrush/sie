@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.6.16
+
+- chore(main): release 0.6.16
+- fix(adapters): honor caller instruction in use_model_encode without a template
+- feat(adapters): use_model_encode — delegate to checkpoint-native encode()
+- Revert "feat(adapters): opt-in template_as_prompt for ST prompt-length-aware templates"
+- Revert "fix(models): serve NV-Embed-v2 via its native latent-attention ST path"
+- fix(models): serve NV-Embed-v2 via its native latent-attention ST path
+- feat(adapters): opt-in template_as_prompt for ST prompt-length-aware templates
+- chore(models): remove Qwen3-0.6B experimental custom LoRA profile
+- test(keda): cover gpu-agnostic kind smoke demand
+- docs(gateway): clarify legacy empty demand comments
+- fix(adapters): harden splade flash gate + add flash-vs-native parity test
+- fix(gateway): normalize explicit GPU demand labels
+- fix(gateway): fan out gpu-agnostic demand across pool profiles for scale-from-zero
+- fix(bundles): pin flash-attn-4 prerelease so sglang 0.5.10.post1 resolves
+- fix(helm): wake a deterministic owner lane on gpu-agnostic demand for multi-profile bundles
+- fix(colbert): GTE muvera also at simhash 6 - CMedQA/MMarco evals OOM at dim 81920
+- fix(colbert): mxbai muvera at simhash 6 (FDE dim 20480) - runner dies at 81920
+- fix(colbert): retune GTE/mxbai muvera for the Dense-projected representation
+- fix(colbert): serve pylate Dense chains and align fallback with flash
+- fix(models): restore e5 templates on multilingual-e5-large ST profile
+- fix(colbert_modernbert_flash): faithful ModernBERT forward + hardened 1_Dense loading
+- test: cover candle warm model residency
+- fix: align candle workers with catalog lane config
+- refactor(server): dedup flash mean-pooling into _flash_pack
+- fix(colbert_modernbert_flash): address CodeRabbit review on #1591
+- fix(colbert_modernbert_flash): only apply Dense head when out_features==token_dim
+- fix(colbert_modernbert_flash): apply trained ColBERT Dense projection
+- Revert "feat(models): onboard topk-io/Iso-ModernColBERT (ColBERT multivector)"
+- fix(colbert_modernbert_flash): tolerate transformers>=5 tokenizer_class
+- feat(models): onboard topk-io/Iso-ModernColBERT (ColBERT multivector)
+
 ## v0.6.15
 
 - chore(main): release 0.6.15

@@ -265,14 +265,17 @@ struct PoolLookup {
     /// Caller-pinned pools still probe the registry when a GPU is
     /// present so demand tracking can avoid spurious scale-up signals.
     exact_gpu_match: bool,
-    /// Concrete machine-profile label that should receive pending demand
+    /// Concrete machine-profile labels that should receive pending demand
     /// even when the caller did not send `X-SIE-MACHINE-PROFILE`.
     ///
-    /// This is populated only when route resolution can name a cold lane
-    /// safely (for example explicit pool+GPU, or a pool spec with exactly
-    /// one profile). KEDA queries are exact `pool/profile/bundle` matches,
-    /// so recording `machine_profile=""` does not scale a specific lane.
-    pending_demand_profile: Option<String>,
+    /// KEDA queries are exact `pool/profile/bundle` matches, so recording
+    /// `machine_profile=""` cannot scale a specific lane. When the caller
+    /// pins a GPU we record that one profile; when a cold gpu-agnostic
+    /// request cannot name one, we fan demand across every profile the pool
+    /// can provision so each candidate cold lane can scale from zero (a
+    /// capable one comes up and serves; the others reap on scale-down).
+    /// Empty when a healthy worker already exists or no profile is known.
+    pending_demand_profiles: Vec<String>,
 }
 
 /// Strict allowlist for caller-supplied pool names (`[A-Za-z0-9_-]`).
@@ -345,10 +348,9 @@ async fn apply_model_pool_default(
 /// - If the caller pinned a pool via `X-SIE-Pool` and supplied a GPU,
 ///   route only when a healthy worker exists in that exact lane. Otherwise
 ///   return `Provisioning` and record pending demand for the pinned lane. If
-///   they pinned only a pool, prefer a healthy worker to infer the concrete
-///   machine-profile token; when none exists, use the pool spec only if it
-///   contains exactly one machine profile so pending demand can still target a
-///   concrete KEDA lane.
+///   they pinned only a pool, use the pool's provisionable profiles for
+///   pending-demand fan-out, probing a concrete cold lane only when the pool
+///   has exactly one profile.
 /// - Otherwise look up a healthy default-pool worker for `(bundle, gpu)`.
 ///   The worker must also report the gateway's expected bundle config hash.
 ///   If GPU was specified and the exact tuple has no worker, return
@@ -375,7 +377,7 @@ async fn resolve_effective_pool(
                 admission_pool: normalized_pool,
                 demand_pool: DEFAULT_POOL_NAME.to_string(),
                 exact_gpu_match: false,
-                pending_demand_profile: None,
+                pending_demand_profiles: Vec::new(),
             };
         };
         // Caller pinned a pool. With the new subject shape, a pool-only
@@ -385,15 +387,21 @@ async fn resolve_effective_pool(
         // retryable provisioning error until a healthy worker is present so
         // the gateway does not publish to a stream with no active consumer.
         if gpu.is_empty() {
-            let inferred_profile = infer_single_pool_profile(pool_manager, pool_name).await;
-            let lookup_gpu = inferred_profile.as_deref().unwrap_or("");
+            let profiles = demand_profiles_for_pool(pool_manager, pool_name).await;
+            // Probe the exact cold lane when the pool has a single profile;
+            // otherwise probe profile-agnostically and let demand fan out.
+            let lookup_gpu = if profiles.len() == 1 {
+                profiles[0].as_str()
+            } else {
+                ""
+            };
             let route = registry
                 .resolve_queue_route_in_pool(bundle, lookup_gpu, &queue_pool, bundle_config_hash)
                 .await;
-            let pending_demand_profile = if route.is_none() {
-                inferred_profile
+            let pending_demand_profiles = if route.is_none() {
+                profiles
             } else {
-                None
+                Vec::new()
             };
             return PoolLookup {
                 resolution: match route {
@@ -403,7 +411,7 @@ async fn resolve_effective_pool(
                 admission_pool: normalize_pool_name(pool_name),
                 demand_pool: queue_pool,
                 exact_gpu_match: false,
-                pending_demand_profile,
+                pending_demand_profiles,
             };
         }
 
@@ -419,10 +427,10 @@ async fn resolve_effective_pool(
             admission_pool: normalize_pool_name(pool_name),
             demand_pool: queue_pool,
             exact_gpu_match,
-            pending_demand_profile: if exact_gpu_match {
-                None
+            pending_demand_profiles: if exact_gpu_match {
+                Vec::new()
             } else {
-                Some(gpu.to_string())
+                vec![gpu.to_lowercase()]
             },
         };
     }
@@ -438,19 +446,19 @@ async fn resolve_effective_pool(
         Some(route) => PoolResolution::Route(route),
         None => PoolResolution::Provisioning,
     };
-    let pending_demand_profile = if !gpu.is_empty() && !exact_gpu_match {
-        Some(gpu.to_string())
+    let pending_demand_profiles = if !gpu.is_empty() && !exact_gpu_match {
+        vec![gpu.to_lowercase()]
     } else if matches!(resolution, PoolResolution::Provisioning) {
-        infer_single_pool_profile(pool_manager, DEFAULT_POOL_NAME).await
+        demand_profiles_for_pool(pool_manager, DEFAULT_POOL_NAME).await
     } else {
-        None
+        Vec::new()
     };
     PoolLookup {
         resolution,
         admission_pool: DEFAULT_POOL_NAME.to_string(),
         demand_pool: DEFAULT_POOL_NAME.to_string(),
         exact_gpu_match,
-        pending_demand_profile,
+        pending_demand_profiles,
     }
 }
 
@@ -468,12 +476,14 @@ async fn queue_pool_for_request(
     manager.queue_pool_for_pool(&normalized).await
 }
 
-async fn infer_single_pool_profile(
+async fn demand_profiles_for_pool(
     pool_manager: Option<&PoolManager>,
     pool_name: &str,
-) -> Option<String> {
-    let manager = pool_manager?;
-    manager.single_machine_profile_for_pool(pool_name).await
+) -> Vec<String> {
+    match pool_manager {
+        Some(manager) => manager.demand_profiles_for_pool(pool_name).await,
+        None => Vec::new(),
+    }
 }
 
 fn provisioning_message(gpu: &str, bundle: &str) -> String {
@@ -1369,10 +1379,10 @@ async fn proxy_request(
     // folds the demand-tracking probe ("was there an exact
     // (bundle, machine_profile) match?") into the same registry load it uses to pick a
     // route, so we don't make two registry route-resolution calls on the
-    // hot path. The `pending_demand_profile` field is what drives KEDA:
-    // it is set when the caller expressed a GPU preference but no
-    // exact-tuple worker was registered, or when a cold pool-only request
-    // can be mapped to a single machine profile from the pool spec.
+    // hot path. The `pending_demand_profiles` field is what drives KEDA:
+    // it holds the caller's GPU preference when no exact-tuple worker was
+    // registered, or, for a cold gpu-agnostic request, every machine profile
+    // the pool can provision so each candidate lane can scale from zero.
     let lookup = resolve_effective_pool(
         &state.registry,
         Some(&state.pool_manager),
@@ -1384,8 +1394,8 @@ async fn proxy_request(
     .await;
     let demand_pool = lookup.demand_pool.clone();
     let admission_pool = lookup.admission_pool.clone();
-    let pending_demand_profile = lookup.pending_demand_profile.clone();
-    if let Some(profile) = pending_demand_profile.as_deref() {
+    let pending_demand_profiles = lookup.pending_demand_profiles.clone();
+    for profile in &pending_demand_profiles {
         state.demand_tracker.record(&demand_pool, profile, &bundle);
     }
 
@@ -1396,11 +1406,11 @@ async fn proxy_request(
             return build_pool_not_found_response_for_surface(&pool, provisioning_surface);
         }
         PoolResolution::Provisioning => {
-            // If route resolution named a concrete cold lane, demand was
-            // recorded above with that machine-profile label. Otherwise keep
+            // If route resolution named concrete cold lanes, demand was
+            // recorded above with those machine-profile labels. Otherwise keep
             // the legacy empty/unknown-profile series for observability even
             // though KEDA cannot scale a lane without a profile token.
-            if pending_demand_profile.is_none() {
+            if pending_demand_profiles.is_empty() {
                 state.demand_tracker.record(&demand_pool, &gpu, &bundle);
             }
             return build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
@@ -5149,8 +5159,8 @@ async fn resolve_generation_route(
     .await;
     let demand_pool = lookup.demand_pool.clone();
     let admission_pool = lookup.admission_pool.clone();
-    let pending_demand_profile = lookup.pending_demand_profile.clone();
-    if let Some(profile) = pending_demand_profile.as_deref() {
+    let pending_demand_profiles = lookup.pending_demand_profiles.clone();
+    for profile in &pending_demand_profiles {
         state.demand_tracker.record(&demand_pool, profile, bundle);
     }
     let effective_route = match lookup.resolution {
@@ -5163,7 +5173,7 @@ async fn resolve_generation_route(
             ));
         }
         PoolResolution::Provisioning => {
-            if pending_demand_profile.is_none() {
+            if pending_demand_profiles.is_empty() {
                 state.demand_tracker.record(&demand_pool, &gpu, bundle);
             }
             return Err(build_openai_provisioning_response(&gpu, bundle));
@@ -13486,7 +13496,30 @@ mod tests {
         let out = resolve_effective_pool(&reg, None, "default", "l4", "", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_lowercases_explicit_gpu_pending_demand_profiles() {
+        // KEDA ScaledObject queries use lowercased machine_profile labels. Keep
+        // explicit-GPU cold demand on that same label shape even when callers or
+        // profile aliases pass mixed-case values through routing.
+        let reg = pool_registry();
+
+        let default_pool = resolve_effective_pool(&reg, None, "sglang", "RTX6000", "", "").await;
+        assert_eq!(default_pool.resolution, PoolResolution::Provisioning);
+        assert_eq!(
+            default_pool.pending_demand_profiles,
+            vec!["rtx6000".to_string()]
+        );
+
+        let pinned_pool =
+            resolve_effective_pool(&reg, None, "sglang", "RTX6000", "tenant-a", "").await;
+        assert_eq!(pinned_pool.resolution, PoolResolution::Provisioning);
+        assert_eq!(
+            pinned_pool.pending_demand_profiles,
+            vec!["rtx6000".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -13529,7 +13562,7 @@ mod tests {
         let out = resolve_effective_pool(&reg, None, "default", "", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile, None);
+        assert!(out.pending_demand_profiles.is_empty());
     }
 
     #[tokio::test]
@@ -13552,7 +13585,7 @@ mod tests {
         );
         assert_eq!(out.admission_pool, "customer-acme");
         assert_eq!(out.demand_pool, DEFAULT_POOL_NAME);
-        assert_eq!(out.pending_demand_profile, None);
+        assert!(out.pending_demand_profiles.is_empty());
         assert!(!out.exact_gpu_match);
     }
 
@@ -13572,11 +13605,14 @@ mod tests {
         let out = resolve_effective_pool(&reg, Some(&pm), "default", "", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4".to_string()]);
     }
 
     #[tokio::test]
-    async fn test_resolve_effective_pool_does_not_guess_ambiguous_pool_profile() {
+    async fn test_resolve_effective_pool_fans_out_demand_across_ambiguous_pool_profiles() {
+        // A pool-only cold request cannot name one profile of a multi-profile
+        // pool, so demand fans out to every profile (sorted) — each candidate
+        // cold lane can then scale from zero and a capable one serves the work.
         let reg = pool_registry();
         let pm = PoolManager::new(vec!["l4".into(), "a100".into()]);
         let mut gpus = std::collections::HashMap::new();
@@ -13589,7 +13625,30 @@ mod tests {
         let out = resolve_effective_pool(&reg, Some(&pm), "default", "", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile, None);
+        assert_eq!(
+            out.pending_demand_profiles,
+            vec!["a100".to_string(), "l4".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_pool_fans_out_default_pool_demand_when_gpu_agnostic() {
+        // The scale-from-zero case from issue 1681: an unpinned, gpu-agnostic
+        // request for a bundle the multi-profile default pool serves. The
+        // default pool is implicit, so its cold lanes are the cluster's
+        // configured profiles; with no worker yet, demand fans out to each so
+        // every candidate lane can scale from zero and a capable one comes up.
+        let reg = pool_registry();
+        let pm = PoolManager::new(vec!["RTX6000".into(), "l4".into()]);
+
+        let out = resolve_effective_pool(&reg, Some(&pm), "sglang", "", "", "").await;
+        assert_eq!(out.resolution, PoolResolution::Provisioning);
+        assert!(!out.exact_gpu_match);
+        // Sorted + lowercased to match the KEDA machine_profile labels.
+        assert_eq!(
+            out.pending_demand_profiles,
+            vec!["l4".to_string(), "rtx6000".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -13604,7 +13663,7 @@ mod tests {
         let out = resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4-spot".to_string()]);
     }
 
     #[tokio::test]
@@ -13663,7 +13722,7 @@ mod tests {
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert_eq!(out.admission_pool, "tenant-l4");
         assert_eq!(out.demand_pool, DEFAULT_POOL_NAME);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4".to_string()]);
     }
 
     #[tokio::test]
@@ -13724,7 +13783,7 @@ mod tests {
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert_eq!(out.admission_pool, "tenant-a");
         assert_eq!(out.demand_pool, "customer-queue");
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4-spot".to_string()]);
         assert!(!out.exact_gpu_match);
     }
 
@@ -13739,7 +13798,7 @@ mod tests {
         let out = resolve_effective_pool(&reg, None, "default", "l4", "my-bench", "").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4".to_string()]);
     }
 
     #[tokio::test]
@@ -13767,7 +13826,7 @@ mod tests {
             resolve_effective_pool(&reg, None, "default", "l4-spot", "my-bench", "new-hash").await;
         assert_eq!(out.resolution, PoolResolution::Provisioning);
         assert!(!out.exact_gpu_match);
-        assert_eq!(out.pending_demand_profile.as_deref(), Some("l4-spot"));
+        assert_eq!(out.pending_demand_profiles, vec!["l4-spot".to_string()]);
     }
 
     // ── grammar routing: dispatch vs display model ─────────────────

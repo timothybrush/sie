@@ -678,7 +678,6 @@ where
         let advertised_hash =
             advertised_bundle_hash(control_plane_hash.as_deref(), &resp.bundle_config_hash);
         applied = resp.applied_models.len();
-        state.set_loaded_models(resp.applied_models);
 
         if let (Some(control_hash), Some(applied_hash)) = (
             control_plane_hash.as_deref(),
@@ -688,7 +687,7 @@ where
                 epoch = snapshot.epoch,
                 advertised_hash = %control_hash,
                 applied_hash = %applied_hash,
-                "worker-config: Python registry hash differs from control-plane export hash; advertising control-plane hash"
+                "worker-config: worker config hash differs from control-plane export hash; advertising control-plane hash"
             );
         }
         let state_updated = state.mark_export_reconciled(
@@ -925,10 +924,7 @@ mod tests {
             state.bundle_config_hash().read().unwrap().as_str(),
             "hash-7"
         );
-        assert_eq!(
-            state.loaded_models().read().unwrap().as_slice(),
-            ["target-model".to_string()]
-        );
+        assert!(state.loaded_models().read().unwrap().is_empty());
 
         let applied = applied.lock().await;
         assert_eq!(applied.len(), 1);
@@ -994,10 +990,7 @@ mod tests {
             state.bundle_config_hash().read().unwrap().as_str(),
             "default-pool-hash"
         );
-        assert_eq!(
-            state.loaded_models().read().unwrap().as_slice(),
-            ["default-model".to_string()]
-        );
+        assert!(state.loaded_models().read().unwrap().is_empty());
 
         let applied = applied.lock().await;
         assert_eq!(applied.len(), 1);

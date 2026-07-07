@@ -9,7 +9,7 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
-from sie_server.adapters._flash_pack import build_position_ids
+from sie_server.adapters._flash_pack import build_position_ids, mean_pool_packed
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
@@ -476,13 +476,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             # Vectorized: extract last token of each sequence
             pooled = hidden[(cu_seqlens[1:] - 1).long()]
         else:  # mean pooling
-            num_seqs = len(seq_lengths)
-            mean_embeddings = []
-            for i in range(num_seqs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                mean_embeddings.append(hidden[start:end].mean(dim=0))
-            pooled = torch.stack(mean_embeddings)
+            pooled = mean_pool_packed(hidden, cu_seqlens, len(seq_lengths))
 
         if self._dense_projection is not None:
             pooled = self._dense_projection(pooled)

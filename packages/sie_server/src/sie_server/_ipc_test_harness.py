@@ -20,6 +20,8 @@ The process exits on SIGINT / SIGTERM. All stubbed RPCs:
 * ``ProcessGenerate`` — when ``--fake-generate-model`` is set, streams
   ``in_progress`` → ``publish`` → ``ack`` events through the IPC generation
   protocol without loading a real generation adapter.
+* ``SetPinnedModels`` — records the requested pinned set and returns the applied
+  count so the sidecar pinned reconciler can exercise the IPC method.
 * ``Drain`` — handled by ``IpcServer`` itself.
 """
 
@@ -42,6 +44,8 @@ from sie_server.ipc_types import (
     ProcessExtractBatchRequest,
     ProcessScoreBatchRequest,
     ReadinessState,
+    SetPinnedModelsRequest,
+    SetPinnedModelsResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,7 +91,7 @@ class _StubRegistry:
 class _StubExecutor:
     """Duck-typed replacement for :class:`sie_server.queue_executor.QueueExecutor`.
 
-    We only need the four methods ``IpcServer`` actually calls. The test asserts
+    We only need the methods ``IpcServer`` actually calls. The test asserts
     on the outcome shape, not on any real inference output.
 
     The optional ``per_request_delay_ms`` knob injects an ``asyncio.sleep`` at
@@ -111,6 +115,7 @@ class _StubExecutor:
         self._batch_budget = batch_budget
         self._descriptor = descriptor
         self._per_request_delay_ms = per_request_delay_ms
+        self._pinned_models: frozenset[str] = frozenset()
         self.registry = _StubRegistry(generation_model, generation_hidden_polls)
 
     async def ensure_model_ready(self, model_id: str) -> ReadinessState:  # noqa: ARG002
@@ -124,6 +129,10 @@ class _StubExecutor:
 
     def loaded_model_names(self) -> list[str]:
         return []
+
+    async def set_pinned_models(self, req: SetPinnedModelsRequest) -> SetPinnedModelsResponse:
+        self._pinned_models = frozenset(model.strip() for model in req.models if model.strip())
+        return SetPinnedModelsResponse(applied=True, pinned_count=len(self._pinned_models))
 
     async def _maybe_sleep(self) -> None:
         if self._per_request_delay_ms > 0:

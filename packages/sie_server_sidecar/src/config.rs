@@ -18,22 +18,22 @@ pub struct WorkerConfig {
     /// so multiple bundles on the same pool don't step on each other.
     pub bundle: String,
 
-    /// Unix domain socket used to talk to the Python `ipc_server.py`.
+    /// Unix domain socket used to talk to the colocated backend IPC server.
     pub ipc_socket_path: PathBuf,
 
-    /// Number of concurrent IPC connections to the Python sie-server process. `1`
+    /// Number of concurrent IPC connections to the backend process. `1`
     /// preserves the legacy single-socket behaviour; higher values let
     /// the dispatcher's `SIE_MAX_CONCURRENT_BATCHES` actually drive
-    /// parallel Python-side batches. Sourced from `SIE_IPC_POOL_SIZE`
+    /// parallel backend-side batches. Sourced from `SIE_IPC_POOL_SIZE`
     /// (see `main.rs`); when unset we default to
     /// `SIE_MAX_CONCURRENT_BATCHES`'s default (4).
     pub ipc_pool_size: usize,
 
-    /// Per-RPC timeout for ordinary sidecar → Python IPC calls. Sourced from
+    /// Per-RPC timeout for ordinary sidecar-to-backend IPC calls. Sourced from
     /// `SIE_IPC_REQUEST_TIMEOUT_S`.
     pub ipc_request_timeout_s: u64,
 
-    /// Timeout for sidecar → Python `EnsureModelReady` calls. Must be at least
+    /// Timeout for sidecar-to-backend `EnsureModelReady` calls. Must be at least
     /// as long as the slowest expected cold start; SGLang adapters may
     /// legitimately spend many minutes loading large models before they can
     /// answer the readiness handshake. Sourced from
@@ -78,7 +78,7 @@ pub struct WorkerConfig {
     /// IPC `Ping`.
     pub worker_id: String,
 
-    /// How often to send `Ping` RPCs to the Python sie-server process.
+    /// How often to send `Ping` RPCs to the backend process.
     pub ping_interval_ms: u64,
 
     /// Multiplier applied to `ping_interval_ms` to compute the

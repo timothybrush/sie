@@ -27,6 +27,7 @@ See: https://github.com/stanford-futuredata/ColBERT
 from __future__ import annotations
 
 import logging
+import string
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -35,6 +36,7 @@ from torch.nn import functional
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._multivector import maxsim_scores_batched
+from sie_server.adapters._pylate_dense import apply_dense_chain, load_pylate_dense_chain
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ERR_REQUIRES_TEXT, ComputePrecision
 from sie_server.adapters._utils import grouped_score_pairs
@@ -76,7 +78,7 @@ class ColBERTAdapter(BaseAdapter):
     spec = AdapterSpec(
         inputs=("text",),
         outputs=("multivector", "score"),
-        unload_fields=("_model", "_tokenizer", "_linear", "_actual_token_dim"),
+        unload_fields=("_model", "_tokenizer", "_linear", "_actual_token_dim", "_dense_chain"),
     )
 
     def __init__(
@@ -94,6 +96,7 @@ class ColBERTAdapter(BaseAdapter):
         doc_prefix: str = "",
         use_native_attention: bool | None = None,
         query_expansion: bool = True,
+        doc_punctuation_skiplist: bool = True,
         muvera_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -118,6 +121,10 @@ class ColBERTAdapter(BaseAdapter):
             query_expansion: Whether to pad queries with MASK tokens to query_max_length.
                 This is a core ColBERT feature where MASK tokens become additional
                 "virtual" query tokens. Default: True.
+            doc_punctuation_skiplist: Whether to remove punctuation tokens from
+                document multivectors (pylate applies a punctuation skiplist to
+                document embeddings; disable to match a serving path that does
+                not). Default: True.
             muvera_config: MUVERA configuration dict with keys like num_repetitions,
                 num_simhash_projections, normalize. Used for FDE postprocessing.
             **kwargs: Additional arguments (ignored, for compatibility).
@@ -135,11 +142,13 @@ class ColBERTAdapter(BaseAdapter):
         self._doc_prefix = doc_prefix
         self._use_native_attention = use_native_attention
         self._query_expansion = query_expansion
+        self._doc_punctuation_skiplist = doc_punctuation_skiplist
         self._muvera_config = muvera_config
 
         self._model: PreTrainedModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
         self._linear: torch.nn.Linear | None = None
+        self._dense_chain: list[torch.Tensor] | None = None
         self._device: str | None = None
         self._actual_token_dim: int | None = None
         self._is_cuda: bool = False  # Set during load()
@@ -214,18 +223,19 @@ class ColBERTAdapter(BaseAdapter):
         # ``skiplist_words = string.punctuation``).  Document token embeddings
         # whose token ID is in this set are removed before returning
         # multivectors, preventing punctuation from participating in MaxSim.
-        import string
-
-        skiplist_ids: set[int] = set()
-        for ch in string.punctuation:
-            ids = self._tokenizer.encode(ch, add_special_tokens=False)
-            skiplist_ids.update(ids)
-        self._doc_skiplist_ids = skiplist_ids
-        logger.info(
-            "Built document skiplist with %d token IDs from %d punctuation chars",
-            len(skiplist_ids),
-            len(string.punctuation),
-        )
+        if self._doc_punctuation_skiplist:
+            skiplist_ids: set[int] = set()
+            for ch in string.punctuation:
+                ids = self._tokenizer.encode(ch, add_special_tokens=False)
+                skiplist_ids.update(ids)
+            self._doc_skiplist_ids = skiplist_ids
+            logger.info(
+                "Built document skiplist with %d token IDs from %d punctuation chars",
+                len(skiplist_ids),
+                len(string.punctuation),
+            )
+        else:
+            logger.info("Document punctuation skiplist disabled (doc_punctuation_skiplist=False)")
 
         # Determine whether to use native attention or manual flash attention
         config = AutoConfig.from_pretrained(
@@ -235,12 +245,18 @@ class ColBERTAdapter(BaseAdapter):
         self._native_mode = self._is_cuda and self._should_use_native_mode(config)
 
         if self._native_mode:
-            # Use model's native forward with flash_attention_2
-            logger.info("Using native attention mode (model has built-in flash attention)")
+            # Use model's native forward with flash_attention_2, or sdpa when
+            # flash-attn is unavailable (exactly the situation that selects the
+            # ColBERTAdapter fallback for e.g. ModernBERT on pre-Ampere CUDA).
+            # Import lazily to avoid circular deps (core.inference -> core.loader -> base)
+            from sie_server.core.inference import is_flash_attention_available
+
+            attn_impl = "flash_attention_2" if is_flash_attention_available(device) else "sdpa"
+            logger.info("Using native attention mode with attn_implementation=%s", attn_impl)
             self._model = AutoModel.from_pretrained(
                 self._model_name_or_path,
                 torch_dtype=dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_impl,
                 trust_remote_code=True,
             )
         else:
@@ -264,13 +280,31 @@ class ColBERTAdapter(BaseAdapter):
         self._model.to(device)
         self._model.eval()
 
+        # Probe the trained pylate Dense chain first (#1680). When a checkpoint
+        # ships one it IS the projection head, so the legacy probes must not
+        # run; the loader returns None for a missing modules.json AND for a
+        # Dense-less modules.json (e.g. mxbai-colbert-large-v1), so every
+        # checkpoint without a chain falls through to the exact same probes.
+        self._dense_chain = load_pylate_dense_chain(
+            self._model_name_or_path,
+            hidden_size=self._model.config.hidden_size,
+            token_dim=self._token_dim,
+            device=self._device,
+            dtype=dtype,
+        )
         # Check for linear projection layer (ColBERT-specific)
         # Different ColBERT implementations use different names
-        self._linear = self._find_projection_layer()
+        self._linear = None if self._dense_chain is not None else self._find_projection_layer()
 
         # Determine actual output dimension
         hidden_size = self._model.config.hidden_size
-        if self._linear is not None:
+        if self._dense_chain is not None:
+            self._actual_token_dim = self._dense_chain[-1].shape[0]
+            logger.info(
+                "ColBERT pylate Dense chain: %s",
+                [tuple(w.shape) for w in self._dense_chain],
+            )
+        elif self._linear is not None:
             self._actual_token_dim = self._linear.out_features
             logger.info(
                 "ColBERT projection: %d -> %d",
@@ -304,6 +338,12 @@ class ColBERTAdapter(BaseAdapter):
         # If explicitly specified in adapter options, use that
         if self._use_native_attention is not None:
             return self._use_native_attention
+
+        # ModernBERT requires native mode (the manual flash loop is BERT-only:
+        # it iterates model.encoder.layer, which ModernBERT does not have)
+        if getattr(config, "model_type", None) == "modernbert":
+            logger.info("Detected ModernBERT architecture, using native mode (manual flash loop is BERT-only)")
+            return True
 
         # Auto-detect based on model config
         # Rotary embeddings require native mode (our manual loop doesn't support them)
@@ -613,8 +653,11 @@ class ColBERTAdapter(BaseAdapter):
             outputs = self._model(**batch)
             hidden = outputs.last_hidden_state  # [batch, seq_len, hidden_size]
 
-            # Apply projection layer if present, or Matryoshka truncation
-            if self._linear is not None:
+            # Apply the trained pylate Dense chain if present, else the single
+            # projection layer, else Matryoshka truncation
+            if self._dense_chain is not None:
+                hidden = apply_dense_chain(hidden, self._dense_chain)
+            elif self._linear is not None:
                 hidden = self._linear(hidden)
             elif self._actual_token_dim is not None and self._actual_token_dim < hidden.shape[-1]:
                 hidden = hidden[:, :, : self._actual_token_dim]
@@ -633,14 +676,16 @@ class ColBERTAdapter(BaseAdapter):
             input_ids = batch["input_ids"]
 
             for i in range(len(texts)):
-                if is_query:
-                    # Queries: keep ALL tokens (matches PyLate: "we do not
-                    # want to prune expansion tokens in queries even if we
+                if is_query and use_expansion:
+                    # Expanded queries: keep ALL tokens (matches PyLate: "we do
+                    # not want to prune expansion tokens in queries even if we
                     # do not attend to them in attention layers")
                     seq_hidden = hidden[i]
                     seq_ids = input_ids[i]
                 else:
-                    # Documents: use attention_mask to drop real PAD tokens
+                    # Documents and non-expanded queries: use attention_mask to
+                    # drop real PAD tokens (without expansion, PAD rows carry
+                    # no semantics and must not leak into the multivectors)
                     mask = attention_mask[i].bool()
                     seq_hidden = hidden[i][mask]
                     seq_ids = input_ids[i][mask]
@@ -740,8 +785,11 @@ class ColBERTAdapter(BaseAdapter):
             # Run transformer layers with flash attention
             hidden = self._run_transformer_flash(hidden, cu_seqlens, max_seqlen, total_tokens)
 
-            # Apply projection layer if present
-            if self._linear is not None:
+            # Apply the trained pylate Dense chain if present, else the single
+            # projection layer
+            if self._dense_chain is not None:
+                hidden = apply_dense_chain(hidden, self._dense_chain)
+            elif self._linear is not None:
                 hidden = self._linear(hidden)
 
             # L2 normalize

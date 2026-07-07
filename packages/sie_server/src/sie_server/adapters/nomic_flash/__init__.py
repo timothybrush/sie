@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
-from sie_server.adapters._flash_pack import build_position_ids
+from sie_server.adapters._flash_pack import build_position_ids, mean_pool_packed
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
@@ -523,12 +523,7 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 cls_embeddings.append(hidden[start])
             pooled = torch.stack(cls_embeddings)
         else:  # mean pooling
-            mean_embeddings = []
-            for i in range(num_seqs):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                mean_embeddings.append(hidden[start:end].mean(dim=0))
-            pooled = torch.stack(mean_embeddings)
+            pooled = mean_pool_packed(hidden, cu_seqlens, num_seqs)
 
         if normalize:
             pooled = F.normalize(pooled, p=2, dim=-1)

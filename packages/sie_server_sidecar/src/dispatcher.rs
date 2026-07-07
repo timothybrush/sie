@@ -1,5 +1,5 @@
 //! Per-batch dispatcher: decode NATS JetStream messages into WorkItems,
-//! fan out to the Python inference core over IPC, publish results, and
+//! fan out to the backend over IPC, publish results, and
 //! ACK/NAK each message.
 //!
 //!   fetch -> decode + validate (subject, reply_subject, model_id)
@@ -2042,7 +2042,7 @@ impl Dispatcher {
 
     /// Remove and return all in-flight generation task handles. Called
     /// during shutdown after the pull loops stop so long-running streams can
-    /// settle before the backend drain RPC closes Python-side state.
+    /// settle before the backend drain RPC closes backend-side state.
     pub async fn take_generation_handles(&self) -> Vec<JoinHandle<()>> {
         let mut guard = self.generation_handles.lock().await;
         guard.drain(..).collect()

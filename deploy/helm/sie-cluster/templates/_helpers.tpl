@@ -468,15 +468,13 @@ store enabled" and an empty result as "off".
 {{/*
 Distinct machine profiles serving a bundle within a queue pool.
 
-Drives the KEDA pending_demand trigger's scale-from-zero matcher. When a
-gpu-agnostic request (e.g. /v1/chat/completions without an X-SIE-MACHINE-PROFILE
-or a model `:profile` suffix) cannot be served, the gateway records pending
-demand with an EMPTY machine_profile label, because a multi-profile queue pool
-gives it no single cold lane to name (proxy.rs PoolLookup.pending_demand_profile).
-A per-lane scaler keyed on machine_profile="<profile>" never sees that demand, so
-the lane stays at zero and the model is stuck "provisioning". A lane whose bundle
-maps to exactly one machine profile in the pool is unambiguous and can safely also
-count the empty-label demand.
+Drives the KEDA pending_demand trigger's scale-from-zero matcher. Current
+gateways fan gpu-agnostic cold demand (for example, /v1/chat/completions without
+an X-SIE-MACHINE-PROFILE or a model `:profile` suffix) out to concrete machine
+profiles at the source, so each per-lane scaler can see the demand it owns. Older
+gateways could emit that demand under the EMPTY machine_profile label instead.
+A lane whose bundle maps to exactly one machine profile in the pool is
+unambiguous and can safely keep counting that legacy empty-label bucket.
 
 Args (dict): root, queuePool, bundle.
 Returns a comma-joined, sorted list of distinct machine profiles.

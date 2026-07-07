@@ -753,7 +753,7 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn test_list_models_advertises_profile_only_candle_models_as_variants() {
+    async fn test_list_models_advertises_profile_only_candle_variants() {
         let (app, state, _bundles_dir, _models_dir) = build_router_with_state().await;
         seed_profile_only_candle_model(&state, "acme/candle-only");
 

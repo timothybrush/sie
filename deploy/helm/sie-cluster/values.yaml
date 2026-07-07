@@ -687,8 +687,10 @@ workers:
   #
   # Pool-level keys (shared across bundles on this hardware):
   #   enabled:         bool. Skip rendering the whole pool when false.
-  #   engine:          Optional runtime engine default for bundle lanes in this
-  #                    pool. `pytorch` (default) or `candle`.
+  #   engine:          Optional bundle execution-engine default for lanes in
+  #                    this pool. `pytorch` (default) or `candle`. Used by the
+  #                    chart for image/label selection, not propagated as a
+  #                    worker process env var.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
   #   gpu.product:     string. nvidia.com/gpu.product node-label match.
   #   gpuType:         GPU/node label used for node selection and display.
@@ -708,16 +710,6 @@ workers:
   #                    container. For `engine: candle`, this is the Rust
   #                    native worker image instead of Python.
   #   runtimeClassName: Optional override of common.runtimeClassName.
-  #   candle.modelId:  Primary Hugging Face model id loaded by the Rust Candle
-  #                    worker. Required when `engine: candle` unless
-  #                    `candle.modelIds` is set.
-  #   candle.modelIds: Optional list, or comma-separated string, of Hugging
-  #                    Face model ids loaded by the Rust worker. Defaults to
-  #                    `[candle.modelId]`.
-  #   candle.profile:  Optional catalog profile pinned to this Rust Candle
-  #                    adapter process. Leave empty for default-only native
-  #                    models; set to `candle` only for side-by-side profile
-  #                    variants such as `model:candle`.
   #   candle.cudaComputeCap:
   #                    Optional per-pool Rust Candle CUDA compute capability
   #                    override. If omitted, the chart resolves it from
@@ -742,10 +734,9 @@ workers:
   # Each queuePool/machineProfile/bundle lane renders one StatefulSet +
   # KEDA ScaledObject + PDB + image-prepull DaemonSet, named worker-{pool}-{bundle}.
   #
-  # NOTE: `engine: candle` serves an explicit native model allowlist via
-  # `candle.modelId` or `candle.modelIds`. Multiple model ids can share a
-  # pool when GPU memory and startup budget allow it; use additional pools
-  # for different GPU shapes, batch settings, or profile pinning.
+  # NOTE: `engine: candle` serves applied Candle catalog models for the
+  # lane's bundle/pool, just like PyTorch workers. Use `preloadModels` or pool
+  # `pinnedModels` for warm model residency.
   pools:
 
     # L4 GPU

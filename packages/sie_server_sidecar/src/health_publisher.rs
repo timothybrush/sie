@@ -96,10 +96,10 @@ pub struct HealthPublisherConfig {
     pub gpu_count: i32,
     /// Bundle-config hash so the gateway can correlate against its own
     /// model registry epoch. Updated by the config subscriber after a
-    /// successful Python registry apply.
+    /// successful backend config apply.
     pub bundle_config_hash: SharedBundleConfigHash,
-    /// Models the colocated adapter reports as loaded or configured for
-    /// this runtime. Updated by config apply/reconcile paths.
+    /// Models the colocated backend reports as loaded. Updated by the IPC
+    /// heartbeat, not by config apply.
     pub loaded_models: SharedLoadedModels,
     /// How often to publish. Defaults to [`DEFAULT_PUBLISH_INTERVAL`].
     pub interval: Duration,

@@ -137,9 +137,9 @@ data:
             serverAddress: {{ $promAddr }}
             metricName: sie_gateway_pending_demand_{{ $poolName }}_{{ $bundleName }}
             {{- if $singleProfileBundle }}
-            # Single-profile bundle: add gpu-agnostic demand the gateway records
-            # with an empty machine_profile when it cannot name a cold lane (a
-            # multi-profile pool; see proxy.rs PoolLookup). Each term is guarded
+            # Single-profile bundle: keep counting the legacy gpu-agnostic
+            # empty-profile demand bucket for older gateways. Current gateways
+            # emit concrete profile demand at the source; each term is guarded
             # with `or vector(0)` so one absent series cannot void the sum.
             query: (sum(sie_gateway_pending_demand{pool="{{ $queuePool }}", machine_profile="{{ $machineProfile }}", bundle="{{ $bundle }}"}) or vector(0)) + (sum(sie_gateway_pending_demand{pool="{{ $queuePool }}", machine_profile="", bundle="{{ $bundle }}"}) or vector(0))
             {{- else }}

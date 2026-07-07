@@ -1,5 +1,5 @@
 //! Async IPC client over a Unix domain socket, speaking the length-prefixed
-//! msgpack protocol defined by `sie_server.ipc_server`.
+//! msgpack protocol shared by SIE backend IPC servers.
 //!
 //! # Concurrency model: connection pool
 //!
@@ -8,14 +8,12 @@
 //! most one in-flight RPC; any second caller blocks behind the first.
 //!
 //! To let `SIE_MAX_CONCURRENT_BATCHES` actually translate into parallel
-//! IPC calls — and thus let the Python-side adaptive batcher / GPU
+//! IPC calls — and thus let the backend-side adaptive batcher / GPU
 //! pipeline overlap CPU preprocessing on one batch with GPU inference on
 //! another — we run a small **pool** of N independent connections to the
-//! same `ipc_server.py`.
+//! same backend IPC server.
 //!
-//! * The Python server already accepts many connections concurrently
-//!   (`asyncio.start_unix_server`) and spawns an `asyncio.create_task`
-//!   per incoming frame, so no Python-side change is required; each
+//! * Backend IPC servers accept concurrent connections in deployed runtimes; each
 //!   Rust slot just looks like another sidecar.
 //! * Callers `acquire()` a `SlotGuard` — a fair FIFO checkout — do
 //!   their round-trip, and drop it to return the slot. If all N slots
@@ -69,7 +67,7 @@ const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_POOL_SIZE: usize = 1;
 
 /// WARN threshold for "slow" RPCs — emits one structured line per slow
-/// call so an operator scanning `kubectl logs` sees Python-side
+/// call so an operator scanning `kubectl logs` sees backend-side
 /// stalls without having to open Grafana. The `ipc_request_seconds`
 /// histogram is the primary source of truth; this is the ergonomic
 /// shortcut for live debugging. Keep the budget generous: model
@@ -270,7 +268,7 @@ impl Pool {
 ///   * a fully written frame but no response read yet.
 ///
 /// Either way the socket is **protocol-desynchronized**: the next
-/// request's bytes would be misinterpreted by the Python server as a
+/// request's bytes would be misinterpreted by the backend server as a
 /// continuation of the aborted one, producing either a silent hang or
 /// a corrupt decode.
 ///
@@ -473,11 +471,11 @@ impl IpcClient {
     /// slot only** and transparently retry exactly once, preferring a
     /// fresh slot from the pool so the retry isn't gated on the still-
     /// breaking connection. This avoids NAKing an entire batch just
-    /// because the Python side restarted between two fetches, while
+    /// because the backend side restarted between two fetches, while
     /// also not taking out the other N-1 slots.
     ///
     /// We do *not* retry:
-    /// * `Timeout` — if Python is slow once, it'll likely be slow again,
+    /// * `Timeout` — if the backend is slow once, it'll likely be slow again,
     ///   and a retry would double our tail latency.
     /// * `Server` / `VersionMismatch` — these are logical errors that
     ///   won't go away on retry.
@@ -733,7 +731,7 @@ impl IpcClient {
                 result,
                 elapsed_ms = elapsed_ms as u64,
                 threshold_ms = SLOW_RPC_WARN_MS as u64,
-                "slow IPC RPC — Python side took longer than expected"
+                "slow IPC RPC — backend side took longer than expected"
             );
         }
     }
@@ -819,7 +817,7 @@ impl IpcClient {
     /// this method receives a sequence of response envelopes:
     /// `publish` / `in_progress` / `ack` / `nak` events followed by
     /// `done`. The Rust sidecar owns the real NATS client and JetStream
-    /// message settlement; Python owns generation adapter execution and
+    /// message settlement; the backend owns generation adapter execution and
     /// chunk encoding.
     pub async fn process_generate<F, Fut>(
         &self,

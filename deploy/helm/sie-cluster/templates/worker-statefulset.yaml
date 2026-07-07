@@ -79,20 +79,6 @@ fast at render time.
 {{- if and (eq $engine "candle") (ne $bundle "candle") }}
 {{- fail (printf "workers.pools.%s.bundles.%s.engine=candle requires bundle=candle so gateway routing and worker heartbeats agree" $poolName $bundleName) }}
 {{- end }}
-{{- $poolCandle := default dict $pool.candle }}
-{{- $candleModelIds := list }}
-{{- if $poolCandle.modelIds }}
-{{- if kindIs "slice" $poolCandle.modelIds }}
-{{- $candleModelIds = $poolCandle.modelIds }}
-{{- else }}
-{{- $candleModelIds = list $poolCandle.modelIds }}
-{{- end }}
-{{- else if $poolCandle.modelId }}
-{{- $candleModelIds = list $poolCandle.modelId }}
-{{- end }}
-{{- if and (eq $engine "candle") (eq (len $candleModelIds) 0) }}
-{{- fail (printf "workers.pools.%s.bundles.%s.engine=candle requires workers.pools.%s.candle.modelId or candle.modelIds" $poolName $bundleName $poolName) }}
-{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -197,14 +183,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: SIE_ENGINE
-              value: "candle"
-            - name: SIE_CANDLE_MODELS
-              value: {{ join "," $candleModelIds | quote }}
-            {{- if $poolCandle.profile }}
-            - name: SIE_CANDLE_PROFILE
-              value: {{ $poolCandle.profile | quote }}
-            {{- end }}
             - name: SIE_CANDLE_BATCH_BUDGET
               value: {{ $root.Values.workers.common.rust.candle.batchBudget | default 64 | quote }}
             - name: SIE_CANDLE_MAX_CONCURRENT_FORWARDS

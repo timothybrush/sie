@@ -27,7 +27,7 @@ struct Cli {
     #[arg(long, env = "SIE_IPC_SOCKET_PATH", default_value = "/tmp/sie-ipc.sock")]
     ipc_socket_path: String,
 
-    /// Number of concurrent IPC connections to the Python adapter process.
+    /// Number of concurrent IPC connections to the backend process.
     /// Defaults to `SIE_MAX_CONCURRENT_BATCHES` when unset (falling
     /// back to the dispatcher's own default of 4), so the IPC pool
     /// never becomes the binding constraint on the dispatcher's
@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long, env = "SIE_IPC_POOL_SIZE")]
     ipc_pool_size: Option<usize>,
 
-    /// Timeout, in seconds, for ordinary sidecar → Python IPC calls.
+    /// Timeout, in seconds, for ordinary sidecar-to-backend IPC calls.
     #[arg(long, env = "SIE_IPC_REQUEST_TIMEOUT_S", default_value = "60")]
     ipc_request_timeout_s: u64,
 
@@ -45,7 +45,7 @@ struct Cli {
     #[arg(long, env = "SIE_MODEL_READY_TIMEOUT_S")]
     model_ready_timeout_s: Option<u64>,
 
-    /// Python worker liveness budget in seconds. When set by Helm, the sidecar
+    /// Backend worker liveness budget in seconds. When set by Helm, the sidecar
     /// rejects an EnsureModelReady timeout kubelet would kill before completion.
     #[arg(long, env = "SIE_WORKER_LIVENESS_BUDGET_S")]
     worker_liveness_budget_s: Option<u64>,

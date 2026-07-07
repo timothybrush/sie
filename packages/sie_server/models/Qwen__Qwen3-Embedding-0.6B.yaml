@@ -29,15 +29,3 @@ profiles:
           Instruct: {instruction}
           Query:{text}
         default_instruction: Given a web search query, retrieve relevant passages that answer the query
-  custom:
-    extends: default
-    adapter_options:
-      runtime:
-        pooling: last
-        normalize: true
-        query_template: |-
-          Instruct: {instruction}
-          Query:{text}
-        default_instruction: Given a web search query, retrieve relevant passages that answer the query
-        lora_id: gauravprasadgp/qwen3-embedding_0.6B_lora
-        instruction: Retrieve relevant information

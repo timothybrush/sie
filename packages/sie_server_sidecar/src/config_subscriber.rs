@@ -4,8 +4,8 @@
 //! `sie.config.models._all` (gateway replicas) and
 //! `sie.config.models.<bundle>` (workers). The gateway applies `_all` into its
 //! Rust registry; this module consumes the bundle-scoped subject in the
-//! worker-sidecar and forwards the validated YAML to Python over IPC so the
-//! adapter-local `ModelRegistry` changes in the process that serves inference.
+//! worker-sidecar and forwards the validated YAML over IPC so the backend-local
+//! model registry changes in the process that serves inference.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,8 +22,7 @@ use tracing::{debug, info, warn};
 use crate::health_publisher::{SharedBundleConfigHash, SharedLoadedModels};
 use crate::ipc_client::{IpcClient, IpcError};
 use crate::ipc_types::{
-    ApplyModelConfigRequest, ReadinessState, ReplaceModelConfigsRequest,
-    ReplaceModelConfigsResponse,
+    ApplyModelConfigRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
 };
 use crate::metrics::MetricsRegistry;
 use crate::shutdown::Shutdown;
@@ -44,7 +43,7 @@ pub struct ConfigApplyState {
     bundle_config_hash: SharedBundleConfigHash,
     loaded_models: SharedLoadedModels,
     accepted_bundle_config_hashes: RwLock<VecDeque<String>>,
-    /// Serializes Python registry mutations from live NATS deltas and export
+    /// Serializes worker config mutations from live NATS deltas and export
     /// replay so an older snapshot cannot clobber a newer live apply.
     apply_lock: Mutex<()>,
 }
@@ -144,22 +143,6 @@ impl ConfigApplyState {
             .write()
             .expect("loaded models lock poisoned");
         *guard = deduped;
-    }
-
-    pub fn record_loaded_model(&self, model_id: &str) {
-        let model_id = model_id.trim();
-        if model_id.is_empty() {
-            return;
-        }
-        let mut guard = self
-            .loaded_models
-            .write()
-            .expect("loaded models lock poisoned");
-        if guard.iter().any(|known| known == model_id) {
-            return;
-        }
-        guard.push(model_id.to_string());
-        guard.sort();
     }
 
     fn remember_bundle_hash(&self, hash: &str) {
@@ -390,60 +373,6 @@ fn retryable_ipc_error(e: &IpcError) -> bool {
     }
 }
 
-fn requires_eager_model_ready(bundle_id: &str) -> bool {
-    bundle_id.trim() == "candle"
-}
-
-async fn ensure_candle_model_ready_if_needed(
-    ipc: &Arc<IpcClient>,
-    bundle_id: &str,
-    model_id: &str,
-    epoch: u64,
-) -> Result<(), IpcError> {
-    if !requires_eager_model_ready(bundle_id) {
-        return Ok(());
-    }
-
-    match ipc.ensure_model_ready(model_id).await {
-        Ok(resp) if resp.state == ReadinessState::Ready => {
-            info!(
-                model = %model_id,
-                epoch,
-                "worker-config: Candle model ready after config apply"
-            );
-            Ok(())
-        }
-        Ok(resp) => {
-            warn!(
-                model = %model_id,
-                epoch,
-                state = ?resp.state,
-                "worker-config: Candle model not ready after config apply; retrying"
-            );
-            Err(IpcError::Timeout)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-async fn ensure_candle_models_ready_if_needed(
-    ipc: &Arc<IpcClient>,
-    bundle_id: &str,
-    model_ids: &[String],
-    epoch: u64,
-) -> Result<Vec<String>, IpcError> {
-    if !requires_eager_model_ready(bundle_id) {
-        return Ok(model_ids.to_vec());
-    }
-
-    let mut ready_models = Vec::with_capacity(model_ids.len());
-    for model_id in model_ids {
-        ensure_candle_model_ready_if_needed(ipc, bundle_id, model_id, epoch).await?;
-        ready_models.push(model_id.clone());
-    }
-    Ok(ready_models)
-}
-
 fn next_retry_delay(current: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), RETRY_MAX_DELAY)
 }
@@ -575,43 +504,7 @@ pub(crate) async fn apply_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.apply_model_config(req.clone()).await {
-            Ok(resp) => {
-                match ensure_candle_model_ready_if_needed(&ipc, &req.bundle_id, model_id, epoch)
-                    .await
-                {
-                    Ok(()) => return Ok(Some(resp)),
-                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
-                        attempt = attempt.saturating_add(1);
-                        if attempt == 1
-                            || attempt == 5
-                            || attempt == 30
-                            || attempt.is_multiple_of(120)
-                        {
-                            warn!(
-                                model = %model_id,
-                                epoch,
-                                attempt,
-                                retry_delay_ms = retry_delay.as_millis() as u64,
-                                error = %e,
-                                "worker-config: Candle model readiness still waiting after apply; retrying"
-                            );
-                        } else {
-                            debug!(
-                                model = %model_id,
-                                epoch,
-                                attempt,
-                                error = %e,
-                                "worker-config: Candle model readiness still waiting"
-                            );
-                        }
-                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
-                            return Ok(None);
-                        }
-                        retry_delay = next_retry_delay(retry_delay);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            Ok(resp) => return Ok(Some(resp)),
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -621,7 +514,7 @@ pub(crate) async fn apply_via_ipc_with_retry(
                         attempt,
                         retry_delay_ms = retry_delay.as_millis() as u64,
                         error = %e,
-                        "worker-config: transient Python registry apply failure; retrying"
+                        "worker-config: transient worker config apply failure; retrying"
                     );
                 } else {
                     debug!(
@@ -629,7 +522,7 @@ pub(crate) async fn apply_via_ipc_with_retry(
                         epoch,
                         attempt,
                         error = %e,
-                        "worker-config: Python registry apply still waiting"
+                        "worker-config: worker config apply still waiting"
                     );
                 }
                 if wait_retry_or_shutdown(&shutdown, retry_delay).await {
@@ -652,49 +545,7 @@ pub(crate) async fn replace_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.replace_model_configs(req.clone()).await {
-            Ok(mut resp) => {
-                match ensure_candle_models_ready_if_needed(
-                    &ipc,
-                    &req.bundle_id,
-                    &resp.applied_models,
-                    epoch,
-                )
-                .await
-                {
-                    Ok(ready_models) => {
-                        resp.applied_models = ready_models;
-                        return Ok(Some(resp));
-                    }
-                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
-                        attempt = attempt.saturating_add(1);
-                        if attempt == 1
-                            || attempt == 5
-                            || attempt == 30
-                            || attempt.is_multiple_of(120)
-                        {
-                            warn!(
-                                epoch,
-                                attempt,
-                                retry_delay_ms = retry_delay.as_millis() as u64,
-                                error = %e,
-                                "worker-config: Candle model readiness still waiting after replace; retrying"
-                            );
-                        } else {
-                            debug!(
-                                epoch,
-                                attempt,
-                                error = %e,
-                                "worker-config: Candle model readiness still waiting after replace"
-                            );
-                        }
-                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
-                            return Ok(None);
-                        }
-                        retry_delay = next_retry_delay(retry_delay);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            Ok(resp) => return Ok(Some(resp)),
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -703,14 +554,14 @@ pub(crate) async fn replace_via_ipc_with_retry(
                         attempt,
                         retry_delay_ms = retry_delay.as_millis() as u64,
                         error = %e,
-                        "worker-config: transient Python registry replace failure; retrying"
+                        "worker-config: transient worker config replace failure; retrying"
                     );
                 } else {
                     debug!(
                         epoch,
                         attempt,
                         error = %e,
-                        "worker-config: Python registry replace still waiting"
+                        "worker-config: worker config replace still waiting"
                     );
                 }
                 if wait_retry_or_shutdown(&shutdown, retry_delay).await {
@@ -864,7 +715,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
                 model = %notification.model_id,
                 epoch = notification.epoch,
                 error = %e,
-                "worker-config: Python registry apply failed; epoch not advanced"
+                "worker-config: worker config apply failed; epoch not advanced"
             );
             record_delta(metrics, kind, "apply_error");
             return;
@@ -875,7 +726,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
         warn!(
             model = %notification.model_id,
             epoch = notification.epoch,
-            "worker-config: Python registry reported applied=false; epoch not advanced"
+            "worker-config: worker config reported applied=false; epoch not advanced"
         );
         record_delta(metrics, kind, "apply_rejected");
         return;
@@ -895,7 +746,7 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
             epoch = notification.epoch,
             advertised_hash = %control_plane_hash,
             applied_hash = %resp.bundle_config_hash,
-            "worker-config: Python registry hash differs from control-plane hash; advertising control-plane hash"
+            "worker-config: worker config hash differs from control-plane hash; advertising control-plane hash"
         );
         record_delta(metrics, kind, "hash_mismatch");
     } else {
@@ -903,9 +754,6 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
     }
 
     state.mark_applied(notification.epoch, advertised_hash);
-    if requires_eager_model_ready(&notification.bundle_id) {
-        state.record_loaded_model(&notification.model_id);
-    }
     metrics.config_epoch.set(notification.epoch as i64);
 }
 
@@ -996,13 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn eager_model_ready_is_candle_specific() {
-        assert!(requires_eager_model_ready("candle"));
-        assert!(!requires_eager_model_ready("default"));
-        assert!(!requires_eager_model_ready("sglang"));
-    }
-
-    #[test]
     fn config_notification_accepts_router_id_alias() {
         let json = r#"{
             "router_id": "sie-config-0",
@@ -1068,18 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn loaded_models_are_deduped_and_sorted() {
+    fn set_loaded_models_are_trimmed_deduped_and_sorted() {
         let state = ConfigApplyState::new("initial".into());
-        state.record_loaded_model("model/b");
-        state.record_loaded_model("model/a");
-        state.record_loaded_model("model/b");
-
-        assert_eq!(
-            state.loaded_models().read().unwrap().as_slice(),
-            ["model/a".to_string(), "model/b".to_string()]
-        );
-
-        state.set_loaded_models(vec!["model/d".into(), "".into(), " model/c ".into()]);
+        state.set_loaded_models(vec![
+            "model/d".into(),
+            "".into(),
+            " model/c ".into(),
+            "model/d".into(),
+        ]);
         assert_eq!(
             state.loaded_models().read().unwrap().as_slice(),
             ["model/c".to_string(), "model/d".to_string()]

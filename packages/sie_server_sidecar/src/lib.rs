@@ -126,7 +126,7 @@ fn nats_consumer_reconcile_interval() -> Option<Duration> {
     .map(Duration::from_millis)
 }
 
-/// Drain deadline sent to the Python IPC on shutdown.
+/// Drain deadline sent to the backend IPC on shutdown.
 const DRAIN_DEADLINE_MS: u64 = 15_000;
 
 /// Whether the pull-loop quantum's [`LatencyTracker`] should observe
@@ -352,7 +352,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     });
 
     // Pinned-model reconciler: polls the pool's PoolSpec.pinned_models and pushes
-    // it to the Python worker over IPC. Decoupled from admission so pinned models
+    // it to the backend over IPC. Decoupled from admission so pinned models
     // work even when the admission gate is disabled or fails open.
     let pinned_reconciler_handle =
         crate::pinned_reconciler::spawn(&config, Arc::clone(&ipc), Arc::clone(&shutdown))
@@ -360,11 +360,10 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
 
     // --- Backend router
     //
-    // The sidecar talks to whichever adapter is co-deployed over IPC;
-    // today that is the Python `sie_server` adapter. There is exactly
-    // one backend. `BackendRouter` is kept as the single integration
-    // point so the multi-backend fall-through plumbing stays available
-    // if we ever co-resident two adapters again.
+    // The sidecar talks to whichever backend is co-deployed over IPC.
+    // There is exactly one backend in the current deployment. `BackendRouter`
+    // is kept as the single integration point so the multi-backend fall-through
+    // plumbing stays available if we ever co-resident two adapters again.
     let python_backend: SharedBackend = Arc::new(PythonIpcBackend::new(Arc::clone(&ipc)));
     let backends: Vec<SharedBackend> = vec![Arc::clone(&python_backend)];
 
@@ -998,7 +997,7 @@ fn request_id_from_cancel_subject(subject: &str) -> Option<String> {
     }
 }
 
-/// Ping the Python IPC server on a ticker. A failure is logged but
+/// Ping the backend IPC server on a ticker. A failure is logged but
 /// non-fatal — the consumer loop will surface real problems via
 /// EnsureModelReady / Process* errors.
 ///
@@ -1016,7 +1015,7 @@ fn spawn_heartbeat(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Track consecutive failures so we warn on transitions
         // (0 -> 1 "heartbeat broke", N -> 0 "heartbeat recovered")
-        // without spamming once per tick while Python is down.
+        // without spamming once per tick while the backend is down.
         let mut consecutive_failures: u64 = 0;
         loop {
             let wait = shutdown.wait();
@@ -1156,7 +1155,7 @@ async fn build_pull_stream(
 ///    the quantum deadline, whichever first.
 /// 4. Hand the batch to the dispatcher **as a spawned task**, bounded by
 ///    [`pull_loop_inflight`] so the next fetch can start immediately
-///    while Python processes the previous batch. Without this, a single
+///    while the backend processes the previous batch. Without this, a single
 ///    pull loop serialises `fetch → IPC → GPU → NATS ACK → next fetch`,
 ///    leaving the IPC pool and GPU under-fed under distributed load.
 ///
