@@ -115,8 +115,15 @@ class TestPaddleOCRVLAdapter:
         with pytest.raises(ValueError, match="must be one of"):
             adapter.extract(items, options={"task": "bogus"})
 
-    def test_load_passes_revision_and_trust_remote_code(self) -> None:
-        """load() threads revision + trust_remote_code to both from_pretrained calls."""
+    def test_load_resolves_revision_snapshot_and_passes_trust_remote_code(self) -> None:
+        """load() resolves the pinned revision to a local dir, then loads from it.
+
+        The revision must reach ``snapshot_download`` (not from_pretrained): on
+        transformers 4.57.x ``AutoProcessor.from_pretrained`` drops ``revision``
+        during its offline config probe, so the adapter hands it a pre-resolved
+        local directory instead. ``trust_remote_code`` still threads to both
+        from_pretrained calls.
+        """
         from sie_server.adapters.paddleocr_vl import PaddleOCRVLAdapter
 
         adapter = PaddleOCRVLAdapter(
@@ -130,22 +137,28 @@ class TestPaddleOCRVLAdapter:
         mock_model.to.return_value = mock_model
 
         with (
+            patch("sie_server.adapters.paddleocr_vl.snapshot_download") as mock_snap,
             patch("transformers.AutoProcessor") as mock_ap_cls,
             patch("transformers.AutoModelForCausalLM") as mock_am_cls,
         ):
+            mock_snap.return_value = "/models/paddleocr-vl-snapshot"
             mock_ap_cls.from_pretrained.return_value = mock_processor
             mock_am_cls.from_pretrained.return_value = mock_model
 
             adapter.load("cpu")
 
-            ap_kwargs = mock_ap_cls.from_pretrained.call_args.kwargs
-            am_kwargs = mock_am_cls.from_pretrained.call_args.kwargs
-            assert ap_kwargs["revision"] == "abc123"
+            assert mock_snap.call_args.kwargs["revision"] == "abc123"
+            ap_args, ap_kwargs = mock_ap_cls.from_pretrained.call_args
+            am_args, am_kwargs = mock_am_cls.from_pretrained.call_args
+            assert ap_args[0] == "/models/paddleocr-vl-snapshot"
+            assert am_args[0] == "/models/paddleocr-vl-snapshot"
             assert ap_kwargs["trust_remote_code"] is True
-            assert am_kwargs["revision"] == "abc123"
             assert am_kwargs["trust_remote_code"] is True
+            # revision must NOT reach from_pretrained (it is dropped offline).
+            assert "revision" not in ap_kwargs
+            assert "revision" not in am_kwargs
 
-    def test_load_without_revision_omits_kwarg(self) -> None:
+    def test_load_without_revision_omits_snapshot_kwarg(self) -> None:
         from sie_server.adapters.paddleocr_vl import PaddleOCRVLAdapter
 
         adapter = PaddleOCRVLAdapter(
@@ -158,6 +171,33 @@ class TestPaddleOCRVLAdapter:
         mock_model.to.return_value = mock_model
 
         with (
+            patch("sie_server.adapters.paddleocr_vl.snapshot_download") as mock_snap,
+            patch("transformers.AutoProcessor") as mock_ap_cls,
+            patch("transformers.AutoModelForCausalLM") as mock_am_cls,
+        ):
+            mock_snap.return_value = "/models/paddleocr-vl-snapshot"
+            mock_ap_cls.from_pretrained.return_value = MagicMock()
+            mock_am_cls.from_pretrained.return_value = mock_model
+
+            adapter.load("cpu")
+
+            assert "revision" not in mock_snap.call_args.kwargs
+
+    def test_load_uses_local_dir_without_download(self, tmp_path: object) -> None:
+        """A model_name_or_path that is already a local dir skips snapshot_download."""
+        from pathlib import Path
+
+        from sie_server.adapters.paddleocr_vl import PaddleOCRVLAdapter
+
+        local_dir = Path(str(tmp_path)) / "paddleocr-vl"
+        local_dir.mkdir()
+        adapter = PaddleOCRVLAdapter(str(local_dir), revision="abc123")
+
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+
+        with (
+            patch("sie_server.adapters.paddleocr_vl.snapshot_download") as mock_snap,
             patch("transformers.AutoProcessor") as mock_ap_cls,
             patch("transformers.AutoModelForCausalLM") as mock_am_cls,
         ):
@@ -166,8 +206,8 @@ class TestPaddleOCRVLAdapter:
 
             adapter.load("cpu")
 
-            assert "revision" not in mock_ap_cls.from_pretrained.call_args.kwargs
-            assert "revision" not in mock_am_cls.from_pretrained.call_args.kwargs
+            mock_snap.assert_not_called()
+            assert mock_ap_cls.from_pretrained.call_args.args[0] == str(local_dir)
 
     def test_preprocessor_built_after_load(self) -> None:
         from sie_server.adapters.paddleocr_vl import PaddleOCRVLAdapter
@@ -178,9 +218,11 @@ class TestPaddleOCRVLAdapter:
         mock_model.to.return_value = mock_model
 
         with (
+            patch("sie_server.adapters.paddleocr_vl.snapshot_download") as mock_snap,
             patch("transformers.AutoProcessor") as mock_ap_cls,
             patch("transformers.AutoModelForCausalLM") as mock_am_cls,
         ):
+            mock_snap.return_value = "/models/paddleocr-vl-snapshot"
             mock_ap_cls.from_pretrained.return_value = MagicMock()
             mock_am_cls.from_pretrained.return_value = mock_model
 

@@ -13,7 +13,6 @@ from sie_server.adapters._flash_pack import build_position_ids, mean_pool_packed
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
 from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
-from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import Item
 
@@ -25,11 +24,20 @@ logger = logging.getLogger(__name__)
 _ERR_CPU_NOT_SUPPORTED = "NomicFlashAdapter requires CUDA. Use pytorch_embedding adapter for CPU."
 
 
-class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
+class NomicFlashAdapter(FlashBaseAdapter):
     """Nomic BERT MoE adapter using Flash Attention 2 with variable-length sequences.
 
     This adapter eliminates padding waste by packing sequences and using
     flash_attn_varlen_func. Implements MoE routing in pure PyTorch.
+
+    No LoRA support (``supports_lora() == False``, the base default): weights
+    are hand-loaded from raw safetensors into plain tensor dicts
+    (``self._layers``) and the forward is fully hand-rolled with ``F.linear``
+    — there is no wrappable ``self._model`` module, so ``PEFTLoRAMixin`` could
+    neither load a LoRA (``load_lora`` needs ``self._model``) nor have its
+    delta seen by this forward. Advertising support here previously meant a
+    customer LoRA was silently non-functional. Per the LoRA capability audit,
+    LoRA on this family goes through the merge-at-staging path instead.
     """
 
     fallback_adapter_path: ClassVar[str | None] = "sentence_transformer:SentenceTransformerDenseAdapter"
@@ -63,6 +71,7 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         pooling: PoolingStrategy = "mean",
         query_template: str | None = None,
         doc_template: str | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -75,6 +84,8 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             pooling: Pooling strategy - "cls" or "mean".
             query_template: Template for queries, e.g. "search_query: {text}".
             doc_template: Template for documents, e.g. "search_document: {text}".
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -85,6 +96,7 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._pooling = pooling
         self._query_template = query_template or "search_query: {text}"
         self._doc_template = doc_template or "search_document: {text}"
+        self._revision = revision
 
         # Model components (loaded in load())
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -135,11 +147,15 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load tokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Download and load weights
-        model_path = hf_hub_download(self._model_name_or_path, "model.safetensors")
+        model_path = hf_hub_download(self._model_name_or_path, "model.safetensors", **shared_kwargs)
         self._load_weights(model_path)
 
         self._dense_dim = self._hidden_size
@@ -295,12 +311,25 @@ class NomicFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Convert to numpy and return EncodeOutput
         dense_np = dense_vecs.float().cpu().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): this adapter owns tokenization (the registry
+        # preprocessor for flash adapters is a char-count ESTIMATOR) AND always
+        # applies a query/doc template before tokenizing (Nomic defaults to
+        # ``search_query:``/``search_document:``), so the real post-template,
+        # post-truncation per-item token counts exist only here. ``seq_lengths``
+        # is the exact ``len(input_ids)`` the model processed; expose it through
+        # ``EncodeOutput.extra`` (the designated adapter-extension point) aligned
+        # 1:1 with ``items``. The encode pipeline forwards these for metering, in
+        # preference to the base ``count_input_tokens`` fallback which re-tokenizes
+        # raw ``item.text`` and would undercount by the template's tokens. Mirrors
+        # ``bert_flash``.
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences (starting from 0 for each)."""

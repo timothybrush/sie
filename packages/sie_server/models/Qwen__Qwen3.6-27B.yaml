@@ -1,5 +1,6 @@
 sie_id: Qwen/Qwen3.6-27B
 hf_id: Qwen/Qwen3.6-27B
+hf_revision: 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
 inputs:
   # Qwen3.6-27B is a unified vision-language model (Gated DeltaNet + Gated
   # Attention with an integrated vision encoder; same hybrid family as
@@ -254,6 +255,61 @@ profiles:
         # takes effect because ``runtime.default_sampling`` is now wired into
         # the adapter (core/loader.py); before that fix a key here was a
         # silent no-op and chat clients had to pass ``min_tokens`` themselves.
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          presence_penalty: 1.5
+          min_new_tokens: 10
+        stop_tokens:
+          - "<|im_end|>"
+  # Throughput profile (H100-80GB) — the flagship's batch story. The
+  # ``default`` NEXTN-spec shape is latency-optimized single-stream and
+  # throughput-FLAT (~44 tok/s aggregate c=1→32, effective batch ≈1 —
+  # MP.4 gen-smartest measurement): speculative verification + cuda-graphs
+  # off + ``--disable-overlap-schedule`` serialize decode. This profile
+  # mirrors what made Qwen3-4B-Instruct-2507 scale 36× (c=1→64) on its
+  # spec-off default: speculative OFF, cuda graphs ON (no
+  # ``--disable-cuda-graph``), overlap schedule ON (no
+  # ``--disable-overlap-schedule``), so SGLang's continuous batcher can
+  # actually run a deep decode batch.
+  #
+  # Launch-shape notes:
+  #   * No ``--mamba-scheduler-strategy extra_buffer``: that flag (and the
+  #     overlap disable) is the required NEXTN pair-flag set on the hybrid
+  #     Gated-DeltaNet arch; with spec off the adapter guard doesn't demand
+  #     it and the default mamba scheduler serves batch decode.
+  #   * ``mem_fraction_static: 0.90``: no NEXTN draft weights/KV to host,
+  #     but cuda-graph capture needs workspace outside the static pool —
+  #     0.90 leaves headroom on top of the ~54 GB BF16 weights.
+  #   * ``--cuda-graph-max-bs 32``: pin graph coverage through the measured
+  #     c=32 operating point so deep decode batches stay on graphs.
+  #   * triton attention + outlines grammar kept for Qwen3.x family parity.
+  #
+  # UX story: ``Qwen/Qwen3.6-27B`` (default, latency / single-stream) ·
+  # ``:batch`` (this profile, throughput) · ``:thinking`` (reasoning).
+  # Standalone block (no ``extends``) — same rationale as ``rtx-pro-6000``.
+  batch:
+    max_batch_tokens: 32768
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    kv_budget_tokens: 32768
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.90
+        served_model_name: Qwen/Qwen3.6-27B
+        attention_backend: triton
+        grammar_backend: outlines
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--cuda-graph-max-bs"
+          - "32"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
         default_sampling:
           temperature: 0.7
           top_p: 0.8

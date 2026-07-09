@@ -11,12 +11,14 @@ pub mod batch_cancel;
 pub mod config;
 pub mod config_reconciler;
 pub mod config_subscriber;
+pub mod delivery;
 pub mod dispatcher;
 pub mod health_publisher;
 pub mod ipc_client;
 pub mod ipc_mux;
 pub mod ipc_types;
 pub mod latency;
+pub mod local_ingest;
 pub mod log_util;
 pub mod metrics;
 pub mod nats_consumer;
@@ -41,17 +43,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, warn};
 
-use crate::backend::{BackendRouter, PythonIpcBackend, SharedBackend};
+use crate::backend::{AdapterWorkerPool, BackendRouter, SharedBackend};
 use crate::batch_cancel::{request_id_from_batch_cancel_subject, BatchCancelState};
 use crate::config::WorkerConfig;
 use crate::config_subscriber::ConfigApplyState;
-use crate::dispatcher::Dispatcher;
-use crate::ipc_client::IpcClient;
+use crate::dispatcher::{Dispatcher, QueuedMessage};
 use crate::latency::{FetchExpiryController, LatencyTracker};
 use crate::log_util::ErrChain;
 use crate::metrics::MetricsRegistry;
@@ -126,7 +127,7 @@ fn nats_consumer_reconcile_interval() -> Option<Duration> {
     .map(Duration::from_millis)
 }
 
-/// Drain deadline sent to the backend IPC on shutdown.
+/// Drain deadline sent to adapter IPC on shutdown.
 const DRAIN_DEADLINE_MS: u64 = 15_000;
 
 /// Whether the pull-loop quantum's [`LatencyTracker`] should observe
@@ -248,6 +249,29 @@ pub(crate) fn pull_loop_inflight() -> usize {
         .max(1)
 }
 
+/// Max number of queue messages this sidecar may have admitted locally but
+/// not yet finished through the scheduler/backend path.
+///
+/// Python workers have an explicit pending-queue capacity check before
+/// accepting work. The Rust sidecar owns NATS pulling in queue mode, so this
+/// cap is the equivalent local admission guard. Defaulting to one fetch keeps
+/// enough work to form full batches while preventing a single worker from
+/// hoarding the shared durable consumer when its local scheduler backs up.
+pub(crate) fn pull_loop_max_outstanding(fetch_batch: usize, inflight_cap: usize) -> usize {
+    let raw = std::env::var("SIE_PULL_LOOP_MAX_OUTSTANDING").ok();
+    parse_pull_loop_max_outstanding(raw.as_deref(), fetch_batch, inflight_cap)
+}
+
+fn parse_pull_loop_max_outstanding(
+    raw: Option<&str>,
+    fetch_batch: usize,
+    inflight_cap: usize,
+) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| fetch_batch.max(inflight_cap).max(1))
+}
+
 /// How long we wait at shutdown for already-spawned pull-loop dispatch
 /// tasks to finish before logging and moving on to backend drain. Kept
 /// generous (one Python GPU forward pass + ack round-trip is a few
@@ -285,6 +309,10 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     // payload store, dispatcher, and backend router. Construct first so every
     // downstream component observes its own RPCs into the same registry.
     let metrics_registry = Arc::new(MetricsRegistry::new().context("construct metrics registry")?);
+    metrics_registry
+        .worker_gpu_slots_total
+        .set(config.gpu_count.max(1).into());
+    metrics_registry.worker_gpu_slots_ready.set(0);
     let metrics_handle = metrics::spawn_metrics_server(
         config.metrics_port,
         Arc::clone(&metrics_registry),
@@ -293,25 +321,30 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     )
     .context("spawn metrics server")?;
 
-    // --- IPC client (connect lazily on first call). Wrapped in a
-    // `PythonIpcBackend` below; the dispatcher itself never sees the
-    // raw IPC client, only the backend trait object.
-    let ipc = Arc::new(
-        IpcClient::new_pool(&config.ipc_socket_path, config.ipc_pool_size)
-            .with_timeout(Duration::from_secs(config.ipc_request_timeout_s))
-            .with_model_ready_timeout(Duration::from_secs(config.model_ready_timeout_s))
-            .with_metrics(Arc::clone(&metrics_registry)),
+    // --- Adapter worker pool (connects lazily per child socket).
+    let worker_pool = AdapterWorkerPool::new(
+        &config.ipc_socket_paths,
+        config.ipc_pool_size,
+        config.ipc_request_timeout_s,
+        config.model_ready_timeout_s,
+        Arc::clone(&metrics_registry),
     );
     info!(
-        socket = %config.ipc_socket_path.display(),
+        primary_socket = %config.ipc_socket_path.display(),
+        socket_count = worker_pool.child_count(),
         ipc_pool_size = config.ipc_pool_size,
         ipc_request_timeout_s = config.ipc_request_timeout_s,
         model_ready_timeout_s = config.model_ready_timeout_s,
-        "IPC client initialized with connection pool"
+        "Adapter worker pool initialized"
     );
+
     // --- NATS
-    let (nats_client, jetstream) = connect(&config.nats_url).await.context("connect NATS")?;
-    info!(nats = %config.nats_url, "NATS connected");
+    let nats_url = config
+        .nats_url
+        .as_deref()
+        .context("SIE_NATS_URL is required for the NATS ingest mode")?;
+    let (nats_client, jetstream) = connect(nats_url).await.context("connect NATS")?;
+    info!(nats = %nats_url, "NATS connected");
     let consumer = ensure_stream_and_consumer(&jetstream, &config)
         .await
         .context("ensure NATS stream/consumer")?;
@@ -352,20 +385,18 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     });
 
     // Pinned-model reconciler: polls the pool's PoolSpec.pinned_models and pushes
-    // it to the backend over IPC. Decoupled from admission so pinned models
+    // it to the adapter worker over IPC. Decoupled from admission so pinned models
     // work even when the admission gate is disabled or fails open.
     let pinned_reconciler_handle =
-        crate::pinned_reconciler::spawn(&config, Arc::clone(&ipc), Arc::clone(&shutdown))
+        crate::pinned_reconciler::spawn(&config, Arc::clone(&worker_pool), Arc::clone(&shutdown))
             .context("spawn pinned reconciler")?;
 
     // --- Backend router
     //
-    // The sidecar talks to whichever backend is co-deployed over IPC.
-    // There is exactly one backend in the current deployment. `BackendRouter`
-    // is kept as the single integration point so the multi-backend fall-through
-    // plumbing stays available if we ever co-resident two adapters again.
-    let python_backend: SharedBackend = Arc::new(PythonIpcBackend::new(Arc::clone(&ipc)));
-    let backends: Vec<SharedBackend> = vec![Arc::clone(&python_backend)];
+    // The sidecar talks to the co-deployed adapter workers
+    // through a pool that owns child placement and per-socket health.
+    let adapter_backend: SharedBackend = worker_pool.clone();
+    let backends: Vec<SharedBackend> = vec![Arc::clone(&adapter_backend)];
 
     let router =
         BackendRouter::from_backends_with_metrics(backends, Some(Arc::clone(&metrics_registry)));
@@ -414,9 +445,10 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
 
     let dispatcher = Arc::new(Dispatcher::new(
         Arc::clone(&backend),
-        Arc::clone(&ipc),
+        Arc::clone(&worker_pool),
         payload_store,
-        Arc::clone(&publisher),
+        Some(Arc::clone(&publisher)),
+        config.worker_id.clone(),
         Arc::clone(&metrics_registry),
         Arc::clone(&latency_tracker),
         tokenizer_registry,
@@ -436,7 +468,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
         fetch_ctrl.clone(),
         Arc::clone(&latency_tracker),
         pool_admission.clone(),
-        Arc::clone(&ipc),
+        Arc::clone(&worker_pool),
         Arc::clone(&nats_direct_active),
         batch_cancel_state,
     ));
@@ -448,7 +480,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     let config_subscriber_handle = crate::config_subscriber::spawn(
         nats_client.clone(),
         config.bundle.clone(),
-        Arc::clone(&ipc),
+        Arc::clone(&worker_pool),
         Arc::clone(&config_apply_state),
         Arc::clone(&metrics_registry),
         shutdown.clone(),
@@ -472,7 +504,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
                 },
             }
         }),
-        Arc::clone(&ipc),
+        Arc::clone(&worker_pool),
         Arc::clone(&config_apply_state),
         Arc::clone(&metrics_registry),
         shutdown.clone(),
@@ -480,7 +512,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
 
     // --- Background: heartbeat pings into IPC so /readyz reflects liveness
     let heartbeat_handle = spawn_heartbeat(
-        Arc::clone(&ipc),
+        Arc::clone(&worker_pool),
         Duration::from_millis(config.ping_interval_ms),
         Arc::clone(&readiness),
         Arc::clone(&config_apply_state),
@@ -510,6 +542,7 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
             gpu_count: config.gpu_count,
             bundle_config_hash: config_apply_state.bundle_config_hash(),
             loaded_models: Arc::clone(&loaded_models),
+            metrics: Arc::clone(&metrics_registry),
             interval: Duration::from_millis(config.health_publish_interval_ms),
         })
     } else {
@@ -687,6 +720,203 @@ pub async fn run(config: WorkerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Local-ingest entrypoint: the broker-less sidecar lane. Selected with
+/// `SIE_SIDECAR_INGEST=local`.
+///
+/// Wires the exact dispatcher/prep/scheduler/backend pipeline [`run`]
+/// wires, but the work feed is the [`crate::local_ingest`] UDS server
+/// instead of the NATS pull loop, and every NATS-coupled subsystem is
+/// skipped by construction:
+///
+/// * no NATS connection / streams / consumers / reconciler — the ingest
+///   socket is the only work source;
+/// * no [`WorkPublisher`] — results ride each local delivery's channel
+///   back to the ingest caller (`Dispatcher.publisher = None`);
+/// * no NATS health publisher — the platform autoscaler owns worker health;
+///   the co-located shim watches this process + `/readyz`;
+/// * no NATS config subscriber — config freshness is the HTTP epoch-poll
+///   reconciler alone (`SIE_CONFIG_SERVICE_URL`, optional), which is
+///   transport-independent;
+/// * no gateway pool-admission gate / pinned reconciler — the lane has a
+///   fixed pool identity enforced by the ingest-side re-check, and model
+///   pinning is done by the lane's engine at snapshot time.
+///
+/// The IPC heartbeat stays: it drives `/readyz` freshness and the
+/// bundle-config hash exactly as on Kubernetes.
+pub async fn run_local(config: WorkerConfig) -> anyhow::Result<()> {
+    let shutdown = Arc::new(Shutdown::new());
+    shutdown::install_signal_handlers(shutdown.clone());
+
+    let local_socket = config
+        .local_socket_path
+        .clone()
+        .context("SIE_SIDECAR_LOCAL_SOCKET is required for the local ingest mode")?;
+
+    if config.ready_stale_mult == 0 {
+        warn!(
+            "SIE_WORKER_READYZ_STALE_MULT=0; falling back to readiness::DEFAULT_STALE_MULT ({})",
+            crate::readiness::DEFAULT_STALE_MULT
+        );
+    }
+    let readiness = Arc::new(Readiness::new(
+        config.ping_interval_ms,
+        config.ready_stale_mult,
+    ));
+
+    let metrics_registry = Arc::new(MetricsRegistry::new().context("construct metrics registry")?);
+    metrics_registry
+        .worker_gpu_slots_total
+        .set(config.gpu_count.max(1).into());
+    metrics_registry.worker_gpu_slots_ready.set(0);
+    let metrics_handle = metrics::spawn_metrics_server(
+        config.metrics_port,
+        Arc::clone(&metrics_registry),
+        Arc::clone(&readiness),
+        shutdown.clone(),
+    )
+    .context("spawn metrics server")?;
+
+    let worker_pool = AdapterWorkerPool::new(
+        &config.ipc_socket_paths,
+        config.ipc_pool_size,
+        config.ipc_request_timeout_s,
+        config.model_ready_timeout_s,
+        Arc::clone(&metrics_registry),
+    );
+    info!(
+        primary_socket = %config.ipc_socket_path.display(),
+        socket_count = worker_pool.child_count(),
+        ipc_pool_size = config.ipc_pool_size,
+        ipc_request_timeout_s = config.ipc_request_timeout_s,
+        model_ready_timeout_s = config.model_ready_timeout_s,
+        "local-ingest: adapter worker pool initialized"
+    );
+
+    let raw_payload_store = create_payload_store(config.payload_store_url.as_deref())
+        .await
+        .context("create payload store")?;
+    let payload_store: Arc<dyn payload_store::PayloadStore> = Arc::new(MeteredPayloadStore::new(
+        raw_payload_store,
+        Arc::clone(&metrics_registry),
+    ));
+
+    let adapter_backend: SharedBackend = worker_pool.clone();
+    let backend: SharedBackend = BackendRouter::from_backends_with_metrics(
+        vec![Arc::clone(&adapter_backend)],
+        Some(Arc::clone(&metrics_registry)),
+    );
+
+    // Tokenizer registry fills from `EnsureModelReady` descriptors exactly
+    // like the NATS path — the engine (which carries the image-baked model
+    // configs) is the config source; no sie-config dependency needed for
+    // Rust-side tokenisation.
+    let tokenizer_registry = TokenizerRegistry::empty();
+
+    let scheduler_registry: Arc<crate::scheduler::ProductionSchedulerRegistry> =
+        Arc::new(crate::scheduler::ProductionSchedulerRegistry::new(
+            crate::scheduler::BatchConfig::from_env_or_default(),
+        ));
+    let config_apply_state = Arc::new(ConfigApplyState::new(config.bundle_config_hash.clone()));
+    let loaded_models = config_apply_state.loaded_models();
+    let latency_tracker = Arc::new(Mutex::new(LatencyTracker::new(200, 10)));
+
+    let dispatcher = Arc::new(Dispatcher::new(
+        Arc::clone(&backend),
+        Arc::clone(&worker_pool),
+        payload_store,
+        None, // no NATS publisher: results ride the local delivery channels
+        config.worker_id.clone(),
+        Arc::clone(&metrics_registry),
+        Arc::clone(&latency_tracker),
+        tokenizer_registry,
+        Some(Arc::clone(&scheduler_registry)),
+        Some(shutdown.clone()),
+        Some(Arc::clone(&config_apply_state)),
+        None, // admission is the ingest-side re-check (fixed pool identity)
+        // Batch-cancel rides the NATS cancel subject; local ingest has no
+        // such feed, so a default (empty) state means "nothing cancelled".
+        BatchCancelState::default(),
+    ));
+
+    let heartbeat_handle = spawn_heartbeat(
+        Arc::clone(&worker_pool),
+        Duration::from_millis(config.ping_interval_ms),
+        Arc::clone(&readiness),
+        Arc::clone(&config_apply_state),
+        Arc::clone(&loaded_models),
+        shutdown.clone(),
+    );
+
+    let config_reconciler_handle = crate::config_reconciler::spawn(
+        config.config_service_url.as_ref().map(|base_url| {
+            crate::config_reconciler::ReconcilerConfig {
+                base_url: base_url.clone(),
+                admin_token: config.config_service_token.clone(),
+                bundle: config.bundle.clone(),
+                pool: config.pool.clone(),
+                poll_interval: Duration::from_millis(config.config_poll_interval_ms),
+                full_export_interval: if config.config_full_export_interval_ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(config.config_full_export_interval_ms))
+                },
+            }
+        }),
+        Arc::clone(&worker_pool),
+        Arc::clone(&config_apply_state),
+        Arc::clone(&metrics_registry),
+        shutdown.clone(),
+    );
+
+    // --- Main ingest server: serves until shutdown. A bind failure is
+    // fatal — main exits non-zero and the co-located shim replaces the
+    // container (fail-fast supervision).
+    let ingest_result = crate::local_ingest::run_local_ingest(
+        &local_socket,
+        Arc::clone(&dispatcher),
+        &config.pool,
+        &config.worker_id,
+        Arc::clone(&shutdown),
+    )
+    .await;
+
+    info!("local ingest exited; stopping heartbeat before drain");
+    readiness.mark_draining();
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+    if let Some(h) = config_reconciler_handle {
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Same scheduler final-drain contract as `run()` — residual items
+    // surface to the ingest callers as shutdown "cancelled" errors instead
+    // of JetStream redelivery.
+    let scheduler_drain_handles = dispatcher.take_scheduler_drain_handles().await;
+    if !scheduler_drain_handles.is_empty() {
+        let scheduler_drain_start = Instant::now();
+        info!(
+            drain_loop_count = scheduler_drain_handles.len(),
+            "rust-scheduler: awaiting per-model drain loops"
+        );
+        for h in scheduler_drain_handles {
+            if let Err(e) = h.await {
+                warn!(error = %e, "scheduler drain task join error");
+            }
+        }
+        info!(
+            elapsed_ms = scheduler_drain_start.elapsed().as_millis() as u64,
+            "rust-scheduler: drain loops exited"
+        );
+    }
+
+    info!("draining backends");
+    backend.drain(DRAIN_DEADLINE_MS).await;
+    metrics_handle.abort();
+    info!("sie-server-sidecar (local ingest) shutdown complete");
+    ingest_result
+}
+
 #[derive(Default)]
 struct GenerationDirectHandles {
     pull: Option<JoinHandle<()>>,
@@ -708,7 +938,7 @@ struct GenerationDirectDispatch {
     fetch_ctrl: FetchExpiryController,
     latency_tracker: Arc<Mutex<LatencyTracker>>,
     pool_admission: Option<Arc<PoolAdmissionGate>>,
-    ipc: Arc<IpcClient>,
+    worker_pool: Arc<AdapterWorkerPool>,
     active: Arc<AtomicBool>,
     batch_cancel_state: BatchCancelState,
     handles: Mutex<GenerationDirectHandles>,
@@ -725,7 +955,7 @@ impl GenerationDirectDispatch {
         fetch_ctrl: FetchExpiryController,
         latency_tracker: Arc<Mutex<LatencyTracker>>,
         pool_admission: Option<Arc<PoolAdmissionGate>>,
-        ipc: Arc<IpcClient>,
+        worker_pool: Arc<AdapterWorkerPool>,
         active: Arc<AtomicBool>,
         batch_cancel_state: BatchCancelState,
     ) -> Self {
@@ -738,7 +968,7 @@ impl GenerationDirectDispatch {
             fetch_ctrl,
             latency_tracker,
             pool_admission,
-            ipc,
+            worker_pool,
             active,
             batch_cancel_state,
             handles: Mutex::new(GenerationDirectHandles::default()),
@@ -800,7 +1030,7 @@ impl GenerationDirectDispatch {
         });
         let generation_cancel = spawn_generation_cancel_subscriber(
             self.nats_client.clone(),
-            Arc::clone(&self.ipc),
+            Arc::clone(&self.worker_pool),
             Arc::clone(&self.shutdown),
         );
 
@@ -880,7 +1110,7 @@ fn spawn_nats_consumer_reconciler(
 
 fn spawn_generation_cancel_subscriber(
     nats_client: async_nats::Client,
-    ipc: Arc<IpcClient>,
+    worker_pool: Arc<AdapterWorkerPool>,
     shutdown: Arc<Shutdown>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -906,7 +1136,7 @@ fn spawn_generation_cancel_subscriber(
                         debug!(subject = %subject, "generation: ignoring malformed cancel subject");
                         continue;
                     };
-                    match ipc.signal_generate_cancel(request_id.clone()).await {
+                    match worker_pool.signal_generate_cancel(request_id.clone()).await {
                         Ok(resp) => {
                             debug!(
                                 request_id = %request_id,
@@ -997,13 +1227,13 @@ fn request_id_from_cancel_subject(subject: &str) -> Option<String> {
     }
 }
 
-/// Ping the backend IPC server on a ticker. A failure is logged but
+/// Ping every adapter IPC server on a ticker. A failure is logged but
 /// non-fatal — the consumer loop will surface real problems via
 /// EnsureModelReady / Process* errors.
 ///
-/// Each successful ping refreshes the [`Readiness`] heartbeat timestamp.
+/// Each successful ready ping refreshes the [`Readiness`] heartbeat timestamp.
 fn spawn_heartbeat(
-    ipc: Arc<IpcClient>,
+    worker_pool: Arc<AdapterWorkerPool>,
     every: Duration,
     readiness: Arc<Readiness>,
     config_apply_state: Arc<ConfigApplyState>,
@@ -1027,53 +1257,74 @@ fn spawn_heartbeat(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs_f64() * 1000.0;
-                    match ipc.ping(ts).await {
-                        Ok(resp) => {
-                            if config_apply_state.current_bundle_config_hash().is_empty()
-                                && !resp.bundle_config_hash.is_empty()
-                            {
-                                config_apply_state.set_bundle_hash(resp.bundle_config_hash.clone());
-                            }
-                            match loaded_models.write() {
-                                Ok(mut guard) => {
-                                    *guard = resp.loaded_models;
-                                }
-                                Err(_) => {
-                                    warn!("loaded_models lock poisoned; NATS health will keep the previous model list");
-                                }
-                            }
-                            readiness.record_ping_success();
-                            if consecutive_failures > 0 {
-                                info!(
-                                    consecutive_failures,
-                                    "IPC heartbeat recovered — /readyz will flip green"
-                                );
-                            }
-                            consecutive_failures = 0;
+                    let ping_results = worker_pool.ping_all(ts).await;
+                    let ready_children = worker_pool.ready_child_count();
+                    let successful_ready: Vec<_> = ping_results
+                        .iter()
+                        .filter_map(|(_index, result)| result.as_ref().ok())
+                        .filter(|resp| resp.ready)
+                        .collect();
+                    if let Some(resp) = (ready_children > 0).then(|| successful_ready.first()).flatten() {
+                        if config_apply_state.current_bundle_config_hash().is_empty()
+                            && !resp.bundle_config_hash.is_empty()
+                        {
+                            config_apply_state.set_bundle_hash(resp.bundle_config_hash.clone());
                         }
-                        Err(e) => {
-                            consecutive_failures = consecutive_failures.saturating_add(1);
-                            // First failure and "big milestones" warn;
-                            // in between, stay quiet (the
-                            // `ipc_request_seconds` metric still
-                            // records everything for Grafana).
-                            if consecutive_failures == 1
-                                || consecutive_failures == 5
-                                || consecutive_failures == 30
-                                || consecutive_failures.is_multiple_of(120)
-                            {
-                                warn!(
-                                    consecutive_failures,
-                                    error = %ErrChain(&e),
-                                    "IPC heartbeat failed — /readyz will flip red shortly"
-                                );
-                            } else {
-                                debug!(
-                                    consecutive_failures,
-                                    error = %ErrChain(&e),
-                                    "IPC heartbeat still failing"
-                                );
+                        let mut merged_loaded_models = Vec::new();
+                        for resp in &successful_ready {
+                            merged_loaded_models.extend(resp.loaded_models.iter().cloned());
+                        }
+                        merged_loaded_models.sort();
+                        merged_loaded_models.dedup();
+                        match loaded_models.write() {
+                            Ok(mut guard) => {
+                                *guard = merged_loaded_models;
                             }
+                            Err(_) => {
+                                warn!("loaded_models lock poisoned; NATS health will keep the previous model list");
+                            }
+                        }
+                        readiness.record_ping_success();
+                        if consecutive_failures > 0 {
+                            info!(
+                                consecutive_failures,
+                                ready_children,
+                                total_children = worker_pool.child_count(),
+                                "IPC heartbeat recovered"
+                            );
+                        }
+                        consecutive_failures = 0;
+                    } else {
+                        let error = ping_results
+                            .iter()
+                            .find_map(|(_index, result)| result.as_ref().err())
+                            .map(|e| ErrChain(e).to_string())
+                            .unwrap_or_else(|| "all adapter children reported not ready".to_string());
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        // First failure and "big milestones" warn;
+                        // in between, stay quiet (the
+                        // `ipc_request_seconds` metric still
+                        // records everything for Grafana).
+                        if consecutive_failures == 1
+                            || consecutive_failures == 5
+                            || consecutive_failures == 30
+                            || consecutive_failures.is_multiple_of(120)
+                        {
+                            warn!(
+                                consecutive_failures,
+                                ready_children,
+                                total_children = worker_pool.child_count(),
+                                error = %error,
+                                "IPC heartbeat failed"
+                            );
+                        } else {
+                            debug!(
+                                consecutive_failures,
+                                ready_children,
+                                total_children = worker_pool.child_count(),
+                                error = %error,
+                                "IPC heartbeat still failing"
+                            );
                         }
                     }
                 }
@@ -1120,6 +1371,23 @@ async fn build_pull_stream(
                 }
             }
         }
+    }
+}
+
+async fn acquire_pull_admission_permit(
+    permits: &Arc<Semaphore>,
+    shutdown: &Arc<Shutdown>,
+) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => None,
+        permit = permits.clone().acquire_owned() => match permit {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                warn!("pull-loop admission semaphore closed — exiting loop");
+                None
+            }
+        },
     }
 }
 
@@ -1175,6 +1443,8 @@ async fn run_pull_loop(
     let rebuild_backoff = Duration::from_millis(500);
     let inflight_cap = pull_loop_inflight();
     let dispatch_permits = Arc::new(Semaphore::new(inflight_cap));
+    let outstanding_cap = pull_loop_max_outstanding(fetch_batch, inflight_cap);
+    let admission_permits = Arc::new(Semaphore::new(outstanding_cap));
     let mut inflight_tasks: Vec<JoinHandle<()>> = Vec::new();
 
     info!(
@@ -1183,6 +1453,7 @@ async fn run_pull_loop(
         quantum_min_ms = fetch_ctrl.min.as_millis() as u64,
         quantum_max_ms = fetch_ctrl.max.as_millis() as u64,
         inflight_cap,
+        outstanding_cap,
         "pull loop starting",
     );
 
@@ -1221,14 +1492,21 @@ async fn run_pull_loop(
             };
         }
 
-        // Step 1: block for the first message of the next batch.
+        // Step 1: acquire local admission capacity, then block for the first
+        // message of the next batch. The permit travels with the message until
+        // the scheduler/backend path completes, which prevents one sidecar from
+        // draining the shared durable into an unbounded local scheduler backlog.
+        let Some(first_permit) = acquire_pull_admission_permit(&admission_permits, &shutdown).await
+        else {
+            break 'outer;
+        };
         let first = tokio::select! {
             biased;
             _ = shutdown.wait() => break 'outer,
             next = stream.as_mut().expect("pull stream is initialized").next() => next,
         };
         let first_msg = match first {
-            Some(Ok(msg)) => msg,
+            Some(Ok(msg)) => QueuedMessage::new(msg, Some(first_permit)),
             Some(Err(e)) => {
                 // Recoverable per-poll errors (server TIMEOUT 408, missed
                 // heartbeat, etc.) surface here. The underlying Stream is
@@ -1236,6 +1514,7 @@ async fn run_pull_loop(
                 // internally. Log, count, and keep going.
                 debug!(error = %e, "pull stream poll error; continuing");
                 dispatcher.metrics.nats_stream_errors_total.inc();
+                drop(first_permit);
                 continue 'outer;
             }
             None => {
@@ -1247,6 +1526,7 @@ async fn run_pull_loop(
                 warn!("pull stream returned None (terminal); rebuilding");
                 dispatcher.metrics.nats_stream_errors_total.inc();
                 stream = None;
+                drop(first_permit);
                 continue 'outer;
             }
         };
@@ -1267,19 +1547,23 @@ async fn run_pull_loop(
             if remaining.is_zero() {
                 break;
             }
+            let Ok(next_permit) = admission_permits.clone().try_acquire_owned() else {
+                break;
+            };
             tokio::select! {
                 biased;
                 _ = shutdown.wait() => break,
                 _ = sleep(remaining) => break,
                 next = stream.as_mut().expect("pull stream is initialized").next() => {
                     match next {
-                        Some(Ok(msg)) => batch.push(msg),
+                        Some(Ok(msg)) => batch.push(QueuedMessage::new(msg, Some(next_permit))),
                         Some(Err(e)) => {
                             // Mid-batch recoverable error — yield what we
                             // have; the next iteration's block-on-first
                             // will resynchronise with the stream.
                             debug!(error = %e, "pull stream error mid-batch; flushing partial batch");
                             dispatcher.metrics.nats_stream_errors_total.inc();
+                            drop(next_permit);
                             break;
                         }
                         None => {
@@ -1288,6 +1572,7 @@ async fn run_pull_loop(
                             warn!("pull stream ended mid-batch; flushing partial batch");
                             dispatcher.metrics.nats_stream_errors_total.inc();
                             stream = None;
+                            drop(next_permit);
                             break;
                         }
                     }
@@ -1378,6 +1663,14 @@ mod tests {
             pull_loop_inflight(),
             crate::dispatcher::default_max_concurrent_batches().max(1)
         );
+    }
+
+    #[test]
+    fn pull_loop_max_outstanding_defaults_to_one_fetch_floor() {
+        assert_eq!(parse_pull_loop_max_outstanding(None, 64, 4), 64);
+        assert_eq!(parse_pull_loop_max_outstanding(None, 1, 4), 4);
+        assert_eq!(parse_pull_loop_max_outstanding(Some("0"), 64, 4), 64);
+        assert_eq!(parse_pull_loop_max_outstanding(Some("17"), 64, 4), 17);
     }
 
     #[test]

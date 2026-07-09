@@ -12,6 +12,7 @@ import pytest
 from sie_server.adapters.colpali import ColPaliAdapter
 from sie_server.adapters.colqwen2 import ColQwen2Adapter
 from sie_server.adapters.colqwen3 import ColQwen3Adapter
+from sie_server.adapters.colsmol import ColSmolAdapter
 from sie_server.adapters.nemo_colembed import NemoColEmbedAdapter
 from sie_server.types.inputs import Item
 
@@ -239,6 +240,92 @@ class TestColQwen3Adapter:
         assert mv[8, 0] == 3.0
 
 
+class TestColSmolAdapter:
+    """Tests for ColSmolAdapter with mocked model (small permissive visual-MV)."""
+
+    @pytest.fixture
+    def adapter(self) -> ColSmolAdapter:
+        """Create an adapter instance."""
+        return ColSmolAdapter(
+            "vidore/colSmol-256M",
+            normalize=True,
+            compute_precision="bfloat16",
+        )
+
+    def test_capabilities(self, adapter: ColSmolAdapter) -> None:
+        """Adapter reports correct capabilities."""
+        caps = adapter.capabilities
+        assert caps.inputs == ["text", "image"]
+        assert caps.outputs == ["multivector", "score"]
+
+    def test_dims_before_load_has_default(self, adapter: ColSmolAdapter) -> None:
+        """Dims returns default value before load."""
+        dims = adapter.dims
+        assert dims.multivector == 128  # ColSmol default
+
+    def test_encode_before_load_raises(self, adapter: ColSmolAdapter) -> None:
+        """Encode before load raises error."""
+        items = [Item(text="hello")]
+        with pytest.raises(RuntimeError, match="Model not loaded"):
+            adapter.encode(items, output_types=["multivector"])
+
+    def test_encode_without_input_raises(self, adapter: ColSmolAdapter) -> None:
+        """Encode raises if item has no text or images."""
+        adapter._model = MagicMock()
+        adapter._processor = MagicMock()
+        adapter._device = "cpu"
+
+        items = [Item()]  # No text or images
+        with pytest.raises(ValueError, match="requires either text or images"):
+            adapter.encode(items, output_types=["multivector"])
+
+    def test_validate_output_types(self, adapter: ColSmolAdapter) -> None:
+        """Only multivector output type is supported."""
+        adapter._model = MagicMock()
+        adapter._processor = MagicMock()
+        adapter._device = "cpu"
+
+        items = [Item(text="test")]
+        with pytest.raises(ValueError, match="Unsupported output types"):
+            adapter.encode(items, output_types=["dense"])
+
+        with pytest.raises(ValueError, match="Unsupported output types"):
+            adapter.encode(items, output_types=["sparse"])
+
+    def test_encode_mixed_batch_preserves_order(self, adapter: ColSmolAdapter) -> None:
+        """Mixed text/image items round-trip in input order with one mv per item."""
+        adapter._model = MagicMock()
+        adapter._processor = MagicMock()
+        adapter._device = "cpu"
+        adapter._multivector_dim = 4
+
+        adapter._load_images = lambda item: ["img"] * (1 if item.images else 0)  # type: ignore[method-assign]
+
+        def fake_encode_images(images: list[Any]) -> list[np.ndarray]:
+            return [np.full((2, 4), float(i + 100), dtype=np.float32) for i, _ in enumerate(images)]
+
+        def fake_encode_text(text: str) -> np.ndarray:
+            return np.full((1, 4), float(hash(text) % 1000), dtype=np.float32)
+
+        adapter._encode_images = fake_encode_images  # type: ignore[method-assign]
+        adapter._encode_text = fake_encode_text  # type: ignore[method-assign]
+
+        items = [
+            Item(text="a", images=[{"data": b"x", "format": "png"}]),
+            Item(text="b"),
+            Item(text="c", images=[{"data": b"y", "format": "png"}]),
+            Item(text="d"),
+        ]
+        out = adapter.encode(items, output_types=["multivector"])
+        assert out.batch_size == len(items)
+        assert out.multivector is not None
+        assert len(out.multivector) == len(items)
+        assert out.multivector[0][0, 0] == 100.0
+        assert out.multivector[1][0, 0] == float(hash("b") % 1000)
+        assert out.multivector[2][0, 0] == 101.0
+        assert out.multivector[3][0, 0] == float(hash("d") % 1000)
+
+
 class TestNemoColEmbedV2Config:
     """Tests for NemoColEmbedAdapter v2 configuration (Qwen3-VL backbone, token_dim=2560)."""
 
@@ -394,6 +481,15 @@ class TestVLMCudaCacheClearing:
         source = inspect.getsource(ColQwen2Adapter._encode_images_batched)
         assert "torch.cuda.empty_cache()" in source, (
             "ColQwen2._encode_images_batched must call torch.cuda.empty_cache() to prevent OOM"
+        )
+
+    def test_colsmol_encode_images_has_empty_cache(self) -> None:
+        """ColSmol _encode_images source contains empty_cache call."""
+        import inspect
+
+        source = inspect.getsource(ColSmolAdapter._encode_images)
+        assert "torch.cuda.empty_cache()" in source, (
+            "ColSmol._encode_images must call torch.cuda.empty_cache() to prevent OOM"
         )
 
     def test_nemo_colembed_encode_images_has_empty_cache(self) -> None:

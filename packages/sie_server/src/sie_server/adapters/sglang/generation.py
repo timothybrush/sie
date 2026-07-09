@@ -228,6 +228,10 @@ class SGLangGenerationAdapter(GenerationAdapter):
         mem_fraction_static: float = 0.85,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = True,
+        # Pinned HuggingFace revision (commit SHA / branch / tag). Forwarded to
+        # ``sglang.launch_server`` as ``--revision`` so the served weights match
+        # the YAML-pinned SHA; None serves the repo default.
+        revision: str | None = None,
         served_model_name: str | None = None,
         default_sampling: dict[str, Any] | None = None,
         stop_tokens: list[str] | None = None,
@@ -270,6 +274,7 @@ class SGLangGenerationAdapter(GenerationAdapter):
         self._mem_fraction_static = mem_fraction_static
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._served_model_name = served_model_name or model_name_or_path
         self._default_sampling = default_sampling or {}
         self._stop_tokens = stop_tokens or []
@@ -435,6 +440,8 @@ class SGLangGenerationAdapter(GenerationAdapter):
         ]
         if self._trust_remote_code:
             cmd.append("--trust-remote-code")
+        if self._revision is not None:
+            cmd.extend(["--revision", self._revision])
         if self._disable_cuda_graph:
             cmd.append("--disable-cuda-graph")
         if self._attention_backend:

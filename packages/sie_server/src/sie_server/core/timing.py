@@ -34,6 +34,17 @@ class RequestTiming:
     _postprocess_end: float | None = field(default=None, repr=False)
     _end_time: float | None = field(default=None, repr=False)
 
+    # Authoritative per-item input-token counts, aligned with the request's
+    # item order; ``None`` when no real tokenizer count exists (image path,
+    # char-count estimators). Set by ``EncodePipeline._prepare_batch`` from
+    # ``PreparedItem.cost`` — the same post-tokenization value used for
+    # batching — because this object is the only per-request carrier that
+    # already travels from tokenization to the result path. Consumers
+    # (``queue_executor``) surface it as ``ItemOutcome.units`` for metering;
+    # estimates are deliberately never recorded here (billing must count,
+    # not approximate).
+    input_token_counts: list[int] | None = field(default=None, repr=False)
+
     def start_tokenization(self) -> None:
         """Mark tokenization start."""
         self._tokenize_start = time.monotonic()

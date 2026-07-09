@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream::Message;
@@ -21,14 +22,15 @@ use futures_util::future::join_all;
 use rmpv::Value as MsgValue;
 use serde_json::Value as Json;
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::backend::{BackendError, SharedBackend};
+use crate::backend::{AdapterWorkerPool, BackendError, SharedBackend};
 use crate::batch_cancel::BatchCancelState;
 use crate::config_subscriber::ConfigApplyState;
-use crate::ipc_client::{IpcClient, IpcError};
+use crate::delivery::Delivery;
+use crate::ipc_client::IpcError;
 use crate::ipc_types::{
     BatchOutcome, Disposition, EncodeBatchItem, ExtractBatchItem, GenerateEvent, ItemOutcome,
     PreparedTokens, ProcessEncodeBatchRequest, ProcessExtractBatchRequest, ProcessGenerateRequest,
@@ -39,10 +41,10 @@ use crate::log_util::ErrChain;
 use crate::metrics::MetricsRegistry;
 use crate::payload_store::{PayloadError, PayloadStore};
 use crate::pool_admission::PoolAdmissionGate;
-use crate::publisher::{should_publish, Timings, WorkPublisher};
+use crate::publisher::{shape_and_build_work_result, should_publish, Timings, WorkPublisher};
 use crate::scheduler::{
-    lora_from_options, HasCost, Op as SchedOp, ProductionScheduler, ProductionSchedulerRegistry,
-    SchedulerItem, SchedulerMeta,
+    lora_from_options, HasCost, LoraKey, Op as SchedOp, ProductionScheduler,
+    ProductionSchedulerRegistry, SchedulerItem, SchedulerMeta,
 };
 use crate::shutdown::Shutdown;
 use crate::subject::{extract_model_id, is_worker_direct_work_subject};
@@ -288,6 +290,48 @@ pub enum DispatchError {
     Ack(String),
 }
 
+/// A JetStream message plus an optional pull-loop admission permit — the
+/// pull-loop intake type consumed by [`Dispatcher::handle_batch`].
+///
+/// The permit is intentionally carried with the message until the request
+/// settles. This makes the sidecar's queue intake behave like the Python
+/// worker queue: a pulled item occupies capacity until the scheduler/backend
+/// path has actually finished with it, not merely until it was enqueued.
+/// At decode time `handle_batch` moves the permit into the item's
+/// [`Delivery`], which owns it for the rest of the pipeline.
+pub(crate) struct QueuedMessage {
+    msg: Message,
+    admission_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedMessage {
+    #[must_use]
+    pub(crate) fn new(msg: Message, admission_permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            msg,
+            admission_permit,
+        }
+    }
+
+    fn into_parts(self) -> (Message, Option<OwnedSemaphorePermit>) {
+        (self.msg, self.admission_permit)
+    }
+}
+
+impl From<Message> for QueuedMessage {
+    fn from(msg: Message) -> Self {
+        Self::new(msg, None)
+    }
+}
+
+impl std::ops::Deref for QueuedMessage {
+    type Target = Message;
+
+    fn deref(&self) -> &Self::Target {
+        &self.msg
+    }
+}
+
 /// Pre-bundled handles the dispatcher needs — avoids a giant fn signature.
 pub struct Dispatcher {
     /// Inference backend — typically a [`crate::backend::BackendRouter`]
@@ -295,12 +339,20 @@ pub struct Dispatcher {
     /// Held behind a trait object so the dispatcher doesn't care which
     /// backend runs which model.
     pub backend: SharedBackend,
-    /// Direct IPC client used for streaming generation. The batch backend
+    /// Adapter worker pool used for streaming generation. The batch backend
     /// trait remains outcome-oriented; generation is event-streaming, so
-    /// the dispatcher talks to Python's `ProcessGenerate` RPC directly.
-    pub ipc: Arc<IpcClient>,
+    /// the dispatcher asks the pool to pick the concrete child socket.
+    pub worker_pool: Arc<AdapterWorkerPool>,
     pub payload_store: Arc<dyn PayloadStore>,
-    pub publisher: Arc<WorkPublisher>,
+    /// NATS result publisher. `None` in local-ingest mode (P2.10, §4.6)
+    /// where results ride each [`Delivery::Local`]'s event channel instead
+    /// — the invariant "a [`Delivery::Nats`] item implies `Some`" holds by
+    /// construction (`run()` wires both NATS and the publisher; `run_local()`
+    /// wires neither).
+    pub publisher: Option<Arc<WorkPublisher>>,
+    /// Stable worker id stamped on locally-delivered `WorkResult`s. Same
+    /// value the NATS `WorkPublisher` stamps on its results.
+    pub worker_id: String,
     pub metrics: Arc<MetricsRegistry>,
     /// Rolling latency tracker shared with the pull loop. On every
     /// successful publish we record `inference_ms + postprocess_ms`
@@ -368,9 +420,10 @@ impl Dispatcher {
     #[allow(clippy::too_many_arguments)] // each arg is a distinct dependency
     pub fn new(
         backend: SharedBackend,
-        ipc: Arc<IpcClient>,
+        worker_pool: Arc<AdapterWorkerPool>,
         payload_store: Arc<dyn PayloadStore>,
-        publisher: Arc<WorkPublisher>,
+        publisher: Option<Arc<WorkPublisher>>,
+        worker_id: String,
         metrics: Arc<MetricsRegistry>,
         latency_tracker: Arc<Mutex<LatencyTracker>>,
         tokenizer_registry: Arc<TokenizerRegistry>,
@@ -387,9 +440,10 @@ impl Dispatcher {
         );
         Self {
             backend,
-            ipc,
+            worker_pool,
             payload_store,
             publisher,
+            worker_id,
             metrics,
             latency_tracker,
             batch_semaphore: Arc::new(Semaphore::new(default_max_concurrent_batches())),
@@ -421,15 +475,15 @@ impl Dispatcher {
         worker_direct && operation != "generate" && self.batch_cancel_state.is_cancelled(request_id)
     }
 
-    async fn ack_cancelled_worker_direct_batch(&self, wi: &WorkItem, msg: &Message) {
+    async fn ack_cancelled_worker_direct_batch(&self, wi: &WorkItem, delivery: &Delivery) {
         debug!(
             request_id = %wi.request_id,
             work_item_id = %wi.work_item_id,
             operation = %wi.operation,
-            subject = %msg.subject,
+            origin = %delivery.log_ref(),
             "batch-direct: ACKing cancelled worker-direct item"
         );
-        match ack(msg).await {
+        match ack(delivery).await {
             Ok(()) => self.metrics.messages_acked_total.inc(),
             Err(e) => {
                 warn!(error = %e, "ack failed on cancelled worker-direct batch item");
@@ -460,8 +514,11 @@ fn unknown_bundle_config_hash<'a>(
 impl Dispatcher {
     /// Process a full fetched batch.
     ///
-    /// Returns after every message has either been ACKed (we published a
-    /// result) or NAKed (we'll see it again).
+    /// Legacy op handlers return after every message has either been ACKed
+    /// (we published a result) or NAKed (we'll see it again). Scheduler-routed
+    /// handlers return after enqueue, but any pull-loop admission permit
+    /// rides the item's [`Delivery`] (inside [`SchedulerMeta`]) until the
+    /// scheduler/backend path settles it.
     ///
     /// Model-id routing: derived from the NATS **subject**, falling back
     /// to `WorkItem.model_id` when the subject is malformed. On
@@ -474,7 +531,7 @@ impl Dispatcher {
     ///   avoid ACK-timeout storms.
     /// * within a model, encode/score/extract run concurrently via
     ///   `tokio::join!` so slow payload fetches don't block other ops.
-    pub async fn handle_batch(self: &Arc<Self>, messages: Vec<Message>) {
+    pub(crate) async fn handle_batch(self: &Arc<Self>, messages: Vec<QueuedMessage>) {
         let batch_started = Instant::now();
         let batch_size = messages.len();
         self.metrics
@@ -483,8 +540,12 @@ impl Dispatcher {
         info!(batch_size, "handle_batch: start");
 
         let base_delay_ms = base_nak_delay_ms();
-        let mut decoded: Vec<(WorkItem, Message)> = Vec::with_capacity(batch_size);
-        for msg in messages {
+        let mut decoded: Vec<(WorkItem, Delivery)> = Vec::with_capacity(batch_size);
+        for queued in messages {
+            // The admission permit moves into the [`Delivery`] here: every
+            // reject path below settles (ACK/NAK) and drops it immediately,
+            // and successful decodes carry it until downstream settlement.
+            let (msg, admission_permit) = queued.into_parts();
             // Record JetStream delivery count so operators can spot hot
             // redelivery (which usually means a worker is hitting ack_wait).
             // `info()` returns Ok for pull-based messages; core NATS messages
@@ -512,7 +573,12 @@ impl Dispatcher {
                         subject = %msg.subject,
                         "could not extract model_id from subject — NAKing for redelivery",
                     );
-                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    nak_one(
+                        &Delivery::Nats(msg, admission_permit),
+                        base_delay_ms,
+                        &self.metrics,
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -526,7 +592,7 @@ impl Dispatcher {
                             reply_subject = %truncate(&wi.reply_subject, 60),
                             "rejecting WorkItem with suspicious reply_subject — ACKing to drop",
                         );
-                        match ack(&msg).await {
+                        match ack(&Delivery::Nats(msg, admission_permit)).await {
                             Ok(()) => self.metrics.messages_acked_total.inc(),
                             Err(e) => {
                                 warn!(error = %e, "ack failed on drop");
@@ -541,7 +607,11 @@ impl Dispatcher {
                         &wi.operation,
                         worker_direct,
                     ) {
-                        self.ack_cancelled_worker_direct_batch(&wi, &msg).await;
+                        self.ack_cancelled_worker_direct_batch(
+                            &wi,
+                            &Delivery::Nats(msg, admission_permit),
+                        )
+                        .await;
                         continue;
                     }
                     if let Some(gate) = self.pool_admission.as_ref() {
@@ -558,7 +628,12 @@ impl Dispatcher {
                                 .pool_admission_naks_total
                                 .with_label_values(&["logical_pool_not_assigned"])
                                 .inc();
-                            nak_one(&msg, base_delay_ms, &self.metrics).await;
+                            nak_one(
+                                &Delivery::Nats(msg, admission_permit),
+                                base_delay_ms,
+                                &self.metrics,
+                            )
+                            .await;
                             continue;
                         }
                     }
@@ -572,7 +647,7 @@ impl Dispatcher {
                         );
                         wi.model_id = subject_model;
                     }
-                    decoded.push((wi, msg));
+                    decoded.push((wi, Delivery::Nats(msg, admission_permit)));
                 }
                 Err(e) => {
                     // NAK so JetStream redelivers (possibly to a worker on a
@@ -580,7 +655,12 @@ impl Dispatcher {
                     // max_deliver. ACK-dropping would silently discard the
                     // item on a transient msgpack glitch.
                     warn!(error = %e, subject = %msg.subject, "failed to decode WorkItem — NAKing for redelivery");
-                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    nak_one(
+                        &Delivery::Nats(msg, admission_permit),
+                        base_delay_ms,
+                        &self.metrics,
+                    )
+                    .await;
                 }
             }
         }
@@ -592,14 +672,50 @@ impl Dispatcher {
             );
             return;
         }
+        self.dispatch_decoded(decoded, batch_size, batch_started)
+            .await;
+    }
 
+    /// Dispatch already-decoded `(WorkItem, Delivery)` pairs — the shared
+    /// tail of [`Self::handle_batch`], also fed directly by the local-ingest
+    /// server (P2.10, §4.6) whose items arrive pre-decoded over the UDS
+    /// rather than as NATS messages. Both ingest paths coalesce in the same
+    /// per-model scheduler batch assembly downstream.
+    pub async fn dispatch_decoded(
+        self: &Arc<Self>,
+        decoded: Vec<(WorkItem, Delivery)>,
+        batch_size: usize,
+        batch_started: Instant,
+    ) {
         let mut generate_items = Vec::new();
         let mut regular_items = Vec::with_capacity(decoded.len());
-        for (wi, msg) in decoded {
+        for (wi, delivery) in decoded {
             if wi.operation == "generate" {
-                generate_items.push((wi, msg));
+                match delivery {
+                    // Generation bypasses the scheduler; re-bundle the permit
+                    // with the message so intake capacity stays held until
+                    // the generate task settles the delivery.
+                    Delivery::Nats(msg, permit) => {
+                        generate_items.push((wi, QueuedMessage::new(msg, permit)))
+                    }
+                    delivery @ Delivery::Local(_) => {
+                        // Generation streams chunk envelopes over NATS reply
+                        // subjects; the local-ingest publish_work op is
+                        // one-shot (PROTOCOL.md v0.1 — streaming ops land
+                        // with P2.6). Answer a typed error instead of
+                        // silently sinking the item.
+                        let _ = self
+                            .publish_error(
+                                &wi,
+                                &delivery,
+                                "bad_operation",
+                                "generate is not supported on the local-ingest lane (P2.6)",
+                            )
+                            .await;
+                    }
+                }
             } else {
-                regular_items.push((wi, msg));
+                regular_items.push((wi, delivery));
             }
         }
         let generate_count = generate_items.len();
@@ -629,9 +745,14 @@ impl Dispatcher {
                         return;
                     }
                 };
-                this.metrics.inflight_batches.inc();
+                let count_model_group_inflight = this.scheduler_registry.is_none();
+                if count_model_group_inflight {
+                    this.metrics.inflight_batches.inc();
+                }
                 let result = this.handle_model_group(&model_id, items).await;
-                this.metrics.inflight_batches.dec();
+                if count_model_group_inflight {
+                    this.metrics.inflight_batches.dec();
+                }
                 drop(permit);
                 if let Err(e) = result {
                     warn!(model = %model_id, error = %ErrChain(&e), "model group handling failed");
@@ -647,7 +768,7 @@ impl Dispatcher {
         );
     }
 
-    async fn spawn_generate_items(self: &Arc<Self>, items: Vec<(WorkItem, Message)>) {
+    async fn spawn_generate_items(self: &Arc<Self>, items: Vec<(WorkItem, QueuedMessage)>) {
         let mut handles = self.generation_handles.lock().await;
         handles.retain(|h| !h.is_finished());
         for (wi, msg) in items {
@@ -658,7 +779,7 @@ impl Dispatcher {
         }
     }
 
-    async fn handle_generate_item(self: Arc<Self>, mut wi: WorkItem, msg: Message) {
+    async fn handle_generate_item(self: Arc<Self>, mut wi: WorkItem, msg: QueuedMessage) {
         let model_id = wi.model_id.clone();
         let delivery = DeliveryContext::from_message(&msg);
         let model_lbl = self.metrics.model_label(&model_id).into_owned();
@@ -700,7 +821,7 @@ impl Dispatcher {
                     error = %ErrChain(&e),
                     "EnsureModelReady failed for generate — NAKing"
                 );
-                nak_one(&msg, nak_delay_for_backend_error(&e), &self.metrics).await;
+                nak_msg(&msg, nak_delay_for_backend_error(&e), &self.metrics).await;
                 return;
             }
         };
@@ -727,7 +848,7 @@ impl Dispatcher {
                     .publish_generate_terminal_error(&wi, MODEL_LOADING_ERROR_CODE, &message)
                     .await
                 {
-                    Ok(_) => match ack(&msg).await {
+                    Ok(_) => match ack_msg(&msg).await {
                         Ok(()) => {
                             self.metrics.messages_acked_total.inc();
                             self.metrics
@@ -765,7 +886,7 @@ impl Dispatcher {
                             .generate_model_loading_responses_total
                             .with_label_values(&[&model_lbl, "loading_started", "publish_failed"])
                             .inc();
-                        nak_one(&msg, base_delay_ms, &self.metrics).await;
+                        nak_msg(&msg, base_delay_ms, &self.metrics).await;
                     }
                 }
                 return;
@@ -786,7 +907,7 @@ impl Dispatcher {
                     pending = delivery.pending,
                     "generate model retry requested — NAKing"
                 );
-                nak_one(&msg, base_delay_ms, &self.metrics).await;
+                nak_msg(&msg, base_delay_ms, &self.metrics).await;
                 return;
             }
             ReadinessState::LoadingInProgress => {
@@ -812,7 +933,7 @@ impl Dispatcher {
                     .publish_generate_terminal_error(&wi, MODEL_LOADING_ERROR_CODE, &message)
                     .await
                 {
-                    Ok(_) => match ack(&msg).await {
+                    Ok(_) => match ack_msg(&msg).await {
                         Ok(()) => {
                             self.metrics.messages_acked_total.inc();
                             self.metrics
@@ -854,7 +975,7 @@ impl Dispatcher {
                                 "publish_failed",
                             ])
                             .inc();
-                        nak_one(&msg, delay_ms, &self.metrics).await;
+                        nak_msg(&msg, delay_ms, &self.metrics).await;
                     }
                 }
                 return;
@@ -863,7 +984,7 @@ impl Dispatcher {
 
         // Resolve an offloaded generate payload. The gateway offloads large
         // vision work items to the object store (``payload_ref`` set,
-        // ``generate`` blanked); fetch + inline so the Python worker — which
+        // ``generate`` blanked); fetch + inline so the adapter worker — which
         // has no object-store access — receives a self-contained WorkItem. The
         // blob is base64-string image data, so it decodes cleanly as
         // ``serde_json::Value`` (msgpack ``bin`` would not).
@@ -890,7 +1011,7 @@ impl Dispatcher {
                             "failed to decode offloaded generate payload — publishing error + ACK"
                         );
                         match self
-                            .publish_error(
+                            .publish_error_generate(
                                 &wi,
                                 "internal_error",
                                 "failed to decode offloaded generate payload",
@@ -898,7 +1019,7 @@ impl Dispatcher {
                             )
                             .await
                         {
-                            Ok(_) => match ack(&msg).await {
+                            Ok(_) => match ack_msg(&msg).await {
                                 Ok(()) => self.metrics.messages_acked_total.inc(),
                                 Err(e) => {
                                     warn!(
@@ -913,7 +1034,7 @@ impl Dispatcher {
                                     self.metrics.jetstream_ack_failures_total.inc();
                                 }
                             },
-                            Err(_) => nak_one(&msg, base_delay_ms, &self.metrics).await,
+                            Err(_) => nak_msg(&msg, base_delay_ms, &self.metrics).await,
                         }
                         return;
                     }
@@ -933,7 +1054,7 @@ impl Dispatcher {
                         error = %e,
                         "failed to resolve offloaded generate payload — NAKing"
                     );
-                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    nak_msg(&msg, base_delay_ms, &self.metrics).await;
                     return;
                 }
             }
@@ -957,7 +1078,7 @@ impl Dispatcher {
                     "failed to re-encode generate WorkItem — publishing error + ACK"
                 );
                 match self
-                    .publish_error(
+                    .publish_error_generate(
                         &wi,
                         "internal_error",
                         "failed to encode generate work item",
@@ -965,7 +1086,7 @@ impl Dispatcher {
                     )
                     .await
                 {
-                    Ok(_) => match ack(&msg).await {
+                    Ok(_) => match ack_msg(&msg).await {
                         Ok(()) => self.metrics.messages_acked_total.inc(),
                         Err(e) => {
                             warn!(
@@ -980,12 +1101,22 @@ impl Dispatcher {
                             self.metrics.jetstream_ack_failures_total.inc();
                         }
                     },
-                    Err(_) => nak_one(&msg, base_delay_ms, &self.metrics).await,
+                    Err(_) => nak_msg(&msg, base_delay_ms, &self.metrics).await,
                 }
                 return;
             }
         };
 
+        let Some(publisher) = self.publisher.clone() else {
+            // Unreachable by construction: generate items only arrive here
+            // as NATS deliveries, and `run()` always wires the publisher.
+            warn!(
+                work_item_id = %wi.work_item_id,
+                "generate item without a NATS publisher — NAKing"
+            );
+            nak_msg(&msg, base_delay_ms, &self.metrics).await;
+            return;
+        };
         let settled = Arc::new(AtomicBool::new(false));
         let msg = Arc::new(msg);
         let delivery_log = Arc::new(GenerateDeliveryLogContext {
@@ -994,13 +1125,13 @@ impl Dispatcher {
             model_id: model_id.clone(),
             delivery,
         });
-        let publisher = Arc::clone(&self.publisher);
         let metrics = Arc::clone(&self.metrics);
         let settled_for_events = Arc::clone(&settled);
         let msg_for_events = Arc::clone(&msg);
         let delivery_log_for_events = Arc::clone(&delivery_log);
+        self.metrics.inflight_batches.inc();
         let result = self
-            .ipc
+            .worker_pool
             .process_generate(
                 ProcessGenerateRequest {
                     model_id: model_id.clone(),
@@ -1020,6 +1151,7 @@ impl Dispatcher {
                 },
             )
             .await;
+        decrement_gauge(&self.metrics.inflight_batches, 1);
 
         match result {
             Ok(()) => {
@@ -1037,7 +1169,7 @@ impl Dispatcher {
                         pending = delivery_log.delivery.pending,
                         "ProcessGenerate ended without ACK/NAK event — NAKing"
                     );
-                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    nak_msg(&msg, base_delay_ms, &self.metrics).await;
                 }
             }
             Err(e) => {
@@ -1056,7 +1188,7 @@ impl Dispatcher {
                     "ProcessGenerate failed — NAKing if unsettled"
                 );
                 if !settled.swap(true, Ordering::SeqCst) {
-                    nak_one(&msg, base_delay_ms, &self.metrics).await;
+                    nak_msg(&msg, base_delay_ms, &self.metrics).await;
                 }
             }
         }
@@ -1065,7 +1197,7 @@ impl Dispatcher {
     async fn handle_model_group(
         self: &Arc<Self>,
         model_id: &str,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
         let group_started = Instant::now();
         let group_size = items.len();
@@ -1201,28 +1333,23 @@ impl Dispatcher {
         let mut encode_items = Vec::new();
         let mut score_items = Vec::new();
         let mut extract_items = Vec::new();
-        let mut unknown_items: Vec<(WorkItem, Message)> = Vec::new();
-        for (wi, msg) in dispatch {
+        let mut unknown_items: Vec<(WorkItem, Delivery)> = Vec::new();
+        for (wi, delivery) in dispatch {
             match wi.operation.as_str() {
-                "encode" => encode_items.push((wi, msg)),
-                "score" => score_items.push((wi, msg)),
-                "extract" => extract_items.push((wi, msg)),
-                _ => unknown_items.push((wi, msg)),
+                "encode" => encode_items.push((wi, delivery)),
+                "score" => score_items.push((wi, delivery)),
+                "extract" => extract_items.push((wi, delivery)),
+                _ => unknown_items.push((wi, delivery)),
             }
         }
 
-        for (wi, msg) in &unknown_items {
+        for (wi, delivery) in &unknown_items {
             warn!(op = %wi.operation, "unknown operation — publishing error + ACK");
             match self
-                .publish_error(
-                    wi,
-                    "bad_operation",
-                    "unknown operation",
-                    is_worker_direct_work_subject(&msg.subject),
-                )
+                .publish_error(wi, delivery, "bad_operation", "unknown operation")
                 .await
             {
-                Ok(_) => match ack(msg).await {
+                Ok(_) => match ack(delivery).await {
                     Ok(()) => self.metrics.messages_acked_total.inc(),
                     Err(e) => {
                         warn!(error = %e, "ack after bad_operation error-publish failed");
@@ -1234,7 +1361,7 @@ impl Dispatcher {
                     // and we get another chance to either succeed or hit
                     // max_deliver → DLQ (preserves the failure rather
                     // than silently dropping it).
-                    nak_one(msg, base_nak_delay_ms(), &self.metrics).await;
+                    nak_one(delivery, base_nak_delay_ms(), &self.metrics).await;
                 }
             }
         }
@@ -1319,7 +1446,7 @@ impl Dispatcher {
     async fn handle_encode(
         &self,
         model_id: &str,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
         let model_lbl = self.metrics.model_label(model_id);
         let _timer = self
@@ -1327,8 +1454,9 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "encode"])
             .start_timer();
-        let mut resolved: Vec<(WorkItem, Message, MsgValue, f64)> = Vec::with_capacity(items.len());
-        for (wi, msg) in items {
+        let mut resolved: Vec<(WorkItem, Delivery, MsgValue, f64)> =
+            Vec::with_capacity(items.len());
+        for (wi, delivery) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1340,15 +1468,10 @@ impl Dispatcher {
                         "failed to resolve encode item"
                     );
                     match self
-                        .publish_error(
-                            &wi,
-                            "payload_error",
-                            "failed to resolve item",
-                            is_worker_direct_work_subject(&msg.subject),
-                        )
+                        .publish_error(&wi, &delivery, "payload_error", "failed to resolve item")
                         .await
                     {
-                        Ok(_) => match ack(&msg).await {
+                        Ok(_) => match ack(&delivery).await {
                             Ok(()) => self.metrics.messages_acked_total.inc(),
                             Err(e) => {
                                 warn!(error = %e, "ack after error-publish failed");
@@ -1360,13 +1483,13 @@ impl Dispatcher {
                             // gives another attempt (or surfaces the
                             // error later). Swallowed publish errors
                             // would otherwise silently drop the item.
-                            nak_one(&msg, base_nak_delay_ms(), &self.metrics).await;
+                            nak_one(&delivery, base_nak_delay_ms(), &self.metrics).await;
                         }
                     }
                     continue;
                 }
             };
-            resolved.push((wi, msg, item_json, fetch_ms));
+            resolved.push((wi, delivery, item_json, fetch_ms));
         }
         if resolved.is_empty() {
             return Ok(());
@@ -1415,7 +1538,7 @@ impl Dispatcher {
                     batch_size = resolved.len(),
                     "ProcessEncodeBatch failed — NAKing group"
                 );
-                let msgs_only: Vec<(WorkItem, Message)> =
+                let msgs_only: Vec<(WorkItem, Delivery)> =
                     resolved.into_iter().map(|(wi, m, _, _)| (wi, m)).collect();
                 nak_all(&msgs_only, delay, &self.metrics).await;
                 return Err(e.into());
@@ -1438,7 +1561,7 @@ impl Dispatcher {
     async fn handle_score(
         &self,
         model_id: &str,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
         let model_lbl = self.metrics.model_label(model_id);
         let _timer = self
@@ -1446,9 +1569,9 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "score"])
             .start_timer();
-        let mut prepared: Vec<(WorkItem, Message, MsgValue, Vec<MsgValue>, f64)> =
+        let mut prepared: Vec<(WorkItem, Delivery, MsgValue, Vec<MsgValue>, f64)> =
             Vec::with_capacity(items.len());
-        for (wi, msg) in items {
+        for (wi, delivery) in items {
             let (query, score_items, fetch_ms) = match self.resolve_score(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1462,13 +1585,13 @@ impl Dispatcher {
                     match self
                         .publish_error(
                             &wi,
+                            &delivery,
                             "payload_error",
                             "failed to resolve score payload",
-                            is_worker_direct_work_subject(&msg.subject),
                         )
                         .await
                     {
-                        Ok(_) => match ack(&msg).await {
+                        Ok(_) => match ack(&delivery).await {
                             Ok(()) => self.metrics.messages_acked_total.inc(),
                             Err(e) => {
                                 warn!(error = %e, "ack after error-publish failed");
@@ -1476,13 +1599,13 @@ impl Dispatcher {
                             }
                         },
                         Err(_) => {
-                            nak_one(&msg, base_nak_delay_ms(), &self.metrics).await;
+                            nak_one(&delivery, base_nak_delay_ms(), &self.metrics).await;
                         }
                     }
                     continue;
                 }
             };
-            prepared.push((wi, msg, query, score_items, fetch_ms));
+            prepared.push((wi, delivery, query, score_items, fetch_ms));
         }
         if prepared.is_empty() {
             return Ok(());
@@ -1534,7 +1657,7 @@ impl Dispatcher {
                     batch_size = prepared.len(),
                     "ProcessScoreBatch failed — NAKing group"
                 );
-                let msgs_only: Vec<(WorkItem, Message)> = prepared
+                let msgs_only: Vec<(WorkItem, Delivery)> = prepared
                     .into_iter()
                     .map(|(wi, m, _, _, _)| (wi, m))
                     .collect();
@@ -1559,7 +1682,7 @@ impl Dispatcher {
     async fn handle_extract(
         &self,
         model_id: &str,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
         let model_lbl = self.metrics.model_label(model_id);
         let _timer = self
@@ -1567,8 +1690,9 @@ impl Dispatcher {
             .pull_batch_process_seconds
             .with_label_values(&[&model_lbl, "extract"])
             .start_timer();
-        let mut resolved: Vec<(WorkItem, Message, MsgValue, f64)> = Vec::with_capacity(items.len());
-        for (wi, msg) in items {
+        let mut resolved: Vec<(WorkItem, Delivery, MsgValue, f64)> =
+            Vec::with_capacity(items.len());
+        for (wi, delivery) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -1580,15 +1704,10 @@ impl Dispatcher {
                         "failed to resolve extract item"
                     );
                     match self
-                        .publish_error(
-                            &wi,
-                            "payload_error",
-                            "failed to resolve item",
-                            is_worker_direct_work_subject(&msg.subject),
-                        )
+                        .publish_error(&wi, &delivery, "payload_error", "failed to resolve item")
                         .await
                     {
-                        Ok(_) => match ack(&msg).await {
+                        Ok(_) => match ack(&delivery).await {
                             Ok(()) => self.metrics.messages_acked_total.inc(),
                             Err(e) => {
                                 warn!(error = %e, "ack after error-publish failed");
@@ -1596,13 +1715,13 @@ impl Dispatcher {
                             }
                         },
                         Err(_) => {
-                            nak_one(&msg, base_nak_delay_ms(), &self.metrics).await;
+                            nak_one(&delivery, base_nak_delay_ms(), &self.metrics).await;
                         }
                     }
                     continue;
                 }
             };
-            resolved.push((wi, msg, item_json, fetch_ms));
+            resolved.push((wi, delivery, item_json, fetch_ms));
         }
         if resolved.is_empty() {
             return Ok(());
@@ -1647,7 +1766,7 @@ impl Dispatcher {
                     batch_size = resolved.len(),
                     "ProcessExtractBatch failed — NAKing group"
                 );
-                let msgs_only: Vec<(WorkItem, Message)> =
+                let msgs_only: Vec<(WorkItem, Delivery)> =
                     resolved.into_iter().map(|(wi, m, _, _)| (wi, m)).collect();
                 nak_all(&msgs_only, delay, &self.metrics).await;
                 return Err(e.into());
@@ -1679,7 +1798,11 @@ impl Dispatcher {
 
     // -- outcome / publish helpers ---------------------------------------
 
-    async fn apply_outcomes(&self, outcome: BatchOutcome, resolved: Vec<(WorkItem, Message, f64)>) {
+    async fn apply_outcomes(
+        &self,
+        outcome: BatchOutcome,
+        resolved: Vec<(WorkItem, Delivery, f64)>,
+    ) {
         // Decide which index (if any) each outcome binds to, using the
         // pure `resolve_outcome_indices` helper. Indices are into
         // `resolved`; `None` means "ghost outcome, no matching item".
@@ -1692,7 +1815,7 @@ impl Dispatcher {
             outcome.outcomes.iter().map(|o| o.work_item_id.as_str()),
         );
 
-        let mut resolved: Vec<Option<(WorkItem, Message, f64)>> =
+        let mut resolved: Vec<Option<(WorkItem, Delivery, f64)>> =
             resolved.into_iter().map(Some).collect();
 
         for (outcome_idx, item_outcome) in outcome.outcomes.into_iter().enumerate() {
@@ -1703,40 +1826,31 @@ impl Dispatcher {
                 );
                 continue;
             };
-            let Some((wi, msg, fetch_ms)) = resolved[idx].take() else {
+            let Some((wi, delivery, fetch_ms)) = resolved[idx].take() else {
                 continue;
             };
-            self.apply_outcome(&wi, &msg, &item_outcome, fetch_ms).await;
+            self.apply_outcome(&wi, &delivery, &item_outcome, fetch_ms)
+                .await;
         }
 
         // Any messages left without a corresponding outcome: the executor
         // dropped them. NAK so they get redelivered.
         for slot in resolved.iter_mut() {
-            let Some((_wi, msg, _fm)) = slot.take() else {
+            let Some((_wi, delivery, _fm)) = slot.take() else {
                 continue;
             };
             warn!(
-                subject = %msg.subject,
+                origin = %delivery.log_ref(),
                 "no outcome from executor — NAKing"
             );
-            if let Err(e) = msg
-                .ack_with(async_nats::jetstream::AckKind::Nak(Some(
-                    std::time::Duration::from_millis(base_nak_delay_ms()),
-                )))
-                .await
-            {
-                warn!(error = %e, "NAK failed");
-                self.metrics.jetstream_nak_failures_total.inc();
-            } else {
-                self.metrics.messages_naked_total.inc();
-            }
+            nak_one(&delivery, base_nak_delay_ms(), &self.metrics).await;
         }
     }
 
     async fn apply_outcome(
         &self,
         wi: &WorkItem,
-        msg: &Message,
+        delivery: &Delivery,
         outcome: &ItemOutcome,
         payload_fetch_ms: f64,
     ) {
@@ -1748,16 +1862,7 @@ impl Dispatcher {
                         queue_ms,
                         payload_fetch_ms,
                     });
-                    match self
-                        .publisher
-                        .publish_result(
-                            &wi.reply_subject,
-                            outcome,
-                            timings,
-                            is_worker_direct_work_subject(&msg.subject),
-                        )
-                        .await
-                    {
+                    match self.deliver_result(wi, delivery, outcome, timings).await {
                         Ok(()) => {
                             // Record latency only on the success path —
                             // sampling error-path latency would bias the
@@ -1855,7 +1960,7 @@ impl Dispatcher {
                         }
                     }
                 }
-                match ack(msg).await {
+                match ack(delivery).await {
                     Ok(()) => self.metrics.messages_acked_total.inc(),
                     Err(e) => {
                         warn!(error = %e, "ack failed");
@@ -1864,24 +1969,74 @@ impl Dispatcher {
                 }
             }
             Disposition::NakRetry => {
-                let delay = std::time::Duration::from_millis(
+                nak_one(
+                    delivery,
                     outcome.nak_delay_ms.unwrap_or_else(base_nak_delay_ms),
-                );
-                match msg
-                    .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
-                    .await
-                {
-                    Ok(()) => self.metrics.messages_naked_total.inc(),
-                    Err(e) => {
-                        warn!(error = %e, "nak failed");
-                        self.metrics.jetstream_nak_failures_total.inc();
-                    }
-                }
+                    &self.metrics,
+                )
+                .await;
             }
         }
     }
 
-    /// Publish a synthetic error `WorkResult` on `wi.reply_subject`.
+    /// Route one publishable outcome to its delivery-appropriate result
+    /// sink: NATS reply-subject publish for [`Delivery::Nats`] (verbatim
+    /// legacy behaviour, including the fire-and-forget empty-reply-subject
+    /// contract), or an in-process [`crate::delivery::LocalDeliveryEvent`]
+    /// for [`Delivery::Local`] — same `WorkResult` bytes either way via
+    /// [`shape_and_build_work_result`].
+    async fn deliver_result(
+        &self,
+        wi: &WorkItem,
+        delivery: &Delivery,
+        outcome: &ItemOutcome,
+        timings: Option<Timings>,
+    ) -> Result<(), crate::publisher::PublishError> {
+        match delivery {
+            Delivery::Nats(..) => {
+                let Some(publisher) = self.publisher.as_ref() else {
+                    // Unreachable by construction (`run()` wires NATS +
+                    // publisher together); keep the item redeliverable
+                    // rather than sinking it if the invariant ever breaks.
+                    warn!(
+                        work_item_id = %wi.work_item_id,
+                        "NATS delivery without a publisher — skipping publish"
+                    );
+                    return Err(crate::publisher::PublishError::NoPublisher);
+                };
+                publisher
+                    .publish_result(
+                        &wi.reply_subject,
+                        outcome,
+                        timings,
+                        delivery.worker_direct(),
+                    )
+                    .await
+            }
+            Delivery::Local(local) => {
+                // reply_subject is NATS-only; local results always ride the
+                // ingest socket back to the caller that is awaiting them.
+                let result = shape_and_build_work_result(
+                    outcome,
+                    &self.worker_id,
+                    timings,
+                    delivery.worker_direct(),
+                );
+                if !local.send_result(result) {
+                    debug!(
+                        work_item_id = %wi.work_item_id,
+                        origin = %delivery.log_ref(),
+                        "local ingest caller gone — dropping WorkResult"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Publish a synthetic error `WorkResult` on `wi.reply_subject`
+    /// ([`Delivery::Nats`]) or straight to the local ingest caller
+    /// ([`Delivery::Local`]).
     ///
     /// Returns:
     /// * `Ok(true)` — published (or fire-and-forget: empty reply_subject).
@@ -1895,36 +2050,53 @@ impl Dispatcher {
     async fn publish_error(
         &self,
         wi: &WorkItem,
+        delivery: &Delivery,
         code: &str,
         message: &str,
-        worker_direct: bool,
     ) -> Result<bool, crate::publisher::PublishError> {
-        // Synthetic outcome so we reuse the publisher encoder. No timings:
-        // error-only publishes omit queue_ms / processing_ms / payload_fetch_ms.
-        let outcome = ItemOutcome {
-            work_item_id: wi.work_item_id.clone(),
-            request_id: wi.request_id.clone(),
-            item_index: wi.item_index,
-            disposition: Disposition::PublishErrorAndAck,
-            nak_delay_ms: None,
-            result_msgpack: Vec::new(),
-            error: Some(message.to_string()),
-            error_code: Some(code.to_string()),
-            inference_ms: None,
-            tokenization_ms: None,
-            postprocessing_ms: None,
-            raw_output: None,
-        };
-        match self
-            .publisher
-            .publish_result(&wi.reply_subject, &outcome, None, worker_direct)
-            .await
-        {
+        let outcome = synthetic_error_outcome(wi, code, message);
+        match self.deliver_result(wi, delivery, &outcome, None).await {
             Ok(()) => Ok(true),
             Err(crate::publisher::PublishError::EmptyReplySubject) => {
                 // Fire-and-forget work item. No one is waiting for the
                 // error; ACKing lets JetStream drop it on the floor,
                 // which is the right behaviour.
+                debug!(work_item_id = %wi.work_item_id, "skipping error publish — empty reply_subject");
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(
+                    work_item_id = %wi.work_item_id,
+                    error = %e,
+                    "failed to publish error WorkResult"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Generate-path twin of [`Self::publish_error`]. The generate flow is
+    /// NATS-only (local-ingest generate items are rejected before reaching
+    /// it, see [`Self::dispatch_decoded`]) and holds its [`Message`] in an
+    /// `Arc` for the event stream, so it cannot wrap one into a
+    /// [`Delivery`]; publish straight through the NATS publisher.
+    async fn publish_error_generate(
+        &self,
+        wi: &WorkItem,
+        code: &str,
+        message: &str,
+        worker_direct: bool,
+    ) -> Result<bool, crate::publisher::PublishError> {
+        let Some(publisher) = self.publisher.as_ref() else {
+            return Err(crate::publisher::PublishError::NoPublisher);
+        };
+        let outcome = synthetic_error_outcome(wi, code, message);
+        match publisher
+            .publish_result(&wi.reply_subject, &outcome, None, worker_direct)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(crate::publisher::PublishError::EmptyReplySubject) => {
                 debug!(work_item_id = %wi.work_item_id, "skipping error publish — empty reply_subject");
                 Ok(true)
             }
@@ -1958,8 +2130,11 @@ impl Dispatcher {
             );
             return Ok(true);
         }
+        let Some(publisher) = self.publisher.as_ref() else {
+            return Err(crate::publisher::PublishError::NoPublisher);
+        };
         let payload = encode_generate_terminal_error_chunk(wi, code, message)?;
-        match self.publisher.publish_raw(&wi.reply_subject, payload).await {
+        match publisher.publish_raw(&wi.reply_subject, payload).await {
             Ok(()) => Ok(true),
             Err(crate::publisher::PublishError::EmptyReplySubject) => {
                 debug!(
@@ -2060,18 +2235,14 @@ impl Dispatcher {
         &self,
         model_id: &str,
         scheduler: &Arc<ProductionScheduler>,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) {
-        self.metrics
-            .scheduler
-            .enqueued_items_total
-            .with_label_values(&[&self.metrics.model_label(model_id), "encode"])
-            .inc_by(items.len() as u64);
-        for (wi, msg) in items {
+        let mut grouped: HashMap<LoraKey, Vec<(SchedulerItem, SchedulerMeta)>> = HashMap::new();
+        for (wi, delivery) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
-                    self.fail_resolve(&wi, &msg, &e, "failed to resolve encode item")
+                    self.fail_resolve(&wi, &delivery, &e, "failed to resolve encode item")
                         .await;
                     continue;
                 }
@@ -2094,10 +2265,24 @@ impl Dispatcher {
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens,
             };
-            let worker_direct = is_worker_direct_work_subject(&msg.subject);
-            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
+            let item = SchedulerItem::Encode(ebi);
+            let child_index = self.record_scheduler_enqueue(model_id, &item);
+            let worker_direct = delivery.worker_direct();
+            let meta = SchedulerMeta::new_with_worker_direct(wi, delivery, fetch_ms, worker_direct)
+                .with_worker_child_index(child_index);
+            grouped.entry(lora).or_default().push((item, meta));
+        }
+        let enqueued = grouped.values().map(Vec::len).sum::<usize>();
+        if enqueued > 0 {
+            self.metrics
+                .scheduler
+                .enqueued_items_total
+                .with_label_values(&[&self.metrics.model_label(model_id), "encode"])
+                .inc_by(enqueued as u64);
+        }
+        for (lora, grouped_items) in grouped {
             scheduler
-                .submit(SchedOp::Encode, lora, SchedulerItem::Encode(ebi), meta)
+                .submit_many(SchedOp::Encode, lora, grouped_items)
                 .await;
         }
     }
@@ -2115,23 +2300,18 @@ impl Dispatcher {
         &self,
         model_id: &str,
         scheduler: &Arc<ProductionScheduler>,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) {
-        self.metrics
-            .scheduler
-            .enqueued_items_total
-            .with_label_values(&[&self.metrics.model_label(model_id), "score"])
-            .inc_by(items.len() as u64);
-        for (wi, msg) in items {
+        let mut grouped: Vec<(SchedulerItem, SchedulerMeta)> = Vec::new();
+        for (wi, delivery) in items {
             let (query, score_items, fetch_ms) = match self.resolve_score(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
-                    self.fail_resolve(&wi, &msg, &e, "failed to resolve score payload")
+                    self.fail_resolve(&wi, &delivery, &e, "failed to resolve score payload")
                         .await;
                     continue;
                 }
             };
-            let lora = lora_from_options(&wi.options);
             let sbi = ScoreBatchItem {
                 work_item_id: wi.work_item_id.clone(),
                 request_id: wi.request_id.clone(),
@@ -2146,10 +2326,21 @@ impl Dispatcher {
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens: None,
             };
-            let worker_direct = is_worker_direct_work_subject(&msg.subject);
-            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
+            let item = SchedulerItem::Score(sbi);
+            let child_index = self.record_scheduler_enqueue(model_id, &item);
+            let worker_direct = delivery.worker_direct();
+            let meta = SchedulerMeta::new_with_worker_direct(wi, delivery, fetch_ms, worker_direct)
+                .with_worker_child_index(child_index);
+            grouped.push((item, meta));
+        }
+        if !grouped.is_empty() {
+            self.metrics
+                .scheduler
+                .enqueued_items_total
+                .with_label_values(&[&self.metrics.model_label(model_id), "score"])
+                .inc_by(grouped.len() as u64);
             scheduler
-                .submit(SchedOp::Score, lora, SchedulerItem::Score(sbi), meta)
+                .submit_many(SchedOp::Score, LoraKey::base(), grouped)
                 .await;
         }
     }
@@ -2163,18 +2354,14 @@ impl Dispatcher {
         &self,
         model_id: &str,
         scheduler: &Arc<ProductionScheduler>,
-        items: Vec<(WorkItem, Message)>,
+        items: Vec<(WorkItem, Delivery)>,
     ) {
-        self.metrics
-            .scheduler
-            .enqueued_items_total
-            .with_label_values(&[&self.metrics.model_label(model_id), "extract"])
-            .inc_by(items.len() as u64);
-        for (wi, msg) in items {
+        let mut grouped: HashMap<LoraKey, Vec<(SchedulerItem, SchedulerMeta)>> = HashMap::new();
+        for (wi, delivery) in items {
             let (item_json, fetch_ms) = match self.resolve_item(&wi).await {
                 Ok(v) => v,
                 Err(e) => {
-                    self.fail_resolve(&wi, &msg, &e, "failed to resolve extract item")
+                    self.fail_resolve(&wi, &delivery, &e, "failed to resolve extract item")
                         .await;
                     continue;
                 }
@@ -2195,12 +2382,34 @@ impl Dispatcher {
                 bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
                 payload_fetch_ms: fetch_ms,
             };
-            let worker_direct = is_worker_direct_work_subject(&msg.subject);
-            let meta = SchedulerMeta::new_with_worker_direct(wi, msg, fetch_ms, worker_direct);
+            let item = SchedulerItem::Extract(xbi);
+            let child_index = self.record_scheduler_enqueue(model_id, &item);
+            let worker_direct = delivery.worker_direct();
+            let meta = SchedulerMeta::new_with_worker_direct(wi, delivery, fetch_ms, worker_direct)
+                .with_worker_child_index(child_index);
+            grouped.entry(lora).or_default().push((item, meta));
+        }
+        let enqueued = grouped.values().map(Vec::len).sum::<usize>();
+        if enqueued > 0 {
+            self.metrics
+                .scheduler
+                .enqueued_items_total
+                .with_label_values(&[&self.metrics.model_label(model_id), "extract"])
+                .inc_by(enqueued as u64);
+        }
+        for (lora, grouped_items) in grouped {
             scheduler
-                .submit(SchedOp::Extract, lora, SchedulerItem::Extract(xbi), meta)
+                .submit_many(SchedOp::Extract, lora, grouped_items)
                 .await;
         }
+    }
+
+    fn record_scheduler_enqueue(&self, model_id: &str, item: &SchedulerItem) -> usize {
+        let cost = item.cost();
+        self.metrics.worker_queue_depth.inc();
+        self.metrics.worker_pending_cost.add(clamp_u64_to_i64(cost));
+        self.worker_pool
+            .record_model_pending_enqueue(model_id, cost)
     }
 
     /// Shared failure tail for the three scheduler-enqueue paths.
@@ -2209,7 +2418,13 @@ impl Dispatcher {
     /// [`Self::handle_extract`] flows: publish a synthetic
     /// `payload_error` WorkResult then ACK; if the publish itself
     /// fails, NAK so JetStream redelivers.
-    async fn fail_resolve(&self, wi: &WorkItem, msg: &Message, err: &PayloadError, log_msg: &str) {
+    async fn fail_resolve(
+        &self,
+        wi: &WorkItem,
+        delivery: &Delivery,
+        err: &PayloadError,
+        log_msg: &str,
+    ) {
         warn!(
             error = %ErrChain(err),
             work_item_id = %wi.work_item_id,
@@ -2218,15 +2433,10 @@ impl Dispatcher {
             "{log_msg}"
         );
         match self
-            .publish_error(
-                wi,
-                "payload_error",
-                "failed to resolve item",
-                is_worker_direct_work_subject(&msg.subject),
-            )
+            .publish_error(wi, delivery, "payload_error", "failed to resolve item")
             .await
         {
-            Ok(_) => match ack(msg).await {
+            Ok(_) => match ack(delivery).await {
                 Ok(()) => self.metrics.messages_acked_total.inc(),
                 Err(e) => {
                     warn!(error = %e, "ack after error-publish failed");
@@ -2234,7 +2444,7 @@ impl Dispatcher {
                 }
             },
             Err(_) => {
-                nak_one(msg, base_nak_delay_ms(), &self.metrics).await;
+                nak_one(delivery, base_nak_delay_ms(), &self.metrics).await;
             }
         }
     }
@@ -2534,6 +2744,29 @@ fn rag_to_wire(
     }
 }
 
+/// Synthetic error `ItemOutcome` for pre-execution failures (payload
+/// resolution, bad operation, offload decode). Shared by the NATS and
+/// local delivery error paths so both emit the identical wire shape.
+/// No timings: error-only publishes omit queue_ms / processing_ms /
+/// payload_fetch_ms.
+fn synthetic_error_outcome(wi: &WorkItem, code: &str, message: &str) -> ItemOutcome {
+    ItemOutcome {
+        work_item_id: wi.work_item_id.clone(),
+        request_id: wi.request_id.clone(),
+        item_index: wi.item_index,
+        disposition: Disposition::PublishErrorAndAck,
+        nak_delay_ms: None,
+        result_msgpack: Vec::new(),
+        error: Some(message.to_string()),
+        error_code: Some(code.to_string()),
+        inference_ms: None,
+        tokenization_ms: None,
+        postprocessing_ms: None,
+        raw_output: None,
+        units: None,
+    }
+}
+
 fn opt_non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -2572,7 +2805,7 @@ async fn handle_generate_event(
     publisher: Arc<WorkPublisher>,
     metrics: Arc<MetricsRegistry>,
     settled: Arc<AtomicBool>,
-    msg: Arc<Message>,
+    msg: Arc<QueuedMessage>,
     delivery_log: Arc<GenerateDeliveryLogContext>,
 ) -> Result<(), DispatchError> {
     match event.kind.as_str() {
@@ -2583,7 +2816,7 @@ async fn handle_generate_event(
         }
         "ack" => {
             if !settled.swap(true, Ordering::SeqCst) {
-                match ack(&msg).await {
+                match ack_msg(&msg).await {
                     Ok(()) => {
                         info!(
                             work_item_id = %delivery_log.work_item_id,
@@ -2637,7 +2870,7 @@ async fn handle_generate_event(
                     pending = delivery_log.delivery.pending,
                     "generate delivery NAKed by Python"
                 );
-                nak_one(&msg, delay_ms, &metrics).await;
+                nak_msg(&msg, delay_ms, &metrics).await;
             }
         }
         "in_progress" => {
@@ -2685,35 +2918,19 @@ async fn handle_generate_event(
     Ok(())
 }
 
-async fn ack(msg: &Message) -> Result<(), DispatchError> {
-    msg.ack()
-        .await
-        .map_err(|e| DispatchError::Ack(e.to_string()))
+async fn ack(delivery: &Delivery) -> Result<(), DispatchError> {
+    delivery.ack().await.map_err(DispatchError::Ack)
 }
 
-async fn nak_all(items: &[(WorkItem, Message)], delay_ms: u64, metrics: &MetricsRegistry) {
-    let delay = std::time::Duration::from_millis(delay_ms);
-    for (_, m) in items {
-        match m
-            .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
-            .await
-        {
-            Ok(()) => metrics.messages_naked_total.inc(),
-            Err(e) => {
-                warn!(error = %e, "nak failed");
-                metrics.jetstream_nak_failures_total.inc();
-            }
-        }
+async fn nak_all(items: &[(WorkItem, Delivery)], delay_ms: u64, metrics: &MetricsRegistry) {
+    for (_, d) in items {
+        nak_one(d, delay_ms, metrics).await;
     }
     debug!(count = items.len(), delay_ms, "NAKed group");
 }
 
-async fn nak_one(msg: &Message, delay_ms: u64, metrics: &MetricsRegistry) {
-    let delay = std::time::Duration::from_millis(delay_ms);
-    match msg
-        .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
-        .await
-    {
+async fn nak_one(delivery: &Delivery, delay_ms: u64, metrics: &MetricsRegistry) {
+    match delivery.nak(delay_ms).await {
         Ok(()) => metrics.messages_naked_total.inc(),
         Err(e) => {
             warn!(error = %e, "nak failed");
@@ -2722,10 +2939,10 @@ async fn nak_one(msg: &Message, delay_ms: u64, metrics: &MetricsRegistry) {
     }
 }
 
-async fn progress_all(items: &[(WorkItem, Message)], metrics: &MetricsRegistry) -> bool {
+async fn progress_all(items: &[(WorkItem, Delivery)], metrics: &MetricsRegistry) -> bool {
     let mut all_ok = true;
-    for (_, m) in items {
-        if !progress_one(m, metrics).await {
+    for (_, d) in items {
+        if !progress_one(d, metrics).await {
             all_ok = false;
         }
     }
@@ -2735,13 +2952,37 @@ async fn progress_all(items: &[(WorkItem, Message)], metrics: &MetricsRegistry) 
     all_ok
 }
 
-async fn progress_one(msg: &Message, metrics: &MetricsRegistry) -> bool {
-    match msg.ack_with(async_nats::jetstream::AckKind::Progress).await {
+async fn progress_one(delivery: &Delivery, metrics: &MetricsRegistry) -> bool {
+    match delivery.progress().await {
         Ok(()) => true,
         Err(e) => {
             warn!(error = %e, "progress ack failed");
             metrics.jetstream_ack_failures_total.inc();
             false
+        }
+    }
+}
+
+// Generate-path (NATS-only) settlement helpers. The generation flow shares
+// its `Message` behind an `Arc` with the streaming-event callback, so it
+// cannot move it into a [`Delivery`]; these mirror `ack`/`nak_one` exactly.
+
+async fn ack_msg(msg: &Message) -> Result<(), DispatchError> {
+    msg.ack()
+        .await
+        .map_err(|e| DispatchError::Ack(e.to_string()))
+}
+
+async fn nak_msg(msg: &Message, delay_ms: u64, metrics: &MetricsRegistry) {
+    let delay = std::time::Duration::from_millis(delay_ms);
+    match msg
+        .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
+        .await
+    {
+        Ok(()) => metrics.messages_naked_total.inc(),
+        Err(e) => {
+            warn!(error = %e, "nak failed");
+            metrics.jetstream_nak_failures_total.inc();
         }
     }
 }
@@ -2806,6 +3047,50 @@ pub(crate) enum WaveRole {
     Drain,
 }
 
+fn release_scheduler_pressure(
+    metrics: &MetricsRegistry,
+    worker_pool: &AdapterWorkerPool,
+    model_id: &str,
+    items: &[SchedulerItem],
+    metadata: &[SchedulerMeta],
+) {
+    if items.is_empty() {
+        return;
+    }
+    assert_eq!(
+        items.len(),
+        metadata.len(),
+        "FormattedBatch items and metadata must stay aligned",
+    );
+
+    let mut total_cost = 0_u64;
+    let mut child_pending: BTreeMap<usize, (usize, u64)> = BTreeMap::new();
+    let mut unattributed_count = 0_usize;
+    let mut unattributed_cost = 0_u64;
+
+    for (item, meta) in items.iter().zip(metadata.iter()) {
+        let item_cost = item.cost();
+        total_cost = total_cost.saturating_add(item_cost);
+        if let Some(child_index) = meta.worker_child_index {
+            let entry = child_pending.entry(child_index).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(item_cost);
+        } else {
+            unattributed_count += 1;
+            unattributed_cost = unattributed_cost.saturating_add(item_cost);
+        }
+    }
+
+    decrement_gauge(&metrics.worker_queue_depth, items.len() as i64);
+    decrement_gauge(&metrics.worker_pending_cost, clamp_u64_to_i64(total_cost));
+    for (child_index, (item_count, cost)) in child_pending {
+        worker_pool.record_child_pending_dequeue(child_index, item_count, cost);
+    }
+    if unattributed_count > 0 {
+        worker_pool.record_model_pending_dequeue(model_id, unattributed_count, unattributed_cost);
+    }
+}
+
 /// Per-batch scheduler-tick: pack the flushed batch into a
 /// [`RunBatchRequest`], hand it to the backend, apply outcomes
 /// through the existing dispatcher publish/ACK/NAK path, and feed
@@ -2839,6 +3124,7 @@ async fn process_scheduler_batch(
         items,
         metadata,
         total_cost: _,
+        flush_reason,
     } = batch;
     let mut kept_items = Vec::with_capacity(items.len());
     let mut kept_metadata = Vec::with_capacity(metadata.len());
@@ -2850,8 +3136,15 @@ async fn process_scheduler_batch(
             &meta.wi.operation,
             meta.worker_direct,
         ) {
+            release_scheduler_pressure(
+                &dispatcher.metrics,
+                &dispatcher.worker_pool,
+                model_id,
+                std::slice::from_ref(&item),
+                std::slice::from_ref(&meta),
+            );
             dispatcher
-                .ack_cancelled_worker_direct_batch(&meta.wi, &meta.msg)
+                .ack_cancelled_worker_direct_batch(&meta.wi, &meta.delivery)
                 .await;
             cancelled += 1;
             continue;
@@ -2871,12 +3164,21 @@ async fn process_scheduler_batch(
         items: kept_items,
         metadata: kept_metadata,
         total_cost: kept_cost,
+        flush_reason,
     };
     if batch.items.is_empty() {
         return;
     }
     let batch_size = batch.items.len();
     let total_cost = batch.total_cost;
+    let flush_reason = batch.flush_reason.as_label();
+    release_scheduler_pressure(
+        &dispatcher.metrics,
+        &dispatcher.worker_pool,
+        model_id,
+        &batch.items,
+        &batch.metadata,
+    );
     let op_label = match op {
         SchedOp::Encode => "encode",
         SchedOp::Score => "score",
@@ -3023,6 +3325,12 @@ async fn process_scheduler_batch(
         .batch_cost
         .with_label_values(&[&model_lbl, op_label, lora_metric_label])
         .observe(total_cost as f64);
+    dispatcher
+        .metrics
+        .scheduler
+        .flush_reason_total
+        .with_label_values(&[&model_lbl, op_label, lora_metric_label, flush_reason])
+        .inc();
     let _timer = dispatcher
         .metrics
         .pull_batch_process_seconds
@@ -3030,10 +3338,12 @@ async fn process_scheduler_batch(
         .start_timer();
     let started = Instant::now();
     dispatcher.metrics.ipc_requests_total.inc();
+    dispatcher.metrics.inflight_batches.inc();
 
     let outcome = match dispatcher.backend.run_batch(req).await {
         Ok(o) => o,
         Err(e) => {
+            dispatcher.metrics.inflight_batches.dec();
             dispatcher.metrics.ipc_failures_total.inc();
             let delay = nak_delay_for_backend_error(&e);
             warn!(
@@ -3044,12 +3354,16 @@ async fn process_scheduler_batch(
                 batch_size,
                 "scheduler RunBatch failed — NAKing batch",
             );
-            let msgs_only: Vec<(WorkItem, Message)> =
-                batch.metadata.into_iter().map(|m| (m.wi, m.msg)).collect();
+            let msgs_only: Vec<(WorkItem, Delivery)> = batch
+                .metadata
+                .into_iter()
+                .map(|m| (m.wi, m.delivery))
+                .collect();
             nak_all(&msgs_only, delay, &dispatcher.metrics).await;
             return;
         }
     };
+    dispatcher.metrics.inflight_batches.dec();
 
     // Collect per-item timings BEFORE we move the metadata into
     // `apply_outcomes`. Two telemetry flows out of this loop:
@@ -3114,10 +3428,10 @@ async fn process_scheduler_batch(
         now,
     );
 
-    let resolved: Vec<(WorkItem, Message, f64)> = batch
+    let resolved: Vec<(WorkItem, Delivery, f64)> = batch
         .metadata
         .into_iter()
-        .map(|m| (m.wi, m.msg, m.fetch_ms))
+        .map(|m| (m.wi, m.delivery, m.fetch_ms))
         .collect();
     dispatcher.apply_outcomes(outcome, resolved).await;
 
@@ -3202,10 +3516,22 @@ async fn process_scheduler_batch(
         batch_id,
         batch_size,
         total_cost,
+        flush_reason,
         role = ?role,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "scheduler batch complete",
     );
+}
+
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn decrement_gauge(gauge: &prometheus::IntGauge, value: i64) {
+    if value <= 0 {
+        return;
+    }
+    gauge.sub(value);
 }
 
 /// Per-model background task: consume flushed batches from the
@@ -3240,6 +3566,29 @@ fn pipeline_depth() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.clamp(1, 8))
         .unwrap_or(2)
+}
+
+/// Whether the scheduler may flush the first item after an idle gap
+/// immediately instead of waiting for the coalesce window.
+///
+/// Default true preserves the current low-load latency behavior.
+/// Operators can set `SIE_BATCHER_IDLE_BYPASS_ENABLED=false` for
+/// passthrough runtimes such as Candle when multi-worker fanout makes
+/// each worker see a thinner local stream and early singleton flushes
+/// under-fill GPU forwards.
+fn scheduler_idle_bypass_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SIE_BATCHER_IDLE_BYPASS_ENABLED")
+            .ok()
+            .map(|raw| {
+                !matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true)
+    })
 }
 
 /// Acquire one permit from `pipeline_sem` (blocking the consume loop
@@ -3304,9 +3653,11 @@ pub(crate) async fn scheduler_drain_loop(
     shutdown: Arc<Shutdown>,
 ) {
     let depth = pipeline_depth();
+    let idle_bypass_enabled = scheduler_idle_bypass_enabled();
     info!(
         model = %model_id,
         pipeline_depth = depth,
+        idle_bypass_enabled,
         "rust-scheduler: drain loop started",
     );
 
@@ -3341,12 +3692,16 @@ pub(crate) async fn scheduler_drain_loop(
     // stands alone:
     //
     //   * `was_idle` starts true and is forwarded to `consume_next`
-    //     as the `immediate` flag. When the worker just polled an
-    //     empty queue, the next item to arrive should flush at once
-    //     instead of paying the full `max_batch_wait_ms` (50 ms in
-    //     the auto-calibrated regime). Without this, low-concurrency
-    //     traffic eats one full wait window per batch and p50 ends
-    //     up dominated by the controller's wait knob.
+    //     as the `immediate` flag when idle-bypass is enabled. When
+    //     the worker just polled an empty queue, the next item to
+    //     arrive can flush at once instead of paying the full
+    //     `max_batch_wait_ms` (50 ms in the auto-calibrated regime).
+    //     Without this, low-concurrency traffic eats one full wait
+    //     window per batch and p50 ends up dominated by the
+    //     controller's wait knob. Operators can disable this via
+    //     `SIE_BATCHER_IDLE_BYPASS_ENABLED=false` for passthrough GPU
+    //     runtimes whose per-worker stream gets too thin under
+    //     multi-worker fanout.
     //
     //   * After every consumed batch we loop on `try_drain_same` for
     //     the same `(op, lora)` until it returns `None`. With
@@ -3366,7 +3721,7 @@ pub(crate) async fn scheduler_drain_loop(
     let mut was_idle = true;
     loop {
         tokio::select! {
-            (op, lora, batch) = scheduler.consume_next(was_idle) => {
+            (op, lora, batch) = scheduler.consume_next(was_idle && idle_bypass_enabled) => {
                 let initial_batch_size = batch.items.len();
                 // First batch in the wave drives the controller step.
                 spawn_pipelined_batch(
@@ -3490,9 +3845,17 @@ fn decode_offloaded_generate(bytes: &[u8]) -> Result<Json, rmp_serde::decode::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use crate::delivery::LocalDelivery;
 
     fn text_item(text: &str) -> MsgValue {
         MsgValue::Map(vec![(MsgValue::from("text"), MsgValue::from(text))])
+    }
+
+    fn adapter_pool_with_metrics(metrics: Arc<MetricsRegistry>) -> Arc<AdapterWorkerPool> {
+        let paths = [PathBuf::from("/tmp/sie-test-ipc-0.sock")];
+        AdapterWorkerPool::new(&paths, 1, 60, 900, metrics)
     }
 
     fn wi(request: &str, idx: u32, model: &str, op: &str) -> WorkItem {
@@ -3529,6 +3892,73 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
         }
+    }
+
+    fn encode_scheduler_item(work: &WorkItem) -> SchedulerItem {
+        SchedulerItem::Encode(EncodeBatchItem {
+            work_item_id: work.work_item_id.clone(),
+            request_id: work.request_id.clone(),
+            item_index: work.item_index,
+            total_items: work.total_items,
+            timestamp: work.timestamp,
+            item: work.item.clone().expect("test item"),
+            output_types: work.output_types.clone(),
+            instruction: work.instruction.clone(),
+            is_query: work.is_query,
+            options: work.options.clone(),
+            profile_id: Some(work.profile_id.clone()),
+            bundle_config_hash: Some(work.bundle_config_hash.clone()),
+            payload_fetch_ms: 0.0,
+            prepared_tokens: None,
+        })
+    }
+
+    #[test]
+    fn releasing_cancelled_scheduled_item_clears_global_and_child_pressure() {
+        let metrics = Arc::new(MetricsRegistry::new().unwrap());
+        let worker_pool = adapter_pool_with_metrics(Arc::clone(&metrics));
+        let work = wi("req-cancel", 0, "model-a", "encode");
+        let item = encode_scheduler_item(&work);
+        let child_index = worker_pool.record_model_pending_enqueue(&work.model_id, item.cost());
+        metrics.worker_queue_depth.inc();
+        metrics
+            .worker_pending_cost
+            .add(clamp_u64_to_i64(item.cost()));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let meta = SchedulerMeta::new_with_worker_direct(
+            work.clone(),
+            Delivery::Local(LocalDelivery::new(0, 0, tx)),
+            0.0,
+            true,
+        )
+        .with_worker_child_index(child_index);
+
+        release_scheduler_pressure(
+            &metrics,
+            &worker_pool,
+            &work.model_id,
+            std::slice::from_ref(&item),
+            std::slice::from_ref(&meta),
+        );
+
+        assert_eq!(metrics.worker_queue_depth.get(), 0);
+        assert_eq!(metrics.worker_pending_cost.get(), 0);
+        let child_label = child_index.to_string();
+        assert_eq!(
+            metrics
+                .worker_child_queue_depth
+                .with_label_values(&[child_label.as_str()])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .worker_child_pending_cost
+                .with_label_values(&[child_label.as_str()])
+                .get(),
+            0
+        );
     }
 
     #[test]
@@ -3796,6 +4226,18 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_idle_bypass_enabled_default_is_true() {
+        // Env-free assertion only. The function caches its first
+        // result, so tests must not mutate the env var in-process.
+        if std::env::var("SIE_BATCHER_IDLE_BYPASS_ENABLED").is_err() {
+            assert!(
+                scheduler_idle_bypass_enabled(),
+                "idle bypass must default on for low-load latency parity"
+            );
+        }
+    }
+
+    #[test]
     fn queue_ms_from_future_timestamp_clamps_to_zero() {
         let in_the_future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3977,6 +4419,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: post_ms,
             raw_output: None,
+            units: None,
         }
     }
 

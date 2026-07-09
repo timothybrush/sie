@@ -708,7 +708,10 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::clone(&config),
         model_registry: Arc::clone(&model_registry),
         pool_manager: Arc::clone(&pool_manager),
-        work_publisher,
+        // Handlers see the transport-neutral dispatch trait; lifecycle
+        // methods stay on the concrete clones retained above.
+        work_publisher: work_publisher
+            .map(|publisher| publisher as Arc<dyn queue::dispatch::WorkDispatcher>),
         demand_tracker,
         config_epoch: config_epoch.clone(),
     });

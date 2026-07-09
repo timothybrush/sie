@@ -142,6 +142,11 @@ celerybeat.pid
 
 # Environments
 .env
+# Managed-service cloud provisioning secrets (cloud-provision / deploy/cloud).
+# Vendor credentials live in the env or a gitignored secrets file, never the
+# repo (audit §1/§14). Belt-and-braces so a local copy can never be committed.
+*.sie-cloud-secrets.env
+.env.cloud
 .venv
 env/
 venv/
@@ -264,3 +269,4 @@ tmp/
 .local/
 
 .requirements-modal.txt
+packages/sie_cloud/deploy/manifests/archive/

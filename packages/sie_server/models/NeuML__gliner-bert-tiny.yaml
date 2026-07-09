@@ -1,5 +1,6 @@
 sie_id: NeuML/gliner-bert-tiny
 hf_id: NeuML/gliner-bert-tiny
+hf_revision: 6d9e1fce43af8cab4ab13ff3a6a9762ebfd1a1cf
 inputs:
   text: true
   image: false

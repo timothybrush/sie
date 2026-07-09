@@ -150,6 +150,8 @@ pub struct PingResponse {
     #[serde(default)]
     pub worker_id: String,
     #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
     pub bundle_config_hash: String,
     #[serde(default)]
     pub loaded_models: Vec<String>,
@@ -755,6 +757,24 @@ pub struct ItemOutcome {
     /// results. See [`RawOutput`] for the wire-format fallback matrix.
     #[serde(default)]
     pub raw_output: Option<RawOutput>,
+    /// Authoritative billable-unit counts (P3.5, design §7.3): real
+    /// tokenizer counts emitted by the engine so metering edges never
+    /// re-derive units from estimates. Optional; passed through onto the
+    /// `WorkResult` wire unchanged.
+    #[serde(default)]
+    pub units: Option<UnitCounts>,
+}
+
+/// Mirror of `sie_server.ipc_types.UnitCounts` — a field is set only when
+/// the engine holds an authoritative count for it (§7.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitCounts {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub pages: Option<u64>,
+    #[serde(default)]
+    pub images: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -966,6 +986,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             raw_output: None,
+            units: None,
         };
         let bytes = rmp_serde::to_vec_named(&outcome).unwrap();
         let back: ItemOutcome = rmp_serde::from_slice(&bytes).unwrap();
@@ -1231,6 +1252,7 @@ mod tests {
         let back: PingResponse = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(back.worker_id, "w-1");
         assert_eq!(back.timestamp_ms, 123.0);
+        assert!(!back.ready);
         assert_eq!(back.bundle_config_hash, "");
         assert!(back.loaded_models.is_empty());
     }

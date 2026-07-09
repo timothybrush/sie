@@ -112,6 +112,17 @@ class ScoreOutput:
     # Metadata
     batch_size: int = 0
 
+    # Unit-meter seam (§7.3): authoritative per-pair input-token counts,
+    # aligned 1:1 with ``scores`` — the REAL tokenizer length of each
+    # (query, doc) pair the model processed, summed by the queue executor
+    # into ``ItemOutcome.units.input_tokens`` for the score work item.
+    # ``None`` when the adapter cannot surface a real count (char-proxy
+    # rerankers): metering then falls back to its reserve estimate rather
+    # than billing an estimate as a count. Sliced/assembled positionally
+    # with ``scores`` (see ScoreHandler) so fused cross-request batches
+    # keep each pair's count attributed to the right work item.
+    input_token_counts: list[int] | None = None
+
     def __post_init__(self) -> None:
         """Validate consistency of output fields."""
         if len(self.scores.shape) != 1:
@@ -121,6 +132,9 @@ class ScoreOutput:
             self.batch_size = self.scores.shape[0]
         elif self.scores.shape[0] != self.batch_size:
             msg = f"scores batch size {self.scores.shape[0]} != {self.batch_size}"
+            raise ValueError(msg)
+        if self.input_token_counts is not None and len(self.input_token_counts) != self.batch_size:
+            msg = f"input_token_counts length {len(self.input_token_counts)} != batch_size {self.batch_size}"
             raise ValueError(msg)
 
 
@@ -150,6 +164,25 @@ class ExtractOutput:
     # Metadata
     batch_size: int = 0
 
+    # Unit-meter seam (§7.3): authoritative per-item input-token counts,
+    # aligned 1:1 with ``entities`` — the REAL tokenizer length of each
+    # document as counted by the extractor's own tokenizer, surfaced by
+    # the queue executor as ``ItemOutcome.units.input_tokens``. ``None``
+    # when the adapter owns tokenization opaquely and cannot cheaply
+    # expose a count: metering then falls back to its reserve estimate
+    # rather than billing an estimate as a count. Sliced/assembled
+    # positionally with ``entities`` (see ExtractHandler).
+    input_token_counts: list[int] | None = None
+
+    # Unit-meter seam (§7): authoritative per-item PAGE counts, aligned 1:1
+    # with ``entities`` — the canonical parse/OCR billing dimension ("$ per
+    # 1k pages", design §7). Document-model parsers (docling) surface the real
+    # page count they processed here, which the queue executor folds into
+    # ``ItemOutcome.units.pages``. ``None`` when the adapter processes no
+    # document pages (text/NER extractors like GLiNER): metering then stays on
+    # its token/reserve basis. Sliced/assembled positionally with ``entities``.
+    pages: list[int] | None = None
+
     def __post_init__(self) -> None:
         """Validate consistency of output fields."""
         if self.batch_size == 0:
@@ -172,4 +205,12 @@ class ExtractOutput:
 
         if self.data is not None and len(self.data) != self.batch_size:
             msg = f"data list length {len(self.data)} != batch_size {self.batch_size}"
+            raise ValueError(msg)
+
+        if self.pages is not None and len(self.pages) != self.batch_size:
+            msg = f"pages list length {len(self.pages)} != batch_size {self.batch_size}"
+            raise ValueError(msg)
+
+        if self.input_token_counts is not None and len(self.input_token_counts) != self.batch_size:
+            msg = f"input_token_counts length {len(self.input_token_counts)} != batch_size {self.batch_size}"
             raise ValueError(msg)

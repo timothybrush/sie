@@ -92,6 +92,7 @@ class Qwen2FlashCrossEncoderAdapter(FlashBaseAdapter):
         trust_remote_code: bool = False,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision = "bfloat16",
+        revision: str | None = None,
         yes_token: str = "1",  # noqa: S107
         no_token: str = "0",  # noqa: S107
         input_format: InputFormat = "mxbai",
@@ -106,6 +107,8 @@ class Qwen2FlashCrossEncoderAdapter(FlashBaseAdapter):
             trust_remote_code: Whether to trust remote code.
             max_seq_length: Maximum sequence length for query+document.
             compute_precision: Compute precision (bfloat16 recommended).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             yes_token: Text whose first token ID is the "positive" logit.
             no_token: Text whose first token ID is the "negative" logit.
             input_format: Template preset — ``"mxbai"`` or ``"qwen3"``.
@@ -120,6 +123,7 @@ class Qwen2FlashCrossEncoderAdapter(FlashBaseAdapter):
         self._trust_remote_code = trust_remote_code
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         # Configurable template / scoring params
         self._yes_token: str = yes_token
@@ -168,10 +172,14 @@ class Qwen2FlashCrossEncoderAdapter(FlashBaseAdapter):
             self._score_mode,
         )
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # Load model with eager attention - we handle flash attention manually
@@ -179,7 +187,7 @@ class Qwen2FlashCrossEncoderAdapter(FlashBaseAdapter):
             self._model_name_or_path,
             torch_dtype=self._dtype,
             attn_implementation="eager",
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()

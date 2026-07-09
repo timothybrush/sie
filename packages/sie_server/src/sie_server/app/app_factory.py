@@ -168,6 +168,7 @@ class AppFactory:
             model_filter=config.model_filter,
             memory_config=memory_config,
             device=config.device,
+            devices=config.devices,
             engine_config=engine_config,
             pool_name=config.pool_name,
             pinned_models=config.pinned_models,

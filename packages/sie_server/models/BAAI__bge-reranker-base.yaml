@@ -1,5 +1,6 @@
 sie_id: BAAI/bge-reranker-base
 hf_id: BAAI/bge-reranker-base
+hf_revision: 2cfc18c9415c912f9d8155881c133215df768a70
 inputs:
   text: true
   image: false

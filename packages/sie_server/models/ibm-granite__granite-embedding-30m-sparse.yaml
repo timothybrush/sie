@@ -1,5 +1,6 @@
 sie_id: ibm-granite/granite-embedding-30m-sparse
 hf_id: ibm-granite/granite-embedding-30m-sparse
+hf_revision: ad82b1fd09541c998c8d45045d601c51fdb8a9b7
 inputs:
   text: true
   image: false

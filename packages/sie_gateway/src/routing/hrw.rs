@@ -1,10 +1,10 @@
 //! Highest-Random-Weight (rendezvous) hashing for direct-dispatch routing.
 //!
 //! Given a request hash and a snapshot of candidate workers, pick the
-//! single worker whose combined hash with the request key is largest.
-//! This is `O(n)` per pick, stable across all callers without
-//! coordination, and degrades gracefully when workers come and go
-//! (only `1/n` of keys move on membership change).
+//! least-pressured worker and use the HRW score as the deterministic
+//! tie-breaker. This is `O(n)` per pick, stable across all callers without
+//! coordination for equal-pressure workers, and still degrades gracefully
+//! when workers come and go.
 //!
 //! Snapshots are immutable. The
 //! [`crate::state::worker_registry::WorkerRegistry`] owns the source
@@ -15,21 +15,41 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::key::RoutingKeyResolved;
 
-/// One entry on the HRW ring. Pre-hashing `worker_id` once at snapshot
-/// build time keeps `pick_worker` cheap.
+/// One entry on the direct-dispatch ring. Pre-hashing `worker_id` once at
+/// snapshot build time keeps `pick_worker` cheap; pressure fields are copied
+/// from worker heartbeats so gateway selection can avoid already-busy pods.
 #[derive(Debug, Clone)]
 pub struct RingEntry {
     pub worker_id: String,
     pub worker_id_hash: u64,
+    pub ready_gpu_slots: i32,
+    pub queue_depth: i32,
+    pub pending_cost: i64,
+    pub inflight_batches: i32,
 }
 
 impl RingEntry {
+    #[cfg(test)]
     pub fn new(worker_id: impl Into<String>) -> Self {
+        Self::with_pressure(worker_id, 1, 0, 0, 0)
+    }
+
+    pub fn with_pressure(
+        worker_id: impl Into<String>,
+        ready_gpu_slots: i32,
+        queue_depth: i32,
+        pending_cost: i64,
+        inflight_batches: i32,
+    ) -> Self {
         let worker_id = worker_id.into();
         let worker_id_hash = xxh3_64(worker_id.as_bytes());
         Self {
             worker_id,
             worker_id_hash,
+            ready_gpu_slots: ready_gpu_slots.max(1),
+            queue_depth: queue_depth.max(0),
+            pending_cost: pending_cost.max(0),
+            inflight_batches: inflight_batches.max(0),
         }
     }
 }
@@ -44,9 +64,16 @@ pub struct RingSnapshot {
 }
 
 impl RingSnapshot {
+    #[cfg(test)]
     pub fn new(worker_ids: impl IntoIterator<Item = String>) -> Self {
         Self {
             entries: worker_ids.into_iter().map(RingEntry::new).collect(),
+        }
+    }
+
+    pub fn from_entries(entries: impl IntoIterator<Item = RingEntry>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
         }
     }
 
@@ -62,7 +89,11 @@ impl RingSnapshot {
     }
 }
 
-/// HRW pick: highest `combine(request_hash, worker_id_hash)` wins.
+/// Pressure-aware HRW pick.
+///
+/// Lower slot-normalized `pending_cost`, `queue_depth`, and
+/// `inflight_batches` win first. HRW is then used as a stable tie-breaker so
+/// equal-pressure workers still distribute cache/routing keys deterministically.
 ///
 /// Returns `None` when the snapshot is empty (caller falls back to the
 /// pool subject) or when the resolved key has no hash (caller may
@@ -80,12 +111,36 @@ pub fn pick_worker<'a>(snapshot: &'a RingSnapshot, key: &RoutingKeyResolved) -> 
     snapshot
         .entries
         .iter()
-        .max_by(|a, b| {
-            combine(request_hash, a.worker_id_hash)
-                .cmp(&combine(request_hash, b.worker_id_hash))
-                .then_with(|| a.worker_id.cmp(&b.worker_id))
+        .min_by(|a, b| {
+            pressure_key(a)
+                .cmp(&pressure_key(b))
+                .then_with(|| {
+                    combine(request_hash, b.worker_id_hash)
+                        .cmp(&combine(request_hash, a.worker_id_hash))
+                })
+                .then_with(|| b.worker_id.cmp(&a.worker_id))
         })
         .map(|e| e.worker_id.as_str())
+}
+
+fn pressure_key(entry: &RingEntry) -> (i64, i64, i64, i64, i64, i64) {
+    let slots = i64::from(entry.ready_gpu_slots.max(1));
+    (
+        ceil_div_i64(entry.pending_cost.max(0), slots),
+        ceil_div_i64(i64::from(entry.queue_depth.max(0)), slots),
+        ceil_div_i64(i64::from(entry.inflight_batches.max(0)), slots),
+        entry.pending_cost.max(0),
+        i64::from(entry.queue_depth.max(0)),
+        i64::from(entry.inflight_batches.max(0)),
+    )
+}
+
+fn ceil_div_i64(value: i64, divisor: i64) -> i64 {
+    if value <= 0 {
+        0
+    } else {
+        (value + divisor.max(1) - 1) / divisor.max(1)
+    }
 }
 
 /// Combine the request key hash with a worker-id hash.

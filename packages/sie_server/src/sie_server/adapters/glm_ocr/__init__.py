@@ -48,6 +48,7 @@ class GlmOcrAdapter(ModelAdapter):
         max_new_tokens: int = 8192,
         num_beams: int = 1,
         attn_implementation: str = "sdpa",
+        revision: str | None = None,
         user_text: str = DEFAULT_USER_TEXT,
         **kwargs: Any,
     ) -> None:
@@ -59,6 +60,8 @@ class GlmOcrAdapter(ModelAdapter):
             max_new_tokens: Maximum tokens to generate.
             num_beams: Number of beams for beam search.
             attn_implementation: Attention implementation - "eager", "sdpa", or "flash_attention_2".
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when loading model artifacts.
+                Forwarded to ``from_pretrained(..., revision=...)``.
             user_text: Default user text appended to the image in the chat prompt.
             **kwargs: Ignored extra arguments from the loader.
         """
@@ -68,6 +71,7 @@ class GlmOcrAdapter(ModelAdapter):
         self._max_new_tokens = max_new_tokens
         self._num_beams = num_beams
         self._attn_implementation = attn_implementation
+        self._revision = revision
         self._user_text = user_text
 
         self._model: Any = None
@@ -100,6 +104,10 @@ class GlmOcrAdapter(ModelAdapter):
 
         dtype = self._resolve_dtype(device)
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         logger.info(
             "Loading GLM-OCR model %s on device=%s with dtype=%s, attn=%s",
             self._model_name_or_path,
@@ -108,12 +116,13 @@ class GlmOcrAdapter(ModelAdapter):
             self._attn_implementation,
         )
 
-        self._processor = AutoProcessor.from_pretrained(self._model_name_or_path)
+        self._processor = AutoProcessor.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         self._model = AutoModelForImageTextToText.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=self._attn_implementation,
+            **shared_kwargs,
         )
 
         self._model.to(device)  # ty: ignore[invalid-argument-type]

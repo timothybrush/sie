@@ -13,6 +13,10 @@ import the registry).
 from __future__ import annotations
 
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Container, Iterable
 
 
 class EvictionResult(Enum):
@@ -40,3 +44,37 @@ class EvictionResult(Enum):
 
     UNLOAD_FAILED = "unload_failed"
     """A candidate was selected but its unload raised."""
+
+
+def select_eviction_candidate(
+    lru_order: Iterable[str],
+    *,
+    exclude_name: str,
+    is_pinned: Callable[[str], bool],
+    loaded: Container[str],
+    unloading: Container[str],
+) -> str | None:
+    """Pick the first LRU-ordered model eligible for eviction, or ``None``.
+
+    Walks ``lru_order`` (least-recently-used first) and returns the first entry
+    that is not the caller's own ``exclude_name``, not pinned, still ``loaded``,
+    and not already ``unloading``. Pure decision — no I/O, no unload — so the
+    OOM-recovery eviction *policy* is testable in isolation and lives in one
+    place instead of inline in ``ModelRegistry.evict_lru_excluding``.
+
+    The registry state is injected (``is_pinned`` predicate, ``loaded`` /
+    ``unloading`` containers) so this stays free of any registry import — the
+    worker's OOM-recovery path must not import the registry. This is the next
+    slice of the ResidencyPolicy seam described in this module's docstring.
+    """
+    for candidate in lru_order:
+        if candidate == exclude_name:
+            continue
+        if is_pinned(candidate):
+            continue
+        if candidate not in loaded:
+            continue
+        if candidate in unloading:
+            continue
+        return candidate
+    return None

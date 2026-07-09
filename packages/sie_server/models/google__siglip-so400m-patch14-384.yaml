@@ -1,5 +1,6 @@
 sie_id: google/siglip-so400m-patch14-384
 hf_id: google/siglip-so400m-patch14-384
+hf_revision: 9fdffc58afc957d1a03a25b10dba0329ab15c2a3
 inputs:
   text: true
   image: true

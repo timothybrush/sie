@@ -20,6 +20,12 @@ pub enum PublishError {
     Encode(#[from] rmp_serde::encode::Error),
     #[error("empty reply_subject — cannot publish")]
     EmptyReplySubject,
+    /// A NATS delivery reached a dispatcher wired without a
+    /// [`WorkPublisher`] (local-ingest mode, P2.10). Unreachable by
+    /// construction; mapped to the skip-ACK path so the item stays
+    /// redeliverable if the invariant ever breaks.
+    #[error("no NATS publisher configured (local-ingest mode)")]
+    NoPublisher,
 }
 
 /// Per-item timings stamped onto `WorkResult` by the worker.
@@ -63,20 +69,7 @@ impl WorkPublisher {
     ) -> Result<(), PublishError> {
         check_reply_subject(reply_subject)?;
 
-        // If Python emitted `raw_output` (deferring wire framing to Rust),
-        // shape it into `result_msgpack` here. Any shape error becomes an
-        // error `WorkResult` so a misconfigured model cannot silently drop
-        // a request.
-        let owned;
-        let effective = match shape_raw_output_for_wire(outcome) {
-            ShapeOutcome::Unchanged => outcome,
-            ShapeOutcome::Shaped(o) => {
-                owned = o;
-                &owned
-            }
-        };
-
-        let result = build_work_result(effective, &self.worker_id, timings, worker_direct);
+        let result = shape_and_build_work_result(outcome, &self.worker_id, timings, worker_direct);
         let bytes = rmp_serde::to_vec_named(&result)?;
         debug!(
             reply = %reply_subject,
@@ -216,6 +209,33 @@ fn shape(raw: &RawOutput) -> Result<Vec<u8>, ShapeError> {
     ))
 }
 
+/// Shape `raw_output` (if any) into `result_msgpack` bytes, then build the
+/// gateway-facing `WorkResult`. This is the full outcome→wire conversion
+/// [`WorkPublisher::publish_result`] performs before its NATS publish;
+/// exposed as a pure function so the local-ingest path (P2.10, §4.6) —
+/// which returns `WorkResult`s over a socket instead of publishing them —
+/// produces byte-identical results.
+pub fn shape_and_build_work_result(
+    outcome: &ItemOutcome,
+    worker_id: &str,
+    timings: Option<Timings>,
+    worker_direct: bool,
+) -> WorkResult {
+    // If Python emitted `raw_output` (deferring wire framing to Rust),
+    // shape it into `result_msgpack` here. Any shape error becomes an
+    // error `WorkResult` so a misconfigured model cannot silently drop
+    // a request.
+    let owned;
+    let effective = match shape_raw_output_for_wire(outcome) {
+        ShapeOutcome::Unchanged => outcome,
+        ShapeOutcome::Shaped(o) => {
+            owned = o;
+            &owned
+        }
+    };
+    build_work_result(effective, worker_id, timings, worker_direct)
+}
+
 /// Convert an `ItemOutcome` into a `WorkResult` (gateway-facing wire
 /// type). `NakRetry` should never reach this path — the caller filters.
 /// `timings.is_some()` → queue / processing / payload_fetch are stamped;
@@ -274,6 +294,7 @@ pub fn build_work_result(
         tokenization_ms: outcome.tokenization_ms,
         postprocessing_ms: outcome.postprocessing_ms,
         payload_fetch_ms,
+        units: outcome.units.clone(),
         worker_direct,
     }
 }
@@ -315,6 +336,7 @@ mod tests {
             tokenization_ms: Some(1.1),
             postprocessing_ms: Some(0.3),
             raw_output: None,
+            units: None,
         }
     }
 

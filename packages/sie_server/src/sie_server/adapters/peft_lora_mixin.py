@@ -18,12 +18,81 @@ import gc
 import hashlib
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from peft import PeftModel
 
 logger = logging.getLogger(__name__)
+
+
+def validate_lora_target_modules(
+    lora_path: str,
+    target_modules: Any,
+    called_module_names: Collection[str],
+) -> None:
+    """Reject a LoRA whose ``target_modules`` misses every module the serving
+    forward actually calls.
+
+    Manual (module-call) flash forwards invoke a fixed set of submodules
+    directly instead of the model's top-level ``forward``. PEFT wraps exactly
+    the modules named in the LoRA's ``target_modules`` — so a LoRA targeting
+    only modules the manual forward never calls (e.g. ``pooler.dense``) is
+    applied to nothing and serves base weights with **zero error** (the
+    negative-control failure mode in the LoRA capability audit §3). This check
+    makes that mismatch fail loudly at load/staging time instead.
+
+    Args:
+        lora_path: Public LoRA id (HF/local path), for error messages.
+        target_modules: The PEFT config's ``target_modules`` — typically a
+            list/set of module-name suffixes (``"query"``, ``"q_proj"``,
+            possibly dotted like ``"encoder.layer.0.attention.self.query"``)
+            or a regex string matched against full module paths.
+        called_module_names: Leaf module names the adapter's serving forward
+            actually invokes (e.g. ``{"query", "key", "value", "dense"}``).
+
+    Raises:
+        ValueError: If ``target_modules`` is a collection and none of its
+            entries resolve (by leaf name) to a called module. A regex-string
+            ``target_modules`` that matches no called leaf name only warns —
+            regexes may legitimately target full dotted paths this check
+            cannot resolve without the model instance.
+    """
+    if not target_modules or not called_module_names:
+        # Nothing to check (PEFT will resolve/refuse its own defaults).
+        return
+
+    called = set(called_module_names)
+
+    if isinstance(target_modules, str):
+        # PEFT regex form (fullmatched against full module paths). Leaf names
+        # are all we have here, so treat no-match as a warning, not an error.
+        if not any(re.fullmatch(target_modules, name) for name in called):
+            logger.warning(
+                "LoRA '%s' declares regex target_modules %r which matches none "
+                "of the modules the serving forward calls (%s) — if it also "
+                "matches no full module path, the LoRA will have no effect",
+                lora_path,
+                target_modules,
+                sorted(called),
+            )
+        return
+
+    targets = [str(t) for t in target_modules]
+    # Compare by leaf component: PEFT matches suffixes, and dotted targets
+    # ("encoder.layer.0.attention.self.query") end in the module's leaf name.
+    if any(t.rsplit(".", 1)[-1] in called for t in targets):
+        return
+
+    msg = (
+        f"LoRA '{lora_path}' targets modules {sorted(targets)!r}, but the "
+        f"serving forward only calls {sorted(called)!r} — the LoRA would be "
+        f"silently ignored (zero effect). Retrain/export the LoRA against the "
+        f"called projections, or serve it via the merge-at-staging path."
+    )
+    raise ValueError(msg)
 
 
 class PEFTLoRAMixin:
@@ -59,6 +128,16 @@ class PEFTLoRAMixin:
     _active_lora: str | None = None
     _loaded_loras: set[str]  # Track which LoRAs are loaded
     _lora_adapter_names: dict[str, str]  # Public LoRA id -> PEFT-safe adapter name
+
+    #: Leaf names of the submodules the adapter's serving forward actually
+    #: invokes (e.g. ``frozenset({"query", "key", "value", "dense"})``).
+    #: ``None`` (default) skips the staging-side ``target_modules`` check —
+    #: appropriate for adapters that run the model's standard ``forward``,
+    #: where every PEFT-wrapped module is reached. Manual/module-call flash
+    #: adapters should declare their called set so a LoRA whose
+    #: ``target_modules`` intersect none of them is rejected at load instead
+    #: of silently serving base weights (LoRA capability audit §3).
+    lora_called_module_names: ClassVar[frozenset[str] | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Initialize _loaded_loras set for subclasses."""
@@ -133,6 +212,11 @@ class PEFTLoRAMixin:
             raise RuntimeError(msg) from e
 
         logger.info("Loading LoRA adapter: %s", lora_path)
+
+        # Fail loudly on a LoRA the serving forward would silently ignore
+        # (target_modules ∩ called modules = ∅) before any PEFT wrapping.
+        self._validate_lora_target_modules(lora_path)
+
         peft_adapter_name = self._peft_adapter_name(lora_path)
 
         if self._peft_model is None:
@@ -166,6 +250,37 @@ class PEFTLoRAMixin:
         logger.info("LoRA '%s' loaded, estimated memory: %.2f MB", lora_path, memory_bytes / 1024 / 1024)
 
         return memory_bytes
+
+    def _validate_lora_target_modules(self, lora_path: str) -> None:
+        """Check the LoRA's ``target_modules`` against the called-module set.
+
+        No-op when the adapter does not declare
+        :attr:`lora_called_module_names` (standard-forward adapters). Reads
+        only the LoRA's ``adapter_config.json`` via ``PeftConfig`` — no
+        weights are loaded. A failure to *fetch* the config is logged and
+        skipped (the actual ``PeftModel`` load will surface the real error);
+        a fetched config whose targets miss every called module raises
+        ``ValueError`` (see :func:`validate_lora_target_modules`).
+        """
+        called = self.lora_called_module_names
+        if not called:
+            return
+
+        try:
+            from peft import PeftConfig
+
+            peft_config = PeftConfig.from_pretrained(lora_path)
+            target_modules = getattr(peft_config, "target_modules", None)
+        except Exception as e:  # noqa: BLE001 — config fetch is best-effort
+            logger.warning(
+                "Could not read PEFT config for LoRA '%s' to validate target_modules (%s); "
+                "skipping the check — the load itself will surface any real error",
+                lora_path,
+                e,
+            )
+            return
+
+        validate_lora_target_modules(lora_path, target_modules, called)
 
     def unload_lora(self, lora_name: str) -> None:
         """Unload a LoRA adapter.

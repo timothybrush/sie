@@ -57,6 +57,7 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         pooling: PoolingStrategy = "mean",
         query_template: str | None = None,
         doc_template: str | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -69,6 +70,8 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             pooling: Pooling strategy - "cls" or "mean".
             query_template: Optional template for queries, e.g. "query: {text}".
             doc_template: Optional template for documents, e.g. "passage: {text}".
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -79,6 +82,7 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._pooling = pooling
         self._query_template = query_template
         self._doc_template = doc_template
+        self._revision = revision
 
         self._model: XLMRobertaModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -109,7 +113,11 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load model with eager attention - we'll run our own flash attention
         self._model = AutoModel.from_pretrained(
@@ -117,6 +125,7 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             torch_dtype=dtype,
             attn_implementation="eager",  # We handle attention manually
             trust_remote_code=True,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -226,12 +235,25 @@ class XLMRobertaFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Convert to numpy and return EncodeOutput
         dense_np = dense_vecs.float().cpu().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): this adapter owns tokenization (the registry
+        # preprocessor for flash adapters is a char-count ESTIMATOR) AND applies
+        # the model's query/doc template before tokenizing (e.g. arctic-embed's
+        # ``query: {text}``, multilingual-e5's ``query:``/``passage:``), so the
+        # real post-template, post-truncation per-item token counts exist only
+        # here. ``seq_lengths`` is the exact ``len(input_ids)`` the model
+        # processed; expose it through ``EncodeOutput.extra`` (the designated
+        # adapter-extension point) aligned 1:1 with ``items``. The encode
+        # pipeline forwards these for metering, in preference to the base
+        # ``count_input_tokens`` fallback which re-tokenizes raw ``item.text``
+        # and would undercount by the template's tokens. Mirrors ``bert_flash``.
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build XLMRoberta-style position IDs (each restarts at padding_idx + 1)."""

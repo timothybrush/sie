@@ -1,7 +1,7 @@
 //! Direct-dispatch routing.
 //!
 //! Public API:
-//! - [`pick_worker`]: HRW (rendezvous-hash) selection for a `(model, pool)` ring.
+//! - [`pick_worker`]: pressure-aware selection with HRW tie-breaks for a `(model, pool)` ring.
 //! - [`key::resolve`]: priority-ordered routing-key extraction + xxh3 hashing.
 //! - [`fmt_key_hash`]: privacy-safe log formatter (`xxh:XXXXXXXX`).
 //! - [`log_raw_keys_enabled`] / [`warn_if_raw_logging_enabled`]: opt-in raw-key logging.

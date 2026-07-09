@@ -73,6 +73,7 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_template: str | None = None,
         doc_template: str | None = None,
         trust_remote_code: bool = True,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -84,6 +85,8 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             query_template: Optional template for queries.
             doc_template: Optional template for documents.
             trust_remote_code: Whether to trust remote code (required for NewForMaskedLM).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -93,6 +96,7 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
 
         self._model: Any = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -130,15 +134,19 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             attn_mode,
         )
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         self._model = AutoModelForMaskedLM.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -498,6 +506,7 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 cached_path = try_to_load_from_cache(
                     repo_id=self._model_name_or_path,
                     filename="idf.json",
+                    revision=self._revision,
                 )
                 # try_to_load_from_cache returns a str path, None (not cached),
                 # or _CACHED_NO_EXIST sentinel (explicitly absent). Only a str
@@ -509,6 +518,7 @@ class GTESparseFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                     cached_path = hf_hub_download(
                         repo_id=self._model_name_or_path,
                         filename="idf.json",
+                        revision=self._revision,
                     )
                 if not isinstance(cached_path, str):
                     logger.warning("IDF not found for %s", self._model_name_or_path)

@@ -1,5 +1,6 @@
 sie_id: answerdotai/answerai-colbert-small-v1
 hf_id: answerdotai/answerai-colbert-small-v1
+hf_revision: c72aa89bc61afdd85373643f3a1a75b2aad6e0fe
 inputs:
   text: true
   image: false

@@ -716,10 +716,12 @@ mod tests {
     #[test]
     fn config_produces_expected_names() {
         let cfg = WorkerConfig {
-            nats_url: String::new(),
+            nats_url: Some(String::new()),
+            local_socket_path: None,
             pool: "default".into(),
             bundle: "b".into(),
             ipc_socket_path: PathBuf::from("/tmp/s.sock"),
+            ipc_socket_paths: vec![PathBuf::from("/tmp/s.sock")],
             ipc_pool_size: 1,
             ipc_request_timeout_s: 60,
             model_ready_timeout_s: 900,

@@ -2,7 +2,12 @@
  * Retry logic with exponential backoff and jitter
  */
 
-import { DEFAULT_MAX_RETRY_DELAY, DEFAULT_RETRY_DELAY } from "./constants.js";
+import {
+  DEFAULT_MAX_RETRY_DELAY,
+  DEFAULT_RETRY_DELAY,
+  RESOURCE_EXHAUSTED_DEFAULT_DELAY,
+  RESOURCE_EXHAUSTED_MAX_DELAY,
+} from "./constants.js";
 
 const RETRY_JITTER_FRACTION = 0.25;
 
@@ -34,6 +39,40 @@ export function applyRetryJitter(delay: number): number {
   if (delay <= 0) return Math.max(delay, 0);
   const low = delay * (1 - RETRY_JITTER_FRACTION);
   return Math.max(0, low + Math.random() * (delay - low));
+}
+
+/**
+ * Compute the next sleep interval (ms) for a `503 RESOURCE_EXHAUSTED` retry.
+ *
+ * Mirrors the Python SDK's `compute_oom_backoff`: a first-retry
+ * `Retry-After` hint is honoured verbatim (capped at `maxDelay`, no
+ * jitter — the server gave an explicit instruction); subsequent retries
+ * use bounded exponential backoff, `max(baseDelay, retryAfter) * 2**attempt`
+ * capped at `maxDelay`, with bounded downward jitter so a fleet of clients
+ * evicted by the same OOM event does not retry in lockstep. Always returns
+ * a value in `[0, maxDelay]`.
+ *
+ * @param retryAfter - Parsed `Retry-After` hint in milliseconds, if any
+ * @param attempt - 0-indexed retry number (0 = first retry)
+ */
+export function computeOomBackoff(
+  retryAfter: number | undefined,
+  attempt: number,
+  baseDelay: number = RESOURCE_EXHAUSTED_DEFAULT_DELAY,
+  maxDelay: number = RESOURCE_EXHAUSTED_MAX_DELAY,
+): number {
+  // Defensive floor: a negative Retry-After (malformed upstream) must not
+  // produce a negative sleep.
+  const safeRetryAfter = retryAfter !== undefined ? Math.max(retryAfter, 0) : undefined;
+  if (safeRetryAfter !== undefined && attempt === 0) {
+    return Math.min(safeRetryAfter, maxDelay);
+  }
+  // `max(...)`: a zero hint falls back to `baseDelay`, and a hint above
+  // `baseDelay` keeps the schedule non-decreasing (see the Python SDK's
+  // `compute_oom_backoff` for the full rationale).
+  const base = safeRetryAfter !== undefined ? Math.max(baseDelay, safeRetryAfter) : baseDelay;
+  const capped = Math.max(0, Math.min(base * 2 ** attempt, maxDelay));
+  return applyRetryJitter(capped);
 }
 
 /**

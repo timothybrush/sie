@@ -783,3 +783,40 @@ class TestEncodeLoraRouting:
         assert response.headers.get("Retry-After") != "1"
         registry.ensure_lora_loaded_async.assert_called_once_with("test-model", "org/test-lora")
         mock_adapter.encode.assert_not_called()
+
+    def test_lora_on_non_supporting_model_returns_typed_400(self, mock_adapter: MagicMock) -> None:
+        """A lora_id aimed at a non-LoRA model must be a typed 400, never a silent serve.
+
+        Negative control for the LoRA capability audit: adapters whose forward
+        cannot honor a LoRA (e.g. ``bert_flash`` fused-QKV, ``nomic_flash`` raw
+        safetensors) report ``supports_lora() == False``, which makes
+        ``ModelRegistry.ensure_lora_loaded_async`` raise ``ValueError`` (the
+        exact raise is locked by
+        ``tests/adapters/test_lora.py::TestLoraRejectionOnNonSupportingAdapters``).
+        The endpoint must translate that into 400 INVALID_INPUT and must NOT
+        fall through to serving base weights as if the LoRA were applied.
+        """
+        registry = self._make_lora_registry(mock_adapter)
+        registry.ensure_lora_loaded_async = AsyncMock(
+            side_effect=ValueError("Model 'test-model' does not support LoRA"),
+        )
+        app = FastAPI()
+        app.include_router(encode_router)
+        app.state.registry = registry
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/encode/test-model",
+            json={
+                "items": [{"text": "Hello"}],
+                "params": {"options": {"lora_id": "org/customer-lora"}},
+            },
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "INVALID_INPUT"
+        assert "does not support LoRA" in detail["message"]
+        # The worst-case failure mode is silent mis-serving: the request must
+        # not reach the adapter at all.
+        mock_adapter.encode.assert_not_called()

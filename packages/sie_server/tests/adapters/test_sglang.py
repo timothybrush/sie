@@ -1,5 +1,6 @@
 """Tests for SGLang embedding adapter (HTTP server mode)."""
 
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -198,7 +199,12 @@ class TestSGLangEmbeddingAdapter:
         mock_response.status_code = 200
         mock_post.return_value = mock_response
 
-        adapter = SGLangEmbeddingAdapter("test-model", normalize=False)
+        # Pin single-POST concurrency: the default fan-out (SIE_SGLANG_EMBED_
+        # CONCURRENCY=8) shards this 2-text batch into two 1-text POSTs, but the
+        # mock above serves 2 embeddings per POST — the shard/response mismatch
+        # (a893384ba) is what broke this test. concurrency=1 keeps the legacy
+        # single blocking POST so the asserts on the one call still hold.
+        adapter = SGLangEmbeddingAdapter("test-model", normalize=False, embed_concurrency=1)
         adapter._server_url = "http://localhost:30000"
 
         items = [Item(text="hello"), Item(text="world")]
@@ -425,6 +431,46 @@ class TestSGLangEmbeddingAdapter:
 
         with pytest.raises(ValueError, match="configured dense_dim=1024, observed=2048"):
             adapter.encode([Item(text="test")], output_types=["dense"])
+
+    def test_embed_texts_concurrent_preserves_order(self) -> None:
+        """Sharded concurrent embedding concatenates shards back in input order."""
+        adapter = SGLangEmbeddingAdapter("test-model", embed_concurrency=3)
+        adapter._embed_concurrency = 3  # pin past any env override
+        adapter._session = MagicMock()
+        adapter._post_executor = ThreadPoolExecutor(max_workers=3)
+        try:
+            # One row per text valued by the text's int id, so a mis-ordered
+            # concat across shards would be detectable.
+            def fake_post(texts: list[str], model_name: str, session: object) -> np.ndarray:
+                return np.array([[float(t)] for t in texts], dtype=np.float32)
+
+            with patch.object(adapter, "_post_embedding_batch", side_effect=fake_post):
+                out = adapter._embed_texts([str(i) for i in range(6)], "test-model")
+            assert out.shape == (6, 1)
+            assert [int(v) for v in out[:, 0]] == list(range(6))
+        finally:
+            adapter._post_executor.shutdown(wait=True)
+
+    def test_embed_texts_concurrent_propagates_shard_error(self) -> None:
+        """A failure in any shard propagates out of the concurrent gather."""
+        adapter = SGLangEmbeddingAdapter("test-model", embed_concurrency=3)
+        adapter._embed_concurrency = 3  # pin past any env override
+        adapter._session = MagicMock()
+        adapter._post_executor = ThreadPoolExecutor(max_workers=3)
+        try:
+
+            def fake_post(texts: list[str], model_name: str, session: object) -> np.ndarray:
+                if "3" in texts:
+                    raise RuntimeError("shard boom")
+                return np.array([[float(t)] for t in texts], dtype=np.float32)
+
+            with (
+                patch.object(adapter, "_post_embedding_batch", side_effect=fake_post),
+                pytest.raises(RuntimeError, match="shard boom"),
+            ):
+                adapter._embed_texts([str(i) for i in range(6)], "test-model")
+        finally:
+            adapter._post_executor.shutdown(wait=True)
 
 
 class TestSGLangLoRA:

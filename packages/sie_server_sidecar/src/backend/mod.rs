@@ -1,17 +1,17 @@
 //! Inference backend abstraction.
 //!
 //! A [`InferenceBackend`] is the thing the dispatcher calls to turn a
-//! batch of `WorkItem`s into results. The default implementation is
-//! [`PythonIpcBackend`] — a thin adapter around [`crate::ipc_client::IpcClient`]
-//! that preserves the exact contract the Python `sie-server` expects.
+//! batch of `WorkItem`s into results. The queue-mode default is
+//! [`AdapterWorkerPool`], which owns one IPC client per colocated adapter
+//! child. [`PythonIpcBackend`] remains the single-socket IPC backend used by
+//! tests and specialised call sites.
 //!
 //! # Why this exists
 //!
-//! The worker-sidecar owns NATS consumption, scheduling, and dispatch
-//! while Python remains the default inference engine (via UDS + msgpack
-//! RPC). This trait is the extension point for additional engines: a
-//! native backend can claim select models without touching the NATS or
-//! dispatcher code paths.
+//! The worker-sidecar owns NATS consumption, scheduling, and dispatch while
+//! adapter processes own model execution over UDS + msgpack RPC. This trait
+//! keeps those concerns separated: Python/PyTorch and Rust/Candle children can
+//! share the dispatcher, IPC protocol, metrics, and config fanout paths.
 //!
 //! # Not a runtime fallback
 //!
@@ -79,14 +79,15 @@ use crate::ipc_types::{
     ProcessScoreBatchRequest, RunBatchRequest,
 };
 
+pub mod adapter_pool;
 pub mod python_ipc;
 pub mod router;
 
-// The sidecar talks to whichever adapter is co-deployed over IPC; today
-// that is the Python `sie_server` adapter. GPU-independent pieces
-// (tokenize, text prep, IPC types, output formatting) live in this crate
+// The sidecar talks to colocated adapter children over IPC. GPU-independent
+// pieces (tokenize, text prep, IPC types, output formatting) live in this crate
 // under `prep` and `protocol`.
 
+pub use adapter_pool::AdapterWorkerPool;
 pub use python_ipc::PythonIpcBackend;
 pub use router::BackendRouter;
 

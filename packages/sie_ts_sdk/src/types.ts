@@ -271,10 +271,18 @@ export interface WorkerInfo {
   url: string;
   /** GPU type (e.g., "l4", "a100-80gb") */
   gpu: string;
+  /** Number of GPUs on this worker */
+  gpuCount: number;
+  /** Number of worker GPU slots ready to receive work */
+  readyGpuSlots: number;
   /** Whether the worker is healthy */
   healthy: boolean;
   /** Number of items in the worker's queue */
   queueDepth: number;
+  /** Worker-local scheduler pending cost */
+  pendingCost: number;
+  /** Number of batches currently executing on the worker */
+  inflightBatches: number;
   /** List of model names loaded on this worker */
   loadedModels: string[];
 }
@@ -311,6 +319,27 @@ export interface PoolCreateSpec {
   gpus?: Record<string, number>;
   /** Optional maximum assigned workers per machine profile */
   gpuCaps?: Record<string, number>;
+}
+
+/**
+ * Optional arguments for `SIEClient.createPool`, mirroring the Python SDK's
+ * `create_pool` keyword arguments (`bundle`, `minimum_worker_count`,
+ * `pinned_models`).
+ */
+export interface CreatePoolOptions {
+  /** Optional bundle filter. When set, only workers running this bundle will be assigned to the pool. */
+  bundle?: string;
+  /**
+   * Per-pool warm floor (minimum machines kept warm). The gateway publishes
+   * it as `sie_gateway_pool_warm_floor` for KEDA. Defaults to 0 (scale to zero).
+   */
+  minimumWorkerCount?: number;
+  /**
+   * Model ids to keep loaded so the first request to them pays no cold
+   * model-load. Each id must be a model the gateway already tracks and may be
+   * profile-qualified ("model-name:profile_name"); unknown ids are rejected.
+   */
+  pinnedModels?: string[];
 }
 
 /**
@@ -365,7 +394,15 @@ export interface PoolInfo {
 // WebSocket Status Types
 // ---------------------------------------------------------------------------
 
-export type ModelState = "available" | "loading" | "loaded" | "unloading";
+/**
+ * Canonical model residency states. The runtime `MODEL_STATES` array is the
+ * single source the `ModelState` type is derived from, so it can be checked
+ * against the shared golden fixture (`packages/wire-fixtures/model_state.json`)
+ * in CI. Includes `"failed"` (a terminal load-failure state) to stay in parity
+ * with the Python SDK and server, which already carry it.
+ */
+export const MODEL_STATES = ["available", "loading", "loaded", "unloading", "failed"] as const;
+export type ModelState = (typeof MODEL_STATES)[number];
 
 export interface ClusterSummary {
   worker_count: number;
@@ -469,10 +506,118 @@ export interface SIEClientOptions {
   gpu?: string;
   /** API key for authentication (sent as Bearer token) */
   apiKey?: string;
-  /** Whether to auto-retry on 503 PROVISIONING responses */
+  /**
+   * Whether to auto-retry retryable capacity signals (503 PROVISIONING,
+   * idempotent 504 gateway timeouts, transient connect errors).
+   * Default: `true`, matching the Python SDK's `wait_for_capacity=True`.
+   * BREAKING (0.7): the default was previously `false` — pass `false`
+   * explicitly to fail fast.
+   */
   waitForCapacity?: boolean;
   /** Maximum time to wait for provisioning in milliseconds (default: 300000) */
   provisionTimeout?: number;
+  /**
+   * Control-plane base URL for the `connections` namespace (connector
+   * auth lives on the control plane, not the keyed gateway). Required to call
+   * `client.connections.*`.
+   */
+  controlPlaneUrl?: string;
+  /** Org the `connections` namespace operates on (org-scoped by path in the POC). */
+  org?: string;
+}
+
+/**
+ * An org-scoped connection (connector auth by name). The secret is never
+ * returned by the list endpoint (only the job-runner resolve path sees it).
+ */
+export interface Connection {
+  id?: number;
+  type?: string;
+  name?: string;
+  created_at?: number;
+}
+
+/** The `201` envelope from creating a connection (org + connection, no secret). */
+export interface ConnectionCreated extends Connection {
+  org?: string;
+  account_id?: number;
+}
+
+/** The envelope from revoking (soft-deleting) a connection. */
+export interface ConnectionRevoked {
+  org?: string;
+  account_id?: number;
+  name?: string;
+  state?: string;
+}
+
+/**
+ * An OpenAI-shaped file object (`POST/GET /v1/files`). The
+ * gateway emits `{id, object:"file", bytes, created_at, filename, purpose}`;
+ * `status` / `expires_at` are the optional OpenAI fields surfaced
+ * when the TTL-GC lands. Byte-for-byte OpenAI's `FileObject`.
+ */
+export interface File {
+  id?: string;
+  object?: string;
+  bytes?: number;
+  created_at?: number;
+  filename?: string;
+  purpose?: string;
+  status?: string;
+  expires_at?: number;
+}
+
+/** The envelope from deleting a file (OpenAI `FileDeleted`). */
+export interface FileDeleted {
+  id?: string;
+  object?: string;
+  deleted?: boolean;
+}
+
+/** Per-batch request tally (OpenAI `request_counts`). */
+export interface BatchRequestCounts {
+  total?: number;
+  completed?: number;
+  failed?: number;
+}
+
+/**
+ * An OpenAI-shaped batch object (`POST/GET /v1/batches`).
+ * The gateway emits `{id, object:"batch", endpoint, input_file_id,
+ * completion_window, status, output_file_id, error_file_id, created_at,
+ * finished_at, request_counts, errors}`. The granular OpenAI
+ * timestamps (`completed_at` etc.) are optional — a strict OpenAI SDK reads them
+ * when the gateway surfaces them.
+ */
+export interface Batch {
+  id?: string;
+  object?: string;
+  endpoint?: string;
+  input_file_id?: string;
+  completion_window?: string;
+  status?: string;
+  output_file_id?: string | null;
+  error_file_id?: string | null;
+  created_at?: number;
+  finished_at?: number | null;
+  in_progress_at?: number | null;
+  completed_at?: number | null;
+  failed_at?: number | null;
+  expired_at?: number | null;
+  cancelled_at?: number | null;
+  request_counts?: BatchRequestCounts;
+  errors?: unknown;
+  metadata?: Record<string, unknown> | null;
+}
+
+/** The listing envelope from `GET /v1/batches` (OpenAI cursor page). */
+export interface BatchList {
+  object?: string;
+  data?: Batch[];
+  first_id?: string;
+  last_id?: string;
+  has_more?: boolean;
 }
 
 /**
@@ -802,11 +947,11 @@ export interface ChatCompletionChunk {
 export interface ChatCompletionOptions {
   /**
    * When `true`, retry the SAFE pre-execution capacity signals
-   * (`503 PROVISIONING`, `503 MODEL_LOADING`) until
-   * `provisionTimeoutMs` elapses. When `false`, the first such signal
-   * throws (`ProvisioningError` / `ModelLoadingError` / `ServerError`).
-   * Defaults to the client's `waitForCapacity` (false unless the
-   * constructor opted in).
+   * (`503 PROVISIONING`, `503 MODEL_LOADING`, `503 RESOURCE_EXHAUSTED`)
+   * until `provisionTimeoutMs` elapses. When `false`, the first
+   * provisioning signal throws (`ProvisioningError` / `ModelLoadingError`
+   * / `ServerError`). Defaults to the client's `waitForCapacity`
+   * (true unless the constructor opted out).
    */
   waitForCapacity?: boolean;
   /**

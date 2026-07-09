@@ -78,6 +78,12 @@ spec:
             - name: SIE_LOG_JSON
               value: "true"
             {{- end }}
+            # Deployment-env signal (mirrors the worker). Arms the config service's
+            # fail-closed guard: in a production env WITHOUT an admin/inference token
+            # it refuses to serve unauthenticated, rather than exposing an open
+            # (writable) catalog. Self-host dev sets a non-prod value to stay open.
+            - name: SIE_DEPLOYMENT_ENV
+              value: {{ if and .Values.telemetry .Values.telemetry.deploymentEnv }}{{ .Values.telemetry.deploymentEnv | quote }}{{ else }}"production"{{ end }}
             {{- if .Values.config.auth.adminTokenSecretName }}
             - name: SIE_ADMIN_TOKEN
               valueFrom:

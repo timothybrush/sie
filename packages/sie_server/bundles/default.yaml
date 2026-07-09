@@ -13,6 +13,7 @@ adapters:
 - sie_server.adapters.colpali
 - sie_server.adapters.colqwen2
 - sie_server.adapters.colqwen3
+- sie_server.adapters.colsmol
 - sie_server.adapters.grounding_dino
 - sie_server.adapters.gte_sparse_flash
 - sie_server.adapters.jina_flash_cross_encoder

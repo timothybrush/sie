@@ -7,8 +7,15 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// NATS server URL (e.g. `nats://localhost:4222`).
-    pub nats_url: String,
+    /// NATS server URL (e.g. `nats://localhost:4222`). Required for the
+    /// default NATS ingest (`run()`); `None` is valid only for the
+    /// local-ingest mode (`run_local()`, P2.10 §4.6) which never
+    /// touches NATS.
+    pub nats_url: Option<String>,
+
+    /// UDS path for the local-ingest listener (`SIE_SIDECAR_LOCAL_SOCKET`).
+    /// Only read by `run_local()`; `None` on NATS deployments.
+    pub local_socket_path: Option<PathBuf>,
 
     /// Pool name — drives the stream (`WORK_POOL_{pool}`), durable consumer
     /// (`{pool}_{machine_profile}_{bundle}`), and subject filters.
@@ -18,10 +25,14 @@ pub struct WorkerConfig {
     /// so multiple bundles on the same pool don't step on each other.
     pub bundle: String,
 
-    /// Unix domain socket used to talk to the colocated backend IPC server.
+    /// Primary Unix domain socket used to talk to the colocated adapter worker.
     pub ipc_socket_path: PathBuf,
 
-    /// Number of concurrent IPC connections to the backend process. `1`
+    /// Unix domain sockets used to talk to adapter worker children. Defaults to
+    /// [`Self::ipc_socket_path`] for the single-worker baseline.
+    pub ipc_socket_paths: Vec<PathBuf>,
+
+    /// Number of concurrent IPC connections to each adapter worker process. `1`
     /// preserves the legacy single-socket behaviour; higher values let
     /// the dispatcher's `SIE_MAX_CONCURRENT_BATCHES` actually drive
     /// parallel backend-side batches. Sourced from `SIE_IPC_POOL_SIZE`
@@ -29,11 +40,11 @@ pub struct WorkerConfig {
     /// `SIE_MAX_CONCURRENT_BATCHES`'s default (4).
     pub ipc_pool_size: usize,
 
-    /// Per-RPC timeout for ordinary sidecar-to-backend IPC calls. Sourced from
+    /// Per-RPC timeout for ordinary sidecar → adapter IPC calls. Sourced from
     /// `SIE_IPC_REQUEST_TIMEOUT_S`.
     pub ipc_request_timeout_s: u64,
 
-    /// Timeout for sidecar-to-backend `EnsureModelReady` calls. Must be at least
+    /// Timeout for sidecar → adapter `EnsureModelReady` calls. Must be at least
     /// as long as the slowest expected cold start; SGLang adapters may
     /// legitimately spend many minutes loading large models before they can
     /// answer the readiness handshake. Sourced from
@@ -78,7 +89,7 @@ pub struct WorkerConfig {
     /// IPC `Ping`.
     pub worker_id: String,
 
-    /// How often to send `Ping` RPCs to the backend process.
+    /// How often to send `Ping` RPCs to adapter worker processes.
     pub ping_interval_ms: u64,
 
     /// Multiplier applied to `ping_interval_ms` to compute the
@@ -88,7 +99,7 @@ pub struct WorkerConfig {
     ///
     /// Default `3`. Override with `SIE_WORKER_READYZ_STALE_MULT`
     /// when ops want a looser bound (e.g. `5` to roughly match the
-    /// Python adapter's historical 10 s window with a 2 s ping).
+    /// adapter worker's historical 10 s window with a 2 s ping).
     /// `0` falls back to the default at construction time so a
     /// misconfigured env var doesn't make the pod look unready on
     /// the very tick after a successful ping.
@@ -202,10 +213,12 @@ mod tests {
 
     fn sample() -> WorkerConfig {
         WorkerConfig {
-            nats_url: "nats://localhost:4222".into(),
+            nats_url: Some("nats://localhost:4222".into()),
+            local_socket_path: None,
             pool: "l4".into(),
             bundle: "default".into(),
             ipc_socket_path: PathBuf::from("/tmp/sie-ipc.sock"),
+            ipc_socket_paths: vec![PathBuf::from("/tmp/sie-ipc.sock")],
             ipc_pool_size: 1,
             ipc_request_timeout_s: 60,
             model_ready_timeout_s: 900,

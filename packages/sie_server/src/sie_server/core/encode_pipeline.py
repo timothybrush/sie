@@ -102,6 +102,44 @@ class EncodePipeline:
             )
             timing.add_postprocessing_ms(postprocess_ms)
 
+        # Unit-meter fallback: adapters that own their tokenization (flash
+        # packing — the registry preprocessor is a char-count estimator
+        # there) expose real per-item counts via ``EncodeOutput.extra``.
+        # The preprocessor-recorded counts (authoritative too) win when both
+        # exist; malformed/misaligned values are dropped rather than
+        # mis-attributed — metering falls back to its reserve estimate.
+        if timing.input_token_counts is None:
+            extra_counts = encode_output.extra.get("input_token_counts")
+            if (
+                isinstance(extra_counts, list)
+                and len(extra_counts) == len(items)
+                and all(isinstance(count, int) and not isinstance(count, bool) for count in extra_counts)
+            ):
+                timing.input_token_counts = [int(count) for count in extra_counts]
+
+        # Shared metering seam: adapters that own their tokenization but do not
+        # pre-stamp ``extra`` (every flash text encoder — e5/bert_flash,
+        # ColBERT, …) still expose real counts through the base
+        # ``count_input_tokens`` hook, which re-tokenizes ``items`` with the
+        # adapter's own tokenizer (the §P3.5 ground-truth basis). This is a
+        # pure fallback: it never runs when the preprocessor or ``extra``
+        # already recorded counts, so bge-m3(-flash) keep their exact values.
+        # ``None`` (server-backed / image adapters) leaves the meter on its
+        # reserve estimate rather than billing an approximation.
+        if timing.input_token_counts is None:
+            try:
+                adapter = registry.get(model)
+            except KeyError:
+                adapter = None
+            if adapter is not None:
+                counts = await asyncio.to_thread(adapter.count_input_tokens, items)
+                if (
+                    isinstance(counts, list)
+                    and len(counts) == len(items)
+                    and all(isinstance(count, int) and not isinstance(count, bool) for count in counts)
+                ):
+                    timing.input_token_counts = [int(count) for count in counts]
+
         formatted_output = EncodeHandler.format_output(
             encode_output,
             output_types=response_output_types if response_output_types is not None else output_types,
@@ -149,10 +187,12 @@ class EncodePipeline:
                 )
                 if fast_path is not None:
                     timing.end_tokenization()
+                    cls._record_input_token_counts(preprocessor_registry, model, fast_path, timing)
                     return fast_path
 
             prepared_batch = await preprocessor_registry.prepare(model, items, config, is_query=is_query)
             timing.end_tokenization()
+            cls._record_input_token_counts(preprocessor_registry, model, prepared_batch, timing)
             return prepared_batch
 
         # Image path: use image preprocessor if available
@@ -179,6 +219,39 @@ class EncodePipeline:
 
         # No preprocessor available - return None to signal direct adapter call
         return None
+
+    @classmethod
+    def _record_input_token_counts(
+        cls,
+        preprocessor_registry: PreprocessorRegistry,
+        model: str,
+        prepared_batch: PreparedBatch | None,
+        timing: RequestTiming,
+    ) -> None:
+        """Record authoritative per-item input-token counts on ``timing``.
+
+        Only when the model's text preprocessor is the real
+        :class:`TextPreprocessor` — its ``PreparedItem.cost`` is
+        ``len(input_ids)`` from the actual tokenizer. Char-count estimators
+        (``CharCountPreprocessor`` for library-wrapped adapters) are skipped:
+        the unit meter counts, it never approximates, so estimated costs
+        must not masquerade as authoritative counts on the result path.
+        """
+        if prepared_batch is None or not prepared_batch.items:
+            return
+        try:
+            preprocessor = preprocessor_registry.get_preprocessor(model, "text")
+        except Exception:  # noqa: BLE001 — descriptor lookup must never fail the request
+            return
+        if not isinstance(preprocessor, TextPreprocessor):
+            return
+        counts = [0] * len(prepared_batch.items)
+        for prepared in prepared_batch.items:
+            index = prepared.original_index
+            if not isinstance(index, int) or not 0 <= index < len(counts):
+                return  # malformed batch — leave counts unset rather than mis-attribute
+            counts[index] = int(prepared.cost)
+        timing.input_token_counts = counts
 
     @classmethod
     async def _try_fast_path(

@@ -43,7 +43,7 @@ from sie_server.core.pool_isolation import (
 )
 from sie_server.core.postprocessor_registry import PostprocessorRegistry
 from sie_server.core.preprocessor_registry import PreprocessorRegistry
-from sie_server.core.residency import EvictionResult
+from sie_server.core.residency import EvictionResult, select_eviction_candidate
 from sie_server.core.worker import ModelWorker
 from sie_server.core.worker.types import AdaptiveBatchingParams
 from sie_server.observability.metrics import record_idle_eviction
@@ -132,6 +132,25 @@ def _adapter_load_required_bytes(adapter: ModelAdapter, memory_manager: MemoryMa
     return min(required, stats.total_bytes)
 
 
+def _normalize_devices(device: str, devices: list[str] | None) -> list[str]:
+    """Return a non-empty, de-duplicated device list preserving order."""
+    raw_devices = devices or [device]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_devices:
+        item = raw.strip()
+        if not item or item in seen:
+            continue
+        normalized.append(item)
+        seen.add(item)
+    return normalized or [device]
+
+
+def _device_family(device: str) -> str:
+    """Return the root device family (``cuda`` for ``cuda:0``)."""
+    return device.split(":", 1)[0].lower()
+
+
 class ModelRegistry:
     """Registry for managing model configs and loaded models.
 
@@ -155,6 +174,7 @@ class ModelRegistry:
         drain_timeout_s: float = 30.0,
         model_filter: list[str] | None = None,
         device: str = "cpu",
+        devices: list[str] | None = None,
         engine_config: EngineConfig | None = None,
         enable_hot_reload: bool = True,
         pool_name: str | None = None,
@@ -169,6 +189,9 @@ class ModelRegistry:
             drain_timeout_s: Timeout in seconds to wait for worker drain before unload.
             model_filter: Optional list of model names to include. If None, all models are available.
             device: Default device for memory tracking (e.g., "cuda:0", "mps", "cpu").
+            devices: Optional ordered list of devices available to this worker.
+                When set, lazy model loads place whole models across these
+                devices; adapters still receive a single concrete device.
             enable_hot_reload: Whether to enable hot reload of model configs when models_dir is set.
             pool_name: The worker's pool identity (``SIE_POOL``).
                 Used to gate the pool-isolation validator that rejects mixing
@@ -185,6 +208,8 @@ class ModelRegistry:
         self._models_dir: str | None = str(models_dir) if models_dir is not None else None
         self._model_filter = set(model_filter) if model_filter else None
         self._device = device
+        self._devices = _normalize_devices(device, devices)
+        self._device_order = {name: i for i, name in enumerate(self._devices)}
         self._enable_hot_reload = enable_hot_reload
         self._pool_name = pool_name.strip().lower() if pool_name else None
         # Normalised pinned set: bare lowercase sie_ids, never chosen for eviction.
@@ -197,7 +222,13 @@ class ModelRegistry:
         # Share CPU pool between preprocessor and postprocessor registries
         self._postprocessor_registry = PostprocessorRegistry(self._preprocessor_registry._executor)
         self._memory_config = memory_config or MemoryConfig()
-        self._memory_manager = MemoryManager(device=device, config=self._memory_config)
+        self._memory_managers = {
+            device_name: MemoryManager(device=device_name, config=self._memory_config) for device_name in self._devices
+        }
+        # Default manager for callers that operate on the registry's primary
+        # device. Multi-device code paths use ``_memory_manager_for_device``
+        # with the loaded model's concrete device.
+        self._memory_manager = self._memory_managers[self._devices[0]]
         self._drain_timeout_s = drain_timeout_s
 
         # Disk cache management
@@ -533,7 +564,15 @@ class ModelRegistry:
     @property
     def memory_manager(self) -> MemoryManager:
         """Return the memory manager for device memory tracking."""
+        active_managers = [manager for manager in self._memory_managers.values() if manager.loaded_model_count > 0]
+        if len(active_managers) == 1:
+            return active_managers[0]
         return self._memory_manager
+
+    @property
+    def memory_managers(self) -> dict[str, MemoryManager]:
+        """Return memory managers keyed by concrete device."""
+        return dict(self._memory_managers)
 
     @property
     def engine_config(self) -> EngineConfig | None:
@@ -549,6 +588,65 @@ class ModelRegistry:
     def device(self) -> str:
         """Return the default device for model loading."""
         return self._device
+
+    @property
+    def devices(self) -> list[str]:
+        """Return concrete devices available for whole-model placement."""
+        return list(self._devices)
+
+    def _memory_manager_for_device(self, device: str) -> MemoryManager:
+        manager = self._memory_managers.get(device)
+        if manager is None:
+            manager = MemoryManager(device=device, config=self._memory_config)
+            self._memory_managers[device] = manager
+            self._device_order[device] = len(self._device_order)
+        return manager
+
+    def _memory_manager_for_model(self, name: str) -> MemoryManager:
+        loaded = self._loaded.get(name)
+        if loaded is None:
+            return self._memory_manager
+        return self._memory_manager_for_device(loaded.device)
+
+    def _select_device_for_model(self, requested_family: str | None = None) -> str:
+        candidates = [
+            device for device in self._devices if requested_family is None or _device_family(device) == requested_family
+        ]
+
+        def score(device: str) -> tuple[bool, int, int]:
+            manager = self._memory_manager_for_device(device)
+            try:
+                under_pressure = manager.check_pressure()
+            except Exception:
+                logger.exception("Failed to check memory pressure for device %s; keeping it eligible", device)
+                under_pressure = False
+            return (under_pressure, manager.loaded_model_count, self._device_order[device])
+
+        return min(candidates, key=score)
+
+    def _resolve_load_device(self, requested_device: str) -> str:
+        """Resolve a request/default device to one concrete load target."""
+        if len(self._devices) == 1:
+            only_device = self._devices[0]
+            if (
+                requested_device != only_device
+                and _device_family(requested_device) == _device_family(only_device)
+                and ":" in only_device
+                and ":" not in requested_device
+            ):
+                return only_device
+            return requested_device
+        if requested_device in self._memory_managers and requested_device not in self._devices:
+            return requested_device
+        if requested_device in self._devices:
+            return requested_device
+        if ":" in requested_device:
+            return requested_device
+        requested_family = _device_family(requested_device)
+        device_families = {_device_family(device) for device in self._devices}
+        if requested_family in device_families:
+            return self._select_device_for_model(requested_family)
+        return requested_device
 
     def has_model(self, name: str) -> bool:
         """Check if a model config exists in the registry."""
@@ -712,7 +810,7 @@ class ModelRegistry:
         protected from eviction. No-op for a model that is not loaded.
         """
         if name in self._loaded:
-            self._memory_manager.touch(name)
+            self._memory_manager_for_model(name).touch(name)
 
     def load(self, name: str, device: str) -> ModelAdapter:
         """Load a model onto a device.
@@ -739,6 +837,9 @@ class ModelRegistry:
             msg = _ERR_MODEL_ALREADY_LOADED.format(name=name)
             raise ValueError(msg)
 
+        load_device = self._resolve_load_device(device)
+        memory_manager = self._memory_manager_for_device(load_device)
+
         # Ensure model weights are cached (download from HF / cluster cache
         # if needed). Kept as a distinct phase from instantiate so the
         # post-download timeout in ``ModelLoader`` does not cover the
@@ -746,23 +847,24 @@ class ModelRegistry:
         # ``HF_HUB_DOWNLOAD_TIMEOUT`` stall detection only.
         self._loader.ensure_weights_cached(config)
 
-        # Instantiate the adapter with device-aware fallback selection
-        adapter = self._loader.instantiate_adapter(name, config, model_dir, device)
+        # Instantiate the adapter on the resolved concrete device.
+        adapter = self._loader.instantiate_adapter(name, config, model_dir, load_device)
 
-        required_load_bytes = _adapter_load_required_bytes(adapter, self._memory_manager)
-        while self._memory_manager.should_evict_for_load(required_load_bytes):
-            lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+        required_load_bytes = _adapter_load_required_bytes(adapter, memory_manager)
+        while memory_manager.should_evict_for_load(required_load_bytes):
+            lru_model = memory_manager.get_lru_model(exclude=self._pinned_models)
             if lru_model is None:
                 break
 
-            stats = self._memory_manager.get_stats()
+            stats = memory_manager.get_stats()
             logger.info(
-                "Pre-load eviction: %.2f GB free, %.2f GB required, %.1f%% used "
+                "Pre-load eviction: %s %.2f GB free, %.2f GB required, %.1f%% used "
                 "(threshold %.1f%%); evicting '%s' before loading '%s'",
+                load_device,
                 stats.available_gb,
                 (required_load_bytes or 0) / (1024**3),
                 stats.usage_ratio * 100,
-                self._memory_manager.pressure_threshold_pct,
+                memory_manager.pressure_threshold_pct,
                 lru_model,
                 name,
             )
@@ -770,13 +872,13 @@ class ModelRegistry:
 
         # Try to load onto device, with OOM retry
         try:
-            loaded = self._loader.load_and_register(name, device, adapter, config)
+            loaded = self._loader.load_and_register(name, load_device, adapter, config)
         except RuntimeError as e:
             if not self._is_oom_error(e):
                 raise
 
             # OOM - try to evict LRU non-pinned model and retry
-            lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+            lru_model = memory_manager.get_lru_model(exclude=self._pinned_models)
             if lru_model is None:
                 logger.error("OOM loading '%s' but no non-pinned models to evict", name)
                 raise
@@ -790,14 +892,14 @@ class ModelRegistry:
 
             # Retry once after eviction - weights still on disk so we
             # skip ``ensure_weights_cached`` here.
-            adapter = self._loader.instantiate_adapter(name, config, model_dir, device)
-            loaded = self._loader.load_and_register(name, device, adapter, config)
+            adapter = self._loader.instantiate_adapter(name, config, model_dir, load_device)
+            loaded = self._loader.load_and_register(name, load_device, adapter, config)
 
         # Track loaded state
         self._loaded[name] = loaded
 
         # Register with memory manager for LRU tracking
-        self._memory_manager.register_model(name, estimated_bytes=loaded.memory_bytes)
+        self._memory_manager_for_device(loaded.device).register_model(name, estimated_bytes=loaded.memory_bytes)
 
         # Clear any stale failure record from a prior attempt.
         self._failed.pop(name, None)
@@ -834,14 +936,18 @@ class ModelRegistry:
         async with lock:
             # Double-check after acquiring lock (another request may have loaded it)
             if name in self._loaded:
-                self._memory_manager.touch(name)
+                self._memory_manager_for_model(name).touch(name)
                 return self._loaded[name].adapter
+
+            load_device = self._resolve_load_device(device)
+            memory_manager = self._memory_manager_for_device(load_device)
 
             # Check if model is being unloaded - caller should retry
             if name in self._unloading:
                 msg = f"Model '{name}' is currently being unloaded"
                 raise RuntimeError(msg)
 
+            config = self._configs[name]
             config = self._configs[name]
 
             # Mark as loading before starting (visible to WebSocket status)
@@ -859,14 +965,14 @@ class ModelRegistry:
                 await self._loader.ensure_weights_cached_async(name, config)
 
                 # Instantiate adapter (in thread pool, post-download timeout applies)
-                adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, device)
+                adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, load_device)
 
-                required_load_bytes = _adapter_load_required_bytes(adapter, self._memory_manager)
+                required_load_bytes = _adapter_load_required_bytes(adapter, memory_manager)
 
                 # Pre-load eviction: evict LRU non-pinned models until current pressure
                 # and any adapter-provided load headroom requirement are satisfied.
-                while self._memory_manager.should_evict_for_load(required_load_bytes):
-                    lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+                while memory_manager.should_evict_for_load(required_load_bytes):
+                    lru_model = memory_manager.get_lru_model(exclude=self._pinned_models)
                     if lru_model is None:
                         break  # No non-pinned models to evict, proceed with load attempt
 
@@ -880,17 +986,18 @@ class ModelRegistry:
                             "Evictor found ghost '%s' (in memory manager, not loaded); dropping stale entry",
                             lru_model,
                         )
-                        self._memory_manager.unregister_model(lru_model)
+                        memory_manager.unregister_model(lru_model)
                         continue
 
-                    stats = self._memory_manager.get_stats()
+                    stats = memory_manager.get_stats()
                     logger.info(
-                        "Pre-load eviction: %.2f GB free, %.2f GB required, %.1f%% used "
+                        "Pre-load eviction: %s %.2f GB free, %.2f GB required, %.1f%% used "
                         "(threshold %.1f%%); evicting '%s' before loading '%s'",
+                        load_device,
                         stats.available_gb,
                         (required_load_bytes or 0) / (1024**3),
                         stats.usage_ratio * 100,
-                        self._memory_manager.pressure_threshold_pct,
+                        memory_manager.pressure_threshold_pct,
                         lru_model,
                         name,
                     )
@@ -898,13 +1005,13 @@ class ModelRegistry:
 
                 try:
                     # Load onto device (loader handles main thread vs executor)
-                    loaded = await self._loader.load_and_register_async(name, device, adapter, config)
+                    loaded = await self._loader.load_and_register_async(name, load_device, adapter, config)
                 except RuntimeError as e:
                     if not self._is_oom_error(e):
                         raise
 
                     # OOM despite pre-load eviction: evict LRU non-pinned model and retry once
-                    lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
+                    lru_model = memory_manager.get_lru_model(exclude=self._pinned_models)
                     if lru_model is None:
                         logger.error("OOM loading '%s' but no non-pinned models to evict", name)
                         raise
@@ -918,14 +1025,17 @@ class ModelRegistry:
 
                     # Retry once after eviction. Weights are still cached
                     # on disk so we skip ``ensure_weights_cached_async``.
-                    adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, device)
-                    loaded = await self._loader.load_and_register_async(name, device, adapter, config)
+                    adapter = await self._loader.instantiate_adapter_async(name, config, model_dir, load_device)
+                    loaded = await self._loader.load_and_register_async(name, load_device, adapter, config)
 
                 # Track loaded state
                 self._loaded[name] = loaded
 
                 # Register with memory manager for LRU tracking
-                self._memory_manager.register_model(name, estimated_bytes=loaded.memory_bytes)
+                self._memory_manager_for_device(loaded.device).register_model(
+                    name,
+                    estimated_bytes=loaded.memory_bytes,
+                )
 
                 load_duration = time.monotonic() - load_start
                 if load_duration > 300:
@@ -1103,7 +1213,7 @@ class ModelRegistry:
         self._loader.unregister(name, device)
 
         # Unregister from memory manager
-        self._memory_manager.unregister_model(name)
+        self._memory_manager_for_device(device).unregister_model(name)
 
         logger.info("Model '%s' unloaded", name)
 
@@ -1198,7 +1308,7 @@ class ModelRegistry:
                 except Exception:  # noqa: BLE001 - best-effort; must not skip below
                     logger.warning("loader.unregister failed during unload of '%s'", name, exc_info=True)
                 # Unregister from memory manager (a plain dict-pop; never raises)
-                self._memory_manager.unregister_model(name)
+                self._memory_manager_for_device(device).unregister_model(name)
 
             # Freeing memory makes any prior OOM-class load failure on a
             # *sibling* model retryable; clear those records so the next
@@ -1610,7 +1720,7 @@ class ModelRegistry:
                 msg = f"Worker not available for model '{name}'"
                 raise RuntimeError(msg)
 
-            self._memory_manager.touch(name)
+            self._memory_manager_for_model(name).touch(name)
 
             if not worker.is_running:
                 await worker.start()
@@ -1702,30 +1812,32 @@ class ModelRegistry:
             return EvictionResult.LOCK_TIMEOUT
 
         try:
-            # Walk LRU order and pick the first that is not ``exclude_name``,
-            # not pinned, and is still loaded (the OrderedDict in the memory
-            # manager may include entries already torn down by another path).
-            for candidate in self._memory_manager.loaded_models:
-                if candidate == exclude_name:
-                    continue
-                if self._is_pinned(candidate):
-                    continue
-                if candidate not in self._loaded:
-                    continue
-                if candidate in self._unloading:
-                    continue
-                logger.info(
-                    "OOM recovery: evicting LRU sibling '%s' (caller='%s')",
-                    candidate,
-                    exclude_name,
-                )
-                try:
-                    await self._do_unload(candidate)
-                except Exception:
-                    logger.exception("OOM recovery: failed to evict '%s'", candidate)
-                    return EvictionResult.UNLOAD_FAILED
-                return EvictionResult.EVICTED
-            return EvictionResult.NO_CANDIDATE
+            manager = self._memory_manager_for_model(exclude_name)
+            # Residency policy owns the *decision* (which sibling to evict);
+            # the registry owns the *action* (draining + unloading it). Use
+            # the caller's device-local LRU order so multi-device OOM recovery
+            # frees memory on the GPU that actually hit pressure.
+            candidate = select_eviction_candidate(
+                manager.loaded_models,
+                exclude_name=exclude_name,
+                is_pinned=self._is_pinned,
+                loaded=self._loaded,
+                unloading=self._unloading,
+            )
+            if candidate is None:
+                return EvictionResult.NO_CANDIDATE
+            logger.info(
+                "OOM recovery: evicting LRU sibling '%s' on %s (caller='%s')",
+                candidate,
+                manager.device,
+                exclude_name,
+            )
+            try:
+                await self._do_unload(candidate)
+            except Exception:
+                logger.exception("OOM recovery: failed to evict '%s'", candidate)
+                return EvictionResult.UNLOAD_FAILED
+            return EvictionResult.EVICTED
         finally:
             lock.release()
 
@@ -1831,7 +1943,11 @@ class ModelRegistry:
         while self._idle_evict_running:
             try:
                 await asyncio.sleep(interval)
-                stale = self._memory_manager.get_idle_models(idle_threshold_s=threshold, exclude=self._pinned_models)
+                stale = [
+                    name
+                    for manager in self._memory_managers.values()
+                    for name in manager.get_idle_models(idle_threshold_s=threshold, exclude=self._pinned_models)
+                ]
                 if not stale:
                     continue
 
@@ -1843,7 +1959,7 @@ class ModelRegistry:
                         # arrived after the snapshot.
                         if name not in self._loaded:
                             continue
-                        info = self._memory_manager.get_model_info(name)
+                        info = self._memory_manager_for_model(name).get_model_info(name)
                         if info is None:
                             continue
                         age = time.monotonic() - info.last_used_at
@@ -1921,48 +2037,49 @@ class ModelRegistry:
                 await asyncio.sleep(self._memory_config.memory_check_interval_s)
 
                 # Quick check without lock
-                if not self._memory_manager.check_pressure():
+                pressured_managers = [manager for manager in self._memory_managers.values() if manager.check_pressure()]
+                if not pressured_managers:
                     continue
 
                 # Pressure detected - acquire lock and evict
                 lock = self._get_load_lock()
                 async with lock:
-                    # Re-check under lock (may have resolved)
-                    while self._memory_manager.check_pressure():
-                        # Don't evict if only 1 model loaded - would cause immediate reload
-                        if self._memory_manager.loaded_model_count <= 1:
-                            logger.debug(
-                                "Memory pressure detected but only %d model loaded, skipping eviction",
-                                self._memory_manager.loaded_model_count,
-                            )
-                            break
+                    for manager in pressured_managers:
+                        # Re-check under lock (may have resolved)
+                        while manager.check_pressure():
+                            # Don't evict if only 1 model loaded - would cause immediate reload
+                            if manager.loaded_model_count <= 1:
+                                logger.debug(
+                                    "Memory pressure detected on %s but only %d model loaded, skipping eviction",
+                                    manager.device,
+                                    manager.loaded_model_count,
+                                )
+                                break
 
-                        lru_model = self._memory_manager.get_lru_model(exclude=self._pinned_models)
-                        if lru_model is None:
-                            logger.debug(
-                                "Memory pressure detected but no non-pinned models to evict, skipping",
-                            )
-                            break
+                            lru_model = manager.get_lru_model(exclude=self._pinned_models)
+                            if lru_model is None:
+                                break
 
-                        if lru_model not in self._loaded:
-                            # Belt-and-braces ghost guard (see #1600): drop a
-                            # stale MemoryManager entry with no ``_loaded``
-                            # model instead of spinning on a no-op _do_unload.
-                            logger.warning(
-                                "Memory monitor found ghost '%s' (not loaded); dropping stale entry",
+                            if lru_model not in self._loaded:
+                                # Belt-and-braces ghost guard (see #1600): drop a
+                                # stale MemoryManager entry with no ``_loaded``
+                                # model instead of spinning on a no-op _do_unload.
+                                logger.warning(
+                                    "Memory monitor found ghost '%s' (not loaded); dropping stale entry",
+                                    lru_model,
+                                )
+                                manager.unregister_model(lru_model)
+                                continue
+
+                            stats = manager.get_stats()
+                            logger.info(
+                                "Memory monitor: %s pressure %.1f%% > %.1f%% threshold, evicting LRU model '%s'",
+                                manager.device,
+                                stats.usage_ratio * 100,
+                                manager.pressure_threshold_pct,
                                 lru_model,
                             )
-                            self._memory_manager.unregister_model(lru_model)
-                            continue
-
-                        stats = self._memory_manager.get_stats()
-                        logger.info(
-                            "Memory monitor: pressure %.1f%% > %.1f%% threshold, evicting LRU model '%s'",
-                            stats.usage_ratio * 100,
-                            self._memory_manager.pressure_threshold_pct,
-                            lru_model,
-                        )
-                        await self._do_unload(lru_model)
+                            await self._do_unload(lru_model)
 
             except asyncio.CancelledError:
                 break

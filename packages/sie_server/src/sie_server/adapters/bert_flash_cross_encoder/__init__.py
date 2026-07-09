@@ -44,6 +44,7 @@ class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
         trust_remote_code: bool = False,
         max_seq_length: int = 512,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -53,6 +54,8 @@ class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
             trust_remote_code: Whether to trust remote code.
             max_seq_length: Maximum sequence length for query+document.
             compute_precision: Compute precision (float16, bfloat16, float32).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored).
         """
         _ = kwargs
@@ -60,6 +63,7 @@ class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
         self._trust_remote_code = trust_remote_code
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         # Loaded state
         self._model: Any = None
@@ -102,10 +106,14 @@ class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
             self._dtype,
         )
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # Load model with eager attention (we handle flash attention manually)
@@ -113,7 +121,7 @@ class BertFlashCrossEncoderAdapter(FlashBaseAdapter):
             self._model_name_or_path,
             torch_dtype=self._dtype,
             attn_implementation="eager",
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()

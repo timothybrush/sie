@@ -7,7 +7,7 @@
 //! - xxh3 prefix-truncation semantics.
 //! - Privacy: `fmt_key_hash` never reveals the raw string; `xxh:` prefix only.
 
-use super::hrw::{pick_worker, RingSnapshot};
+use super::hrw::{pick_worker, RingEntry, RingSnapshot};
 use super::key::{
     derive_prefix_key, derive_prefix_key_with, hash_bytes, resolve, resolve_with_prefix, KeySource,
     PrefixConfig, PROMPT_PREFIX_BYTES,
@@ -114,6 +114,36 @@ fn duplicate_worker_ids_hash_and_tiebreak_identically() {
         snap.entries[1].worker_id_hash
     );
     assert_eq!(snap.entries[0].worker_id, snap.entries[1].worker_id);
+}
+
+#[test]
+fn pick_prefers_lower_pressure_over_hrw_winner() {
+    let key = resolve(Some("pressure-key"), None, None, None);
+    let pure = RingSnapshot::new(vec!["busy".to_string(), "idle".to_string()]);
+    let pure_winner = pick_worker(&pure, &key).expect("pure HRW winner");
+    let other = if pure_winner == "busy" {
+        "idle"
+    } else {
+        "busy"
+    };
+
+    let snap = RingSnapshot::from_entries([
+        RingEntry::with_pressure(pure_winner, 1, 100, 1000, 10),
+        RingEntry::with_pressure(other, 1, 0, 0, 0),
+    ]);
+
+    assert_eq!(pick_worker(&snap, &key), Some(other));
+}
+
+#[test]
+fn pick_normalizes_pressure_by_ready_gpu_slots() {
+    let key = resolve(Some("slot-pressure-key"), None, None, None);
+    let snap = RingSnapshot::from_entries([
+        RingEntry::with_pressure("wide", 4, 4, 40, 4),
+        RingEntry::with_pressure("narrow", 1, 2, 20, 2),
+    ]);
+
+    assert_eq!(pick_worker(&snap, &key), Some("wide"));
 }
 
 #[test]

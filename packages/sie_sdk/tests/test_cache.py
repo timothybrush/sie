@@ -14,6 +14,7 @@ from sie_sdk.cache import (
     ensure_model_cached,
     get_cache_config,
     is_model_cached,
+    populate_cluster_cache,
 )
 from sie_sdk.exceptions import GatedModelError
 
@@ -245,6 +246,96 @@ class TestCacheHierarchy:
 
             # Should have tried cluster cache
             mock_get.assert_called_once()
+
+
+class TestPopulateClusterCache:
+    """Tests for populate_cluster_cache()."""
+
+    @staticmethod
+    def _cached_model(local_cache: Path, model_id: str = "BAAI/bge-m3") -> Path:
+        """Create an HF-style cached model directory and return its root."""
+        model_dir = local_cache / f"models--{model_id.replace('/', '--')}"
+        snapshot = model_dir / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.safetensors").write_text("weights")
+        (snapshot / "config.json").write_text("{}")
+        return model_dir
+
+    def test_no_cluster_cache_configured(self, tmp_path: Path) -> None:
+        """Returns False without touching storage when cluster cache is unset."""
+        self._cached_model(tmp_path)
+        config = CacheConfig(local_cache=tmp_path, cluster_cache=None)
+
+        with patch("sie_sdk.cache.get_storage_backend") as mock_get:
+            assert populate_cluster_cache("BAAI/bge-m3", config) is False
+            mock_get.assert_not_called()
+
+    def test_model_not_in_local_cache(self, tmp_path: Path) -> None:
+        """Returns False without touching storage when the model is not cached."""
+        config = CacheConfig(local_cache=tmp_path, cluster_cache="s3://bucket/cache")
+
+        with patch("sie_sdk.cache.get_storage_backend") as mock_get:
+            assert populate_cluster_cache("BAAI/bge-m3", config) is False
+            mock_get.assert_not_called()
+
+    def test_uploads_model_directory(self, tmp_path: Path) -> None:
+        """Happy path: uploads the model dir to the mirrored cluster path."""
+        model_dir = self._cached_model(tmp_path)
+        config = CacheConfig(local_cache=tmp_path, cluster_cache="s3://bucket/cache")
+
+        with patch("sie_sdk.cache.get_storage_backend") as mock_get:
+            mock_backend = MagicMock()
+            mock_backend.upload_directory.return_value = 2
+            mock_get.return_value = mock_backend
+
+            assert populate_cluster_cache("BAAI/bge-m3", config) is True
+
+            mock_get.assert_called_once_with("s3://bucket/cache")
+            mock_backend.upload_directory.assert_called_once_with(
+                model_dir,
+                "s3://bucket/cache/models--BAAI--bge-m3",
+            )
+
+    def test_zero_files_uploaded_returns_false(self, tmp_path: Path) -> None:
+        """Backend reporting zero uploaded files is surfaced as failure."""
+        self._cached_model(tmp_path)
+        config = CacheConfig(local_cache=tmp_path, cluster_cache="s3://bucket/cache")
+
+        with patch("sie_sdk.cache.get_storage_backend") as mock_get:
+            mock_backend = MagicMock()
+            mock_backend.upload_directory.return_value = 0
+            mock_get.return_value = mock_backend
+
+            assert populate_cluster_cache("BAAI/bge-m3", config) is False
+
+    def test_reads_config_from_environment(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """config=None resolves via get_cache_config() (env variables)."""
+        self._cached_model(tmp_path)
+        monkeypatch.setenv("SIE_LOCAL_CACHE", str(tmp_path))
+        monkeypatch.setenv("SIE_CLUSTER_CACHE", "s3://env-bucket/cache")
+
+        with patch("sie_sdk.cache.get_storage_backend") as mock_get:
+            mock_backend = MagicMock()
+            mock_backend.upload_directory.return_value = 1
+            mock_get.return_value = mock_backend
+
+            assert populate_cluster_cache("BAAI/bge-m3") is True
+            mock_get.assert_called_once_with("s3://env-bucket/cache")
+
+    def test_roundtrip_with_local_backend(self, tmp_path: Path) -> None:
+        """Uploading via the real LocalBackend mirrors the HF cache layout."""
+        local_cache = tmp_path / "local"
+        local_cache.mkdir()
+        self._cached_model(local_cache)
+        cluster = tmp_path / "cluster"
+        cluster.mkdir()
+
+        config = CacheConfig(local_cache=local_cache, cluster_cache=str(cluster))
+
+        assert populate_cluster_cache("BAAI/bge-m3", config) is True
+        uploaded = cluster / "models--BAAI--bge-m3" / "snapshots" / "abc123"
+        assert (uploaded / "model.safetensors").read_text() == "weights"
+        assert (uploaded / "config.json").read_text() == "{}"
 
 
 class TestGatedModelErrorHandling:

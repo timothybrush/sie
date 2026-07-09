@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from sie_langchain import SIEEmbeddings, SIESparseEncoder
 
@@ -76,6 +78,20 @@ class TestSIEEmbeddings:
 
         call_kwargs = mock_sie_client.encode.call_args[1]
         assert call_kwargs["instruction"] == "Represent this for search:"
+
+    def test_api_key_forwarded_to_sync_client(self) -> None:
+        """api_key must reach the lazily-created SIEClient as a Bearer header (design §9.4)."""
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            embeddings = SIEEmbeddings(base_url="http://localhost:8080", api_key="sk-sie-test")
+            client = embeddings.client
+            call_kwargs = mock_client.call_args.kwargs
+            assert call_kwargs["headers"]["Authorization"] == "Bearer sk-sie-test"
+            client.close()
+
+    def test_api_key_forwarded_to_async_client(self) -> None:
+        """api_key must reach the lazily-created SIEAsyncClient (design §9.4)."""
+        embeddings = SIEEmbeddings(base_url="http://localhost:8080", api_key="sk-sie-test")
+        assert embeddings.async_client._api_key == "sk-sie-test"
 
 
 class TestSIEEmbeddingsAsync:
@@ -219,3 +235,12 @@ class TestSIESparseEncoder:
         encoder = SIESparseEncoder(model="test-model")
 
         assert encoder._client is None
+
+    def test_api_key_forwarded_to_sync_client(self) -> None:
+        """api_key must reach the lazily-created SIEClient as a Bearer header (design §9.4)."""
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            encoder = SIESparseEncoder(base_url="http://localhost:8080", api_key="sk-sie-test")
+            client = encoder.client
+            call_kwargs = mock_client.call_args.kwargs
+            assert call_kwargs["headers"]["Authorization"] == "Bearer sk-sie-test"
+            client.close()

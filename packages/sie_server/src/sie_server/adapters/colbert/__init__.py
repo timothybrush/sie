@@ -98,6 +98,7 @@ class ColBERTAdapter(BaseAdapter):
         query_expansion: bool = True,
         doc_punctuation_skiplist: bool = True,
         muvera_config: dict[str, Any] | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -127,10 +128,14 @@ class ColBERTAdapter(BaseAdapter):
                 not). Default: True.
             muvera_config: MUVERA configuration dict with keys like num_repetitions,
                 num_simhash_projections, normalize. Used for FDE postprocessing.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading the tokenizer, config, model, and Dense-chain/projection
+                artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
+        self._revision = revision
         self._token_dim = token_dim
         self._normalize = normalize
         self._max_seq_length = max_seq_length
@@ -171,15 +176,20 @@ class ColBERTAdapter(BaseAdapter):
         dtype = self._resolve_dtype()
 
         logger.info(
-            "Loading ColBERT model %s on device=%s with dtype=%s",
+            "Loading ColBERT model %s on device=%s with dtype=%s revision=%s",
             self._model_name_or_path,
             device,
             dtype,
+            self._revision,
         )
+
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": True}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=True,
+            **shared_kwargs,
         )
 
         # Register prefix tokens (e.g. [Q], [D]) as special tokens if they are
@@ -240,7 +250,7 @@ class ColBERTAdapter(BaseAdapter):
         # Determine whether to use native attention or manual flash attention
         config = AutoConfig.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=True,
+            **shared_kwargs,
         )
         self._native_mode = self._is_cuda and self._should_use_native_mode(config)
 
@@ -257,7 +267,7 @@ class ColBERTAdapter(BaseAdapter):
                 self._model_name_or_path,
                 torch_dtype=dtype,
                 attn_implementation=attn_impl,
-                trust_remote_code=True,
+                **shared_kwargs,
             )
         else:
             # Load model with eager attention - we'll run our own flash attention
@@ -266,7 +276,7 @@ class ColBERTAdapter(BaseAdapter):
                 self._model_name_or_path,
                 torch_dtype=dtype,
                 attn_implementation="eager",
-                trust_remote_code=True,
+                **shared_kwargs,
             )
 
         # Resize token embeddings if we added new prefix tokens above.
@@ -291,6 +301,7 @@ class ColBERTAdapter(BaseAdapter):
             token_dim=self._token_dim,
             device=self._device,
             dtype=dtype,
+            revision=self._revision,
         )
         # Check for linear projection layer (ColBERT-specific)
         # Different ColBERT implementations use different names
@@ -401,7 +412,7 @@ class ColBERTAdapter(BaseAdapter):
 
             # Try to get safetensors file
             try:
-                file_path = hf_hub_download(self._model_name_or_path, "model.safetensors")
+                file_path = hf_hub_download(self._model_name_or_path, "model.safetensors", revision=self._revision)
             except (OSError, ValueError):
                 return None
 

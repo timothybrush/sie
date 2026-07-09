@@ -46,6 +46,7 @@ class NLIClassificationFlashAdapter(FlashBaseAdapter):
         multi_label: bool = False,
         max_length: int = 512,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize native NLI classification adapter.
@@ -58,6 +59,8 @@ class NLIClassificationFlashAdapter(FlashBaseAdapter):
                 If False, use softmax for mutually exclusive labels.
             max_length: Maximum sequence length for tokenization.
             compute_precision: Precision for inference (float16, bfloat16, float32).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         _ = kwargs
@@ -66,6 +69,7 @@ class NLIClassificationFlashAdapter(FlashBaseAdapter):
         self._multi_label = multi_label
         self._max_length = max_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         # Loaded state
         self._model: Any = None
@@ -95,12 +99,17 @@ class NLIClassificationFlashAdapter(FlashBaseAdapter):
             device,
         )
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load tokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load model (use 'dtype' not deprecated 'torch_dtype')
         self._model = AutoModelForSequenceClassification.from_pretrained(
             self._model_name_or_path,
+            **shared_kwargs,
         )
         self._model = self._model.to(dtype=self._dtype)
         self._model.to(device)

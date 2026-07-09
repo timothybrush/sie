@@ -9,12 +9,12 @@
 # which the registry classifies as ``DEPENDENCY``.
 sie_id: google/embeddinggemma-300m
 hf_id: google/embeddinggemma-300m
-# Track the default branch. Note: ``main`` is mutable on the Hub, so
-# this does NOT guarantee bit-for-bit reproducibility — it merely names
-# the branch we expect HuggingFace to resolve. For a true pin, replace
-# this with an immutable commit SHA after verifying the new revision
-# against ``test_google_embeddinggemma_300m_dense``.
-hf_revision: main
+# Pinned to an immutable commit SHA (design §6.6): a served id maps to
+# identical weights forever. ``main`` was mutable and did NOT guarantee
+# bit-for-bit reproducibility; resolved 2026-07-05 via the HF metadata API.
+# A weights change must be published as a NEW versioned id, not a re-pin
+# under this id (re-verify against ``test_google_embeddinggemma_300m_dense``).
+hf_revision: 57c266a740f537b4dc058e1b0cda161fd15afa75
 inputs:
   text: true
   image: false

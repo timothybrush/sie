@@ -601,15 +601,20 @@ optional client traceparent
 
 `/v1/embeddings` is rewritten to `/v1/encode`, and the gateway explicitly forwards `traceparent` / `tracestate` onto the queue work item. `gateway.publish` is opened only when the exporter is active; otherwise the gateway scopes the inbound context over publish so downstream workers can still attach to the caller's trace. The sidecar opens `sidecar.dispatch` around the coalesced batch, then serializes that span back onto IPC items so `worker.run_batch` nests under it. If the sidecar exporter is off, it falls back to the original gateway context.
 
+On multi-GPU worker pods, this same sidecar hop is where non-generation work is assigned to the model's placed child GPU before IPC dispatch; `/v1/embeddings` inherits that behavior after the encode rewrite.
+
 Generation path (`/v1/generate`, `/v1/chat/completions`):
 
 ```
 optional client traceparent
   -> gateway.proxy_generate or gateway.proxy_chat
+  -> worker-sidecar IPC ProcessGenerate
   -> worker.streaming_processor
 ```
 
-Streaming generation bypasses the sidecar. The gateway opens `gateway.proxy_generate` (the OTel-renamed export of the internal `gateway.proxy` tracing span) for native generation or `gateway.proxy_chat` for OpenAI-compatible chat, injects that context into the streaming work item, and the Python worker extracts it before `worker.streaming_processor`.
+Streaming generation goes through the worker-sidecar. The gateway opens `gateway.proxy_generate` (the OTel-renamed export of the internal `gateway.proxy` tracing span) for native generation or `gateway.proxy_chat` for OpenAI-compatible chat, injects that context into the streaming work item, and publishes the item to the worker-direct generation stream. The sidecar receives the generation item, resolves any offloaded payload, selects the model's placed child GPU, forwards `ProcessGenerate` over that child's IPC socket, and publishes Python's streaming events back to the gateway reply subject. The Python worker extracts the gateway trace context before `worker.streaming_processor`.
+
+Multi-GPU caveat: one hot generation model is still bound to one child GPU at a time. This does not shard one model across N GPUs and does not replicate the same model across all child GPUs. Multiple generation models can be placed across children; the same model stays sticky to its child unless that child becomes unready or fails.
 
 Batch fan-in parents on the first valid inbound context and records the remaining distinct valid contexts as OpenTelemetry links. The sidecar does this before `sidecar.dispatch`; Python and Rust workers do the same before `worker.run_batch`. The propagator is installed even when export is off, so trace context flows with tracing disabled. Runtime shutdown uses a bounded ~3 s trace flush. The Helm default sampler is `parentbased_traceidratio` at `0.05`, which preserves inbound sampling decisions and samples 5% of new roots.
 

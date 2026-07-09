@@ -46,6 +46,7 @@ impl EncodeItemHandle {
             tokenization_ms: None,
             postprocessing_ms: None,
             raw_output: None,
+            units: None,
         }
     }
 }
@@ -68,6 +69,7 @@ pub fn encode_error_outcome(item: &EncodeBatchItem, code: &str, message: String)
         tokenization_ms: None,
         postprocessing_ms: None,
         raw_output: None,
+        units: None,
     }
 }
 
@@ -90,6 +92,7 @@ pub fn encode_error_outcome_score(
         tokenization_ms: None,
         postprocessing_ms: None,
         raw_output: None,
+        units: None,
     }
 }
 

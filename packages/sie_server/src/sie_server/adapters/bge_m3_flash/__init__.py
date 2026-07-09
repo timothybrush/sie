@@ -57,6 +57,7 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
         normalize: bool = True,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -66,6 +67,8 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
             normalize: Whether to L2-normalize dense embeddings.
             max_seq_length: Maximum sequence length (default 8192).
             compute_precision: Compute precision (float16 recommended for flash).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -73,6 +76,7 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: XLMRobertaModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -105,13 +109,18 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
             dtype,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load model with eager attention - we'll run our own flash attention
         self._model = AutoModel.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation="eager",  # We handle attention manually
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -129,7 +138,7 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
         # Resolve the actual directory: could be a local path or HF model ID
         base_path = Path(model_path)
         if not base_path.is_dir():
-            base_path = Path(snapshot_download(model_path))
+            base_path = Path(snapshot_download(model_path, revision=self._revision))
 
         colbert_path = base_path / "colbert_linear.pt"
         if colbert_path.exists():
@@ -232,7 +241,15 @@ class BGEM3FlashAdapter(BGEM3ScoreMixin, PEFTLoRAMixin, FlashBaseAdapter):
                 normalize=normalize,
             )
 
-        return self._to_inference_output(results, output_types, len(items), is_query)
+        output = self._to_inference_output(results, output_types, len(items), is_query)
+        # Unit-meter seam: this adapter owns tokenization (the registry-level
+        # preprocessor for flash adapters is a char-count ESTIMATOR), so the
+        # real per-item token counts exist only here. Expose them through
+        # ``EncodeOutput.extra`` — the designated adapter-extension point —
+        # aligned 1:1 with ``items``; the encode pipeline forwards them to
+        # the result path for metering (never estimates).
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     # score() and score_pairs() are provided by BGEM3ScoreMixin.
 

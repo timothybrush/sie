@@ -12,7 +12,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SIEClient } from "../src/client.js";
-import { ProvisioningError, RequestError, SIEConnectionError, ServerError } from "../src/errors.js";
+import {
+  ProvisioningError,
+  RequestError,
+  ResourceExhaustedError,
+  SIEConnectionError,
+  ServerError,
+} from "../src/errors.js";
 import { packMessage, unpackMessage } from "../src/msgpack.js";
 
 // Mock fetch globally
@@ -510,10 +516,14 @@ describe("SIEClient error handling", () => {
   });
 
   it("should throw SIEConnectionError for fetch failures", async () => {
-    // User scenario: "The server is down"
+    // User scenario: "The server is down". waitForCapacity now defaults to
+    // true (Python-SDK parity), so opt out to fail fast instead of retrying
+    // the connect error for the whole provision budget.
     mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
 
-    await expect(client.encode("bge-m3", { text: "test" })).rejects.toThrow(SIEConnectionError);
+    await expect(
+      client.encode("bge-m3", { text: "test" }, { waitForCapacity: false }),
+    ).rejects.toThrow(SIEConnectionError);
   });
 
   it("should throw SIEConnectionError for timeout", async () => {
@@ -761,6 +771,269 @@ describe("SIEClient retry on connection errors and provisioning 503s", () => {
 
     expect(result.dense).toBeInstanceOf(Float32Array);
     expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+
+  it("defaults waitForCapacity to true (Python-SDK parity)", async () => {
+    // No explicit waitForCapacity anywhere: the constructor default must
+    // now retry 503 PROVISIONING instead of failing fast.
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "PROVISIONING", message: "provisioning" } }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMsgpackResponse({
+          items: [{ dense: { values: new Float32Array([0.1]) } }],
+        }),
+      );
+
+    const promise = client.encode("bge-m3", { text: "test" });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await promise;
+
+    expect(result.dense).toBeInstanceOf(Float32Array);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+});
+
+describe("SIEClient retry on 503 RESOURCE_EXHAUSTED and 504 gateway timeout", () => {
+  beforeEach(() => {
+    mockFetch.mockClear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function oomResponse(headers: Record<string, string> = {}): Response {
+    return new Response(
+      JSON.stringify({ error: { code: "RESOURCE_EXHAUSTED", message: "out of memory" } }),
+      { status: 503, headers: { "Content-Type": "application/json", ...headers } },
+    );
+  }
+
+  function gatewayTimeoutResponse(): Response {
+    return new Response(
+      JSON.stringify({ error: { code: "GATEWAY_TIMEOUT", message: "result deadline exceeded" } }),
+      { status: 504, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  it("retries 503 RESOURCE_EXHAUSTED with backoff then succeeds", async () => {
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockResolvedValueOnce(oomResponse()).mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ dense: { values: new Float32Array([0.1]) } }],
+      }),
+    );
+
+    const promise = client.encode("bge-m3", { text: "test" });
+
+    // First OOM backoff is jittered but never exceeds the 5s base.
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await promise;
+
+    expect(result.dense).toBeInstanceOf(Float32Array);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+
+  it("retries 503 RESOURCE_EXHAUSTED even when waitForCapacity is false", async () => {
+    // Python-SDK parity: the OOM budget is independent of waitForCapacity
+    // on the buffered paths (the worker already accepted the request).
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockResolvedValueOnce(oomResponse()).mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ dense: { values: new Float32Array([0.1]) } }],
+      }),
+    );
+
+    const promise = client.encode("bge-m3", { text: "test" }, { waitForCapacity: false });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await promise;
+
+    expect(result.dense).toBeInstanceOf(Float32Array);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+
+  it("throws ResourceExhaustedError after the bounded OOM retry budget", async () => {
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    // Sustained OOM: every attempt returns RESOURCE_EXHAUSTED.
+    mockFetch.mockImplementation(() => Promise.resolve(oomResponse()));
+
+    const promise = client.encode("bge-m3", { text: "test" });
+    const expectation = expect(promise).rejects.toThrow(ResourceExhaustedError);
+
+    // Max backoff schedule (no Retry-After): ≤5s, ≤10s, ≤20s → ≤35s total.
+    await vi.advanceTimersByTimeAsync(35_000);
+    await expectation;
+
+    // RESOURCE_EXHAUSTED_MAX_RETRIES = 3 → 4 requests (initial + 3 retries).
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+
+    await client.close();
+  });
+
+  it("honors Retry-After verbatim on the first OOM retry", async () => {
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockResolvedValueOnce(oomResponse({ "Retry-After": "1" })).mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ dense: { values: new Float32Array([0.1]) } }],
+      }),
+    );
+
+    const promise = client.encode("bge-m3", { text: "test" });
+
+    // The first server hint (1s) is honored verbatim — no jitter, so the
+    // retry must not fire before the full second elapses.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await promise;
+
+    expect(result.dense).toBeInstanceOf(Float32Array);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+
+  it("retries 504 gateway timeouts on the idempotent encode path", async () => {
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockResolvedValueOnce(gatewayTimeoutResponse()).mockResolvedValueOnce(
+      createMsgpackResponse({
+        items: [{ dense: { values: new Float32Array([0.1]) } }],
+      }),
+    );
+
+    const promise = client.encode("bge-m3", { text: "test" });
+
+    // 504 retry delay defaults to MODEL_LOADING_DEFAULT_DELAY (5s).
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await promise;
+
+    expect(result.dense).toBeInstanceOf(Float32Array);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    await client.close();
+  });
+
+  it("does not retry 504 when waitForCapacity is false", async () => {
+    const client = new SIEClient("http://localhost:8080", { timeout: 1000 });
+
+    mockFetch.mockResolvedValueOnce(gatewayTimeoutResponse());
+
+    await expect(
+      client.encode("bge-m3", { text: "test" }, { waitForCapacity: false }),
+    ).rejects.toThrow(ServerError);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    await client.close();
+  });
+});
+
+describe("SIEClient.createPool() - bundle / warm-floor / pinned-model args", () => {
+  beforeEach(() => {
+    mockFetch.mockClear();
+  });
+
+  function poolCreatedResponse(): Response {
+    return createMockResponse({ name: "eval", spec: {}, status: { state: "pending" } });
+  }
+
+  it("sends bundle, minimum_worker_count and pinned_models on the wire", async () => {
+    const client = new SIEClient("http://localhost:8080");
+    mockFetch.mockResolvedValueOnce(poolCreatedResponse());
+
+    await client.createPool("eval", { l4: 2 }, { l4: 4 }, "batch", {
+      bundle: "default",
+      minimumWorkerCount: 1,
+      pinnedModels: ["bge-m3:default"],
+    });
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe("http://localhost:8080/v1/pools");
+    expect(JSON.parse(init.body)).toEqual({
+      name: "eval",
+      gpus: { l4: 2 },
+      gpu_caps: { l4: 4 },
+      queue_pool: "batch",
+      bundle: "default",
+      minimum_worker_count: 1,
+      pinned_models: ["bge-m3:default"],
+    });
+
+    await client.close();
+  });
+
+  it("omits the optional fields from the wire body when not provided", async () => {
+    const client = new SIEClient("http://localhost:8080");
+    mockFetch.mockResolvedValueOnce(poolCreatedResponse());
+
+    await client.createPool("eval", { l4: 2 });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ name: "eval", gpus: { l4: 2 } });
+
+    await client.close();
+  });
+
+  it("preserves an explicit zero warm floor (scale to zero)", async () => {
+    const client = new SIEClient("http://localhost:8080");
+    mockFetch.mockResolvedValueOnce(poolCreatedResponse());
+
+    await client.createPool("eval", { l4: 2 }, undefined, undefined, { minimumWorkerCount: 0 });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(JSON.parse(init.body).minimum_worker_count).toBe(0);
+
+    await client.close();
+  });
+
+  it("rejects a negative warm floor without issuing a request", async () => {
+    const client = new SIEClient("http://localhost:8080");
+
+    await expect(
+      client.createPool("eval", undefined, undefined, undefined, { minimumWorkerCount: -1 }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
 
     await client.close();
   });

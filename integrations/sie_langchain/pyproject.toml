@@ -1,6 +1,6 @@
 [project]
 name = "sie-langchain"
-version = "0.6.16"
+version = "0.6.17"
 description = "SIE integration for LangChain"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,7 +13,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # For integration tests
-    "chromadb>=0.4",
+    "chromadb>=1.5.9",
     "langchain-chroma>=0.1",
 ]
 

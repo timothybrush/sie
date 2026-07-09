@@ -527,8 +527,12 @@ export function parseGenerateResult(data: Record<string, unknown>): GenerateResu
 interface WireWorkerInfo {
   url: string;
   gpu: string;
+  gpu_count?: number;
+  ready_gpu_slots?: number;
   healthy: boolean;
   queue_depth: number;
+  pending_cost?: number;
+  inflight_batches?: number;
   loaded_models: string[];
 }
 
@@ -561,8 +565,12 @@ export function parseCapacityInfo(data: unknown, gpuFilter?: string): CapacityIn
   const parsedWorkers: WorkerInfo[] = workers.map((w) => ({
     url: w.url,
     gpu: w.gpu,
+    gpuCount: w.gpu_count ?? 0,
+    readyGpuSlots: w.ready_gpu_slots ?? w.gpu_count ?? (w.healthy ? 1 : 0),
     healthy: w.healthy,
     queueDepth: w.queue_depth,
+    pendingCost: w.pending_cost ?? 0,
+    inflightBatches: w.inflight_batches ?? 0,
     loadedModels: w.loaded_models,
   }));
 

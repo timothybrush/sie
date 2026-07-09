@@ -93,6 +93,16 @@ class ExtractHandler(OperationHandler[ExtractOutput]):
         relations = [output.relations[index]] if output.relations is not None else None
         objects = [output.objects[index]] if output.objects is not None else None
         data = [output.data[index]] if output.data is not None else None
+        # Unit-meter counts are positional like ``entities``; slice them with
+        # the item so fused cross-request batches keep each doc's real token
+        # count attributed to the right work item (see EncodeHandler).
+        counts = output.input_token_counts
+        sliced_counts = [counts[index]] if counts is not None and 0 <= index < len(counts) else None
+        # Per-item page counts are positional like token counts (see above):
+        # slice them with the item so the parse/OCR page dimension (§7) stays
+        # attributed to the right work item under cross-request fusion.
+        pages = output.pages
+        sliced_pages = [pages[index]] if pages is not None and 0 <= index < len(pages) else None
         return ExtractOutput(
             entities=[output.entities[index]],
             classifications=classifications,
@@ -100,6 +110,8 @@ class ExtractHandler(OperationHandler[ExtractOutput]):
             objects=objects,
             data=data,
             batch_size=1,
+            input_token_counts=sliced_counts,
+            pages=sliced_pages,
         )
 
     def assemble_output(
@@ -157,6 +169,29 @@ class ExtractHandler(OperationHandler[ExtractOutput]):
                 p_data = partials[i].data
                 data.append(p_data[0] if p_data is not None else {})
 
+        # Reassemble per-item unit counts (see slice_output). All-or-nothing:
+        # a partial without a count means the meter cannot attribute the item
+        # exactly, so no counts are surfaced (metering falls back to its
+        # reserve estimate rather than under-counting).
+        assembled_counts: list[int] = []
+        for i in range(batch_size):
+            partial_counts = partials[i].input_token_counts
+            if not (isinstance(partial_counts, list) and len(partial_counts) == 1):
+                assembled_counts = []
+                break
+            assembled_counts.append(partial_counts[0])
+
+        # Reassemble per-item page counts (same all-or-nothing contract as the
+        # token counts): a partial missing its page count means the parse
+        # dimension cannot be attributed exactly, so no pages are surfaced.
+        assembled_pages: list[int] = []
+        for i in range(batch_size):
+            partial_pages = partials[i].pages
+            if not (isinstance(partial_pages, list) and len(partial_pages) == 1):
+                assembled_pages = []
+                break
+            assembled_pages.append(partial_pages[0])
+
         return ExtractOutput(
             entities=entities,
             classifications=classifications,
@@ -164,6 +199,8 @@ class ExtractHandler(OperationHandler[ExtractOutput]):
             objects=objects,
             data=data,
             batch_size=batch_size,
+            input_token_counts=assembled_counts or None,
+            pages=assembled_pages or None,
         )
 
     @classmethod

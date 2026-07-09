@@ -108,7 +108,12 @@ impl TokenBucket {
 /// `serde_json::Value` — they never carry binary data, and keeping
 /// them JSON-shaped avoids rewriting the (de)serializer for the
 /// small config surface.
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize` exists for dispatch implementations behind the
+/// [`super::dispatch::WorkDispatcher`] seam that ship the params block
+/// whole over a transport (the NATS path instead borrows individual
+/// fields into `WorkItemRef`); it is not used on the JetStream wire.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct WorkParams {
     pub output_types: Option<Vec<String>>,
     pub instruction: Option<String>,
@@ -500,6 +505,74 @@ struct WorkItemShared<'a> {
     tracestate: Option<&'a str>,
 }
 
+/// Deserialize a msgpack field that is EITHER a byte array OR `nil`.
+///
+/// `WorkResult.result_msgpack` is typed `bytes | None` on the Python worker
+/// (`sie_sdk.queue_types.WorkResult`): a per-item FAILURE legitimately
+/// carries `result_msgpack: None`, which msgpack encodes as `nil` —
+/// `serde_bytes` alone rejects that with "invalid type: unit value,
+/// expected byte array", turning a worker's typed per-item error into an
+/// opaque transport-level decode failure (the whole result batch is
+/// dropped and the request times out). Same fix and visitor shape as the
+/// sidecar's `deserialize_optional_bytes`
+/// (`sie_server_sidecar/src/protocol/ipc_types.rs`).
+fn deserialize_optional_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct OptBytesVisitor;
+
+    impl<'de> Visitor<'de> for OptBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("bytes, a byte sequence, or nil")
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_borrowed_bytes<E: Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+            Ok(v.to_vec())
+        }
+        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            Ok(v.to_vec())
+        }
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(v)
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(v.as_bytes().to_vec())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = seq.size_hint().map(Vec::with_capacity).unwrap_or_default();
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(OptBytesVisitor)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkResult {
     #[serde(default)]
@@ -509,7 +582,11 @@ pub struct WorkResult {
     pub item_index: u32,
     #[serde(default)]
     pub success: bool,
-    #[serde(default, with = "serde_bytes")]
+    #[serde(
+        default,
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "deserialize_optional_bytes"
+    )]
     pub result_msgpack: Vec<u8>,
     #[serde(default)]
     pub error: Option<String>,
@@ -529,8 +606,30 @@ pub struct WorkResult {
     pub postprocessing_ms: Option<f64>,
     #[serde(default)]
     pub payload_fetch_ms: Option<f64>,
+    /// Authoritative billable-unit counts emitted by the worker engine
+    /// (`sie_server.ipc_types.UnitCounts`): `input_tokens` is the real
+    /// tokenizer count taken post-tokenization, never an estimate.
+    /// `#[serde(default)]` keeps the wire backward-compatible — workers
+    /// that don't emit it (and array-encoded legacy results) decode to
+    /// `None`. Consumed by metering edges (e.g. the managed gateway's
+    /// settle path); the OSS gateway itself only carries it through.
+    #[serde(default)]
+    pub units: Option<UnitCounts>,
     #[serde(default)]
     pub worker_direct: bool,
+}
+
+/// Typed unit counts on the result path (see [`WorkResult::units`]).
+/// Every field optional: a field is present only when the worker had an
+/// authoritative count for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitCounts {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub pages: Option<u64>,
+    #[serde(default)]
+    pub images: Option<u64>,
 }
 
 struct CachedStreamInfo {
@@ -812,11 +911,13 @@ fn canonical_stream_subjects(observed: Vec<String>, desired: &str) -> Option<Vec
 /// (`sie_sdk.queue_types.normalize_model_id`) so that workers and the gateway
 /// agree on the wire-level subject:
 ///
-///     `/`     -> `__`
-///     `.`     -> `_dot_`
-///     `*`     -> `_`
-///     `>`     -> `_`
-///     ` `     -> `_`
+/// ```text
+/// `/`     -> `__`
+/// `.`     -> `_dot_`
+/// `*`     -> `_`
+/// `>`     -> `_`
+/// ` `     -> `_`
+/// ```
 ///
 /// The encoding is not fully reversible — e.g. `org/a__b` and `org/a/b` both
 /// collapse to the same token — but this is safe in practice because
@@ -1880,32 +1981,10 @@ impl WorkPublisher {
         }
     }
 
-    /// Arm a one-shot recovery for non-streaming worker-direct batch work.
-    ///
-    /// Capped logical pools direct-dispatch encode/score/extract to one
-    /// admitted worker so unassigned peers do not burn the JetStream
-    /// delivery budget. If that worker or its private consumer disappears
-    /// after the gateway publishes, the worker-specific stream cannot fail
-    /// over by itself. This timer republishes any still-missing items to the
-    /// lane's pool subject once. After those fallback publishes are durably
-    /// acked, it emits a worker-scoped batch cancel so the original sidecar
-    /// can ACK queued worker-direct items that have not reached IPC yet.
-    pub fn spawn_batch_direct_fallback(self: &Arc<Self>, request_id: String, delay: Duration) {
-        let publisher = Arc::clone(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            if let Err(e) = publisher
-                .republish_pending_result_to_pool(&request_id, "batch_direct_timeout")
-                .await
-            {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "batch direct-dispatch fallback failed"
-                );
-            }
-        });
-    }
+    // NOTE: main's inherent `spawn_batch_direct_fallback` lives on the
+    // composition seam instead (queue/dispatch.rs `WorkDispatcherExt` on
+    // `Arc<dyn WorkDispatcher>`) so proprietary dispatchers inherit the
+    // same one-shot direct-batch recovery.
 
     pub async fn republish_pending_result_to_pool(
         &self,
@@ -3842,6 +3921,7 @@ mod tests {
                     tokenization_ms: None,
                     postprocessing_ms: None,
                     payload_fetch_ms: None,
+                    units: None,
                     worker_direct: false,
                 }),
                 None,
@@ -3902,6 +3982,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let duplicate = WorkResult {
@@ -3957,11 +4038,13 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: true,
         };
         let pool_result = WorkResult {
             result_msgpack: vec![2],
             worker_id: Some("pool-worker".into()),
+            units: None,
             worker_direct: false,
             ..stale_direct.clone()
         };
@@ -4324,6 +4407,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: true,
         };
 
@@ -4335,6 +4419,43 @@ mod tests {
         assert!(decoded.success);
         assert_eq!(decoded.result_msgpack, vec![5, 6, 7]);
         assert!(decoded.worker_direct);
+    }
+
+    #[test]
+    fn test_work_result_decodes_nil_result_msgpack() {
+        // The Python worker types `result_msgpack: bytes | None`
+        // (sie_sdk.queue_types.WorkResult) and error results carry None —
+        // msgpack `nil` on the wire. The decoder must accept it (empty
+        // bytes) so a typed per-item failure never becomes an opaque
+        // transport-level decode error (see deserialize_optional_bytes).
+        let failure = rmpv::Value::Map(vec![
+            ("work_item_id".into(), "req-9.0".into()),
+            ("request_id".into(), "req-9".into()),
+            ("item_index".into(), 0u32.into()),
+            ("success".into(), false.into()),
+            ("result_msgpack".into(), rmpv::Value::Nil),
+            ("error".into(), "unsupported operation".into()),
+            ("error_code".into(), "inference_error".into()),
+        ]);
+        let encoded = rmp_serde::to_vec_named(&failure).unwrap();
+        let decoded: WorkResult = rmp_serde::from_slice(&encoded).unwrap();
+        assert!(!decoded.success);
+        assert!(decoded.result_msgpack.is_empty());
+        assert_eq!(decoded.error_code.as_deref(), Some("inference_error"));
+
+        // And a whole array containing a mix of success + nil-failure
+        // results (the real lane-batch shape) decodes item-per-item.
+        let ok = rmpv::Value::Map(vec![
+            ("work_item_id".into(), "req-9.1".into()),
+            ("request_id".into(), "req-9".into()),
+            ("item_index".into(), 1u32.into()),
+            ("success".into(), true.into()),
+            ("result_msgpack".into(), rmpv::Value::Binary(vec![1, 2, 3])),
+        ]);
+        let encoded = rmp_serde::to_vec_named(&vec![failure, ok]).unwrap();
+        let decoded: Vec<WorkResult> = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].result_msgpack, vec![1, 2, 3]);
     }
 
     #[test]
@@ -4440,6 +4561,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
@@ -4464,6 +4586,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let encoded = rmp_serde::to_vec_named(&result).unwrap();
@@ -4505,6 +4628,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();

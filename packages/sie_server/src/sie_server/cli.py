@@ -32,7 +32,7 @@ import typer
 from sie_sdk.bundle_utils import find_bundle_for_models, match_bundle_models
 
 import sie_server
-from sie_server.app.app_state_config import ENV_POOL, AppStateConfig
+from sie_server.app.app_state_config import ENV_DEVICES, ENV_POOL, AppStateConfig
 from sie_server.core.loader import load_model_configs
 from sie_server.main import run_server
 
@@ -70,6 +70,14 @@ def resolve_device(device: str) -> str:
     if device == "auto":
         return detect_device()
     return device
+
+
+def parse_devices(value: str | None) -> list[str] | None:
+    """Parse comma-separated concrete devices from an env var."""
+    if value is None:
+        return None
+    devices = [item.strip() for item in value.split(",") if item.strip()]
+    return devices or None
 
 
 app = typer.Typer(
@@ -290,6 +298,8 @@ def serve(
     # Resolve device (auto-detect if needed)
     resolved_device = resolve_device(device)
     pool_name = os.environ.get(ENV_POOL) or None
+    resolved_devices = parse_devices(os.environ.get(ENV_DEVICES))
+    pool_name = os.environ.get(ENV_POOL) or None
 
     # Handle bundle/models filter
     model_filter: list[str] | None = None
@@ -375,6 +385,8 @@ def serve(
 
     typer.echo(f"Models directory: {models_dir_resolved}")
     typer.echo(f"Device: {resolved_device}")
+    if resolved_devices:
+        typer.echo(f"Devices: {', '.join(resolved_devices)}")
     if resolved_device == "mps":
         # Apple-Silicon banner: surface the one-command local OpenAI endpoint so the
         # first-run experience points at the playground / docs / OpenAI base URL.
@@ -416,6 +428,7 @@ def serve(
     config = AppStateConfig(
         models_dir=models_dir_resolved,
         device=resolved_device,
+        devices=resolved_devices,
         model_filter=model_filter,
         preload_models=preload_models,
         pool_name=pool_name,

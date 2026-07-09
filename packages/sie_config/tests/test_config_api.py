@@ -385,6 +385,31 @@ class TestConfigAPIEdgeCases:
         )
         assert resp.status_code == 200
 
+    @pytest.mark.parametrize("env_var", ["SIE_ENV", "SIE_DEPLOYMENT_ENV"])
+    def test_prod_without_any_token_refuses_reads_and_writes(self, monkeypatch, env_var: str) -> None:
+        # A production deploy with NO auth token must fail closed, not serve open —
+        # armed by EITHER env signal (SIE_ENV managed / SIE_DEPLOYMENT_ENV Helm).
+        monkeypatch.delenv("SIE_ADMIN_TOKEN", raising=False)
+        monkeypatch.delenv("SIE_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("SIE_ENV", raising=False)
+        monkeypatch.delenv("SIE_DEPLOYMENT_ENV", raising=False)
+        monkeypatch.setenv(env_var, "production")
+        app = _create_test_app(self._bundles, self._models)
+        client = TestClient(app)
+        yaml_body = "sie_id: test/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:B\n    max_batch_tokens: 1\n"
+        assert client.get("/v1/configs/models").status_code == 403
+        assert client.post("/v1/configs/models", content=yaml_body).status_code == 403
+
+    def test_dev_without_any_token_stays_open(self, monkeypatch) -> None:
+        # Self-host / dev (no prod env signal) keeps the open-localhost posture.
+        monkeypatch.delenv("SIE_ADMIN_TOKEN", raising=False)
+        monkeypatch.delenv("SIE_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("SIE_ENV", raising=False)
+        monkeypatch.delenv("SIE_DEPLOYMENT_ENV", raising=False)
+        app = _create_test_app(self._bundles, self._models)
+        client = TestClient(app)
+        assert client.get("/v1/configs/models").status_code == 200
+
 
 class TestConfigAPIIdempotency:
     def setup_method(self) -> None:

@@ -7,7 +7,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "mcp>=1.9,<2",
     "sie-sdk>=0.1",
-    "starlette>=0.40",
+    "starlette>=1.3.1",
     "uvicorn[standard]>=0.32,<1",
     "typer>=0.14,<1",
     # Post-validation of cluster output against the requested schema. Already a

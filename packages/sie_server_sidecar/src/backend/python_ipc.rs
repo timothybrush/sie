@@ -48,7 +48,7 @@ impl PythonIpcBackend {
 /// this channel — the Python server always responds with a readiness
 /// state (`RetryLater`) when a model is unknown, which the dispatcher
 /// handles separately via [`EnsureModelReadyResponse`].
-fn map_ipc_error(e: IpcError) -> BackendError {
+pub(crate) fn map_ipc_error(e: IpcError) -> BackendError {
     // Log at debug — the dispatcher already logs warn on NAK decisions.
     debug!(error = %e, "python-ipc backend: IPC call failed");
     BackendError::Transient(e.to_string())

@@ -12,6 +12,11 @@ use tracing::info;
 pub struct AuditLayer;
 
 impl AuditLayer {
+    // `new_without_default` only fires on exported items, so this lint
+    // surfaced when the lib target (src/lib.rs) made the type public API.
+    // Kept as an `allow` rather than a `Default` impl to leave the OSS
+    // surface unchanged.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self
     }

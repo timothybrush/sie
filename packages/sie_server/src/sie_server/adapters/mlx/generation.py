@@ -115,6 +115,12 @@ class MLXGenerationAdapter(GenerationAdapter):
         stop_tokens: list[str] | None = None,
         served_model_name: str | None = None,
         trust_remote_code: bool = False,
+        # Pinned HuggingFace revision. Accepted for constructor parity with the
+        # SGLang adapters, but NOT forwarded: this backend serves the pre-pinned
+        # ``mlx_repo`` (not ``model_name_or_path``) via an ``mlx_lm.server``
+        # subprocess whose argv is built in ``_server.build_launch_command``,
+        # which exposes no ``--revision`` seam. No pinned YAML routes here today.
+        revision: str | None = None,
         startup_timeout_s: float | None = None,
         **kwargs: Any,  # accept (and drop) CUDA/SGLang-only kwargs from the swap
     ) -> None:
@@ -131,6 +137,7 @@ class MLXGenerationAdapter(GenerationAdapter):
         self._stop_tokens = stop_tokens or []
         self._served_model_name = served_model_name or self._model_name_or_path
         self._trust_remote_code = trust_remote_code
+        self._revision = revision  # stored for parity; mlx_lm.server exposes no revision seam (see __init__)
         self._startup_timeout_s = startup_timeout_s
 
         self._process: subprocess.Popen[bytes] | None = None

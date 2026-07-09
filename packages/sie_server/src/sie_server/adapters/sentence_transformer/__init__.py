@@ -43,6 +43,7 @@ class SentenceTransformerDenseAdapter(BaseAdapter):
         max_seq_length: int | None = None,
         compute_precision: ComputePrecision = "float16",
         config_kwargs: dict[str, Any] | None = None,
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -56,6 +57,8 @@ class SentenceTransformerDenseAdapter(BaseAdapter):
             config_kwargs: Additional kwargs passed to model config (e.g., for models
                 with custom code that need specific settings like
                 {"use_memory_efficient_attention": False, "unpad_inputs": False}).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -64,6 +67,7 @@ class SentenceTransformerDenseAdapter(BaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._config_kwargs = config_kwargs
+        self._revision = revision
 
         self._model: SentenceTransformer | None = None
         self._device: str | None = None
@@ -76,12 +80,15 @@ class SentenceTransformerDenseAdapter(BaseAdapter):
             device: Device string (e.g., "cuda:0", "cpu").
         """
         self._device = device
-        self._model = SentenceTransformer(
-            self._model_name_or_path,
-            device=device,
-            trust_remote_code=self._trust_remote_code,
-            config_kwargs=self._config_kwargs,
-        )
+        load_kwargs: dict[str, Any] = {
+            "device": device,
+            "trust_remote_code": self._trust_remote_code,
+            "config_kwargs": self._config_kwargs,
+        }
+        # Omit revision unless pinned so the library default (main) is unchanged.
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
+        self._model = SentenceTransformer(self._model_name_or_path, **load_kwargs)
 
         if self._max_seq_length is not None:
             self._model.max_seq_length = self._max_seq_length
@@ -197,6 +204,7 @@ class SentenceTransformerSparseAdapter(BaseAdapter):
         trust_remote_code: bool = True,
         max_seq_length: int | None = None,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -206,12 +214,15 @@ class SentenceTransformerSparseAdapter(BaseAdapter):
             trust_remote_code: Whether to trust remote code in model files.
             max_seq_length: Override default max sequence length.
             compute_precision: Compute precision (ignored, sentence-transformers handles internally).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
         self._model_name_or_path = str(model_name_or_path)
         self._trust_remote_code = trust_remote_code
         self._max_seq_length = max_seq_length
+        self._revision = revision
 
         self._model: SparseEncoder | None = None
         self._device: str | None = None
@@ -224,11 +235,14 @@ class SentenceTransformerSparseAdapter(BaseAdapter):
             device: Device string (e.g., "cuda:0", "cpu").
         """
         self._device = device
-        self._model = SparseEncoder(
-            self._model_name_or_path,
-            device=device,
-            trust_remote_code=self._trust_remote_code,
-        )
+        load_kwargs: dict[str, Any] = {
+            "device": device,
+            "trust_remote_code": self._trust_remote_code,
+        }
+        # Omit revision unless pinned so the library default (main) is unchanged.
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
+        self._model = SparseEncoder(self._model_name_or_path, **load_kwargs)
 
         if self._max_seq_length is not None:
             self._model.max_seq_length = self._max_seq_length

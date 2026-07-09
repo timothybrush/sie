@@ -28,7 +28,7 @@ fast at render time.
 {{- end }}
 {{- $workerLivenessBudgetS := mul $workerLivenessPeriodS $workerLivenessFailures -}}
 {{- if le $workerLivenessBudgetS $modelReadyTimeoutS }}
-{{- fail (printf "workers.common.modelReadyTimeoutSec=%d must be lower than the Python worker liveness budget (%d * %d = %ds); increase workers.common.probes.liveness.failureThreshold/periodSeconds or lower modelReadyTimeoutSec" $modelReadyTimeoutS $workerLivenessFailures $workerLivenessPeriodS $workerLivenessBudgetS) }}
+{{- fail (printf "workers.common.modelReadyTimeoutSec=%d must be lower than the adapter worker liveness budget (%d * %d = %ds); increase workers.common.probes.liveness.failureThreshold/periodSeconds or lower modelReadyTimeoutSec" $modelReadyTimeoutS $workerLivenessFailures $workerLivenessPeriodS $workerLivenessBudgetS) }}
 {{- end }}
 {{- range $poolName, $pool := .Values.workers.pools }}
 {{- if $pool.enabled }}
@@ -78,6 +78,33 @@ fast at render time.
 {{- end }}
 {{- if and (eq $engine "candle") (ne $bundle "candle") }}
 {{- fail (printf "workers.pools.%s.bundles.%s.engine=candle requires bundle=candle so gateway routing and worker heartbeats agree" $poolName $bundleName) }}
+{{- end }}
+{{- $gpuCount := int $pool.gpu.count }}
+{{- $poolSidecar := default dict $pool.sidecar }}
+{{- $emulatedChildCount := int (dig "emulatedChildCount" 0 $poolSidecar) }}
+{{- if and (gt $emulatedChildCount 0) (gt $gpuCount 0) }}
+{{- fail (printf "workers.pools.%s.sidecar.emulatedChildCount is CPU-only; GPU pools use gpu.count for child fanout." $poolName) }}
+{{- end }}
+{{- $workerChildCount := 1 }}
+{{- if gt $gpuCount 1 }}
+{{- $workerChildCount = $gpuCount }}
+{{- else if gt $emulatedChildCount 1 }}
+{{- $workerChildCount = $emulatedChildCount }}
+{{- end }}
+{{- $multiWorkerChildren := and $root.Values.workers.common.workerSidecar.enabled (gt $workerChildCount 1) }}
+{{- if and $multiWorkerChildren $preloadModels }}
+{{- fail (printf "workers.pools.%s.bundles.%s: preloadModels is not supported with multi-child worker pods; each model must be placed on exactly one child by the worker-sidecar" $poolName $bundleName) }}
+{{- end }}
+{{- $workerIndexes := list 0 }}
+{{- if $multiWorkerChildren }}
+{{- $workerIndexes = until $workerChildCount }}
+{{- end }}
+{{- $ipcSocketPaths := list "/var/run/sie/ipc.sock" }}
+{{- if $multiWorkerChildren }}
+{{- $ipcSocketPaths = list }}
+{{- range $i := until $workerChildCount }}
+{{- $ipcSocketPaths = append $ipcSocketPaths (printf "/var/run/sie/ipc-%d.sock" $i) }}
+{{- end }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -135,7 +162,24 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
       containers:
-        - name: worker
+        {{- range $workerIndex := $workerIndexes }}
+        {{- $workerSocket := "/var/run/sie/ipc.sock" }}
+        {{- if $multiWorkerChildren }}
+        {{- $workerSocket = printf "/var/run/sie/ipc-%d.sock" $workerIndex }}
+        {{- end }}
+        {{- $workerPort := int $root.Values.workers.common.port }}
+        {{- if $multiWorkerChildren }}
+        {{- $workerPort = add $workerPort $workerIndex }}
+        {{- end }}
+        {{- $workerPortName := "http" }}
+        {{- if and $multiWorkerChildren (gt $workerIndex 0) }}
+        {{- $workerPortName = printf "http-%d" $workerIndex }}
+        {{- end }}
+        {{- $containerGpuCount := $gpuCount }}
+        {{- if and $multiWorkerChildren (gt $gpuCount 0) }}
+        {{- $containerGpuCount = 1 }}
+        {{- end }}
+        - name: {{ if $multiWorkerChildren }}worker-{{ $workerIndex }}{{ else }}worker{{ end }}
           {{- $imageTag := default $root.Chart.AppVersion $root.Values.workers.common.image.tag }}
           {{- $rust := $root.Values.workers.common.rust }}
           {{- if eq $engine "candle" }}
@@ -144,22 +188,22 @@ spec:
           imagePullPolicy: {{ $rust.image.pullPolicy }}
           args:
             - --host=0.0.0.0
-            - --port={{ $root.Values.workers.common.port }}
+            - --port={{ $workerPort }}
           {{- else }}
           image: {{ printf "%s:%s-%s-%s" $root.Values.workers.common.image.repository $imageTag $platform $imageBundle }}
           imagePullPolicy: {{ $root.Values.workers.common.image.pullPolicy }}
           args:
             - serve
             - --host=0.0.0.0
-            - --port={{ $root.Values.workers.common.port }}
+            - --port={{ $workerPort }}
             - --bundle={{ $bundle }}
             {{- if $root.Values.workers.common.clusterCache.enabled }}
             - --cluster-cache=$(SIE_CLUSTER_CACHE)
             {{- end }}
           {{- end }}
           ports:
-            - name: http
-              containerPort: {{ $root.Values.workers.common.port }}
+            - name: {{ $workerPortName }}
+              containerPort: {{ $workerPort }}
               protocol: TCP
           env:
             # GPU type for routing
@@ -192,7 +236,20 @@ spec:
             {{- end }}
             # Device configuration (cpu if no GPU, cuda otherwise)
             - name: SIE_DEVICE
-              value: {{ if gt (int $pool.gpu.count) 0 }}cuda{{ else }}cpu{{ end }}
+              value: {{ if gt $gpuCount 0 }}cuda{{ else }}cpu{{ end }}
+            {{- if gt $gpuCount 0 }}
+            {{- $devices := list }}
+            {{- if $multiWorkerChildren }}
+            {{- $devices = append $devices "cuda:0" }}
+            {{- else }}
+            {{- range $i := until $gpuCount }}
+            {{- $devices = append $devices (printf "cuda:%d" $i) }}
+            {{- end }}
+            {{- end }}
+            # Concrete devices visible inside this adapter worker.
+            - name: SIE_DEVICES
+              value: {{ join "," $devices | quote }}
+            {{- end }}
             {{- if $preloadModels }}
             # Models to eagerly load at startup (before readiness)
             - name: SIE_PRELOAD_MODELS
@@ -249,11 +306,17 @@ spec:
             # (at the top of this file) if the sidecar is enabled
             # without NATS.
             - name: SIE_IPC_SOCKET_PATH
-              value: /var/run/sie/ipc.sock
+              value: {{ $workerSocket | quote }}
             - name: SIE_TOKENIZER_STAGING_DIR
               value: /var/run/sie/tokenizers
             - name: SIE_IPC_REQUIRE_HEARTBEAT
               value: "true"
+            {{- if $root.Values.workers.common.passthroughMode }}
+            # Queue-mode batching is owned by the worker-sidecar. Python
+            # treats each IPC frame as a complete GPU batch for this child.
+            - name: SIE_WORKER_PASSTHROUGH
+              value: "1"
+            {{- end }}
             {{- end }}
             {{- if $root.Values.observability.tracing.enabled }}
             {{- include "sie-cluster.tracing.env" (dict "root" $root "serviceName" $root.Values.observability.tracing.serviceName.worker) | nindent 12 }}
@@ -274,7 +337,7 @@ spec:
           startupProbe:
             httpGet:
               path: /healthz
-              port: http
+              port: {{ $workerPortName }}
             {{- toYaml $root.Values.workers.common.probes.startup | nindent 12 }}
           livenessProbe:
             # /livez is GPU-aware: it runs a tiny CUDA sync so a wedged context
@@ -283,23 +346,23 @@ spec:
             # CPU workers report healthy from /livez, so this is safe for all pools.
             httpGet:
               path: /livez
-              port: http
+              port: {{ $workerPortName }}
             {{- toYaml $root.Values.workers.common.probes.liveness | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /readyz
-              port: http
+              port: {{ $workerPortName }}
             {{- toYaml $root.Values.workers.common.probes.readiness | nindent 12 }}
           resources:
             requests:
               {{- toYaml $pool.resources.requests | nindent 14 }}
-              {{- if gt (int $pool.gpu.count) 0 }}
-              nvidia.com/gpu: {{ $pool.gpu.count | quote }}
+              {{- if gt $containerGpuCount 0 }}
+              nvidia.com/gpu: {{ $containerGpuCount | quote }}
               {{- end }}
             limits:
               {{- toYaml $pool.resources.limits | nindent 14 }}
-              {{- if gt (int $pool.gpu.count) 0 }}
-              nvidia.com/gpu: {{ $pool.gpu.count | quote }}
+              {{- if gt $containerGpuCount 0 }}
+              nvidia.com/gpu: {{ $containerGpuCount | quote }}
               {{- end }}
           volumeMounts:
             - name: model-cache
@@ -310,15 +373,15 @@ spec:
             - name: sie-ipc
               mountPath: /var/run/sie
             {{- end }}
+        {{- end }}
         {{- if $root.Values.workers.common.workerSidecar.enabled }}
         # worker-sidecar
         # Owns the NATS JetStream pull loop and forwards work into
-        # the worker adapter process over a shared Unix socket.
+        # the adapter worker process(es) over shared Unix sockets.
         - name: worker-sidecar
           {{- $rs := $root.Values.workers.common.workerSidecar }}
           {{- $configReconcile := default dict $rs.configReconcile }}
           {{- $rsTag := default $root.Chart.AppVersion $rs.image.tag }}
-          {{- $candleBatcher := default dict $root.Values.workers.common.rust.candle.batcher }}
           image: {{ printf "%s:%s" $rs.image.repository $rsTag }}
           imagePullPolicy: {{ $rs.image.pullPolicy }}
           ports:
@@ -329,9 +392,13 @@ spec:
             - name: SIE_WORKER_METRICS_PORT
               value: {{ $rs.metricsPort | quote }}
             - name: SIE_IPC_SOCKET_PATH
-              value: /var/run/sie/ipc.sock
+              value: {{ index $ipcSocketPaths 0 | quote }}
             - name: SIE_TOKENIZER_STAGING_DIR
               value: /var/run/sie/tokenizers
+            {{- if $multiWorkerChildren }}
+            - name: SIE_IPC_SOCKET_PATHS
+              value: {{ join "," $ipcSocketPaths | quote }}
+            {{- end }}
             - name: SIE_POOL
               value: {{ $queuePool | quote }}
             - name: SIE_BUNDLE
@@ -478,23 +545,17 @@ spec:
               value: {{ $rs.pipelineDepth | quote }}
             {{- end }}
             {{- if $rs.batcher }}
-            {{- if and $rs.batcher.coalesceMs (not (and (eq $engine "candle") $candleBatcher.coalesceMs)) }}
+            {{- if $rs.batcher.coalesceMs }}
             - name: SIE_BATCHER_COALESCE_MS
               value: {{ $rs.batcher.coalesceMs | quote }}
             {{- end }}
-            {{- if and $rs.batcher.maxBatchRequests (not (and (eq $engine "candle") $candleBatcher.maxBatchRequests)) }}
+            {{- if $rs.batcher.maxBatchRequests }}
             - name: SIE_BATCHER_MAX_BATCH_REQUESTS
               value: {{ $rs.batcher.maxBatchRequests | quote }}
             {{- end }}
-            {{- end }}
-            {{- if eq $engine "candle" }}
-            {{- if $candleBatcher.coalesceMs }}
-            - name: SIE_BATCHER_COALESCE_MS
-              value: {{ $candleBatcher.coalesceMs | quote }}
-            {{- end }}
-            {{- if $candleBatcher.maxBatchRequests }}
-            - name: SIE_BATCHER_MAX_BATCH_REQUESTS
-              value: {{ $candleBatcher.maxBatchRequests | quote }}
+            {{- if hasKey $rs.batcher "idleBypassEnabled" }}
+            - name: SIE_BATCHER_IDLE_BYPASS_ENABLED
+              value: {{ $rs.batcher.idleBypassEnabled | quote }}
             {{- end }}
             {{- end }}
             {{- if $rs.adaptive }}

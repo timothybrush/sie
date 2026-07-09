@@ -336,3 +336,49 @@ class TestModelCapabilitiesField:
         by_name = {m["name"]: m for m in response.json()["models"]}
         assert by_name["gen-model"]["capabilities"]["code"] is True
         assert by_name["enc-model"]["capabilities"] is None
+
+
+class TestModelRevisionField:
+    """Coverage for the additive ``revision`` field on ``ModelInfo`` (design §6.6)."""
+
+    _SHA = "5617a9f61b028005a4858fdac845db406aefb181"
+
+    @pytest.fixture
+    def rev_client(self) -> TestClient:
+        registry = MagicMock(spec=ModelRegistry)
+        registry.model_names = ["pinned", "unpinned"]
+        configs = {
+            "pinned": ModelConfig(
+                sie_id="pinned",
+                hf_id="org/pinned",
+                hf_revision=self._SHA,
+                tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+                profiles={"default": ProfileConfig(adapter_path="test:Adapter", max_batch_tokens=8192)},
+            ),
+            "unpinned": _make_config("unpinned", "org/unpinned", dense_dim=768),
+        }
+        registry.get_config = lambda name: configs[name]
+        registry.has_model = lambda name: name in configs
+        registry.is_loaded = lambda _name: False
+        registry.is_loading = lambda _name: False
+        registry.is_unloading = lambda _name: False
+        registry.is_failed = lambda _name: False
+        registry.get_failure = lambda _name: None
+
+        app = FastAPI()
+        app.include_router(models_router)
+        app.state.registry = registry
+        return TestClient(app)
+
+    def test_get_model_surfaces_pinned_revision(self, rev_client: TestClient) -> None:
+        data = rev_client.get("/v1/models/pinned").json()
+        assert data["revision"] == self._SHA
+
+    def test_unpinned_model_revision_is_null(self, rev_client: TestClient) -> None:
+        data = rev_client.get("/v1/models/unpinned").json()
+        assert data["revision"] is None
+
+    def test_list_models_carries_revision(self, rev_client: TestClient) -> None:
+        by_name = {m["name"]: m for m in rev_client.get("/v1/models").json()["models"]}
+        assert by_name["pinned"]["revision"] == self._SHA
+        assert by_name["unpinned"]["revision"] is None

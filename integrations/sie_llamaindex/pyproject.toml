@@ -1,6 +1,6 @@
 [project]
 name = "sie-llamaindex"
-version = "0.6.16"
+version = "0.6.17"
 description = "SIE integration for LlamaIndex"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "chromadb>=0.5",
+    "chromadb>=1.5.9",
     "llama-index-vector-stores-chroma>=0.2",
 ]
 

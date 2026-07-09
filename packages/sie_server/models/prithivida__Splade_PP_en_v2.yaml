@@ -1,5 +1,6 @@
 sie_id: prithivida/Splade_PP_en_v2
 hf_id: prithivida/Splade_PP_en_v2
+hf_revision: f0d4aa214dcb60c274052a52c0497535e3aec64c
 inputs:
   text: true
   image: false

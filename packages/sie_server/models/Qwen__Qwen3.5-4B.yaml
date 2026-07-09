@@ -1,5 +1,6 @@
 sie_id: Qwen/Qwen3.5-4B
 hf_id: Qwen/Qwen3.5-4B
+hf_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 inputs:
   # Qwen3.5-4B is a unified vision-language model (Gated DeltaNet + sparse MoE
   # with an integrated vision encoder). The wire surface accepts text+image

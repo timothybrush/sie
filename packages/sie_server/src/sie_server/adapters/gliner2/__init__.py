@@ -43,6 +43,7 @@ class GLiNER2Adapter(BaseAdapter):
         *,
         threshold: float = 0.5,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -51,12 +52,15 @@ class GLiNER2Adapter(BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path.
             threshold: Minimum confidence score for entity extraction (0-1).
             compute_precision: Compute precision for inference.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
         self._threshold = threshold
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: Any = None
         self._device: str | None = None
@@ -73,6 +77,10 @@ class GLiNER2Adapter(BaseAdapter):
 
         # GLiNER2 uses map_location for device placement and quantize for fp16
         use_quantize = device != "cpu" and self._compute_precision == "float16"
+        # gliner2.GLiNER2.from_pretrained exposes no revision seam: it pops only
+        # quantize/compile/map_location and discards the rest of **kwargs, so a
+        # revision never reaches hf_hub_download. self._revision is stored but
+        # cannot be honored here.
         self._model = GLiNER2.from_pretrained(
             self._model_name_or_path,
             map_location=device,

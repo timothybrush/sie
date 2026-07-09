@@ -7,6 +7,7 @@ import struct
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,7 @@ from sie_sdk.bundle_utils import match_bundle_models
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
+from sie_server.core.readiness import mark_not_ready, mark_ready, register_liveness_probe
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.types import WorkerResult
@@ -133,6 +135,15 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     return QueueExecutor(reg), reg
 
 
+@pytest.fixture(autouse=True)
+def _reset_readiness_state() -> Iterator[None]:
+    register_liveness_probe(None)
+    mark_not_ready()
+    yield
+    register_liveness_probe(None)
+    mark_not_ready()
+
+
 def _qwen_profile_variant_yaml() -> str:
     return """
 sie_id: Qwen/Qwen3.6-27B
@@ -243,9 +254,62 @@ class TestFraming:
             assert resp["request_id"] == "r1"
             assert resp["body"]["timestamp_ms"] == 123.0
             assert resp["body"]["worker_id"] == "worker-test"
+            assert resp["body"]["ready"] is False
             assert resp["body"]["bundle_config_hash"] == ""
             assert resp["body"]["loaded_models"] == ["test/model"]
             assert srv.is_heartbeat_fresh()
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_ping_reports_ready_after_worker_ready(self, server_and_path) -> None:
+        _srv, sock = server_and_path
+        mark_ready()
+        client = await _Client.connect(sock)
+        try:
+            with patch(
+                "sie_server.ipc_server.gpu_is_healthy_async",
+                new=AsyncMock(return_value=True),
+            ) as health:
+                resp = await client.rpc("Ping", {"timestamp_ms": 123.0})
+            assert resp["ok"] is True
+            assert resp["body"]["ready"] is True
+            health.assert_awaited_once_with()
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_ping_reports_not_ready_when_gpu_health_fails(self, server_and_path) -> None:
+        _srv, sock = server_and_path
+        mark_ready()
+        client = await _Client.connect(sock)
+        try:
+            with patch(
+                "sie_server.ipc_server.gpu_is_healthy_async",
+                new=AsyncMock(return_value=False),
+            ) as health:
+                resp = await client.rpc("Ping", {"timestamp_ms": 123.0})
+            assert resp["ok"] is True
+            assert resp["body"]["ready"] is False
+            health.assert_awaited_once_with()
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_ping_reports_not_ready_when_gpu_health_raises(self, server_and_path) -> None:
+        _srv, sock = server_and_path
+        mark_ready()
+        client = await _Client.connect(sock)
+        try:
+            with patch(
+                "sie_server.ipc_server.gpu_is_healthy_async",
+                new=AsyncMock(side_effect=RuntimeError("nvml unavailable")),
+            ) as health:
+                resp = await client.rpc("Ping", {"timestamp_ms": 123.0})
+            assert resp["ok"] is True
+            assert resp["body"]["ready"] is False
+            assert resp["body"]["loaded_models"] == ["test/model"]
+            health.assert_awaited_once_with()
         finally:
             await client.close()
 

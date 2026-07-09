@@ -134,6 +134,16 @@ class EncodeHandler(OperationHandler[EncodeOutput]):
         Returns:
             Single-item EncodeOutput.
         """
+        # Per-item unit counts (``extra["input_token_counts"]``, emitted by
+        # adapters that own their tokenization) are positional like dense/
+        # sparse, so they must be sliced with the item — dropping them here
+        # would silently strip the meter's counts whenever the worker fuses
+        # requests into one GPU batch. Other ``extra`` keys have no defined
+        # per-item semantics and are intentionally not propagated.
+        extra: dict[str, Any] = {}
+        counts = output.extra.get("input_token_counts") if output.extra else None
+        if isinstance(counts, list) and 0 <= index < len(counts):
+            extra["input_token_counts"] = [counts[index]]
         return EncodeOutput(
             dense=output.dense[index : index + 1] if output.dense is not None else None,
             sparse=[output.sparse[index]] if output.sparse is not None else None,
@@ -142,6 +152,7 @@ class EncodeHandler(OperationHandler[EncodeOutput]):
             is_query=output.is_query,
             dense_dim=output.dense_dim,
             multivector_token_dim=output.multivector_token_dim,
+            extra=extra,
         )
 
     def assemble_output(
@@ -190,6 +201,21 @@ class EncodeHandler(OperationHandler[EncodeOutput]):
         if first.multivector is not None:
             multivector = [partials[i].multivector[0] for i in range(batch_size)]  # ty: ignore[not-subscriptable]
 
+        # Reassemble per-item unit counts (see slice_output). All-or-nothing:
+        # a partial without a count means the meter cannot attribute the
+        # request exactly, so no counts are surfaced (metering then falls
+        # back to its reserve estimate rather than under-counting).
+        extra: dict[str, Any] = {}
+        assembled_counts: list[int] = []
+        for i in range(batch_size):
+            partial_counts = partials[i].extra.get("input_token_counts") if partials[i].extra else None
+            if not (isinstance(partial_counts, list) and len(partial_counts) == 1):
+                assembled_counts = []
+                break
+            assembled_counts.append(partial_counts[0])
+        if assembled_counts:
+            extra["input_token_counts"] = assembled_counts
+
         return EncodeOutput(
             dense=dense,
             sparse=sparse,
@@ -198,6 +224,7 @@ class EncodeHandler(OperationHandler[EncodeOutput]):
             is_query=first.is_query,
             dense_dim=first.dense_dim,
             multivector_token_dim=first.multivector_token_dim,
+            extra=extra,
         )
 
     @classmethod

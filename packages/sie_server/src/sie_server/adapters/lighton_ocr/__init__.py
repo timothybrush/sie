@@ -48,6 +48,7 @@ class LightOnOCRAdapter(ModelAdapter):
         max_new_tokens: int = 4096,
         num_beams: int = 1,
         attn_implementation: str = "sdpa",
+        revision: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_batch_images: int = 4,
         **kwargs: Any,
@@ -60,6 +61,8 @@ class LightOnOCRAdapter(ModelAdapter):
             max_new_tokens: Maximum tokens to generate.
             num_beams: Number of beams for beam search.
             attn_implementation: Attention implementation - "eager", "sdpa", or "flash_attention_2".
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when loading model artifacts.
+                Forwarded to ``from_pretrained(..., revision=...)``.
             system_prompt: System prompt for the chat template.
             max_batch_images: Max images per batched ``generate()`` call. Bounds KV-cache /
                 vision-activation memory so a large incoming batch cannot OOM (issue #33,
@@ -74,6 +77,7 @@ class LightOnOCRAdapter(ModelAdapter):
         self._max_new_tokens = max_new_tokens
         self._num_beams = num_beams
         self._attn_implementation = attn_implementation
+        self._revision = revision
         self._system_prompt = system_prompt
         self._max_batch_images = max(1, max_batch_images)
 
@@ -110,6 +114,10 @@ class LightOnOCRAdapter(ModelAdapter):
 
         dtype = self._resolve_dtype(device)
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         logger.info(
             "Loading LightOnOCR model %s on device=%s with dtype=%s, attn=%s",
             self._model_name_or_path,
@@ -120,6 +128,7 @@ class LightOnOCRAdapter(ModelAdapter):
 
         self._processor = LightOnOcrProcessor.from_pretrained(
             self._model_name_or_path,
+            **shared_kwargs,
         )
 
         # Batched generation left-pads input_ids (prompt length varies with image
@@ -134,6 +143,7 @@ class LightOnOCRAdapter(ModelAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=self._attn_implementation,
+            **shared_kwargs,
         )
 
         self._model.to(device)  # ty: ignore[invalid-argument-type]

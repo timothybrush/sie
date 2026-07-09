@@ -1,5 +1,6 @@
 sie_id: zai-org/GLM-OCR
 hf_id: zai-org/GLM-OCR
+hf_revision: ca5d8b3e287e52589e37c28385d9655ee4372f9d
 inputs:
   text: false
   image: true

@@ -1,5 +1,6 @@
 sie_id: microsoft/Florence-2-large
 hf_id: microsoft/Florence-2-large
+hf_revision: 21a599d414c4d928c9032694c424fb94458e3594
 inputs:
   text: false
   image: true

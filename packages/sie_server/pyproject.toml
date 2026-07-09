@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.16"
+version = "0.6.17"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -11,7 +11,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.32,<1",
     # Serialization
-    "msgpack>=1.1,<2",
+    "msgpack>=1.2.1,<2",
     "msgpack-numpy>=0.4,<1",
     "orjson>=3.10,<4",
     # ML / Inference
@@ -26,6 +26,9 @@ dependencies = [
     "sentence-transformers>=5.0,<6",
     "safetensors>=0.4,<1",
     "FlagEmbedding>=1.3,<2",
+    # LoRA runtime (adapters/peft_lora_mixin: PeftModel wrap + hot-swap).
+    # Load-bearing for BYO-LoRA; previously only a transitive pin.
+    "peft>=0.19,<1",
     "einops>=0.8,<1", # Tensor ops (required by NV-Embed-v2 trust_remote_code)
     # GLiNER / GLiREL / GLiClass extraction adapters
     "gliner>=0.2,<1",

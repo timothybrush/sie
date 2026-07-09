@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
+from huggingface_hub import snapshot_download
 
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
@@ -137,13 +138,15 @@ class PaddleOCRVLAdapter(BaseAdapter):
         self._device = device
         dtype = self._resolve_dtype_for(device)
 
-        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
-        if self._revision is not None:
-            shared_kwargs["revision"] = self._revision
+        # Resolve to a local snapshot dir so from_pretrained reads config files
+        # straight from disk instead of re-probing the Hub by a dropped revision
+        # (see _resolve_model_dir for why AutoProcessor breaks offline otherwise).
+        model_dir = self._resolve_model_dir()
 
         logger.info(
-            "Loading PaddleOCR-VL model %s on device=%s dtype=%s revision=%s attn=%s",
+            "Loading PaddleOCR-VL model %s (dir=%s) on device=%s dtype=%s revision=%s attn=%s",
             self._model_name_or_path,
+            model_dir,
             device,
             dtype,
             self._revision,
@@ -151,18 +154,18 @@ class PaddleOCRVLAdapter(BaseAdapter):
         )
 
         self._processor = AutoProcessor.from_pretrained(
-            self._model_name_or_path,
-            **shared_kwargs,
+            model_dir,
+            trust_remote_code=self._trust_remote_code,
         )
         # Model's ``auto_map`` registers ``AutoModelForCausalLM`` (not
         # ``AutoModelForImageTextToText``), even though the README suggests
         # the latter. Using the registered class avoids "Unrecognized
         # configuration class" on transformers 4.57.
         self._model = AutoModelForCausalLM.from_pretrained(
-            self._model_name_or_path,
+            model_dir,
             dtype=dtype,
             attn_implementation=self._attn_implementation,
-            **shared_kwargs,
+            trust_remote_code=self._trust_remote_code,
         )
         self._model.to(device)  # ty: ignore[invalid-argument-type]
         self._model.eval()
@@ -175,6 +178,35 @@ class PaddleOCRVLAdapter(BaseAdapter):
 
         self._create_preprocessor()
         logger.info("PaddleOCR-VL model loaded successfully")
+
+    def _resolve_model_dir(self) -> str:
+        """Resolve the model reference to a local snapshot directory.
+
+        Works around a transformers 4.57.x quirk that silently breaks offline
+        loading of ``trust_remote_code`` processors. ``AutoProcessor.from_pretrained``
+        probes for the processor/preprocessor/tokenizer config via ``cached_file``,
+        but filters its kwargs by ``cached_file``'s *named* parameters — and
+        ``cached_file(path_or_repo_id, filename, **kwargs)`` swallows ``revision``
+        into ``**kwargs``. So ``revision`` is dropped and every probe defaults to
+        ``main``. Offline (the Modal lane bakes ``HF_HUB_OFFLINE=1``) only the
+        pinned revision is staged and no ``main`` snapshot exists, so all probes
+        miss, the custom-processor ``auto_map`` is never discovered, and
+        AutoProcessor silently returns the bare tokenizer (``LlamaTokenizerFast``)
+        — which has no ``image_processor`` and cannot preprocess images.
+
+        Passing an already-resolved local directory sidesteps the probe: config
+        files are read straight from disk, revision-free. ``snapshot_download``
+        honours ``HF_HUB_OFFLINE`` (cache-only offline, download when online), so
+        this is safe in both the Modal lane and local dev. A ``weights_path`` that
+        already points at a local directory is returned unchanged.
+        """
+        path = Path(self._model_name_or_path)
+        if path.is_dir():
+            return str(path)
+        download_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            download_kwargs["revision"] = self._revision
+        return snapshot_download(self._model_name_or_path, **download_kwargs)
 
     def _resolve_dtype_for(self, device: str) -> torch.dtype:
         if not device.startswith("cuda"):

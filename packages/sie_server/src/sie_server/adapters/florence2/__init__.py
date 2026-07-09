@@ -84,6 +84,7 @@ class Florence2Adapter(BaseAdapter):
         default_task: str = TASK_OCR_WITH_REGION,
         compute_precision: ComputePrecision = "float16",
         trust_remote_code: bool = True,
+        revision: str | None = None,
         max_new_tokens: int = 1024,
         num_beams: int = 1,
         attn_implementation: str = "eager",
@@ -96,6 +97,8 @@ class Florence2Adapter(BaseAdapter):
             default_task: Default task prompt if not specified in options.
             compute_precision: Compute precision for inference.
             trust_remote_code: Whether to trust remote code (required for Florence-2).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when loading model artifacts.
+                Forwarded to ``from_pretrained(..., revision=...)``.
             max_new_tokens: Maximum tokens to generate.
             num_beams: Number of beams for beam search.
             attn_implementation: Attention implementation - "eager", "sdpa", or "flash_attention_2".
@@ -107,6 +110,7 @@ class Florence2Adapter(BaseAdapter):
         self._default_task = default_task
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._max_new_tokens = max_new_tokens
         self._num_beams = num_beams
         self._attn_implementation = attn_implementation
@@ -129,6 +133,10 @@ class Florence2Adapter(BaseAdapter):
         # Determine dtype
         dtype = self._resolve_dtype()
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         logger.info(
             "Loading Florence-2 model %s on device=%s with dtype=%s, attn=%s",
             self._model_name_or_path,
@@ -140,7 +148,7 @@ class Florence2Adapter(BaseAdapter):
         # Load processor with trust_remote_code (required for Florence-2 custom processor)
         self._processor = AutoProcessor.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # Load model with trust_remote_code to use model's custom code
@@ -148,8 +156,8 @@ class Florence2Adapter(BaseAdapter):
         self._model = AutoModelForCausalLM.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
-            trust_remote_code=self._trust_remote_code,
             attn_implementation=self._attn_implementation,
+            **shared_kwargs,
         )
 
         self._model.to(device)  # ty: ignore[invalid-argument-type]

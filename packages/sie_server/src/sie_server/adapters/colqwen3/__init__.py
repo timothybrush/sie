@@ -56,6 +56,7 @@ class ColQwen3Adapter(BaseAdapter):
         normalize: bool = True,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = True,
+        revision: str | None = None,
         max_seq_length: int | None = None,
         muvera_config: dict[str, Any] | None = None,
         token_dim: int = 320,
@@ -69,6 +70,8 @@ class ColQwen3Adapter(BaseAdapter):
                 already normalizes; kept for interface parity).
             compute_precision: Compute precision for inference.
             trust_remote_code: Required for ColQwen3 (custom processor + model classes).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             max_seq_length: Ignored — ColQwen3 uses dynamic sequence length.
             muvera_config: Optional MUVERA configuration (passed to postprocessor).
             token_dim: Per-token embedding dimension (320 for ColQwen3).
@@ -78,6 +81,7 @@ class ColQwen3Adapter(BaseAdapter):
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._max_num_visual_tokens = max_num_visual_tokens
 
         self._model: Any = None
@@ -106,6 +110,7 @@ class ColQwen3Adapter(BaseAdapter):
             self._model_name_or_path,
             trust_remote_code=self._trust_remote_code,
             max_num_visual_tokens=self._max_num_visual_tokens,
+            revision=self._revision,
         )
 
         load_kwargs: dict[str, Any] = {
@@ -115,6 +120,8 @@ class ColQwen3Adapter(BaseAdapter):
         }
         if attn_impl is not None:
             load_kwargs["attn_implementation"] = attn_impl
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
 
         self._model = AutoModel.from_pretrained(
             self._model_name_or_path,

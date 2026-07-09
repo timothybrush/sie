@@ -6,6 +6,7 @@ from pathlib import Path
 
 # Environment variable names for configuration
 ENV_DEVICE = "SIE_DEVICE"
+ENV_DEVICES = "SIE_DEVICES"
 ENV_MODELS_DIR = "SIE_MODELS_DIR"
 ENV_MODEL_FILTER = "SIE_MODEL_FILTER"
 ENV_PRELOAD_MODELS = "SIE_PRELOAD_MODELS"
@@ -27,6 +28,9 @@ class AppStateConfig:
     device: str = "cpu"
     """Device to load models on (e.g., "cuda:0", "cpu", "mps")."""
 
+    devices: list[str] | None = None
+    """Optional device list for whole-model placement (e.g., ["cuda:0", "cuda:1"])."""
+
     model_filter: list[str] | None = None
     """Optional list of model names to include. If None, all models are available."""
 
@@ -39,6 +43,33 @@ class AppStateConfig:
     pool_name: str | None = None
     """Optional worker pool identity used by ModelRegistry pool-isolation checks."""
 
+    def __post_init__(self) -> None:
+        """Keep scalar and concrete device settings in the same device family."""
+        if not self.devices:
+            return
+
+        devices = [d.strip() for d in self.devices if d.strip()]
+        if not devices:
+            self.devices = None
+            return
+
+        self.devices = devices
+        device_families = {d.split(":", maxsplit=1)[0].lower() for d in devices}
+        configured_family = self.device.strip().split(":", maxsplit=1)[0].lower()
+        families = ", ".join(sorted(device_families))
+
+        if len(device_families) != 1:
+            raise ValueError(
+                f"SIE_DEVICE family '{configured_family}' must match SIE_DEVICES families; got multiple: {families}"
+            )
+
+        if configured_family == "cpu" and len(device_families) == 1:
+            self.device = next(iter(device_families))
+            return
+
+        if configured_family not in device_families:
+            raise ValueError(f"SIE_DEVICE family '{configured_family}' must match SIE_DEVICES families: {families}")
+
     def save_to_env_vars(self) -> None:
         """Serialize configuration to environment variables for uvicorn reload mode."""
         if self.models_dir:
@@ -47,6 +78,11 @@ class AppStateConfig:
             del os.environ[ENV_MODELS_DIR]
 
         os.environ[ENV_DEVICE] = self.device
+
+        if self.devices:
+            os.environ[ENV_DEVICES] = ",".join(self.devices)
+        elif ENV_DEVICES in os.environ:
+            del os.environ[ENV_DEVICES]
 
         if self.model_filter:
             os.environ[ENV_MODEL_FILTER] = ",".join(self.model_filter)
@@ -72,6 +108,8 @@ class AppStateConfig:
     def from_env_vars(cls) -> AppStateConfig:
         """Deserialize configuration from environment variables."""
         device = os.environ.get(ENV_DEVICE, "cpu")
+        devices_str = os.environ.get(ENV_DEVICES)
+        devices = [d.strip() for d in devices_str.split(",") if d.strip()] if devices_str else None
         models_dir = os.environ.get(ENV_MODELS_DIR)
         model_filter_str = os.environ.get(ENV_MODEL_FILTER)
         model_filter = [m.strip() for m in model_filter_str.split(",") if m.strip()] if model_filter_str else None
@@ -84,6 +122,7 @@ class AppStateConfig:
         return cls(
             models_dir=models_dir,
             device=device,
+            devices=devices,
             model_filter=model_filter,
             preload_models=preload_models,
             pinned_models=pinned_models,

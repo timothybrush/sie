@@ -69,6 +69,7 @@ class ColPaliAdapter(BaseAdapter):
         normalize: bool = True,
         compute_precision: ComputePrecision = "float32",
         trust_remote_code: bool = False,
+        revision: str | None = None,
         max_seq_length: int | None = None,
         muvera_config: dict[str, Any] | None = None,
         token_dim: int | None = None,
@@ -82,6 +83,8 @@ class ColPaliAdapter(BaseAdapter):
                 Note: ColPali with eager attention may require float32 due to
                 attention mask dtype issues. flash_attention_2 allows fp16/bf16.
             trust_remote_code: Whether to trust remote code.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             max_seq_length: Ignored - ColPali uses dynamic sequence length.
             muvera_config: Optional MUVERA configuration for converting
                 multi-vector to dense representation. Reserved for future use.
@@ -91,6 +94,7 @@ class ColPaliAdapter(BaseAdapter):
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._muvera_config = muvera_config
         self._token_dim = token_dim
 
@@ -121,10 +125,14 @@ class ColPaliAdapter(BaseAdapter):
             attn_impl,
         )
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load processor
         self._processor = ColPaliProcessor.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # WORKAROUND: The ColPali model config on HuggingFace (vidore/colpali-v1.3-hf) has
@@ -136,7 +144,7 @@ class ColPaliAdapter(BaseAdapter):
         # (text_config.torch_dtype should be "bfloat16", not "float32")
         config = ColPaliConfig.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._fix_config_dtype(config, dtype)
 
@@ -148,6 +156,7 @@ class ColPaliAdapter(BaseAdapter):
             device_map=device,
             attn_implementation=attn_impl,
             trust_remote_code=self._trust_remote_code,
+            revision=self._revision,
         ).eval()
 
         # Get embedding dimension from model config

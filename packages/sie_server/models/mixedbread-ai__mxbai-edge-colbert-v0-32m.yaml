@@ -1,5 +1,6 @@
 sie_id: mixedbread-ai/mxbai-edge-colbert-v0-32m
 hf_id: mixedbread-ai/mxbai-edge-colbert-v0-32m
+hf_revision: 963e23afa1478d8bcc12e5d7115adcfdbd22c3af
 inputs:
   text: true
   image: false

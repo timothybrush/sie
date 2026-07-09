@@ -112,6 +112,11 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r.register(Box::new(ACTIVE_LEASE_GPUS.clone())).unwrap();
     r.register(Box::new(WORKER_COUNT.clone())).unwrap();
     r.register(Box::new(WORKER_QUEUE_DEPTH.clone())).unwrap();
+    r.register(Box::new(WORKER_READY_GPU_SLOTS.clone()))
+        .unwrap();
+    r.register(Box::new(WORKER_PENDING_COST.clone())).unwrap();
+    r.register(Box::new(WORKER_INFLIGHT_BATCHES.clone()))
+        .unwrap();
     r.register(Box::new(WORKER_MEMORY_USED.clone())).unwrap();
     r.register(Box::new(MODEL_WORKERS.clone())).unwrap();
     r.register(Box::new(QUEUE_PUBLISH_SECONDS.clone())).unwrap();
@@ -334,6 +339,39 @@ pub static WORKER_COUNT: LazyLock<GaugeVec> = LazyLock::new(|| {
 pub static WORKER_QUEUE_DEPTH: LazyLock<GaugeVec> = LazyLock::new(|| {
     GaugeVec::new(
         Opts::new("sie_gateway_worker_queue_depth", "Per-worker queue depth"),
+        &["pool", "worker", "machine_profile", "bundle"],
+    )
+    .unwrap()
+});
+
+pub static WORKER_READY_GPU_SLOTS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "sie_gateway_worker_ready_gpu_slots",
+            "Per-worker GPU slots currently ready to receive work",
+        ),
+        &["pool", "worker", "machine_profile", "bundle"],
+    )
+    .unwrap()
+});
+
+pub static WORKER_PENDING_COST: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "sie_gateway_worker_pending_cost",
+            "Per-worker scheduler pending cost as reported by the worker sidecar",
+        ),
+        &["pool", "worker", "machine_profile", "bundle"],
+    )
+    .unwrap()
+});
+
+pub static WORKER_INFLIGHT_BATCHES: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "sie_gateway_worker_inflight_batches",
+            "Per-worker batches currently in flight as reported by the worker sidecar",
+        ),
         &["pool", "worker", "machine_profile", "bundle"],
     )
     .unwrap()
@@ -1060,6 +1098,9 @@ pub struct WorkerSnapshot {
     /// workers that pre-date the pool registration message.
     pub pool_name: String,
     pub queue_depth: i32,
+    pub ready_gpu_slots: i32,
+    pub pending_cost: i64,
+    pub inflight_batches: i32,
     pub memory_used_bytes: i64,
     pub healthy: bool,
 }
@@ -1072,6 +1113,9 @@ pub fn update_worker_metrics(workers: &[WorkerSnapshot]) {
     // long-gone worker as still active. `ACTIVE_LEASE_GPUS` uses the
     // same reset-then-repopulate pattern in `update_pool_metrics`.
     WORKER_QUEUE_DEPTH.reset();
+    WORKER_READY_GPU_SLOTS.reset();
+    WORKER_PENDING_COST.reset();
+    WORKER_INFLIGHT_BATCHES.reset();
     WORKER_MEMORY_USED.reset();
     // Keep `kv_reservation_known` series in sync with the
     // current worker set. The actual value lands once the worker
@@ -1096,6 +1140,15 @@ pub fn update_worker_metrics(workers: &[WorkerSnapshot]) {
         WORKER_QUEUE_DEPTH
             .with_label_values(&[&pool_name, &w.name, &w.machine_profile, &w.bundle])
             .set(w.queue_depth as f64);
+        WORKER_READY_GPU_SLOTS
+            .with_label_values(&[&pool_name, &w.name, &w.machine_profile, &w.bundle])
+            .set(w.ready_gpu_slots as f64);
+        WORKER_PENDING_COST
+            .with_label_values(&[&pool_name, &w.name, &w.machine_profile, &w.bundle])
+            .set(w.pending_cost as f64);
+        WORKER_INFLIGHT_BATCHES
+            .with_label_values(&[&pool_name, &w.name, &w.machine_profile, &w.bundle])
+            .set(w.inflight_batches as f64);
         WORKER_MEMORY_USED
             .with_label_values(&[&w.name, &w.machine_profile, &w.bundle])
             .set(w.memory_used_bytes as f64);
@@ -1259,6 +1312,9 @@ mod tests {
         ACTIVE_LEASE_GPUS.reset();
         WORKER_COUNT.reset();
         WORKER_QUEUE_DEPTH.reset();
+        WORKER_READY_GPU_SLOTS.reset();
+        WORKER_PENDING_COST.reset();
+        WORKER_INFLIGHT_BATCHES.reset();
         WORKER_MEMORY_USED.reset();
         MODEL_WORKERS.reset();
         PENDING_DEMAND.reset();
@@ -1564,6 +1620,9 @@ mod tests {
                 bundle: "default".to_string(),
                 pool_name: "pool-a".to_string(),
                 queue_depth: 5,
+                ready_gpu_slots: 1,
+                pending_cost: 55,
+                inflight_batches: 2,
                 memory_used_bytes: 1000,
                 healthy: true,
             },
@@ -1573,6 +1632,9 @@ mod tests {
                 bundle: "premium".to_string(),
                 pool_name: "pool-b".to_string(),
                 queue_depth: 2,
+                ready_gpu_slots: 0,
+                pending_cost: 20,
+                inflight_batches: 1,
                 memory_used_bytes: 2000,
                 healthy: false,
             },
@@ -1584,6 +1646,10 @@ mod tests {
         let unhealthy = WORKER_COUNT.with_label_values(&["unhealthy"]).get();
         assert!((healthy - 1.0).abs() < f64::EPSILON);
         assert!((unhealthy - 1.0).abs() < f64::EPSILON);
+        let ready_slots = WORKER_READY_GPU_SLOTS
+            .with_label_values(&["pool-a", "w1", "l4", "default"])
+            .get();
+        assert!((ready_slots - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1598,29 +1664,51 @@ mod tests {
             bundle: "default".to_string(),
             pool_name: "Customer-Acme".to_string(),
             queue_depth: 5,
+            ready_gpu_slots: 2,
+            pending_cost: 55,
+            inflight_batches: 3,
             memory_used_bytes: 1000,
             healthy: true,
         }]);
 
-        let canonical = WORKER_QUEUE_DEPTH
+        let queue_depth = WORKER_QUEUE_DEPTH
             .with_label_values(&["customer-acme", "w1", "l4", "default"])
             .get();
-        assert!((canonical - 5.0).abs() < f64::EPSILON);
+        assert!((queue_depth - 5.0).abs() < f64::EPSILON);
+        let ready_slots = WORKER_READY_GPU_SLOTS
+            .with_label_values(&["customer-acme", "w1", "l4", "default"])
+            .get();
+        assert!((ready_slots - 2.0).abs() < f64::EPSILON);
+        let pending_cost = WORKER_PENDING_COST
+            .with_label_values(&["customer-acme", "w1", "l4", "default"])
+            .get();
+        assert!((pending_cost - 55.0).abs() < f64::EPSILON);
+        let inflight_batches = WORKER_INFLIGHT_BATCHES
+            .with_label_values(&["customer-acme", "w1", "l4", "default"])
+            .get();
+        assert!((inflight_batches - 3.0).abs() < f64::EPSILON);
 
         let families = REGISTRY.gather();
-        let mixed_case_present = families
-            .iter()
-            .filter(|mf| mf.name() == "sie_gateway_worker_queue_depth")
-            .flat_map(|mf| mf.get_metric().iter())
-            .any(|m| {
-                m.get_label()
-                    .iter()
-                    .any(|l| l.name() == "pool" && l.value() == "Customer-Acme")
-            });
-        assert!(
-            !mixed_case_present,
-            "worker queue-depth labels must use canonical lowercase pool names"
-        );
+        for metric_name in [
+            "sie_gateway_worker_queue_depth",
+            "sie_gateway_worker_ready_gpu_slots",
+            "sie_gateway_worker_pending_cost",
+            "sie_gateway_worker_inflight_batches",
+        ] {
+            let mixed_case_present = families
+                .iter()
+                .filter(|mf| mf.name() == metric_name)
+                .flat_map(|mf| mf.get_metric().iter())
+                .any(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "pool" && l.value() == "Customer-Acme")
+                });
+            assert!(
+                !mixed_case_present,
+                "{metric_name} labels must use canonical lowercase pool names"
+            );
+        }
     }
 
     #[test]
@@ -1656,6 +1744,9 @@ mod tests {
             bundle: "default".to_string(),
             pool_name: "default-pool".to_string(),
             queue_depth: 42,
+            ready_gpu_slots: 1,
+            pending_cost: 420,
+            inflight_batches: 3,
             memory_used_bytes: 123_456,
             healthy: true,
         }];
@@ -1673,6 +1764,9 @@ mod tests {
             bundle: "premium".to_string(),
             pool_name: "premium-pool".to_string(),
             queue_depth: 7,
+            ready_gpu_slots: 1,
+            pending_cost: 70,
+            inflight_batches: 1,
             memory_used_bytes: 999,
             healthy: true,
         }];

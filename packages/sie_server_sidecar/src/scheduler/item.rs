@@ -45,8 +45,7 @@
 
 use std::time::Instant;
 
-use async_nats::jetstream::Message;
-
+use crate::delivery::Delivery;
 use crate::ipc_types::{
     EncodeBatchItem, ExtractBatchItem, PreparedTokens, RunBatchItem, ScoreBatchItem,
 };
@@ -157,20 +156,23 @@ impl HasCost for SchedulerItem {
 /// through the scheduler to finish the request lifecycle on the
 /// other side.
 ///
-/// Not `Clone`: the JetStream [`Message`] owns the ACK/NAK token,
-/// which must not be duplicated. The scheduler moves items by value
-/// (vec of `(item, metadata)` into the batcher, vec back out of the
-/// flushed [`crate::scheduler::batch_former::FormattedBatch`]), so
+/// Not `Clone`: on the NATS arm the JetStream `Message` inside
+/// [`Delivery`] owns the ACK/NAK token, which must not be duplicated.
+/// The scheduler moves items by value (vec of `(item, metadata)` into
+/// the batcher, vec back out of the flushed
+/// [`crate::scheduler::batch_former::FormattedBatch`]), so
 /// single-ownership is preserved end-to-end.
 pub struct SchedulerMeta {
     /// The parsed work item — needed for `publish_result` / `publish_error`
     /// (reply subject, request id, timings, output types, etc.).
     pub wi: WorkItem,
-    /// JetStream message — owns the ACK / NAK. Dropping it without
-    /// either is safe but leaks: JetStream will redeliver after
-    /// `ack_wait` expires. The drain loop is responsible for ACKing
-    /// on success and NAKing on backend failure.
-    pub msg: Message,
+    /// Settlement token (NATS message or local-ingest slot, P2.10 §4.6)
+    /// — owns the ACK / NAK. Dropping a NATS one without either is safe
+    /// but leaks: JetStream redelivers after `ack_wait` expires; a local
+    /// one surfaces at the ingest layer as a missing-result timeout. The
+    /// drain loop is responsible for ACKing on success and NAKing on
+    /// backend failure.
+    pub delivery: Delivery,
     /// Payload-store fetch latency (ms). Surfaced on the published
     /// [`crate::publisher::Timings`] and on the `payload_fetch_seconds`
     /// histogram.
@@ -183,44 +185,56 @@ pub struct SchedulerMeta {
     /// driven by its own `head_ns` atomic (see
     /// [`super::engine::Scheduler`]).
     pub submitted_at: Instant,
+    /// Adapter worker child selected by the sidecar when this item entered
+    /// the scheduler. Used to keep per-child queue-pressure metrics
+    /// balanced even if model placement changes before the batch flushes.
+    pub worker_child_index: Option<usize>,
 }
 
 impl SchedulerMeta {
     /// Construct the standard triple stamped with `Instant::now`.
     #[must_use]
-    pub fn new(wi: WorkItem, msg: Message, fetch_ms: f64) -> Self {
-        Self::new_with_worker_direct(wi, msg, fetch_ms, false)
+    pub fn new(wi: WorkItem, delivery: Delivery, fetch_ms: f64) -> Self {
+        Self::new_with_worker_direct(wi, delivery, fetch_ms, false)
     }
 
     /// Construct metadata with an explicit delivery-origin marker.
     #[must_use]
     pub fn new_with_worker_direct(
         wi: WorkItem,
-        msg: Message,
+        delivery: Delivery,
         fetch_ms: f64,
         worker_direct: bool,
     ) -> Self {
         Self {
             wi,
-            msg,
+            delivery,
             fetch_ms,
             worker_direct,
             submitted_at: Instant::now(),
+            worker_child_index: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_worker_child_index(mut self, child_index: usize) -> Self {
+        self.worker_child_index = Some(child_index);
+        self
     }
 }
 
 impl std::fmt::Debug for SchedulerMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `Message` intentionally doesn't implement Debug in a
-        // useful way for our purposes — skip it. The rest is cheap
-        // to print.
+        // The NATS `Message` inside `Delivery` intentionally doesn't
+        // implement Debug in a useful way for our purposes — skip it.
+        // The rest is cheap to print.
         f.debug_struct("SchedulerMeta")
             .field("wi_work_item_id", &self.wi.work_item_id)
             .field("wi_request_id", &self.wi.request_id)
             .field("fetch_ms", &self.fetch_ms)
             .field("worker_direct", &self.worker_direct)
             .field("submitted_at", &self.submitted_at)
+            .field("worker_child_index", &self.worker_child_index)
             .finish_non_exhaustive()
     }
 }

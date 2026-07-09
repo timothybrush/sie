@@ -663,3 +663,33 @@ mcpEdge.existingSecretName is set; otherwise the chart-managed one.
 {{- printf "%s-connector-secrets" (include "sie-cluster.mcpEdge.serviceName" .) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Maximum worker child count rendered by any enabled worker pool.
+
+This mirrors worker-statefulset.yaml: GPU pools fan out by gpu.count, and local
+CPU emulation fans out by sidecar.emulatedChildCount. The shared worker Service
+and ServiceMonitor use the maximum to expose/scrape each possible child metrics
+port; pods without a named child port are simply not endpoints for that port.
+*/}}
+{{- define "sie-cluster.worker.maxChildCount" -}}
+{{- $root := . -}}
+{{- $max := 1 -}}
+{{- range $poolName, $pool := $root.Values.workers.pools -}}
+{{- if $pool.enabled -}}
+{{- $gpuCount := int $pool.gpu.count -}}
+{{- $poolSidecar := default dict $pool.sidecar -}}
+{{- $emulatedChildCount := int (dig "emulatedChildCount" 0 $poolSidecar) -}}
+{{- $count := 1 -}}
+{{- if gt $gpuCount 1 -}}
+{{- $count = $gpuCount -}}
+{{- else if gt $emulatedChildCount 1 -}}
+{{- $count = $emulatedChildCount -}}
+{{- end -}}
+{{- if and $root.Values.workers.common.workerSidecar.enabled (gt $count $max) -}}
+{{- $max = $count -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $max -}}
+{{- end }}

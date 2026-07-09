@@ -34,17 +34,23 @@ import {
   PoolError,
   ProvisioningError,
   RequestError,
+  ResourceExhaustedError,
   SIEConnectionError,
   SIEStreamError,
+  ServerError,
 } from "./errors.js";
 import { toImageWireFormat } from "./images.js";
 import type { ImageInput, ImageWireFormat } from "./images.js";
 import {
+  DEFAULT_JOB_WAIT_POLL,
+  DEFAULT_JOB_WAIT_TIMEOUT,
   DEFAULT_LEASE_RENEWAL_INTERVAL,
+  DEFAULT_LONG_RUNNING_TIMEOUT,
   DEFAULT_PROVISION_TIMEOUT,
   DEFAULT_RETRY_DELAY,
   DEFAULT_TIMEOUT,
   HTTP_CLIENT_ERROR_MIN,
+  HTTP_GATEWAY_TIMEOUT,
   JSON_CONTENT_TYPE,
   LORA_LOADING_DEFAULT_DELAY,
   LORA_LOADING_ERROR_CODE,
@@ -53,6 +59,8 @@ import {
   MODEL_LOADING_ERROR_CODE,
   MSGPACK_CONTENT_TYPE,
   PROVISIONING_ERROR_CODE,
+  RESOURCE_EXHAUSTED_ERROR_CODE,
+  RESOURCE_EXHAUSTED_MAX_RETRIES,
   SDK_VERSION_HEADER,
   SERVER_VERSION_HEADER,
 } from "./internal/constants.js";
@@ -68,20 +76,37 @@ import {
   throwIfInputTooLong,
   throwIfModelLoadFailed,
 } from "./internal/parsing.js";
-import { withProvisioningRetry } from "./internal/provisioning.js";
+import { nextOomRetryDelay, withProvisioningRetry } from "./internal/provisioning.js";
 import { applyRetryJitter } from "./internal/retry.js";
+import {
+  type JobResultItem,
+  type JobResults,
+  type JobStatus,
+  type JobSubmitResult,
+  type SubmitJobOptions,
+  TERMINAL_JOB_STATES,
+  buildJobBody,
+  decodeChunkBytes,
+  jobChunks,
+} from "./jobs.js";
 import { packMessage, unpackMessage } from "./msgpack.js";
 import { parseSseStream } from "./sse.js";
 import type {
+  Batch,
   CapacityInfo,
   ChatCompletion,
   ChatCompletionChunk,
   ChatCompletionOptions,
   ChatCompletionRequest,
+  Connection,
+  ConnectionCreated,
+  ConnectionRevoked,
+  CreatePoolOptions,
   EncodeOptions,
   EncodeResult,
   ExtractOptions,
   ExtractResult,
+  FileDeleted,
   GenerateChunk,
   GenerateOptions,
   GenerateResult,
@@ -90,15 +115,103 @@ import type {
   PoolInfo,
   PoolSpec,
   SIEClientOptions,
+  File as SIEFile,
   ScoreOptions,
   ScoreResult,
   StatusMessage,
 } from "./types.js";
 import { SDK_VERSION } from "./version.js";
 
+/** The `client.jobs` batch namespace. */
+export interface JobsNamespace {
+  /** Submit a batch job (`POST /v1/jobs`); returns the created-job envelope. */
+  submit(options: SubmitJobOptions): Promise<JobSubmitResult>;
+  /** Fetch a job's public status doc (`GET /v1/jobs/{id}`). */
+  get(jobId: string): Promise<JobStatus>;
+  /** List the org's jobs (`GET /v1/jobs`; scoped to the key's org). */
+  list(): Promise<JobStatus[]>;
+  /** Cancel a job (`POST /v1/jobs/{id}/cancel`); the hold's remainder releases. */
+  cancel(jobId: string): Promise<JobStatus>;
+  /** Retrieve a finished job's chunk refs and decode the per-item results. */
+  results(jobId: string): Promise<JobResults>;
+  /**
+   * Poll `get` until the job reaches a terminal state, then return its status.
+   * Throws a `job_wait_timeout` `RequestError` if `timeoutMs` elapses first.
+   * Mirrors the Python SDK's `jobs.wait` (default 600s timeout, 2s poll).
+   */
+  wait(jobId: string, options?: { timeoutMs?: number; pollMs?: number }): Promise<JobStatus>;
+}
+
+/** The `client.connections` namespace (org-scoped connector auth). */
+export interface ConnectionsNamespace {
+  /** Create an org-scoped connection (connector auth by name). */
+  add(name: string, type: string, secret: string): Promise<ConnectionCreated>;
+  /** List the org's active connections (secrets redacted). */
+  list(): Promise<Connection[]>;
+  /** Revoke (soft-delete) a connection; frees the name for reuse. */
+  revoke(name: string): Promise<ConnectionRevoked>;
+}
+
+/** Accepted upload payloads — the same shapes `fetch` sends as a body. */
+export type FileUploadInput = Uint8Array | ArrayBuffer | string | Blob;
+
+/**
+ * The `client.files` OpenAI-compatible Files namespace. Method
+ * names/args mirror `openai.files` so an `openai` → `sie-sdk` swap is mechanical.
+ */
+export interface FilesNamespace {
+  /** Upload a file (`POST /v1/files`); `purpose` defaults to `"batch"`. */
+  upload(
+    file: FileUploadInput,
+    options?: { purpose?: string; filename?: string },
+  ): Promise<SIEFile>;
+  /** OpenAI-exact alias for {@link upload} (`files.create({ file, purpose })`). */
+  create(options: { file: FileUploadInput; purpose?: string; filename?: string }): Promise<SIEFile>;
+  /** Fetch a file's metadata (`GET /v1/files/{id}`). */
+  retrieve(fileId: string): Promise<SIEFile>;
+  /** Download a file's raw bytes (`GET /v1/files/{id}/content`). */
+  content(fileId: string): Promise<Uint8Array>;
+  /** Delete a file (`DELETE /v1/files/{id}`; additive OpenAI-parity surface). */
+  delete(fileId: string): Promise<FileDeleted>;
+}
+
+/**
+ * The `client.batches` OpenAI-compatible Batch namespace. A
+ * batch is a job over an uploaded file's JSONL lines;
+ * `list` / `cancel` are the additive OpenAI-parity completion of the surface.
+ * Args are OpenAI's exact snake_case body keys, so an `openai` → `sie-sdk` swap
+ * is mechanical.
+ */
+export interface BatchesNamespace {
+  /** Create a batch (`POST /v1/batches`); returns the Batch object. */
+  create(options: {
+    input_file_id: string;
+    endpoint?: string;
+    completion_window?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<Batch>;
+  /** Fetch a batch's status (`GET /v1/batches/{id}`). */
+  retrieve(batchId: string): Promise<Batch>;
+  /** List the org's batches (`GET /v1/batches`; additive OpenAI-parity). */
+  list(): Promise<Batch[]>;
+  /** Cancel a batch (`POST /v1/batches/{id}/cancel`; additive OpenAI-parity). */
+  cancel(batchId: string): Promise<Batch>;
+}
+
 /** Helper to sleep for a given number of milliseconds */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Derive an upload filename: an explicit override > a File/Blob `.name` > default. */
+function resolveUploadFilename(file: FileUploadInput, filename?: string): string {
+  if (filename) return filename;
+  const name = (file as { name?: unknown }).name;
+  if (typeof name === "string" && name.length > 0) {
+    // A File's `.name` may include a path; keep just the basename.
+    return name.split(/[/\\]/).pop() || "upload.jsonl";
+  }
+  return "upload.jsonl";
 }
 
 /** Sleep that can be cancelled via AbortSignal. Returns true if aborted. */
@@ -203,6 +316,17 @@ export class SIEClient {
   private readonly apiKey?: string;
   private readonly defaultWaitForCapacity: boolean;
   private readonly provisionTimeout: number;
+  private readonly controlPlaneUrl?: string;
+  private readonly org?: string;
+
+  /** Batch class — `POST/GET /v1/jobs` on the keyed gateway. */
+  readonly jobs: JobsNamespace;
+  /** Org-scoped connections (connector auth by name) on the control plane. */
+  readonly connections: ConnectionsNamespace;
+  /** OpenAI-compatible Files API — `POST/GET /v1/files`. */
+  readonly files: FilesNamespace;
+  /** OpenAI-compatible Batch API — `POST/GET /v1/batches`. */
+  readonly batches: BatchesNamespace;
 
   // Pool state: track created pools and their lease renewal scheduling
   private readonly pools: Map<
@@ -232,8 +356,44 @@ export class SIEClient {
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.gpu = options.gpu;
     this.apiKey = options.apiKey;
-    this.defaultWaitForCapacity = options.waitForCapacity ?? false;
+    // BREAKING CHANGE (0.7): default flipped from `false` to `true` to match
+    // the Python SDK (`wait_for_capacity=True`). Callers that relied on
+    // fail-fast 503 PROVISIONING / connect-error behaviour must now pass
+    // `waitForCapacity: false` explicitly.
+    this.defaultWaitForCapacity = options.waitForCapacity ?? true;
     this.provisionTimeout = options.provisionTimeout ?? DEFAULT_PROVISION_TIMEOUT;
+    this.controlPlaneUrl = options.controlPlaneUrl?.replace(/\/$/, "");
+    this.org = options.org;
+
+    // First-class batch + connector surface.
+    this.jobs = {
+      submit: (submitOptions) => this.jobSubmit(submitOptions),
+      get: (jobId) => this.jobGet(jobId),
+      list: () => this.jobList(),
+      cancel: (jobId) => this.jobCancel(jobId),
+      results: (jobId) => this.jobResults(jobId),
+      wait: (jobId, options) => this.jobWait(jobId, options),
+    };
+    this.connections = {
+      add: (name, type, secret) => this.connectionAdd(name, type, secret),
+      list: () => this.connectionList(),
+      revoke: (name) => this.connectionRevoke(name),
+    };
+    // OpenAI-compatible Files + Batches surface — a base_url
+    // swap makes an `openai` batch caller work unchanged.
+    this.files = {
+      upload: (file, options) => this.fileUpload(file, options),
+      create: (options) => this.fileUpload(options.file, options),
+      retrieve: (fileId) => this.fileRetrieve(fileId),
+      content: (fileId) => this.fileContent(fileId),
+      delete: (fileId) => this.fileDelete(fileId),
+    };
+    this.batches = {
+      create: (options) => this.batchCreate(options),
+      retrieve: (batchId) => this.batchRetrieve(batchId),
+      list: () => this.batchList(),
+      cancel: (batchId) => this.batchCancel(batchId),
+    };
   }
 
   /**
@@ -824,8 +984,10 @@ export class SIEClient {
    * generator throws it instead of yielding the chunk.
    *
    * Retry policy mirrors {@link generate}: only explicit SAFE
-   * pre-execution capacity signals — `503 PROVISIONING` and
-   * `503 MODEL_LOADING` — are retried while the provision budget remains.
+   * pre-execution capacity signals — `503 PROVISIONING`,
+   * `503 MODEL_LOADING` and `503 RESOURCE_EXHAUSTED` (the latter only
+   * under `waitForCapacity`) — are retried while the provision budget
+   * remains; a `504` is post-publish and therefore terminal.
    * Once the body opens we never retry (the call is non-idempotent; a
    * mid-stream failure must not re-issue generation).
    *
@@ -860,12 +1022,13 @@ export class SIEClient {
 
     try {
       const startTime = Date.now();
+      let oomRetries = 0;
       let response: Response | undefined;
 
       // Pre-stream provisioning retry loop. We re-fetch on explicit SAFE
-      // pre-execution capacity signals only (503 PROVISIONING / MODEL_LOADING),
-      // parallel to `generate()`. The loop terminates by `break`-ing on a
-      // 200 (the only status that opens a body) or by throwing.
+      // pre-execution capacity signals only (503 PROVISIONING / MODEL_LOADING /
+      // RESOURCE_EXHAUSTED), parallel to `generate()`. The loop terminates by
+      // `break`-ing on a 200 (the only status that opens a body) or by throwing.
       while (true) {
         if (signal?.aborted) {
           throw new SIEConnectionError("Stream aborted before request", "other");
@@ -954,6 +1117,43 @@ export class SIEClient {
             }
             continue;
           }
+          if (errorCode === RESOURCE_EXHAUSTED_ERROR_CODE) {
+            // Pre-stream capacity signal. Mirrors the Python streaming
+            // surface (`next_stream_retry_delay`): retried only under
+            // `waitForCapacity`, bounded by the shared OOM budget.
+            if (!waitForCapacity) {
+              throw new ResourceExhaustedError(
+                `Server resource exhausted after ${oomRetries} retry attempt(s) for model '${model}'`,
+                { model, retries: oomRetries },
+              );
+            }
+            const delay = nextOomRetryDelay({
+              retryAfter: getRetryAfter(attemptResponse),
+              oomRetries,
+              maxOomRetries: RESOURCE_EXHAUSTED_MAX_RETRIES,
+              elapsedMs: Date.now() - startTime,
+              provisionTimeoutMs: this.provisionTimeout,
+              model,
+            });
+            oomRetries += 1;
+            if (await abortableSleep(delay, controller.signal)) {
+              throw new SIEConnectionError("Stream aborted while provisioning", "other");
+            }
+            continue;
+          }
+        }
+
+        // 504 is terminal on the streaming path: post-publish, a worker may
+        // already be generating, and generation is non-idempotent (Python
+        // SDK parity — see `next_stream_retry_delay`).
+        if (attemptResponse.status === HTTP_GATEWAY_TIMEOUT) {
+          throw new ServerError(
+            "Gateway timed out (504) after the request was published to the queue; " +
+              "a worker may already be generating. Not retried because generation is " +
+              "non-idempotent (retrying could double-bill).",
+            await getErrorCode(attemptResponse.clone()),
+            HTTP_GATEWAY_TIMEOUT,
+          );
         }
 
         // Any remaining non-200 is an error.
@@ -1169,11 +1369,20 @@ export class SIEClient {
    * @param gpus - Optional machine profile requirements for pool readiness, e.g., { "l4": 2, "l4-spot": 1 }
    * @param gpuCaps - Optional maximum assigned workers per machine profile
    * @param queuePool - Optional Helm/NATS queue namespace backing this logical pool. Defaults to "default".
+   * @param options - Optional bundle filter, warm floor, and pinned models
+   *                  (Python SDK `create_pool` parity)
    *
    * @example
    * ```typescript
    * // Create or update a pool with 2 L4 GPUs
    * await client.createPool("eval-bench", { l4: 2 });
+   *
+   * // With a bundle filter, warm floor, and pinned models
+   * await client.createPool("eval-bench", { l4: 2 }, undefined, undefined, {
+   *   bundle: "default",
+   *   minimumWorkerCount: 1,
+   *   pinnedModels: ["bge-m3"],
+   * });
    *
    * // Use the pool for requests
    * await client.encode("bge-m3", { text: "Hello" }, { gpu: "eval-bench/l4" });
@@ -1187,8 +1396,13 @@ export class SIEClient {
     gpus?: Record<string, number>,
     gpuCaps?: Record<string, number>,
     queuePool?: string,
+    options: CreatePoolOptions = {},
   ): Promise<void> {
     const alreadyTracking = this.pools.has(name);
+
+    if (options.minimumWorkerCount !== undefined && options.minimumWorkerCount < 0) {
+      throw new RangeError("minimumWorkerCount must be >= 0");
+    }
 
     // Build pool creation request
     const requestBody: {
@@ -1196,6 +1410,9 @@ export class SIEClient {
       gpus?: Record<string, number>;
       gpu_caps?: Record<string, number>;
       queue_pool?: string;
+      bundle?: string;
+      minimum_worker_count?: number;
+      pinned_models?: string[];
     } = {
       name,
     };
@@ -1207,6 +1424,15 @@ export class SIEClient {
     }
     if (queuePool) {
       requestBody.queue_pool = queuePool;
+    }
+    if (options.bundle) {
+      requestBody.bundle = options.bundle;
+    }
+    if (options.minimumWorkerCount !== undefined) {
+      requestBody.minimum_worker_count = options.minimumWorkerCount;
+    }
+    if (options.pinnedModels !== undefined) {
+      requestBody.pinned_models = options.pinnedModels;
     }
 
     const url = `${this.baseUrl}/v1/pools`;
@@ -1589,6 +1815,11 @@ export class SIEClient {
    * Retried (capped by `provisionTimeout`):
    *  - 503 `PROVISIONING` when `waitForCapacity: true`
    *  - 503 `MODEL_LOADING` / `LORA_LOADING`
+   *  - 503 `RESOURCE_EXHAUSTED` regardless of `waitForCapacity` (bounded
+   *    exponential backoff, at most `RESOURCE_EXHAUSTED_MAX_RETRIES`)
+   *  - 504 gateway timeout when `waitForCapacity: true` — encode/score/
+   *    extract are idempotent queue paths, so a post-publish retry is safe
+   *    (unlike generate/chat, where a 504 is terminal)
    *  - `SIEConnectionError` with `kind === "connect"` (issue #95)
    *
    * `kind === "timeout"` is NOT retried — would extend the user-visible
@@ -1607,6 +1838,9 @@ export class SIEClient {
     // Local retry counter for LoRA loading (uses retry count, not time-based)
     // Model loading uses cumulative time check, not retry counter
     let loraRetries = 0;
+    // Retry counter for server-side OOM (RESOURCE_EXHAUSTED). Bounded so a
+    // stuck-at-OOM server cannot cause unbounded blocking.
+    let oomRetries = 0;
 
     while (true) {
       let response: Response;
@@ -1702,6 +1936,38 @@ export class SIEClient {
           const remaining = this.provisionTimeout - elapsed;
           const actualDelay = Math.min(delay, remaining);
           await sleep(actualDelay);
+          continue;
+        }
+
+        if (errorCode === RESOURCE_EXHAUSTED_ERROR_CODE) {
+          // Server-side OOM. Retried regardless of `waitForCapacity`
+          // (bounded budget), matching the Python SDK: the worker already
+          // accepted the request and is recovering from transient capacity
+          // exhaustion.
+          const delay = nextOomRetryDelay({
+            retryAfter: getRetryAfter(response),
+            oomRetries,
+            maxOomRetries: RESOURCE_EXHAUSTED_MAX_RETRIES,
+            elapsedMs: Date.now() - startTime,
+            provisionTimeoutMs: this.provisionTimeout,
+            model,
+          });
+          oomRetries += 1;
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      // Handle 504 (gateway timeout): queued work was published, but the
+      // gateway did not receive a worker result before its deadline.
+      // Encode/score/extract are idempotent, so callers that opted into
+      // waitForCapacity can retry within the provision budget (Python SDK
+      // parity). On budget exhaustion this falls through to handleError.
+      if (response.status === HTTP_GATEWAY_TIMEOUT && waitForCapacity) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed < this.provisionTimeout) {
+          const delay = getRetryAfter(response) ?? MODEL_LOADING_DEFAULT_DELAY;
+          await sleep(Math.min(delay, this.provisionTimeout - elapsed));
           continue;
         }
       }
@@ -1817,6 +2083,343 @@ export class SIEClient {
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Jobs + connections namespaces. Jobs ride the keyed gateway
+  // (`/v1/jobs`); connections ride the control plane (`/internal/orgs/{org}/…`).
+  // ---------------------------------------------------------------------------
+
+  /** One JSON request over `fetch` (bearer auth reused; absolute or base-relative URL). */
+  private async jsonRequest<T>(
+    target: string,
+    method: "GET" | "POST" | "DELETE",
+    body?: unknown,
+    timeoutMs: number = this.timeout,
+  ): Promise<T> {
+    const url = target.startsWith("http") ? target : `${this.baseUrl}${target}`;
+    const headers: Record<string, string> = {
+      Accept: JSON_CONTENT_TYPE,
+      [SDK_VERSION_HEADER]: SDK_VERSION,
+    };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    const init: RequestInit = { method, headers };
+    if (body !== undefined) {
+      headers["Content-Type"] = JSON_CONTENT_TYPE;
+      init.body = JSON.stringify(body);
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    init.signal = controller.signal;
+    try {
+      const response = await fetch(url, init);
+      if (!response.ok) {
+        await handleError(response);
+      }
+      this.checkServerVersion(response);
+      const text = await response.text();
+      return (text ? JSON.parse(text) : {}) as T;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SIEConnectionError(`Request timeout after ${timeoutMs}ms`, "timeout");
+      }
+      if (error instanceof TypeError) {
+        throw new SIEConnectionError(`Connection failed: ${error.message}`, "connect");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private async jobSubmit(options: SubmitJobOptions): Promise<JobSubmitResult> {
+    return this.jsonRequest<JobSubmitResult>(
+      "/v1/jobs",
+      "POST",
+      buildJobBody(options),
+      Math.max(this.timeout, DEFAULT_LONG_RUNNING_TIMEOUT),
+    );
+  }
+
+  private async jobGet(jobId: string): Promise<JobStatus> {
+    return this.jsonRequest<JobStatus>(`/v1/jobs/${encodeURIComponent(jobId)}`, "GET");
+  }
+
+  private async jobList(): Promise<JobStatus[]> {
+    const data = await this.jsonRequest<{ object?: string; data?: JobStatus[] }>("/v1/jobs", "GET");
+    return Array.isArray(data) ? data : (data.data ?? []);
+  }
+
+  private async jobCancel(jobId: string): Promise<JobStatus> {
+    return this.jsonRequest<JobStatus>(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, "POST");
+  }
+
+  private async jobResults(jobId: string): Promise<JobResults> {
+    const job = await this.jobGet(jobId);
+    const chunks = jobChunks(job);
+    const items: JobResultItem[] = [];
+    for (const chunk of chunks) {
+      if (chunk.state !== "succeeded" || !chunk.ref) continue;
+      const raw = await this.readRef(chunk.ref);
+      items.push(...decodeChunkBytes(raw));
+    }
+    const withDims = items.find((it) => it.dims != null);
+    return {
+      job_id: job.id ?? jobId,
+      state: job.state,
+      total_items: job.total_items,
+      settled_credits: job.settled_credits,
+      chunks,
+      retrieved: items.length,
+      dims: withDims ? withDims.dims : null,
+      items,
+    };
+  }
+
+  private async jobWait(
+    jobId: string,
+    options?: { timeoutMs?: number; pollMs?: number },
+  ): Promise<JobStatus> {
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_JOB_WAIT_TIMEOUT;
+    const pollMs = options?.pollMs ?? DEFAULT_JOB_WAIT_POLL;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const job = await this.jobGet(jobId);
+      if (job.state && TERMINAL_JOB_STATES.has(job.state)) {
+        return job;
+      }
+      if (Date.now() >= deadline) {
+        throw new RequestError(
+          `job ${jobId} still ${JSON.stringify(job.state)} after ${timeoutMs}ms`,
+          "job_wait_timeout",
+          504,
+        );
+      }
+      await sleep(pollMs);
+    }
+  }
+
+  /** Retrieve a chunk's payload-store ref (http(s) URL). */
+  private async readRef(ref: string): Promise<Uint8Array> {
+    if (!ref.startsWith("http://") && !ref.startsWith("https://")) {
+      throw new RequestError(
+        `cannot retrieve payload-store ref ${JSON.stringify(ref)} (the TS SDK reads http(s) refs)`,
+        "bad_ref",
+        400,
+      );
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    try {
+      const response = await fetch(ref, {
+        headers: { Accept: "application/octet-stream" },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        await handleError(response);
+      }
+      return new Uint8Array(await response.arrayBuffer());
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SIEConnectionError(`Request timeout after ${this.timeout}ms`, "timeout");
+      }
+      if (error instanceof TypeError) {
+        throw new SIEConnectionError(`Connection failed: ${error.message}`, "connect");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private connectionsBase(): string {
+    if (!this.controlPlaneUrl) {
+      throw new RequestError(
+        "connections require controlPlaneUrl on the client: new SIEClient(url, { controlPlaneUrl, org })",
+        "missing_control_plane_url",
+        400,
+      );
+    }
+    if (!this.org) {
+      throw new RequestError(
+        "connections require org on the client: new SIEClient(url, { controlPlaneUrl, org })",
+        "missing_org",
+        400,
+      );
+    }
+    return `${this.controlPlaneUrl}/internal/orgs/${encodeURIComponent(this.org)}/connections`;
+  }
+
+  private async connectionAdd(
+    name: string,
+    type: string,
+    secret: string,
+  ): Promise<ConnectionCreated> {
+    return this.jsonRequest<ConnectionCreated>(this.connectionsBase(), "POST", {
+      type,
+      name,
+      secret,
+    });
+  }
+
+  private async connectionList(): Promise<Connection[]> {
+    const data = await this.jsonRequest<{ connections?: Connection[] }>(
+      this.connectionsBase(),
+      "GET",
+    );
+    return Array.isArray(data) ? data : (data.connections ?? []);
+  }
+
+  private async connectionRevoke(name: string): Promise<ConnectionRevoked> {
+    return this.jsonRequest<ConnectionRevoked>(
+      `${this.connectionsBase()}/${encodeURIComponent(name)}`,
+      "DELETE",
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Files + batches namespaces — the OpenAI-compatible file /
+  // batch surface on the keyed gateway. Method names/args mirror `openai.files`
+  // / `openai.batches` so switching an OpenAI-batch caller to the SDK is
+  // mechanical.
+  // ---------------------------------------------------------------------------
+
+  /** POST a raw body and parse the JSON response (bearer auth reused). */
+  private async rawPostJson<T>(
+    path: string,
+    body: FileUploadInput,
+    contentType: string,
+    timeoutMs: number = this.timeout,
+  ): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const headers: Record<string, string> = {
+      Accept: JSON_CONTENT_TYPE,
+      "Content-Type": contentType,
+      [SDK_VERSION_HEADER]: SDK_VERSION,
+    };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        await handleError(response);
+      }
+      this.checkServerVersion(response);
+      const text = await response.text();
+      return (text ? JSON.parse(text) : {}) as T;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SIEConnectionError(`Request timeout after ${timeoutMs}ms`, "timeout");
+      }
+      if (error instanceof TypeError) {
+        throw new SIEConnectionError(`Connection failed: ${error.message}`, "connect");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /** GET raw bytes (bearer auth reused); used to download a file's content. */
+  private async rawGetBytes(path: string): Promise<Uint8Array> {
+    const url = `${this.baseUrl}${path}`;
+    const headers: Record<string, string> = {
+      Accept: "application/jsonl",
+      [SDK_VERSION_HEADER]: SDK_VERSION,
+    };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    try {
+      const response = await fetch(url, { method: "GET", headers, signal: controller.signal });
+      if (!response.ok) {
+        await handleError(response);
+      }
+      this.checkServerVersion(response);
+      return new Uint8Array(await response.arrayBuffer());
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new SIEConnectionError(`Request timeout after ${this.timeout}ms`, "timeout");
+      }
+      if (error instanceof TypeError) {
+        throw new SIEConnectionError(`Connection failed: ${error.message}`, "connect");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private async fileUpload(
+    file: FileUploadInput,
+    options?: { purpose?: string; filename?: string },
+  ): Promise<SIEFile> {
+    const purpose = options?.purpose ?? "batch";
+    const filename = resolveUploadFilename(file, options?.filename);
+    const query = new URLSearchParams({ purpose, filename }).toString();
+    const body: FileUploadInput = file instanceof ArrayBuffer ? new Uint8Array(file) : file;
+    return this.rawPostJson<SIEFile>(
+      `/v1/files?${query}`,
+      body,
+      "application/jsonl",
+      Math.max(this.timeout, DEFAULT_LONG_RUNNING_TIMEOUT),
+    );
+  }
+
+  private async fileRetrieve(fileId: string): Promise<SIEFile> {
+    return this.jsonRequest<SIEFile>(`/v1/files/${encodeURIComponent(fileId)}`, "GET");
+  }
+
+  private async fileContent(fileId: string): Promise<Uint8Array> {
+    return this.rawGetBytes(`/v1/files/${encodeURIComponent(fileId)}/content`);
+  }
+
+  private async fileDelete(fileId: string): Promise<FileDeleted> {
+    return this.jsonRequest<FileDeleted>(`/v1/files/${encodeURIComponent(fileId)}`, "DELETE");
+  }
+
+  private async batchCreate(options: {
+    input_file_id: string;
+    endpoint?: string;
+    completion_window?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<Batch> {
+    const body: Record<string, unknown> = {
+      input_file_id: options.input_file_id,
+      endpoint: options.endpoint ?? "/v1/embeddings",
+      completion_window: options.completion_window ?? "24h",
+    };
+    if (options.metadata !== undefined) {
+      body.metadata = options.metadata;
+    }
+    return this.jsonRequest<Batch>(
+      "/v1/batches",
+      "POST",
+      body,
+      Math.max(this.timeout, DEFAULT_LONG_RUNNING_TIMEOUT),
+    );
+  }
+
+  private async batchRetrieve(batchId: string): Promise<Batch> {
+    return this.jsonRequest<Batch>(`/v1/batches/${encodeURIComponent(batchId)}`, "GET");
+  }
+
+  private async batchList(): Promise<Batch[]> {
+    const data = await this.jsonRequest<{ object?: string; data?: Batch[] }>("/v1/batches", "GET");
+    return Array.isArray(data) ? data : (data.data ?? []);
+  }
+
+  private async batchCancel(batchId: string): Promise<Batch> {
+    return this.jsonRequest<Batch>(`/v1/batches/${encodeURIComponent(batchId)}/cancel`, "POST");
   }
 
   private buildWsUrl(path: string): string {

@@ -87,6 +87,15 @@ class ModelInfo(BaseModel):
     max_sequence_length: int | None = None
     profiles: dict[str, ProfileInfo] = {}
 
+    revision: str | None = None
+    """Pinned HF commit SHA for the model's weights (design §6.6).
+
+    Additive field so customers can pin/verify the exact weights behind an id:
+    a served ``sie_id`` maps to identical weights forever, and a weights change
+    is published as a NEW versioned id. ``None`` for ``weights_path`` /
+    ``package_backed`` models (no Hub revision) or an unpinned dev config.
+    """
+
     capabilities: ModelCapabilities | None = None
     """Advertised generation capabilities, ``None`` for non-generate models."""
 
@@ -193,6 +202,7 @@ async def list_models(http_request: Request) -> ModelsListResponse:
                 last_error=last_error,
                 max_sequence_length=config.max_sequence_length,
                 profiles=profiles,
+                revision=getattr(config, "hf_revision", None),
                 capabilities=_resolve_capabilities(config),
             )
         )
@@ -246,5 +256,6 @@ async def get_model(model: str, http_request: Request) -> ModelInfo:
         last_error=last_error,
         max_sequence_length=config.max_sequence_length,
         profiles=profiles,
+        revision=getattr(config, "hf_revision", None),
         capabilities=_resolve_capabilities(config),
     )

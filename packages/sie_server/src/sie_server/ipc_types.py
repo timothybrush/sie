@@ -62,6 +62,7 @@ class PingRequest(msgspec.Struct):
 class PingResponse(msgspec.Struct):
     timestamp_ms: float
     worker_id: str
+    ready: bool = False
     bundle_config_hash: str = ""
     loaded_models: list[str] = msgspec.field(default_factory=list)
 
@@ -469,6 +470,27 @@ class RawOutput(msgspec.Struct):
 # -----------------------------------------------------------------------------
 
 
+class UnitCounts(msgspec.Struct):
+    """Authoritative billable-unit counts for one work item.
+
+    Emitted by the engine on the result path so metering edges (gateways,
+    usage pipelines) never re-derive units from estimates: ``input_tokens``
+    is the REAL tokenizer count taken post-tokenization (``PreparedItem.cost``
+    for text preprocessing), not a bytes/4-style approximation.
+
+    All fields are optional: a field is set only when the engine has an
+    authoritative count for it. ``pages`` (docling parse/OCR) and ``images``
+    (vision extract/encode) are populated by the queue executor when the
+    pipeline surfaces per-item counts (see ``queue_executor._with_pages`` /
+    ``_with_images`` / ``_per_item_image_counts``); they stay ``None`` for
+    work that carries no such count.
+    """
+
+    input_tokens: int | None = None
+    pages: int | None = None
+    images: int | None = None
+
+
 class ItemOutcome(msgspec.Struct):
     work_item_id: str
     request_id: str
@@ -487,6 +509,11 @@ class ItemOutcome(msgspec.Struct):
     # empty and the Rust publisher produces the final wire bytes. See
     # ``RawOutput`` above for the fallback matrix.
     raw_output: RawOutput | None = None
+    # Authoritative billable-unit counts (see ``UnitCounts``). Optional and
+    # appended last: msgspec encodes Structs as msgpack maps, so decoders
+    # that don't know the key (older Rust sidecars) ignore it and older
+    # producers simply omit it — the NATS wire contract is unchanged.
+    units: UnitCounts | None = None
 
 
 class BatchOutcome(msgspec.Struct):

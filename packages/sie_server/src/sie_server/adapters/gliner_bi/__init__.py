@@ -53,6 +53,7 @@ class GLiNERBiAdapter(BaseAdapter):
         attn_implementation: str | None = None,
         max_len: int | None = None,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -69,6 +70,8 @@ class GLiNERBiAdapter(BaseAdapter):
                 ``"flash_attention_2"`` for ModernBERT-based models).
             max_len: Maximum sequence length override for the model.
             compute_precision: Compute precision for inference.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -80,6 +83,7 @@ class GLiNERBiAdapter(BaseAdapter):
         self._attn_implementation = attn_implementation
         self._max_len = max_len
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: Any = None
         self._device: str | None = None
@@ -124,6 +128,8 @@ class GLiNERBiAdapter(BaseAdapter):
             load_kwargs["_attn_implementation"] = attn_impl
         if self._max_len is not None:
             load_kwargs["max_length"] = self._max_len
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
 
         self._model = GLiNER.from_pretrained(
             self._model_name_or_path,

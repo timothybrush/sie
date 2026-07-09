@@ -19,10 +19,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
+use crate::backend::AdapterWorkerPool;
 use crate::health_publisher::{SharedBundleConfigHash, SharedLoadedModels};
-use crate::ipc_client::{IpcClient, IpcError};
+use crate::ipc_client::IpcError;
 use crate::ipc_types::{
-    ApplyModelConfigRequest, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
+    ApplyModelConfigRequest, ReadinessState, ReplaceModelConfigsRequest,
+    ReplaceModelConfigsResponse,
 };
 use crate::metrics::MetricsRegistry;
 use crate::shutdown::Shutdown;
@@ -143,6 +145,22 @@ impl ConfigApplyState {
             .write()
             .expect("loaded models lock poisoned");
         *guard = deduped;
+    }
+
+    pub fn record_loaded_model(&self, model_id: &str) {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .loaded_models
+            .write()
+            .expect("loaded models lock poisoned");
+        if guard.iter().any(|known| known == model_id) {
+            return;
+        }
+        guard.push(model_id.to_string());
+        guard.sort();
     }
 
     fn remember_bundle_hash(&self, hash: &str) {
@@ -268,7 +286,7 @@ struct SubscriberRuntime {
     bundle: String,
     pool: String,
     trusted_producers: Vec<String>,
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
@@ -373,6 +391,60 @@ fn retryable_ipc_error(e: &IpcError) -> bool {
     }
 }
 
+fn requires_eager_model_ready(bundle_id: &str) -> bool {
+    bundle_id.trim() == "candle"
+}
+
+async fn ensure_candle_model_ready_if_needed(
+    ipc: &Arc<AdapterWorkerPool>,
+    bundle_id: &str,
+    model_id: &str,
+    epoch: u64,
+) -> Result<(), IpcError> {
+    if !requires_eager_model_ready(bundle_id) {
+        return Ok(());
+    }
+
+    match ipc.ensure_model_ready_on_placed_child(model_id).await {
+        Ok(resp) if resp.state == ReadinessState::Ready => {
+            info!(
+                model = %model_id,
+                epoch,
+                "worker-config: Candle model ready after config apply"
+            );
+            Ok(())
+        }
+        Ok(resp) => {
+            warn!(
+                model = %model_id,
+                epoch,
+                state = ?resp.state,
+                "worker-config: Candle model not ready after config apply; retrying"
+            );
+            Err(IpcError::Timeout)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn ensure_candle_models_ready_if_needed(
+    ipc: &Arc<AdapterWorkerPool>,
+    bundle_id: &str,
+    model_ids: &[String],
+    epoch: u64,
+) -> Result<Vec<String>, IpcError> {
+    if !requires_eager_model_ready(bundle_id) {
+        return Ok(model_ids.to_vec());
+    }
+
+    let mut ready_models = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        ensure_candle_model_ready_if_needed(ipc, bundle_id, model_id, epoch).await?;
+        ready_models.push(model_id.clone());
+    }
+    Ok(ready_models)
+}
+
 fn next_retry_delay(current: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), RETRY_MAX_DELAY)
 }
@@ -391,7 +463,7 @@ async fn wait_retry_or_shutdown(shutdown: &Shutdown, delay: Duration) -> bool {
 pub fn spawn(
     nats: Client,
     bundle: String,
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
@@ -494,7 +566,7 @@ pub fn spawn(
 }
 
 pub(crate) async fn apply_via_ipc_with_retry(
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     shutdown: Arc<Shutdown>,
     req: ApplyModelConfigRequest,
     model_id: &str,
@@ -504,7 +576,43 @@ pub(crate) async fn apply_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.apply_model_config(req.clone()).await {
-            Ok(resp) => return Ok(Some(resp)),
+            Ok(resp) => {
+                match ensure_candle_model_ready_if_needed(&ipc, &req.bundle_id, model_id, epoch)
+                    .await
+                {
+                    Ok(()) => return Ok(Some(resp)),
+                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
+                        attempt = attempt.saturating_add(1);
+                        if attempt == 1
+                            || attempt == 5
+                            || attempt == 30
+                            || attempt.is_multiple_of(120)
+                        {
+                            warn!(
+                                model = %model_id,
+                                epoch,
+                                attempt,
+                                retry_delay_ms = retry_delay.as_millis() as u64,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after apply; retrying"
+                            );
+                        } else {
+                            debug!(
+                                model = %model_id,
+                                epoch,
+                                attempt,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting"
+                            );
+                        }
+                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
+                            return Ok(None);
+                        }
+                        retry_delay = next_retry_delay(retry_delay);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -536,7 +644,7 @@ pub(crate) async fn apply_via_ipc_with_retry(
 }
 
 pub(crate) async fn replace_via_ipc_with_retry(
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     shutdown: Arc<Shutdown>,
     req: ReplaceModelConfigsRequest,
     epoch: u64,
@@ -545,7 +653,49 @@ pub(crate) async fn replace_via_ipc_with_retry(
     let mut attempt = 0_u64;
     loop {
         match ipc.replace_model_configs(req.clone()).await {
-            Ok(resp) => return Ok(Some(resp)),
+            Ok(mut resp) => {
+                match ensure_candle_models_ready_if_needed(
+                    &ipc,
+                    &req.bundle_id,
+                    &resp.applied_models,
+                    epoch,
+                )
+                .await
+                {
+                    Ok(ready_models) => {
+                        resp.applied_models = ready_models;
+                        return Ok(Some(resp));
+                    }
+                    Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
+                        attempt = attempt.saturating_add(1);
+                        if attempt == 1
+                            || attempt == 5
+                            || attempt == 30
+                            || attempt.is_multiple_of(120)
+                        {
+                            warn!(
+                                epoch,
+                                attempt,
+                                retry_delay_ms = retry_delay.as_millis() as u64,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after replace; retrying"
+                            );
+                        } else {
+                            debug!(
+                                epoch,
+                                attempt,
+                                error = %e,
+                                "worker-config: Candle model readiness still waiting after replace"
+                            );
+                        }
+                        if wait_retry_or_shutdown(&shutdown, retry_delay).await {
+                            return Ok(None);
+                        }
+                        retry_delay = next_retry_delay(retry_delay);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) if retryable_ipc_error(&e) && !shutdown.is_fired() => {
                 attempt = attempt.saturating_add(1);
                 if attempt == 1 || attempt == 5 || attempt == 30 || attempt.is_multiple_of(120) {
@@ -754,6 +904,9 @@ async fn apply_notification(runtime: &SubscriberRuntime, notification: ConfigNot
     }
 
     state.mark_applied(notification.epoch, advertised_hash);
+    if requires_eager_model_ready(&notification.bundle_id) {
+        state.record_loaded_model(&notification.model_id);
+    }
     metrics.config_epoch.set(notification.epoch as i64);
 }
 

@@ -25,11 +25,14 @@ pub struct WorkerState {
     pub name: String,
     pub health: WorkerHealth,
     pub gpu_count: i32,
+    pub ready_gpu_slots: i32,
     pub machine_profile: String,
     pub bundle: String,
     pub bundle_config_hash: String,
     pub models: Vec<String>,
     pub queue_depth: i32,
+    pub pending_cost: i64,
+    pub inflight_batches: i32,
     pub memory_used_bytes: i64,
     pub memory_total_bytes: i64,
     pub last_heartbeat: Instant,
@@ -48,12 +51,12 @@ impl WorkerState {
         self.health == WorkerHealth::Healthy
     }
 
-    /// Eligible for HRW direct dispatch: healthy *and* not saturated.
+    /// Eligible for dispatch: healthy, with at least one ready slot, and not saturated.
     /// Saturated workers stay in the registry (so the pool fallback
     /// still drains to them via the bundle index) but are excluded
     /// from the per-`(model, pool)` HRW ring.
     pub fn eligible_for_dispatch(&self) -> bool {
-        self.healthy() && !self.saturated
+        self.healthy() && self.ready_gpu_slots > 0 && !self.saturated
     }
 
     #[allow(dead_code)]
@@ -82,8 +85,11 @@ pub struct WorkerInfo {
     pub url: String,
     pub gpu: String,
     pub gpu_count: i32,
+    pub ready_gpu_slots: i32,
     pub loaded_models: Vec<String>,
     pub queue_depth: i32,
+    pub pending_cost: i64,
+    pub inflight_batches: i32,
     pub memory_used_bytes: i64,
     pub memory_total_bytes: i64,
     pub healthy: bool,
@@ -149,6 +155,14 @@ pub struct WorkerStatusMessage {
     pub ready: bool,
     #[serde(default)]
     pub gpu_count: i32,
+    /// Total GPU slots visible to the worker pod. Defaults to
+    /// `gpu_count` when absent.
+    #[serde(default)]
+    pub total_gpu_slots: Option<i32>,
+    /// Slots ready to receive work. Defaults to all slots when
+    /// `ready=true`, otherwise zero.
+    #[serde(default)]
+    pub ready_gpu_slots: Option<i32>,
     #[serde(default)]
     pub machine_profile: String,
     #[serde(default)]
@@ -166,6 +180,12 @@ pub struct WorkerStatusMessage {
     /// Compact top-level queue depth (fallback when models array is empty)
     #[serde(default)]
     pub queue_depth: Option<i32>,
+    /// Compact top-level pending scheduler cost.
+    #[serde(default)]
+    pub pending_cost: Option<i64>,
+    /// Compact top-level in-flight batch count.
+    #[serde(default)]
+    pub inflight_batches: Option<i32>,
     /// Compact top-level memory used (fallback when gpus array is empty)
     #[serde(default)]
     pub memory_used_bytes: Option<i64>,
@@ -210,11 +230,18 @@ mod tests {
             name: "w1".into(),
             health,
             gpu_count: 1,
+            ready_gpu_slots: if health == WorkerHealth::Healthy {
+                1
+            } else {
+                0
+            },
             machine_profile: "l4".into(),
             bundle: "default".into(),
             bundle_config_hash: String::new(),
             models: vec![],
             queue_depth: 0,
+            pending_cost: 0,
+            inflight_batches: 0,
             memory_used_bytes: mem_used,
             memory_total_bytes: mem_total,
             last_heartbeat: Instant::now(),
@@ -224,12 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn test_eligible_for_dispatch_requires_healthy_and_not_saturated() {
+    fn test_eligible_for_dispatch_requires_healthy_ready_slot_and_not_saturated() {
         let mut w = make_worker(WorkerHealth::Healthy, 0, 0);
         assert!(w.eligible_for_dispatch());
         w.saturated = true;
         assert!(!w.eligible_for_dispatch());
         w.saturated = false;
+        w.ready_gpu_slots = 0;
+        assert!(!w.eligible_for_dispatch());
+        w.ready_gpu_slots = 1;
         w.health = WorkerHealth::Unhealthy;
         assert!(!w.eligible_for_dispatch());
     }
@@ -296,9 +326,13 @@ mod tests {
         assert!(msg.ready);
         assert!(msg.name.is_empty());
         assert_eq!(msg.gpu_count, 0);
+        assert_eq!(msg.total_gpu_slots, None);
+        assert_eq!(msg.ready_gpu_slots, None);
         assert!(msg.loaded_models.is_empty());
         assert!(msg.models.is_empty());
         assert!(msg.gpus.is_empty());
+        assert_eq!(msg.pending_cost, None);
+        assert_eq!(msg.inflight_batches, None);
         assert!(!msg.terminated);
     }
 
@@ -308,17 +342,25 @@ mod tests {
             "name": "worker-1",
             "ready": true,
             "gpu_count": 2,
+            "total_gpu_slots": 2,
+            "ready_gpu_slots": 1,
             "machine_profile": "a100",
             "bundle": "premium",
             "bundle_config_hash": "abc",
             "loaded_models": ["model-a", "model-b"],
+            "pending_cost": 99,
+            "inflight_batches": 2,
             "models": [{"queue_depth": 3}],
             "gpus": [{"memory_used_bytes": 1000, "memory_total_bytes": 4000}]
         }"#;
         let msg: WorkerStatusMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.name, "worker-1");
         assert_eq!(msg.gpu_count, 2);
+        assert_eq!(msg.total_gpu_slots, Some(2));
+        assert_eq!(msg.ready_gpu_slots, Some(1));
         assert_eq!(msg.loaded_models.len(), 2);
+        assert_eq!(msg.pending_cost, Some(99));
+        assert_eq!(msg.inflight_batches, Some(2));
         assert_eq!(msg.models[0].queue_depth, 3);
         assert_eq!(msg.gpus[0].memory_used_bytes, 1000);
     }

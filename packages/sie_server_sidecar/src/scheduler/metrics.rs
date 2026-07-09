@@ -15,12 +15,10 @@
 //! * [`SchedulerMetrics::models_total`] — live IntGauge of models
 //!   that have had a scheduler materialised.
 //!
-//! The adaptive-controller gauges, starvation counter,
-//! `flush_reason_total`, `active_batchers`, and `hol_wait_ms_mean`
-//! families are declared so the `/metrics` scrape shape stays stable
-//! across builds, but are not yet populated. They will be wired when
-//! we have a concrete operational need; keeping the surface declared
-//! means dashboards can be authored now without a second deploy.
+//! The adaptive-controller gauges, starvation counter, active-batcher,
+//! and head-of-line families are declared alongside the hot batch
+//! shape counters so the `/metrics` scrape shape stays stable across
+//! builds.
 //!
 //! ## Label cardinality
 //!
@@ -59,7 +57,7 @@ pub const FLUSH_REASONS: &[&str] = &[
     "timeout",
     "coalesce",
     "single_oversize",
-    "update_tightened",
+    "idle_bypass",
     "drain",
 ];
 
@@ -157,7 +155,7 @@ impl SchedulerMetrics {
         let flush_reason_total = IntCounterVec::new(
             Opts::new(
                 "sie_worker_scheduler_flush_reason_total",
-                "Scheduler flush triggers. `reason` ∈ cost_cap | count_cap | timeout | coalesce | single_oversize | update_tightened | drain",
+                "Scheduler flush triggers. `reason` ∈ cost_cap | count_cap | timeout | coalesce | single_oversize | idle_bypass | drain",
             ),
             &["model", "operation", "lora", "reason"],
         )?;
@@ -282,8 +280,18 @@ mod tests {
         for r in FLUSH_REASONS {
             assert!(!r.is_empty());
         }
+        let batcher_reasons = [
+            super::super::FlushReason::CostCap.as_label(),
+            super::super::FlushReason::CountCap.as_label(),
+            super::super::FlushReason::Timeout.as_label(),
+            super::super::FlushReason::Coalesce.as_label(),
+            super::super::FlushReason::SingleOversize.as_label(),
+            super::super::FlushReason::IdleBypass.as_label(),
+            super::super::FlushReason::Drain.as_label(),
+        ];
+        assert_eq!(FLUSH_REASONS, batcher_reasons.as_slice());
         // 7 triggers today: cost_cap, count_cap, timeout, coalesce,
-        // single_oversize, update_tightened, drain.
+        // single_oversize, idle_bypass, drain.
         assert_eq!(FLUSH_REASONS.len(), 7);
     }
 

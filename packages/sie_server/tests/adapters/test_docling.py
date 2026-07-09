@@ -60,6 +60,45 @@ class TestDoclingExtract:
         assert out.data[0]["markdown"] == "# md:default"
         assert out.data[0]["document"] == {"name": "document.pdf"}
 
+    def test_surfaces_real_page_count_for_metering(self) -> None:
+        # §7 parse dimension: the adapter reads the DoclingDocument page count
+        # (num_pages()) and surfaces it on ExtractOutput.pages so the result
+        # seam can bill "$ per 1k pages".
+        adapter = DoclingAdapter()
+        adapter._loaded = True
+
+        def _paged_converter(*, ocr_enabled: bool) -> MagicMock:
+            _ = ocr_enabled
+            converter = MagicMock(name="DocumentConverter[paged]")
+
+            def _convert(stream: Any) -> MagicMock:
+                result = MagicMock()
+                result.document.export_to_text.return_value = "text"
+                result.document.export_to_markdown.return_value = "# md"
+                result.document.export_to_dict.return_value = {"name": stream.name}
+                result.document.num_pages.return_value = 3
+                return result
+
+            converter.convert.side_effect = _convert
+            return converter
+
+        adapter._make_converter = MagicMock(side_effect=_paged_converter)  # type: ignore[method-assign]
+
+        out = adapter.extract([Item(document={"data": b"%PDF-1.4 fake", "format": "pdf"})])
+
+        assert out.pages == [3]
+
+    def test_per_item_error_reports_zero_pages(self) -> None:
+        # A per-item failure (no document/image) surfaces 0 pages; an all-error
+        # batch emits no pages dimension at all (metering falls back to reserve).
+        adapter, _ = _make_adapter()
+
+        out = adapter.extract([Item(text="no document here")])
+
+        assert out.data is not None
+        assert "error" in out.data[0]
+        assert out.pages is None
+
     def test_format_hint_drives_stream_name(self) -> None:
         adapter, _ = _make_adapter()
 
