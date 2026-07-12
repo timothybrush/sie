@@ -3,9 +3,6 @@ use axum::response::{IntoResponse, Response};
 
 use crate::http_error::{code as err_code, json_detail};
 
-const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROVISIONING_RETRY_AFTER: &str = "60";
-
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -53,7 +50,7 @@ impl IntoResponse for AppError {
         if is_gpu_provisioning {
             response.headers_mut().insert(
                 HeaderName::from_static("retry-after"),
-                HeaderValue::from_static(PROVISIONING_RETRY_AFTER),
+                HeaderValue::from_static("60"),
             );
             response.headers_mut().insert(
                 HeaderName::from_static("x-sie-error-code"),
@@ -61,11 +58,11 @@ impl IntoResponse for AppError {
             );
             response.headers_mut().insert(
                 HeaderName::from_static("x-sie-version"),
-                HeaderValue::from_static(GATEWAY_VERSION),
+                HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
             );
             response.headers_mut().insert(
                 HeaderName::from_static("x-sie-server-version"),
-                HeaderValue::from_static(GATEWAY_VERSION),
+                HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
             );
         }
         response
@@ -99,10 +96,7 @@ mod tests {
     #[test]
     fn test_gpu_provisioning_has_retry_headers() {
         let response = AppError::GpuProvisioning("l4".into()).into_response();
-        assert_eq!(
-            response.headers().get("retry-after").unwrap(),
-            PROVISIONING_RETRY_AFTER
-        );
+        assert_eq!(response.headers().get("retry-after").unwrap(), "60");
         assert_eq!(
             response.headers().get("x-sie-error-code").unwrap(),
             err_code::PROVISIONING

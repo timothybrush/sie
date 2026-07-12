@@ -5,7 +5,44 @@ use serde::Deserialize;
 
 use crate::types::pool::PoolSpec;
 
-#[derive(Debug, Clone)]
+/// Modal platform proxy-auth credential (superlinked/sie-internal #1740).
+///
+/// When a managed ingress endpoint (config service, generation-lane `/gen`
+/// WebSocket, OTLP collector) is deployed with `requires_proxy_auth=True`,
+/// Modal rejects any request missing a valid `Modal-Key` / `Modal-Secret`
+/// pair AT THE PLATFORM EDGE, before the request reaches app code. The
+/// gateway's config client presents this pair ALONGSIDE the in-app admin
+/// bearer (defense in depth — neither replaces the other).
+///
+/// Read from `SIE_MODAL_PROXY_TOKEN_ID` / `SIE_MODAL_PROXY_TOKEN_SECRET`.
+/// `Some` only when BOTH are non-empty; a half-set pair is a misconfiguration,
+/// not partial auth, so it is treated as absent. Absent means the headers are
+/// never sent, so self-host / dev (no Modal edge) is untouched.
+///
+/// `Debug` is hand-written to REDACT both halves: `Config` derives `Debug` and
+/// is `{:?}`-formatted at startup and in tests, so a derived impl here would
+/// leak the credential into logs (the `Option` already conveys presence).
+#[derive(Clone)]
+pub struct ModalProxyToken {
+    pub key: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for ModalProxyToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModalProxyToken")
+            .field("key", &"<redacted>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+// `Debug` is hand-written (below) rather than derived: several fields hold
+// secret material (`auth_tokens`, `admin_token`, `config_service_token`, and
+// `config_modal_proxy_token`) and `Config` is `{:?}`-formatted at startup, so a
+// derived impl would leak credentials into logs. clippy's
+// `missing_fields_in_debug` keeps the manual impl exhaustive as fields are added.
+#[derive(Clone)]
 pub struct Config {
     // Server
     pub host: String,
@@ -93,9 +130,88 @@ pub struct Config {
     // share one admin secret in-cluster.
     pub config_service_token: Option<String>,
 
+    // Optional Modal platform proxy-auth token the gateway's config client
+    // presents ALONGSIDE `config_service_token` on `GET /v1/configs/*` calls
+    // (superlinked/sie-internal #1740). `Some` only when both
+    // `SIE_MODAL_PROXY_TOKEN_ID` and `SIE_MODAL_PROXY_TOKEN_SECRET` are set;
+    // absent on self-host / dev (no Modal edge), so no proxy headers are sent.
+    pub config_modal_proxy_token: Option<ModalProxyToken>,
+
     // Payload store (local path, s3://bucket/prefix, gs://bucket/prefix, or
     // abfs(s)://container@account.dfs.core.windows.net/prefix)
     pub payload_store_url: String,
+}
+
+/// Render a secret string for `Debug` output: an empty value stays empty (so
+/// "unset" is still visible), any real value collapses to `<redacted>` so the
+/// credential never reaches logs.
+fn redacted_secret(value: &str) -> &'static str {
+    if value.is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
+impl std::fmt::Debug for Config {
+    /// Hand-written so credential-bearing fields never print their values.
+    /// Non-secret fields stay fully visible for debuggability; the secret
+    /// ones (`auth_tokens`, `admin_token`, `config_service_token`) redact while
+    /// preserving present/absent (and count) so misconfig is still diagnosable.
+    /// `config_modal_proxy_token` relies on `ModalProxyToken`'s own redacting
+    /// `Debug`. `nats_url` / `payload_store_url` are connection URLs kept
+    /// visible on purpose (redacting them would hide the target host).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("metrics_port", &self.metrics_port)
+            .field("worker_urls", &self.worker_urls)
+            .field("use_kubernetes", &self.use_kubernetes)
+            .field("k8s_namespace", &self.k8s_namespace)
+            .field("k8s_service", &self.k8s_service)
+            .field("k8s_port", &self.k8s_port)
+            .field("health_mode", &self.health_mode)
+            .field("nats_url", &self.nats_url)
+            .field(
+                "nats_config_trusted_producers",
+                &self.nats_config_trusted_producers,
+            )
+            .field("auth_mode", &self.auth_mode)
+            // Secret: the client API bearer tokens — show only how many.
+            .field(
+                "auth_tokens",
+                &format_args!("<{} redacted>", self.auth_tokens.len()),
+            )
+            // Secret: the admin bearer (SIE_ADMIN_TOKEN).
+            .field("admin_token", &redacted_secret(&self.admin_token))
+            .field("auth_exempt_operational", &self.auth_exempt_operational)
+            .field("log_level", &self.log_level)
+            .field("json_logs", &self.json_logs)
+            .field("enable_pools", &self.enable_pools)
+            .field("hot_reload", &self.hot_reload)
+            .field("watch_polling", &self.watch_polling)
+            .field("multi_router", &self.multi_router)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_stream_pending", &self.max_stream_pending)
+            .field("stream_max_age_s", &self.stream_max_age_s)
+            .field("configured_gpus", &self.configured_gpus)
+            .field("gpu_profile_map", &self.gpu_profile_map)
+            .field("static_queue_pools", &self.static_queue_pools)
+            .field("model_aliases", &self.model_aliases)
+            .field("bundles_dir", &self.bundles_dir)
+            .field("models_dir", &self.models_dir)
+            .field("config_service_url", &self.config_service_url)
+            // Secret: same admin bearer as `admin_token`; keep present/absent.
+            .field(
+                "config_service_token",
+                &self.config_service_token.as_ref().map(|_| "<redacted>"),
+            )
+            // `ModalProxyToken`'s own `Debug` redacts both halves.
+            .field("config_modal_proxy_token", &self.config_modal_proxy_token)
+            .field("payload_store_url", &self.payload_store_url)
+            .finish()
+    }
 }
 
 fn env_bool(key: &str) -> bool {
@@ -376,6 +492,19 @@ impl Config {
                     None
                 } else {
                     Some(raw)
+                }
+            },
+            config_modal_proxy_token: {
+                // #1740: opt-in Modal platform proxy-auth. Both halves required
+                // for the pair to be sent — a half-set pair is a misconfig, not
+                // partial auth, so it degrades to "not configured" (headers
+                // omitted) rather than sending a broken credential.
+                let key = env::var("SIE_MODAL_PROXY_TOKEN_ID").unwrap_or_default();
+                let secret = env::var("SIE_MODAL_PROXY_TOKEN_SECRET").unwrap_or_default();
+                if key.is_empty() || secret.is_empty() {
+                    None
+                } else {
+                    Some(ModalProxyToken { key, secret })
                 }
             },
 
@@ -967,6 +1096,124 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_modal_proxy_token_requires_both_halves() {
+        // #1740: both env vars must be set for the pair to be presented.
+        with_env(
+            &[
+                ("SIE_MODAL_PROXY_TOKEN_ID", "wk-abc"),
+                ("SIE_MODAL_PROXY_TOKEN_SECRET", "ws-xyz"),
+            ],
+            || {
+                let cfg = Config::load();
+                let tok = cfg
+                    .config_modal_proxy_token
+                    .expect("both halves set -> Some");
+                assert_eq!(tok.key, "wk-abc");
+                assert_eq!(tok.secret, "ws-xyz");
+            },
+        );
+    }
+
+    #[test]
+    fn test_modal_proxy_token_half_set_is_none() {
+        // A half-set pair is a misconfig, not partial auth: degrade to None so
+        // no broken credential is ever sent. An empty half is treated as unset
+        // (the load step reads env::var(..).unwrap_or_default()).
+        with_env(
+            &[
+                ("SIE_MODAL_PROXY_TOKEN_ID", "wk-abc"),
+                ("SIE_MODAL_PROXY_TOKEN_SECRET", ""),
+            ],
+            || {
+                assert!(Config::load().config_modal_proxy_token.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn test_modal_proxy_token_unset_is_none() {
+        without_env(
+            &["SIE_MODAL_PROXY_TOKEN_ID", "SIE_MODAL_PROXY_TOKEN_SECRET"],
+            || {
+                assert!(Config::load().config_modal_proxy_token.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn test_modal_proxy_token_debug_redacts_secret() {
+        // `Config` is `{:?}`-formatted at startup and in tests, so the token's
+        // manual Debug impl MUST NOT leak either half into logs.
+        let token = ModalProxyToken {
+            key: "wk-super-secret-id".to_string(),
+            secret: "ws-super-secret-value".to_string(),
+        };
+        let dbg = format!("{token:?}");
+        assert!(!dbg.contains("wk-super-secret-id"), "leaked key: {dbg}");
+        assert!(
+            !dbg.contains("ws-super-secret-value"),
+            "leaked secret: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_config_debug_redacts_all_secret_fields() {
+        // `Config` is `{:?}`-formatted at startup (and in tests), so EVERY
+        // credential-bearing field must be redacted: the client API bearers
+        // (auth_tokens), the admin bearer (admin_token AND the config_service_token
+        // derived from it), and both halves of the Modal proxy token. Non-secret
+        // fields must stay visible for debuggability.
+        with_env(
+            &[
+                ("SIE_AUTH_MODE", "token"),
+                ("SIE_AUTH_TOKENS", "tok-secret-1,tok-secret-2"),
+                ("SIE_ADMIN_TOKEN", "super-admin-secret"),
+                ("SIE_MODAL_PROXY_TOKEN_ID", "wk-id-secret"),
+                ("SIE_MODAL_PROXY_TOKEN_SECRET", "ws-value-secret"),
+                ("SIE_NATS_URL", "nats://nats-host:4222"),
+            ],
+            || {
+                let cfg = Config::load();
+                // Sanity: the secrets really are loaded (so a green assert below
+                // means redaction, not an empty field).
+                assert_eq!(cfg.admin_token, "super-admin-secret");
+                assert_eq!(
+                    cfg.config_service_token.as_deref(),
+                    Some("super-admin-secret")
+                );
+                assert_eq!(cfg.auth_tokens.len(), 2);
+
+                let dbg = format!("{cfg:?}");
+                for leaked in [
+                    "super-admin-secret", // admin_token + config_service_token
+                    "tok-secret-1",
+                    "tok-secret-2", // auth_tokens
+                    "wk-id-secret",
+                    "ws-value-secret", // config_modal_proxy_token
+                ] {
+                    assert!(
+                        !dbg.contains(leaked),
+                        "Config Debug leaked {leaked:?}: {dbg}"
+                    );
+                }
+                assert!(
+                    dbg.contains("<redacted>"),
+                    "expected redaction marker: {dbg}"
+                );
+                // Non-secret connection/config fields stay visible.
+                assert!(
+                    dbg.contains("nats-host"),
+                    "non-secret nats_url must stay visible: {dbg}"
+                );
+            },
+        );
+    }
+
     // ── audit_auth ─────────────────────────────────────────────────
 
     fn cfg_with_auth(
@@ -1008,6 +1255,7 @@ mod tests {
             models_dir: String::new(),
             config_service_url: None,
             config_service_token: None,
+            config_modal_proxy_token: None,
             payload_store_url: String::new(),
         };
         // Silence the "unused mut" warning on the path where we don't mutate.

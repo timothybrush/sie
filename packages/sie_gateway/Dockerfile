@@ -1,4 +1,4 @@
-FROM rust:1.96.0-slim-bookworm AS chef
+FROM rust:1.97.0-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 

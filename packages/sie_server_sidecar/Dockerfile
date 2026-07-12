@@ -20,7 +20,7 @@
 #   testing mount a socket path and set SIE_IPC_SOCKET_PATH accordingly.
 
 ARG FEATURES=cloud-storage
-ARG RUST_VERSION=1.96.0
+ARG RUST_VERSION=1.97.0
 
 # =============================================================================
 # Dependency planner: capture the Cargo graph only.

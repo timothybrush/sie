@@ -71,6 +71,7 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'%');
 
+use crate::config::ModalProxyToken;
 use crate::state::bundle_config_hashes_hash::BundleConfigHashesHash;
 use crate::state::bundles_hash::BundlesHash;
 use crate::state::config_epoch::ConfigEpoch;
@@ -209,6 +210,10 @@ pub enum BootstrapError {
 pub struct BootstrapClient {
     base_url: String,
     admin_token: Option<String>,
+    /// Optional Modal platform proxy-auth token (#1740). When set, every
+    /// request also carries `Modal-Key` / `Modal-Secret` so it clears the
+    /// Modal edge before app code sees it. Absent on self-host / dev.
+    modal_proxy_token: Option<ModalProxyToken>,
     http: reqwest::Client,
 }
 
@@ -267,8 +272,35 @@ impl BootstrapClient {
         Ok(Self {
             base_url,
             admin_token,
+            modal_proxy_token: None,
             http,
         })
+    }
+
+    /// Attach an optional Modal platform proxy-auth token (#1740). Kept as a
+    /// builder so `new`'s two-arg signature (and its many call sites) stays
+    /// stable; the config client sets this from `Config::config_modal_proxy_token`.
+    pub fn with_modal_proxy_token(mut self, token: Option<ModalProxyToken>) -> Self {
+        self.modal_proxy_token = token;
+        self
+    }
+
+    /// Apply both auth layers to a request builder: the in-app admin bearer
+    /// (`config_service_token`) and, when configured, the Modal platform
+    /// proxy-auth headers (#1740). The two are independent — the bearer is
+    /// checked by `sie_config`, the `Modal-Key` / `Modal-Secret` pair by the
+    /// Modal edge — so both are sent when present.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut req = req;
+        if let Some(token) = &self.admin_token {
+            req = req.bearer_auth(token);
+        }
+        if let Some(proxy) = &self.modal_proxy_token {
+            req = req
+                .header("Modal-Key", &proxy.key)
+                .header("Modal-Secret", &proxy.secret);
+        }
+        req
     }
 
     /// Fetch the current epoch + drift fingerprints from `GET /v1/configs/epoch`.
@@ -276,10 +308,7 @@ impl BootstrapClient {
     /// without pulling a full snapshot every tick.
     pub async fn fetch_epoch(&self) -> Result<EpochSnapshot, BootstrapError> {
         let url = format!("{}/v1/configs/epoch", self.base_url.trim_end_matches('/'));
-        let mut req = self.http.get(&url);
-        if let Some(token) = &self.admin_token {
-            req = req.bearer_auth(token);
-        }
+        let req = self.apply_auth(self.http.get(&url));
         let resp = req.send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -313,10 +342,7 @@ impl BootstrapClient {
     pub async fn fetch_bundles(&self) -> Result<Vec<BundleInfo>, BootstrapError> {
         let base = self.base_url.trim_end_matches('/');
         let list_url = format!("{}/v1/configs/bundles", base);
-        let mut req = self.http.get(&list_url);
-        if let Some(token) = &self.admin_token {
-            req = req.bearer_auth(token);
-        }
+        let req = self.apply_auth(self.http.get(&list_url));
         let resp = req.send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -344,10 +370,7 @@ impl BootstrapClient {
             // naming convention.
             let encoded_id = utf8_percent_encode(&entry.bundle_id, PATH_SEGMENT).to_string();
             let yaml_url = format!("{}/v1/configs/bundles/{}", base, encoded_id);
-            let mut req = self.http.get(&yaml_url);
-            if let Some(token) = &self.admin_token {
-                req = req.bearer_auth(token);
-            }
+            let req = self.apply_auth(self.http.get(&yaml_url));
             let resp = req.send().await?;
             let status = resp.status();
             if !status.is_success() {
@@ -404,10 +427,7 @@ impl BootstrapClient {
         registry.install_bundles(bundles);
 
         let url = format!("{}/v1/configs/export", self.base_url.trim_end_matches('/'));
-        let mut req = self.http.get(&url);
-        if let Some(token) = &self.admin_token {
-            req = req.bearer_auth(token);
-        }
+        let req = self.apply_auth(self.http.get(&url));
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -586,6 +606,7 @@ const DEGRADED_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 6
 pub fn spawn_bootstrap_retry(
     base_url: Option<&str>,
     admin_token: Option<&str>,
+    modal_proxy_token: Option<&ModalProxyToken>,
     registry: Arc<ModelRegistry>,
     config_epoch: ConfigEpoch,
     bundles_hash: BundlesHash,
@@ -593,12 +614,15 @@ pub fn spawn_bootstrap_retry(
 ) -> tokio::task::JoinHandle<()> {
     let base_url = base_url.map(str::to_string);
     let admin_token = admin_token.map(str::to_string);
+    let modal_proxy_token = modal_proxy_token.cloned();
     tokio::spawn(async move {
         let Some(base) = base_url else {
             info!("SIE_CONFIG_SERVICE_URL not set; skipping config bootstrap");
             return;
         };
-        let client = match BootstrapClient::new(base, admin_token) {
+        let client = match BootstrapClient::new(base, admin_token)
+            .map(|c| c.with_modal_proxy_token(modal_proxy_token))
+        {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "failed to build bootstrap HTTP client; giving up");
@@ -907,6 +931,7 @@ mod tests {
         let handle = spawn_bootstrap_retry(
             None,
             None,
+            None,
             registry,
             ConfigEpoch::new(),
             BundlesHash::new(),
@@ -1002,6 +1027,68 @@ mod tests {
         assert_eq!(snapshot.epoch, 42);
         assert_eq!(snapshot.bundles_hash, "cafebabe");
         assert_eq!(snapshot.bundle_config_hashes_hash, "facefeed");
+    }
+
+    /// #1740: a client with a Modal proxy token sends `Modal-Key` /
+    /// `Modal-Secret` ALONGSIDE the admin bearer. The mock only matches when
+    /// all three headers are present, so a green result proves both auth
+    /// layers ride every config request.
+    #[tokio::test]
+    async fn config_client_sends_modal_proxy_headers_alongside_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/epoch"))
+            .and(header("authorization", "Bearer admin-secret"))
+            .and(header("modal-key", "wk-abc"))
+            .and(header("modal-secret", "ws-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": 5,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), Some("admin-secret".into()))
+            .unwrap()
+            .with_modal_proxy_token(Some(ModalProxyToken {
+                key: "wk-abc".into(),
+                secret: "ws-xyz".into(),
+            }));
+        let snapshot = client.fetch_epoch().await.unwrap();
+        assert_eq!(snapshot.epoch, 5);
+    }
+
+    /// Without a proxy token, the client sends NO Modal headers — the
+    /// self-host / dev path must not leak an empty or partial credential. The
+    /// in-app bearer is unaffected (it rides independently).
+    #[tokio::test]
+    async fn config_client_omits_modal_headers_when_token_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/epoch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": 9,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), Some("admin-secret".into())).unwrap();
+        let snapshot = client.fetch_epoch().await.unwrap();
+        assert_eq!(snapshot.epoch, 9);
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests by default");
+        let req = requests.first().expect("exactly one epoch request");
+        assert!(
+            !req.headers.contains_key("modal-key"),
+            "no proxy token -> no Modal-Key header"
+        );
+        assert!(!req.headers.contains_key("modal-secret"));
+        assert!(
+            req.headers.contains_key("authorization"),
+            "the in-app bearer still rides every request"
+        );
     }
 
     #[tokio::test]

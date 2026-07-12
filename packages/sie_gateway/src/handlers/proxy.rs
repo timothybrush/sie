@@ -10614,6 +10614,7 @@ mod tests {
             models_dir: models_dir.path().to_string_lossy().to_string(),
             config_service_url: None,
             config_service_token: None,
+            config_modal_proxy_token: None,
             payload_store_url: String::new(),
         };
         AppState {

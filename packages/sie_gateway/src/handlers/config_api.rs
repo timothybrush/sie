@@ -481,6 +481,7 @@ mod tests {
             payload_store_url: String::new(),
             config_service_url: config_service_url.map(str::to_string),
             config_service_token: None,
+            config_modal_proxy_token: None,
         }
     }
 

@@ -499,6 +499,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     state::config_bootstrap::spawn_bootstrap_retry(
         config.config_service_url.as_deref(),
         config.config_service_token.as_deref(),
+        config.config_modal_proxy_token.as_ref(),
         Arc::clone(&model_registry),
         config_epoch.clone(),
         bundles_hash.clone(),
@@ -507,6 +508,7 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     state::config_poller::spawn(
         config.config_service_url.as_deref(),
         config.config_service_token.as_deref(),
+        config.config_modal_proxy_token.as_ref(),
         Arc::clone(&model_registry),
         config_epoch.clone(),
         bundles_hash.clone(),

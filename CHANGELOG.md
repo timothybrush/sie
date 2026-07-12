@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.18
+
+- chore(main): release 0.6.18
+- chore: upgrade rust toolchain and deps
+- fix(cloud): redact all secret-bearing Config fields in Debug (#1740)
+- fix(cloud): redact ModalProxyToken Debug + cover /gen handshake forwarding (#1740)
+- feat(cloud): opt-in Modal proxy-auth layer for config/lane/OTLP ingress (#1740)
+
 ## v0.6.17
 
 - chore(main): release 0.6.17

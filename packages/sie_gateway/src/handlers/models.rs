@@ -371,6 +371,7 @@ mod route_tests {
             payload_store_url: String::new(),
             config_service_url: None,
             config_service_token: None,
+            config_modal_proxy_token: None,
         }
     }
 

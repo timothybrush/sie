@@ -244,6 +244,9 @@ override.tf.json
 # tfvars files may contain secrets
 *.tfvars
 *.tfvars.json
+# Exception: this edge tfvars carries only a Secrets Manager ARN (a resource
+# identifier, not a secret) so the staging-us edge apply needs no manual -var.
+!deploy/cloud/terraform/aws-edge/staging-us.tfvars
 # Keep .terraform.lock.hcl for reproducibility (provider versions)
 
 # Node.js

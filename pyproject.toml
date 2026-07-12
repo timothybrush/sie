@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "sie-server",
     "sie-sdk",
+    "sie-bench",
     "sie-config",
     "einops>=0.8.1",
     # Using fork for filter_languages fix (filters metadata.eval_langs for retrieval tasks)
@@ -14,6 +15,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Terminal UI for monitoring (sie-top command)
+top = ["sie-admin[top]"]
 # Flash Attention optimization for development (Linux only - workspace extra)
 flash-attn = ["sie-server[flash-attn]"]
 # GPU metrics support for server
@@ -87,6 +90,8 @@ torchvision = [
 ]
 sie-server = { workspace = true }
 sie-sdk = { workspace = true }
+sie-bench = { workspace = true }
+sie-admin = { workspace = true }
 sie-config = { workspace = true }
 sie-mcp = { workspace = true }
 
@@ -94,10 +99,13 @@ sie-mcp = { workspace = true }
 # Note: packages/sie_ts_sdk is TypeScript, not Python
 # Note: integrations/sie_ts_* are TypeScript, listed explicitly to avoid matching them
 members = [
+  "packages/sie_admin",
+  "packages/sie_bench",
   "packages/sie_config",
   "packages/sie_mcp",
   "packages/sie_sdk",
   "packages/sie_server",
+  "packages/sie_tools",
   "integrations/sie_chroma",
   "integrations/sie_crewai",
   "integrations/sie_dspy",
@@ -111,10 +119,9 @@ members = [
 
 [tool.pytest.ini_options]
 # Note: integrations are NOT in testpaths because each has its own conftest.py
-# which causes pytest plugin conflicts. Run them per directory, e.g.:
-# uv run pytest integrations/sie_langchain
-testpaths = ["packages/sie_server/tests", "packages/sie_sdk/tests", "packages/sie_config/tests", "packages/sie_mcp/tests"]
-pythonpath = ["packages/sie_server/src", "packages/sie_sdk/src", "packages/sie_config/src", "packages/sie_mcp/src"]
+# which causes pytest plugin conflicts. Run with: mise run test integrations/
+testpaths = ["packages/sie_server/tests", "packages/sie_sdk/tests", "packages/sie_bench/tests", "packages/sie_admin/tests", "packages/sie_config/tests", "packages/sie_mcp/tests", "packages/sie_tools/tests", "tools/mise_tasks/tests", "tools/quality_eval/tests", "product/research/sie-cost-model/bill-cut-model/tests"]
+pythonpath = ["packages/sie_server/src", "packages/sie_sdk/src", "packages/sie_bench/src", "packages/sie_admin/src", "packages/sie_config/src", "packages/sie_mcp/src", "packages/sie_tools/src", "tools/mise_tasks"]
 addopts = "-m 'not integration and not docker and not model' --import-mode=importlib"
 asyncio_mode = "auto"
 markers = [
@@ -234,6 +241,10 @@ ignore = [
     "S105",    # Hardcoded "password" strings — device-flow session tokens are test doubles
     "S106",    # Same, as function arguments (access_token=/refresh_token=)
     "S107",    # Same, as function defaults
+]
+"tools/mise_tasks/tests/test_deploy_posture_audit.py" = [
+    "S105",    # Hardcoded "secret"-like strings are Modal secret NAMES (test doubles), not credentials
+    "S106",    # Same, passed as fixture arguments
 ]
 "**/tests/**/*" = [
     "ANN",     # Type annotations (tests don't need full typing)
