@@ -124,6 +124,24 @@ def test_candle_bundle_only_exposes_profile_variants() -> None:
     )
 
 
+def test_gte_multilingual_candle_profile_targets_rust_fp16() -> None:
+    model_yaml = MODELS_DIR / "Alibaba-NLP__gte-multilingual-base.yaml"
+    data = yaml.safe_load(model_yaml.read_text()) or {}
+    profiles = data["profiles"]
+
+    default = profiles["default"]
+    candle = profiles["candle"]
+
+    assert default["adapter_path"] == "sie_server.adapters.rope_flash:RoPEFlashAdapter"
+    assert candle["extends"] == "default"
+    assert candle["adapter_path"] == "sie_server_rust.adapters.candle:CandleEmbeddingAdapter"
+    assert candle["compute_precision"] == "float16"
+    assert "Alibaba-NLP/gte-multilingual-base:candle" in match_bundle_models(
+        BUNDLES_DIR / "candle.yaml",
+        MODELS_DIR,
+    )
+
+
 @pytest.mark.parametrize("bundle_yaml", sorted(BUNDLES_DIR.glob("*.yaml")))
 def test_bundle_yaml_has_required_fields(bundle_yaml: Path) -> None:
     data = yaml.safe_load(bundle_yaml.read_text()) or {}

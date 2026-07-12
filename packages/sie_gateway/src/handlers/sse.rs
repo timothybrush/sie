@@ -52,7 +52,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
 use crate::metrics;
-use crate::queue::publisher::{self, WorkPublisher};
+use crate::queue::dispatch::WorkDispatcher;
+use crate::queue::publisher;
 use crate::queue::streaming::{ChunkEnvelope, StreamOutcome};
 use crate::server::AppState;
 
@@ -75,7 +76,7 @@ pub enum SseEndpoint {
 /// :func:`build_sse_response`.
 pub struct SseParams<'a> {
     pub state: &'a AppState,
-    pub work_publisher: Arc<WorkPublisher>,
+    pub work_publisher: Arc<dyn WorkDispatcher>,
     /// DISPLAY id (the requested model) — surfaced in the streamed chunk
     /// ``model`` field and the routing/timeout metric labels.
     pub model: String,
@@ -360,7 +361,7 @@ struct SseDriverArgs {
     event_tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     chunk_rx: broadcast::Receiver<ChunkEnvelope>,
     outcome_rx: tokio::sync::oneshot::Receiver<StreamOutcome>,
-    publisher: Arc<WorkPublisher>,
+    publisher: Arc<dyn WorkDispatcher>,
     request_id: String,
     model: String,
     pool: String,

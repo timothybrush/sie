@@ -1,5 +1,6 @@
 sie_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
 hf_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+hf_revision: 1c2b8495b28150b8a4922ee1c8edee224c284c0c
 inputs:
   text: true
   image: true

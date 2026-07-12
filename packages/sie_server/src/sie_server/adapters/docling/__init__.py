@@ -16,6 +16,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _document_page_count(doc: Any) -> int:
+    """Real page count of a parsed ``DoclingDocument`` (the §7 parse unit).
+
+    Prefers the document model's ``num_pages()`` and falls back to ``len(pages)``.
+    Best-effort: any docling-version quirk degrades to ``0`` so metering never
+    fails the parse — the meter then stays on its reserve estimate for the item.
+    """
+    try:
+        num_pages = getattr(doc, "num_pages", None)
+        if callable(num_pages):
+            return max(int(num_pages()), 0)
+        pages = getattr(doc, "pages", None)
+        if pages is not None:
+            return max(len(pages), 0)
+    except Exception:  # noqa: BLE001 — metering must never fail the parse
+        return 0
+    return 0
+
+
 _ERR_REQUIRES_DOCUMENT = "Docling requires Item.document or Item.images[0] with raw bytes"
 
 # Minimal one-page PDF used to warm Docling's layout/table model downloads
@@ -120,23 +139,39 @@ class DoclingAdapter(BaseAdapter):
         ocr_enabled = bool(options and options.get("ocr"))
         results = self._run_extract(items, ocr_enabled=ocr_enabled)
 
+        data = [result for result, _pages in results]
+        # Unit-meter seam (§7): the canonical parse/OCR billing dimension is
+        # PAGES ("$ per 1k pages", design §7). Docling's document model knows
+        # exactly how many pages it parsed per item, so surface that real count
+        # to the queue executor (folded into ``ItemOutcome.units.pages``).
+        # Only emit the dimension when at least one page was parsed — an
+        # all-error batch (0 pages) leaves it unset so the meter falls back to
+        # its reserve estimate rather than billing zero.
+        page_counts = [pages for _result, pages in results]
+        emit_pages = page_counts if any(p > 0 for p in page_counts) else None
+
         return ExtractOutput(
             entities=[[] for _ in items],
-            data=results,
+            data=data,
             batch_size=len(items),
+            pages=emit_pages,
         )
 
-    def _run_extract(self, items: list[Item], *, ocr_enabled: bool) -> list[dict[str, Any]]:
+    def _run_extract(self, items: list[Item], *, ocr_enabled: bool) -> list[tuple[dict[str, Any], int]]:
         """Run extract per-item, serially.
 
         Items are processed one at a time so we can share a single cached
         DocumentConverter (see class docstring). At GPU-bound concurrency the
         worker-level inference executor is already saturating the device, so
         intra-batch parallelism does not buy real throughput.
+
+        Returns per item a ``(result, page_count)`` pair: ``page_count`` is the
+        number of document pages Docling parsed (``0`` on a per-item error), the
+        §7 parse-billing dimension.
         """
         return [self._extract_one(item, ocr_enabled=ocr_enabled) for item in items]
 
-    def _extract_one(self, item: Item, *, ocr_enabled: bool) -> dict[str, Any]:
+    def _extract_one(self, item: Item, *, ocr_enabled: bool) -> tuple[dict[str, Any], int]:
         # Prefer document when both are provided: PDF/DOCX/HTML carry layout
         # that Docling's pipeline exploits; an image is the rasterized
         # fallback for callers that only have a page render.
@@ -148,7 +183,7 @@ class DoclingAdapter(BaseAdapter):
             images = item.images or []
             first_image = images[0] if images else None
             if not is_image_input(first_image):
-                return {"error": _ERR_REQUIRES_DOCUMENT}
+                return {"error": _ERR_REQUIRES_DOCUMENT}, 0
             payload = first_image["data"]
             format_hint = first_image.get("format") or "png"
         try:
@@ -156,7 +191,7 @@ class DoclingAdapter(BaseAdapter):
             return self._convert_bytes(converter, payload, format_hint=format_hint)
         except Exception as e:  # noqa: BLE001 - per-item failure must not poison the batch
             logger.warning("Docling extract failed for item id=%s: %s", item.id, e)
-            return {"error": str(e)}
+            return {"error": str(e)}, 0
 
     def _get_converter(self, *, ocr_enabled: bool) -> Any:
         """Return the cached DocumentConverter for this ocr_enabled value, building lazily on first use."""
@@ -167,7 +202,7 @@ class DoclingAdapter(BaseAdapter):
         self._converters[ocr_enabled] = converter
         return converter
 
-    def _convert_bytes(self, converter: Any, data: bytes, *, format_hint: str | None) -> dict[str, Any]:
+    def _convert_bytes(self, converter: Any, data: bytes, *, format_hint: str | None) -> tuple[dict[str, Any], int]:
         from docling.datamodel.base_models import DocumentStream  # ty: ignore[unresolved-import]
 
         # Docling auto-detects format from bytes; the hint becomes the source name
@@ -176,11 +211,12 @@ class DoclingAdapter(BaseAdapter):
         stream = DocumentStream(name=source_name, stream=io.BytesIO(data))
         result = converter.convert(stream)
         doc = result.document
-        return {
+        payload = {
             "text": doc.export_to_text(),
             "markdown": doc.export_to_markdown(),
             "document": doc.export_to_dict(),
         }
+        return payload, _document_page_count(doc)
 
     def _make_converter(self, *, ocr_enabled: bool) -> Any:
         """Build a fresh DocumentConverter. Callers should usually go through _get_converter() for caching.

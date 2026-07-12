@@ -2948,6 +2948,10 @@
           "healthy": {
             "type": "boolean"
           },
+          "inflight_batches": {
+            "format": "int32",
+            "type": "integer"
+          },
           "loaded_models": {
             "items": {
               "type": "string"
@@ -2965,7 +2969,15 @@
           "name": {
             "type": "string"
           },
+          "pending_cost": {
+            "format": "int64",
+            "type": "integer"
+          },
           "queue_depth": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ready_gpu_slots": {
             "format": "int32",
             "type": "integer"
           },
@@ -2978,8 +2990,11 @@
           "url",
           "gpu",
           "gpu_count",
+          "ready_gpu_slots",
           "loaded_models",
           "queue_depth",
+          "pending_cost",
+          "inflight_batches",
           "memory_used_bytes",
           "memory_total_bytes",
           "healthy",
@@ -3005,7 +3020,7 @@
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
     "title": "SIE Gateway",
-    "version": "0.6.16"
+    "version": "0.6.17"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -73,6 +73,7 @@ class GLiClassAdapter(BaseAdapter):
         threshold: float = 0.0,
         max_seq_length: int | None = None,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize GLiClass adapter.
@@ -88,6 +89,8 @@ class GLiClassAdapter(BaseAdapter):
                 tokenization inside the gliclass pipeline so inputs cannot exceed
                 the model's position-embedding capacity.
             compute_precision: Precision for inference (float16, float32, bfloat16).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._model_name_or_path = str(model_name_or_path)
@@ -95,6 +98,7 @@ class GLiClassAdapter(BaseAdapter):
         self._threshold = threshold
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._pipeline: ZeroShotClassificationPipeline | None = None
         self._tokenizer: PreTrainedTokenizerBase | None = None
@@ -123,9 +127,12 @@ class GLiClassAdapter(BaseAdapter):
             torch_dtype = torch.float32
 
         # Load model and tokenizer
-        model = GLiClassModel.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+        model = GLiClassModel.from_pretrained(self._model_name_or_path, **shared_kwargs)
         model = model.to(device, dtype=torch_dtype)
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Bound the tokenizer's max length so any internal tokenization in the
         # gliclass library auto-truncates to the model's actual capacity.

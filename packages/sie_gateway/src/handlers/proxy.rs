@@ -18,6 +18,7 @@ use crate::http_error::{
     openai_code as oai_code, openai_type as oai_type,
 };
 use crate::metrics;
+use crate::queue::dispatch::{WorkDispatcher, WorkDispatcherExt};
 use crate::queue::publisher;
 
 use crate::server::AppState;
@@ -1015,6 +1016,119 @@ fn resolve_bundle_for_request(
     Ok(bundle)
 }
 
+/// Normalized machine-profile + pool routing resolved from the request
+/// headers. Shared by the primitive (`resolve_routing`) and generation
+/// (`resolve_generation_route`) paths so the header parse → pool validate →
+/// model-pool default → machine-profile resolution lives in one place.
+struct ProfilePoolRoute {
+    gpu: String,
+    pool_name: String,
+    gpu_configured: bool,
+}
+
+/// Failure modes of [`resolve_profile_and_pool`].
+///
+/// Error *rendering* stays with each caller so the native
+/// (`endpoint_error_response`) and OpenAI (`json_openai_error`) surfaces keep
+/// their exact status / code / param wire shape; this enum only carries the
+/// labels both callers need for the rejection metric.
+enum ProfilePoolError {
+    /// Caller-supplied pool failed the strict `[A-Za-z0-9_-]` allowlist.
+    /// Carries the post-split machine profile for the metric label.
+    InvalidPool { gpu: String },
+    /// Model is assigned to a different pool than the request targeted.
+    /// Carries the metric labels (machine profile + normalized pool) and the
+    /// caller-facing explanation.
+    PoolMismatch {
+        gpu: String,
+        pool_name: String,
+        message: String,
+    },
+}
+
+/// Resolve the machine-profile + pool routing carried by the request headers.
+///
+/// Parses `X-SIE-MACHINE-PROFILE` (optionally a combined
+/// `pool/machine-profile`) and `X-SIE-Pool`, validates the pool against the
+/// strict allowlist BEFORE it can flow into the JetStream work subject
+/// `sie.work.{pool}.{machine_profile}.{bundle}.{model}` (an out-of-charset pool
+/// would re-tokenise the subject — subject injection — and silently mis-route,
+/// so reject rather than mangle), applies the model's default pool, resolves a
+/// bare GPU to its spot variant, and reports whether the GPU is configured.
+///
+/// Pure resolution: it records no metrics and builds no response bodies, so
+/// each caller keeps its own rejection metric and error envelope. Behaviour
+/// mirrors the inline block it replaced in both callers exactly.
+async fn resolve_profile_and_pool(
+    state: &AppState,
+    headers: &HeaderMap,
+    model_name: &str,
+) -> Result<ProfilePoolRoute, ProfilePoolError> {
+    // Parse GPU from X-SIE-MACHINE-PROFILE header
+    let mut gpu = headers
+        .get("x-sie-machine-profile")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let mut pool_name = headers
+        .get("x-sie-pool")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Parse pool from GPU param (e.g., "eval-l4/l4")
+    if !gpu.is_empty() && gpu.contains('/') {
+        let parts: Vec<&str> = gpu.splitn(2, '/').collect();
+        pool_name = parts[0].to_string();
+        gpu = parts[1].to_string();
+    }
+
+    if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
+        return Err(ProfilePoolError::InvalidPool { gpu });
+    }
+    if !pool_name.is_empty() {
+        pool_name = normalize_pool_name(&pool_name);
+    }
+
+    let model_pool = state.model_registry.get_model_pool_name(model_name);
+    if let Err(message) = apply_model_pool_default(
+        &mut pool_name,
+        model_pool.as_deref(),
+        Some(&state.pool_manager),
+    )
+    .await
+    {
+        return Err(ProfilePoolError::PoolMismatch {
+            gpu,
+            pool_name,
+            message,
+        });
+    }
+
+    // Resolve bare GPU to spot variant
+    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
+        gpu = resolve_machine_profile(&gpu, &state.config.gpu_profile_map);
+    }
+
+    // Validate GPU is configured. Compute this *before* tagging the metric
+    // label slot so an arbitrary, unconfigured, caller-supplied GPU never
+    // reaches a Prometheus label (unbounded cardinality / DoS).
+    let gpu_configured = gpu.is_empty()
+        || state.config.configured_gpus.is_empty()
+        || state
+            .config
+            .configured_gpus
+            .iter()
+            .any(|cg| cg.eq_ignore_ascii_case(&gpu));
+
+    Ok(ProfilePoolRoute {
+        gpu,
+        pool_name,
+        gpu_configured,
+    })
+}
+
 /// The routing decision for a request: canonical model name, serving bundle,
 /// and engine. Produced by [`resolve_routing`].
 struct RoutingResult {
@@ -1138,83 +1252,44 @@ async fn resolve_routing(
         .or_else(|| engine_pin.clone())
         .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
 
-    // Parse GPU from X-SIE-MACHINE-PROFILE header
-    let mut gpu = headers
-        .get("x-sie-machine-profile")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let mut pool_name = headers
-        .get("x-sie-pool")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // Parse pool from GPU param (e.g., "eval-l4/l4")
-    if !gpu.is_empty() && gpu.contains('/') {
-        let parts: Vec<&str> = gpu.splitn(2, '/').collect();
-        pool_name = parts[0].to_string();
-        gpu = parts[1].to_string();
-    }
-
-    // Validate the caller-supplied pool against a strict allowlist BEFORE it can
-    // flow into the JetStream work subject
-    // `sie.work.{pool}.{machine_profile}.{bundle}.{model}`. An out-of-charset
-    // pool would otherwise re-tokenise the subject (subject injection) and
-    // silently mis-route the request, so reject with an OpenAI-shaped 400 rather
-    // than mangle. Empty pool means "gateway picks the default pool" and is left
-    // untouched.
-    if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
-        metrics::record_rejected_request_for_pool("unknown", &gpu, &bundle, "invalid_pool");
-        return Err(Box::new(endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            Some("pool"),
-            "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
-        )));
-    }
-    if !pool_name.is_empty() {
-        pool_name = normalize_pool_name(&pool_name);
-    }
-    let model_pool = state.model_registry.get_model_pool_name(&model_name);
-    if let Err(message) = apply_model_pool_default(
-        &mut pool_name,
-        model_pool.as_deref(),
-        Some(&state.pool_manager),
-    )
-    .await
-    {
-        metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
-        return Err(Box::new(endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            Some("pool"),
+    // Machine-profile + pool resolution, shared with the generation path via
+    // `resolve_profile_and_pool`. Errors are rendered here in this endpoint's
+    // envelope (native `detail` or OpenAI, per `endpoint_error_response`).
+    let ProfilePoolRoute {
+        gpu,
+        pool_name,
+        gpu_configured,
+    } = match resolve_profile_and_pool(state, headers, &model_name).await {
+        Ok(route) => route,
+        Err(ProfilePoolError::InvalidPool { gpu }) => {
+            metrics::record_rejected_request_for_pool("unknown", &gpu, &bundle, "invalid_pool");
+            return Err(Box::new(endpoint_error_response(
+                endpoint,
+                StatusCode::BAD_REQUEST,
+                err_code::INVALID_REQUEST,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                Some("pool"),
+                "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)",
+            )));
+        }
+        Err(ProfilePoolError::PoolMismatch {
+            gpu,
+            pool_name,
             message,
-        )));
-    }
-
-    // Resolve bare GPU to spot variant
-    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
-        gpu = resolve_machine_profile(&gpu, &state.config.gpu_profile_map);
-    }
-
-    // Validate GPU is configured. Compute this *before* tagging the metric label
-    // slot so an arbitrary, unconfigured, caller-supplied GPU never reaches a
-    // Prometheus label (unbounded cardinality / DoS).
-    let gpu_configured = gpu.is_empty()
-        || state.config.configured_gpus.is_empty()
-        || state
-            .config
-            .configured_gpus
-            .iter()
-            .any(|cg| cg.eq_ignore_ascii_case(&gpu));
+        }) => {
+            metrics::record_rejected_request_for_pool(&pool_name, &gpu, &bundle, "pool_mismatch");
+            return Err(Box::new(endpoint_error_response(
+                endpoint,
+                StatusCode::BAD_REQUEST,
+                err_code::INVALID_REQUEST,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                Some("pool"),
+                message,
+            )));
+        }
+    };
 
     Ok(RoutingResult {
         model_name,
@@ -1520,7 +1595,7 @@ async fn proxy_request(
 
     let publish_fut = queue_mode_proxy(
         &state,
-        work_publisher,
+        work_publisher.as_ref(),
         endpoint,
         &model_name,
         &bundle,
@@ -1595,7 +1670,7 @@ fn should_trace_proxy_request(endpoint: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn queue_mode_proxy(
     state: &AppState,
-    work_publisher: &publisher::WorkPublisher,
+    work_publisher: &dyn WorkDispatcher,
     endpoint: &str,
     model: &str,
     bundle: &str,
@@ -2115,7 +2190,7 @@ async fn queue_mode_proxy(
 /// the client-disconnect / axum task-abort path to trigger the cancel
 /// (axum drops the handler task when the connection closes).
 pub(crate) struct StreamCancelGuard {
-    publisher: Arc<publisher::WorkPublisher>,
+    publisher: Arc<dyn WorkDispatcher>,
     request_id: String,
     model: String,
     pool: String,
@@ -2124,7 +2199,7 @@ pub(crate) struct StreamCancelGuard {
 
 impl StreamCancelGuard {
     pub(crate) fn new(
-        publisher: Arc<publisher::WorkPublisher>,
+        publisher: Arc<dyn WorkDispatcher>,
         request_id: String,
         model: String,
         pool: String,
@@ -2293,7 +2368,7 @@ pub(crate) enum StreamingDriverErr {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_streaming_generate(
     state: &AppState,
-    work_publisher: Arc<publisher::WorkPublisher>,
+    work_publisher: Arc<dyn WorkDispatcher>,
     // DISPLAY id (the requested model) — drives metric labels + the cancel
     // guard. ``dispatch_model`` below is the id actually published to NATS /
     // the work item (the grammar ``:no-spec`` variant when routing fired);
@@ -2309,7 +2384,7 @@ pub(crate) async fn run_streaming_generate(
     params: &publisher::WorkParams,
 ) -> Result<StreamingDriverOk, StreamingDriverErr> {
     let publish_start = Instant::now();
-    // Resolve the routing key, build the HRW ring snapshot,
+    // Resolve the routing key, build the pressure-aware routing snapshot,
     // pick a worker. Falls back to pool publish when:
     // - generate params are absent (caller will surface a 400).
     // - the resolved key has no hash (no routing_key / prompt_cache_key
@@ -2391,7 +2466,7 @@ pub(crate) async fn run_streaming_generate(
                     worker_id = %worker_id,
                     key = %crate::routing::fmt_key_hash(resolved_key.hash.unwrap_or(0)),
                     source = resolved_key.source.as_label(),
-                    "HRW pick"
+                    "pressure-aware worker pick"
                 );
                 (
                     publisher::PublishTarget::Worker {
@@ -2767,6 +2842,27 @@ pub(crate) fn worker_error_openai_type(code: &str) -> &'static str {
     }
 }
 
+/// Retry semantics for a transient worker-emitted error code: the
+/// `Retry-After` header value (seconds, as a string) paired with the
+/// canonical SIE error code, or `None` when the code is not a known
+/// retryable signal.
+///
+/// Single source of truth shared by the streaming (OpenAI-envelope) and unary
+/// (SIE-native [`build_retryable_error_response`]) paths — the two surfaces
+/// render the error body differently but agree on the retry semantics. Pairs
+/// with [`worker_error_http_status`] / [`worker_error_openai_type`].
+fn worker_error_retry_after(code: &str) -> Option<(&'static str, &'static str)> {
+    match code {
+        RESOURCE_EXHAUSTED_ERROR_CODE => Some((
+            RESOURCE_EXHAUSTED_RETRY_AFTER,
+            RESOURCE_EXHAUSTED_ERROR_CODE,
+        )),
+        MODEL_LOADING_ERROR_CODE => Some((MODEL_LOADING_RETRY_AFTER, MODEL_LOADING_ERROR_CODE)),
+        LORA_LOADING_ERROR_CODE => Some((LORA_LOADING_RETRY_AFTER, LORA_LOADING_ERROR_CODE)),
+        _ => None,
+    }
+}
+
 /// Build the OpenAI-envelope error response for one of the
 /// :class:`StreamingDriverErr` variants. Used by both
 /// ``proxy_generate`` (via :func:`queue_mode_streaming_generate`) and
@@ -2902,19 +2998,7 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                     HeaderValue::from_static("1"),
                 );
             }
-            let retryable = match code.as_str() {
-                RESOURCE_EXHAUSTED_ERROR_CODE => Some((
-                    RESOURCE_EXHAUSTED_RETRY_AFTER,
-                    RESOURCE_EXHAUSTED_ERROR_CODE,
-                )),
-                MODEL_LOADING_ERROR_CODE => {
-                    Some((MODEL_LOADING_RETRY_AFTER, MODEL_LOADING_ERROR_CODE))
-                }
-                LORA_LOADING_ERROR_CODE => {
-                    Some((LORA_LOADING_RETRY_AFTER, LORA_LOADING_ERROR_CODE))
-                }
-                _ => None,
-            };
+            let retryable = worker_error_retry_after(code.as_str());
             if let Some((retry_after, error_code)) = retryable {
                 resp.headers_mut().insert(
                     HeaderName::from_static("retry-after"),
@@ -2982,7 +3066,7 @@ pub(crate) fn build_streaming_publish_failed_for_sse(
 #[allow(clippy::too_many_arguments)]
 async fn queue_mode_streaming_generate(
     state: &AppState,
-    work_publisher: Arc<publisher::WorkPublisher>,
+    work_publisher: Arc<dyn WorkDispatcher>,
     // DISPLAY id (requested model) — response body, success metrics, audit log.
     model: &str,
     // DISPATCH id (grammar ``:no-spec`` variant when routed) — NATS subject +
@@ -5007,7 +5091,7 @@ struct ResolvedRoute {
     effective_pool: String,
     effective_machine_profile: String,
     bundle_config_hash: String,
-    work_publisher: Arc<publisher::WorkPublisher>,
+    work_publisher: Arc<dyn WorkDispatcher>,
     token_id: String,
     content_length: i64,
 }
@@ -5023,93 +5107,69 @@ async fn resolve_generation_route(
     bundle: &str,
     model_name: &str,
 ) -> Result<ResolvedRoute, Response> {
-    let mut gpu = hdr
-        .get("x-sie-machine-profile")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let mut pool_name = hdr
-        .get("x-sie-pool")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    if !gpu.is_empty() && gpu.contains('/') {
-        let parts: Vec<&str> = gpu.splitn(2, '/').collect();
-        pool_name = parts[0].to_string();
-        gpu = parts[1].to_string();
-    }
-
-    if !pool_name.is_empty() && !is_valid_pool_name(&pool_name) {
-        metrics::record_rejected_request_for_pool("unknown", &gpu, bundle, "invalid_pool");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json_openai_error(
-                "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)".to_string(),
-                oai_type::INVALID_REQUEST,
-                Some("X-SIE-Pool"),
-                oai_code::INVALID_REQUEST,
-            )),
-        )
-            .into_response());
-    }
-    if !pool_name.is_empty() {
-        pool_name = normalize_pool_name(&pool_name);
-    }
-    let model_pool = state.model_registry.get_model_pool_name(model_name);
-    if let Err(message) = apply_model_pool_default(
-        &mut pool_name,
-        model_pool.as_deref(),
-        Some(&state.pool_manager),
-    )
-    .await
-    {
-        metrics::record_rejected_request_for_pool(&pool_name, &gpu, bundle, "pool_mismatch");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json_openai_error(
-                message,
-                oai_type::INVALID_REQUEST,
-                Some("X-SIE-Pool"),
-                oai_code::INVALID_REQUEST,
-            )),
-        )
-            .into_response());
-    }
-
-    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
-        gpu = resolve_machine_profile(&gpu, &state.config.gpu_profile_map);
-    }
-
-    if !gpu.is_empty() && !state.config.configured_gpus.is_empty() {
-        let found = state
-            .config
-            .configured_gpus
-            .iter()
-            .any(|cg| cg.eq_ignore_ascii_case(&gpu));
-        if !found {
-            let metric_pool = if pool_name.is_empty() {
-                DEFAULT_POOL_NAME
-            } else {
-                pool_name.as_str()
-            };
-            metrics::record_rejected_request_for_pool(
-                metric_pool,
-                "invalid",
-                bundle,
-                "gpu_not_configured",
-            );
+    // Machine-profile + pool resolution, shared with the primitive path via
+    // `resolve_profile_and_pool`. Errors are rendered here in the OpenAI
+    // envelope (`json_openai_error`), preserving the compat surface.
+    let ProfilePoolRoute {
+        gpu,
+        pool_name,
+        gpu_configured,
+    } = match resolve_profile_and_pool(state, hdr, model_name).await {
+        Ok(route) => route,
+        Err(ProfilePoolError::InvalidPool { gpu }) => {
+            metrics::record_rejected_request_for_pool("unknown", &gpu, bundle, "invalid_pool");
             return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::BAD_REQUEST,
                 Json(json_openai_error(
-                    format!("GPU type '{gpu}' is not configured in this cluster."),
-                    oai_type::SERVER_ERROR,
-                    Some("X-SIE-MACHINE-PROFILE"),
-                    oai_code::TRANSPORT_FAILURE,
+                    "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)".to_string(),
+                    oai_type::INVALID_REQUEST,
+                    Some("X-SIE-Pool"),
+                    oai_code::INVALID_REQUEST,
                 )),
             )
                 .into_response());
         }
+        Err(ProfilePoolError::PoolMismatch {
+            gpu,
+            pool_name,
+            message,
+        }) => {
+            metrics::record_rejected_request_for_pool(&pool_name, &gpu, bundle, "pool_mismatch");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json_openai_error(
+                    message,
+                    oai_type::INVALID_REQUEST,
+                    Some("X-SIE-Pool"),
+                    oai_code::INVALID_REQUEST,
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    if !gpu_configured {
+        let metric_pool = if pool_name.is_empty() {
+            DEFAULT_POOL_NAME
+        } else {
+            pool_name.as_str()
+        };
+        metrics::record_rejected_request_for_pool(
+            metric_pool,
+            "invalid",
+            bundle,
+            "gpu_not_configured",
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_openai_error(
+                format!("GPU type '{gpu}' is not configured in this cluster."),
+                oai_type::SERVER_ERROR,
+                Some("X-SIE-MACHINE-PROFILE"),
+                oai_code::TRANSPORT_FAILURE,
+            )),
+        )
+            .into_response());
     }
 
     let Some(work_publisher_arc) = state.work_publisher.clone() else {
@@ -7154,24 +7214,23 @@ fn batch_direct_fallback_delay(request_timeout_s: f64) -> Duration {
 /// The worker is **not** marked unhealthy — these codes are transient
 /// per-request signals, not worker-health signals.
 fn build_retryable_error_response(code: &'static str, message: &str) -> Response {
-    let retry_after = match code {
-        RESOURCE_EXHAUSTED_ERROR_CODE => RESOURCE_EXHAUSTED_RETRY_AFTER,
-        MODEL_LOADING_ERROR_CODE => MODEL_LOADING_RETRY_AFTER,
-        LORA_LOADING_ERROR_CODE => LORA_LOADING_RETRY_AFTER,
-        // Defensive default. Should be unreachable given the
-        // ``unanimous_retryable_error_code`` allow-list (the only caller
-        // pathway), but if a future code is added there without here, fall
-        // back to the most conservative retry hint we know rather than
-        // panicking in production. The ``debug_assert!`` ensures any such
-        // mismatch fails loudly in tests / dev builds.
-        _ => {
+    // Retry hint via the shared `worker_error_retry_after` classifier — the
+    // same source of truth the streaming path uses.
+    let retry_after = worker_error_retry_after(code)
+        .map(|(retry_after, _)| retry_after)
+        .unwrap_or_else(|| {
+            // Defensive default. Should be unreachable given the
+            // ``unanimous_retryable_error_code`` allow-list (the only caller
+            // pathway), but if a future code is added there without here, fall
+            // back to the most conservative retry hint we know rather than
+            // panicking in production. The ``debug_assert!`` ensures any such
+            // mismatch fails loudly in tests / dev builds.
             debug_assert!(
                 false,
                 "build_retryable_error_response called with unmapped code: {code}"
             );
             MODEL_LOADING_RETRY_AFTER
-        }
-    };
+        });
     let mut resp = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -10801,6 +10860,8 @@ mod tests {
                     name: "assigned-cold".to_string(),
                     ready: true,
                     gpu_count: 1,
+                    total_gpu_slots: Some(1),
+                    ready_gpu_slots: Some(1),
                     machine_profile: "l4".to_string(),
                     pool_name: DEFAULT_POOL_NAME.to_string(),
                     bundle: "default".to_string(),
@@ -10809,6 +10870,8 @@ mod tests {
                     models: Vec::new(),
                     gpus: Vec::new(),
                     queue_depth: None,
+                    pending_cost: None,
+                    inflight_batches: None,
                     memory_used_bytes: None,
                     memory_total_bytes: None,
                     saturated: false,
@@ -11707,6 +11770,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let body = build_generate_success_body("Qwen/Qwen3-4B-Instruct", &[&r], false);
@@ -12099,6 +12163,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         }
     }
@@ -12119,6 +12184,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         }
     }
@@ -13153,6 +13219,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: false,
         };
         let resp_body = result.result_msgpack.clone();
@@ -13189,6 +13256,7 @@ mod tests {
                 tokenization_ms: None,
                 postprocessing_ms: None,
                 payload_fetch_ms: None,
+                units: None,
                 worker_direct: false,
             },
             publisher::WorkResult {
@@ -13206,6 +13274,7 @@ mod tests {
                 tokenization_ms: None,
                 postprocessing_ms: None,
                 payload_fetch_ms: None,
+                units: None,
                 worker_direct: false,
             },
         ];
@@ -13399,6 +13468,8 @@ mod tests {
             name: "worker-1".into(),
             ready: true,
             gpu_count: 1,
+            total_gpu_slots: None,
+            ready_gpu_slots: None,
             machine_profile: gpu.into(),
             pool_name: pool.into(),
             bundle: bundle.into(),
@@ -13410,6 +13481,8 @@ mod tests {
                 memory_total_bytes: 4000,
             }],
             queue_depth: None,
+            pending_cost: None,
+            inflight_batches: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
@@ -16644,6 +16717,32 @@ mod tests {
             worker_error_openai_type("rate_limit_exceeded"),
             oai_type::RATE_LIMIT
         );
+    }
+
+    /// The shared retry classifier maps each retryable worker code to its
+    /// `Retry-After` + canonical code and returns `None` for terminal codes.
+    /// Locks the single source of truth the streaming and unary error paths
+    /// share (see `worker_error_retry_after`).
+    #[test]
+    fn test_worker_error_retry_after_maps_retryable_codes() {
+        assert_eq!(
+            worker_error_retry_after(RESOURCE_EXHAUSTED_ERROR_CODE),
+            Some((
+                RESOURCE_EXHAUSTED_RETRY_AFTER,
+                RESOURCE_EXHAUSTED_ERROR_CODE
+            ))
+        );
+        assert_eq!(
+            worker_error_retry_after(MODEL_LOADING_ERROR_CODE),
+            Some((MODEL_LOADING_RETRY_AFTER, MODEL_LOADING_ERROR_CODE))
+        );
+        assert_eq!(
+            worker_error_retry_after(LORA_LOADING_ERROR_CODE),
+            Some((LORA_LOADING_RETRY_AFTER, LORA_LOADING_ERROR_CODE))
+        );
+        // Terminal / non-retryable codes carry no retry hint.
+        assert_eq!(worker_error_retry_after("invalid_request"), None);
+        assert_eq!(worker_error_retry_after("transport_failure"), None);
     }
 
     // ── SSE: generate-endpoint `stream` flag extraction ────────────

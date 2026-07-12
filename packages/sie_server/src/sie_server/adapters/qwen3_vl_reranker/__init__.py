@@ -103,12 +103,14 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         *,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = False,
+        revision: str | None = None,
         max_seq_length: int | None = None,
         default_instruction: str = _DEFAULT_INSTRUCTION,
     ) -> None:
         self._model_name_or_path = str(model_name_or_path)
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._max_seq_length = max_seq_length
         self._default_instruction = default_instruction
 
@@ -144,6 +146,7 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
                 trust_remote_code=self._trust_remote_code,
                 min_pixels=256 * 28 * 28,
                 max_pixels=1280 * 28 * 28,
+                revision=self._revision,
             )
         except (TypeError, OSError) as exc:
             logger.info(
@@ -151,7 +154,10 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
                 self._model_name_or_path,
                 exc,
             )
-            # Load processor from base model (same vision architecture)
+            # Load processor from base model (same vision architecture).
+            # NOTE: no ``revision`` here — this is a different repo than
+            # ``self._model_name_or_path``, so the pinned revision (a ref in the
+            # reranker repo) does not apply to the base model's artifacts.
             base_model = "Qwen/Qwen3-VL-2B-Instruct"
             self._processor = AutoProcessor.from_pretrained(
                 base_model,
@@ -164,6 +170,7 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
             self._processor.tokenizer = AutoTokenizer.from_pretrained(  # ty: ignore[unresolved-attribute]
                 self._model_name_or_path,
                 trust_remote_code=self._trust_remote_code,
+                revision=self._revision,
             )
 
         if self._max_seq_length is not None and hasattr(self._processor, "tokenizer"):
@@ -176,6 +183,8 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         }
         if attn_impl is not None:
             load_kwargs["attn_implementation"] = attn_impl
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
 
         self._model = Qwen3VLForConditionalGeneration.from_pretrained(
             self._model_name_or_path,

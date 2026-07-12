@@ -55,6 +55,17 @@ class TestEngineConfig:
         assert config.attention_backend == "flash_attention_2"
         assert config.default_compute_precision == "bfloat16"
 
+    def test_max_batch_requests_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SIE_MAX_BATCH_REQUESTS overrides the batch-depth cap (the sglang-embed deep-batch lane knob).
+
+        The managed embed lane bakes this env into the container image so the
+        engine's batcher packs deeper forwards; proves the env-wiring the deploy
+        relies on (default 64 -> 128).
+        """
+        assert EngineConfig().max_batch_requests == 64
+        monkeypatch.setenv("SIE_MAX_BATCH_REQUESTS", "128")
+        assert EngineConfig().max_batch_requests == 128
+
     def test_invalid_attention_backend(self) -> None:
         """Invalid attention backend is rejected."""
         with pytest.raises(ValidationError):

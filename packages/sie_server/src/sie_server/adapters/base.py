@@ -353,6 +353,71 @@ class ModelAdapter(ABC):
         msg = f"{self.__class__.__name__} does not support extract()"
         raise NotImplementedError(msg)
 
+    def count_input_tokens(self, items: list[Item]) -> list[int] | None:
+        """Authoritative per-item input-token counts for the unit meter (§7.3).
+
+        Shared metering seam for adapters that own their tokenization (flash
+        packers, library wrappers) and therefore leave the encode preprocessor
+        blind: returning the real per-item ``len(input_ids)`` here lets the
+        encode/extract result path bill $/1M input tokens (§7.1) off the same
+        ground-truth basis the pipeline records for adapters that tokenize in
+        the preprocessor (§P3.5), with no per-adapter code.
+
+        Default: ``None`` — leaving ``ItemOutcome.units`` unset so the metering
+        edge falls back to its reserve estimate rather than billing an
+        approximation. Concrete adapters with an in-process tokenizer override
+        this (see :class:`BaseAdapter`); server-backed / image adapters keep the
+        ``None`` default.
+        """
+        _ = items
+        return None
+
+    def count_pair_input_tokens(
+        self,
+        query: Item,
+        docs: list[Item],
+        *,
+        instruction: str | None = None,
+    ) -> list[int] | None:
+        """Authoritative per-pair input-token counts for reranker metering (§7.3).
+
+        Reranker analogue of :meth:`count_input_tokens`: a cross-encoder
+        tokenizes each ``(query, doc)`` pair jointly, so the pair's billable
+        input is the length of that joint encoding — the same basis the in-tree
+        ``cross_encoder`` adapter surfaces on its ``ScoreOutput``. Lets rerankers
+        that own their tokenization (flash cross-encoders) surface real counts
+        without per-adapter code.
+
+        Default ``None`` (reserve fallback); overridden by :class:`BaseAdapter`.
+        """
+        _ = (query, docs, instruction)
+        return None
+
+    def count_input_images(self, items: list[Item]) -> list[int] | None:
+        """Authoritative per-item input-IMAGE counts for the unit meter (§7).
+
+        Vision analogue of :meth:`count_input_tokens` for the "$ per image"
+        price dimension (§7). Unlike tokens, an image count needs no model or
+        tokenizer — it is simply the number of image inputs the adapter
+        consumed for the item — so the default counts them straight off the
+        wire ``Item`` and EVERY vision adapter (CLIP/SigLIP encode, Florence-2
+        extract, …) inherits authoritative per-image metering with no
+        per-adapter code.
+
+        Returns per-item ``len(item.images)`` (``0`` for text-only items). The
+        encode/extract result seam treats an all-zero total as absent so a
+        pure-text request never emits a spurious ``images=0`` — the meter then
+        stays on its token/reserve basis. Best-effort: never raises, since
+        metering must not fail inference. Adapters that expand one input image
+        into several billable tiles/crops may override this to bill the real
+        count.
+        """
+        counts: list[int] = []
+        for item in items:
+            images = getattr(item, "images", None)
+            counts.append(len(images) if images else 0)
+        return counts
+
     def get_preprocessor(self) -> Any | None:
         """Get the preprocessor for this adapter if available.
 

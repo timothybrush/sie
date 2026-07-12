@@ -32,7 +32,6 @@ from sie_server.adapters._utils import (
     resolve_embedding_options,
     validate_output_types,
 )
-from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import Item
 
@@ -46,13 +45,23 @@ logger = logging.getLogger(__name__)
 _ERR_CPU_NOT_SUPPORTED = "BertFlashAdapter requires CUDA. Use pytorch_embedding adapter for CPU."
 
 
-class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
+class BertFlashAdapter(FlashBaseAdapter):
     """BERT adapter using Flash Attention 2 with variable-length sequences.
 
     This adapter eliminates padding waste by packing sequences and using
     flash_attn_varlen_func. Achieves higher throughput than SDPA-based adapters.
 
     Works with any BERT-based model for dense embeddings.
+
+    No LoRA support (``supports_lora() == False``, the base default): this
+    adapter fuses ``query``/``key``/``value`` weights into ``_fused_qkv_weights``
+    at load time and runs attention via ``functional.linear`` on those cached
+    tensors, so a PEFT wrapper around ``self._model`` is never consulted for the
+    attention projections — an attention-targeting LoRA would be silently
+    dropped (served without the customer's adapter, no error). Do not re-add
+    ``PEFTLoRAMixin`` unless the forward re-reads the (possibly LoRA-wrapped)
+    submodules; per the LoRA capability audit, LoRA on this family goes through
+    the merge-at-staging path instead.
     """
 
     fallback_adapter_path: ClassVar[str | None] = "sentence_transformer:SentenceTransformerDenseAdapter"
@@ -80,6 +89,7 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         pooling: PoolingStrategy = "mean",
         query_template: str | None = None,
         doc_template: str | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -92,6 +102,8 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             pooling: Pooling strategy - "cls" or "mean".
             query_template: Optional template for queries, e.g. "query: {text}".
             doc_template: Optional template for documents, e.g. "passage: {text}".
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -102,6 +114,7 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._pooling = pooling
         self._query_template = query_template
         self._doc_template = doc_template
+        self._revision = revision
 
         self._model: BertModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -136,13 +149,18 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load model with eager attention - we'll run our own flash attention
         self._model = AutoModel.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation="eager",  # We handle attention manually
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -273,12 +291,25 @@ class BertFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Transfer 16-bit to CPU first, then upcast to float32 — halves GPU→CPU bandwidth
         dense_np = dense_vecs.cpu().float().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): this adapter owns tokenization (the registry
+        # preprocessor for flash adapters is a char-count ESTIMATOR) AND applies
+        # the model's query/doc template before tokenizing, so the real per-item
+        # token counts — post-template, post-truncation — exist only here.
+        # ``seq_lengths`` is the exact ``len(input_ids)`` the model processed for
+        # each item; expose it through ``EncodeOutput.extra`` (the designated
+        # adapter-extension point) aligned 1:1 with ``items``. The encode
+        # pipeline forwards these to the result path for metering, in preference
+        # to the base ``count_input_tokens`` fallback which re-tokenizes raw
+        # ``item.text`` and would undercount by the template's tokens. Mirrors
+        # ``bge_m3_flash``.
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, seq_lengths_tensor: torch.Tensor, total_tokens: int) -> torch.Tensor:
         """Build BERT-style position IDs for packed sequences (vectorized).

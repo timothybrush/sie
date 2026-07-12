@@ -7,7 +7,7 @@
 //! The W3C [`TraceContextPropagator`] is installed globally regardless
 //! of that exporter gate so that the inbound gateway
 //! `traceparent` (carried on the work envelope) still propagates
-//! through to the backend worker. Without an exporter the sidecar
+//! through to the adapter worker. Without an exporter the sidecar
 //! itself records no spans, but the IDs continue to flow — the
 //! `into_run_batch_item_with_trace` fallback in the dispatcher copies
 //! the gateway context onto the wire items unchanged.

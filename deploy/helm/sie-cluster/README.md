@@ -138,7 +138,14 @@ label that KEDA cannot match.
 | `sie_gateway_pending_demand` | Gateway | Trigger scale from 0 |
 | `sie_gateway_worker_queue_depth` | Gateway worker registry | Scale up on queued work in the exact pool/profile/bundle lane |
 | `sie_gateway_active_lease_gpus` | Gateway pool manager | Hold distinct assigned-worker capacity for active pool leases in the exact pool/profile/bundle lane |
+| `sie_gateway_worker_pending_cost` | Gateway worker registry | Track worker-local scheduler pressure by cost, not only item count |
+| `sie_gateway_worker_ready_gpu_slots` | Gateway worker registry | Show how many GPU slots in a worker pod are ready to receive work |
+| `sie_gateway_worker_inflight_batches` | Gateway worker registry | Show batches currently executing inside worker pods |
 | `sie_gateway_rejected_requests_total` | Gateway | Scale up on sustained capacity/no-worker rejections after retryable cold-load reasons are excluded |
+
+KEDA scales worker StatefulSet replicas. It does not add or remove Python
+processes or containers inside a running worker pod, so a multi-GPU worker is
+one larger scaling unit with richer per-replica pressure metrics.
 
 ### Worker-sidecar Metrics
 
@@ -155,8 +162,21 @@ The chart wires sidecar scraping as:
 - worker Service port `worker-metrics`
 - worker ServiceMonitor endpoint `worker-metrics`
 
+For multi-child workers, the same worker Service also exposes adapter child
+metrics ports `http-1` through `http-(N-1)` in addition to the baseline `http`
+port, and the worker ServiceMonitor scrapes each of those endpoints. That keeps
+adapter-native metrics visible for every child container, while sidecar
+`sie_worker_child_*` gauges remain the placement/queue-depth source of truth.
+
 Alert rules that need the sidecar scrape target match
 `endpoint="worker-metrics"` rather than an old `job="sie-worker"` label.
+
+Multi-child sidecars also expose child-level GPU slot gauges with a `child`
+label: `sie_worker_child_ready`, `sie_worker_child_models`,
+`sie_worker_child_queue_depth`, `sie_worker_child_pending_cost`, and
+`sie_worker_child_inflight_batches`. The gateway receives the pod-level
+heartbeat fields; these sidecar metrics are the per-child view used to audit
+placement and queue pressure inside one worker pod.
 
 ## Configuration
 
@@ -214,6 +234,54 @@ gateway:
 autoscaling:
   enabled: true
   cooldownPeriod: 600  # 10 min before scale-down
+```
+
+### Multi-GPU Worker Shapes
+
+Req6 separates the Kubernetes allocation shape from the worker execution shape.
+Set `workers.pools.<name>.gpu.count` above `1` when one worker pod should
+consume multiple GPUs from a single VM. The chart requests that many
+`nvidia.com/gpu` devices and renders one adapter worker child per GPU.
+
+The queue-mode multi-GPU shape is one pod with one `worker-sidecar` plus
+`worker-0` through `worker-(N-1)` adapter containers. Python/PyTorch and
+Rust/Candle children use the same sidecar IPC fanout. Each child requests one
+GPU, sees `SIE_DEVICES=cuda:0` when the runtime consumes that env var, binds a
+unique HTTP/probe port, and serves a unique IPC socket. The sidecar receives
+`SIE_IPC_SOCKET_PATHS`, owns the pod-level queue consumer, and places models
+onto child sockets by child readiness, placed-model count, pending scheduler
+cost, pending item count, and in-flight batch count. That placement scoring is a
+fixed sidecar policy.
+
+For local CPU-only dev, `workers.pools.<name>.sidecar.emulatedChildCount` can
+render multiple CPU worker children with distinct IPC sockets and no
+`nvidia.com/gpu` request. This is intended for Tilt/e2e coverage of child
+routing and metrics only; GPU pools must use `gpu.count` for real capacity.
+
+This is the Req6 one-child-at-a-time model placement topology. It distributes
+different models from one runtime bundle across the pod's GPU slots. A child can
+own multiple models, but one model is not spread across children, replicated for
+throughput, or tensor/model-parallelized for an oversized model.
+
+Each worker pod serves exactly one runtime bundle. Different bundles render as
+different worker StatefulSets and therefore different worker identities.
+
+Example AWS shape for a 4-GPU L4 node:
+
+```yaml
+workers:
+  pools:
+    l4-4x:
+      enabled: true
+      machineProfile: l4-4x
+      gpuType: nvidia-l4
+      gpu:
+        count: 4
+        product: NVIDIA-L4
+      bundles:
+        default:
+          minReplicas: 0
+          maxReplicas: 3
 ```
 
 ### Queue Pool Patterns
@@ -654,7 +722,7 @@ Pre-configured dashboards:
 
 ### Distributed Tracing (OTLP)
 
-Distributed tracing is **off by default** — the rendered chart is unchanged unless you opt in. Enabling injects the OpenTelemetry exporter env onto the gateway, worker sidecar, Python worker, and Rust worker so a request is traced end to end (OTLP gRPC, `:4317`). Non-generation endpoints (encode/score/extract/embeddings) publish through `gateway.publish` before `sidecar.dispatch` and `worker.run_batch`; generation (`/v1/generate`, `/v1/chat/completions`) uses `gateway.proxy_generate` / `gateway.proxy_chat` and `worker.streaming_processor`, bypassing the sidecar. Sampling defaults to a head-based parent sampler (`parentbased_traceidratio` at `0.05`), which honors an inbound `traceparent` decision and otherwise samples 5% of new traces.
+Distributed tracing is **off by default** — the rendered chart is unchanged unless you opt in. Enabling injects the OpenTelemetry exporter env onto the gateway, worker sidecar, adapter worker, and Rust worker so a request is traced end to end (OTLP gRPC, `:4317`). Queue-mode endpoints (encode/score/extract/embeddings) publish through `gateway.publish` before `sidecar.dispatch` and `worker.run_batch`; generation (`/v1/generate`, `/v1/chat/completions`) also opens gateway-originated spans for the streaming path. Sampling defaults to a head-based parent sampler (`parentbased_traceidratio` at `0.05`), which honors an inbound `traceparent` decision and otherwise samples 5% of new traces.
 
 **Bring your own collector** (Tempo, Jaeger, or an existing OTel Collector) — recommended:
 

@@ -1,5 +1,6 @@
 sie_id: Qwen/Qwen3-4B-Instruct-2507
 hf_id: Qwen/Qwen3-4B-Instruct-2507
+hf_revision: cdbee75f17c01a7cc42f958dc650907174af0554
 inputs:
   text: true
   image: false
@@ -14,15 +15,18 @@ tasks:
     context_length: 32768
     max_output_tokens: 4096
     capabilities:
-      # Same constraint as Qwen3.5-4B / Qwen3.6-27B: this profile runs the
-      # default ``grammar_backend: outlines``, and SGLang's outlines_backend
-      # does NOT implement ebnf (it logs ``Skip unsupported key_type='ebnf'``
-      # then fails the compile — confirmed on A100 smoke 2026-05-26). Only
-      # advertise ``"ebnf"`` here once a profile pins an EBNF-capable backend
-      # (``grammar_backend: xgrammar``) AND a via-SIE EBNF smoke passes; the
-      # gateway gates requests on this exact list, so advertising ebnf without
-      # an ebnf-capable backend admits requests the worker then fails to serve.
-      # The ``test_advertised_ebnf_requires_capable_backend`` consistency test
+      # This model pins ``grammar_backend: xgrammar`` on every profile (see
+      # adapter_options.loadtime below). The switch off the default Outlines
+      # backend was forced by a request-time crash: Outlines' FSM engine
+      # (interegular) raises ``Unsupported`` on regex anchors (``^``/``$``) and
+      # that uncaught exception SIGQUITs SGLang's scheduler — a single
+      # user-supplied anchored regex (e.g. ``^[0-9]{5}$``) killed the whole
+      # lane (peer-closed-connection 500s for every later request). XGrammar
+      # tolerates anchors and serves ``json_schema`` + ``regex`` identically.
+      # ``"ebnf"`` is still NOT advertised: XGrammar can compile it, but the
+      # gateway gates on this exact list and the via-SIE EBNF smoke for this
+      # model has not been run — add ``"ebnf"`` only once it passes. The
+      # ``test_advertised_ebnf_requires_capable_backend`` consistency test
       # guards this invariant. Adding a new ``grammar.kind`` variant requires
       # both the gateway parser and this list to be updated.
       grammar: ["json_schema", "regex"]
@@ -56,10 +60,14 @@ tasks:
     # without blocking model load — add entries only for shapes you
     # know are hot.
     prewarm_grammars:
-      # Bare pattern, NOT anchored: this model uses the default Outlines
-      # grammar backend, and Outlines regexes are implicitly anchored —
-      # its FSM engine (interegular) rejects ``^``/``$`` with
-      # ``Unsupported``, which crashes SGLang's scheduler. Use ``(yes|no)``.
+      # NOTE: the worker only prewarms the Outlines backend (XGrammar compiles
+      # are cheap and done on demand), so under ``grammar_backend: xgrammar``
+      # (above) this block is an inert no-op — retained as valid config for the
+      # Outlines fallback. Kept de-anchored so it stays crash-safe if a profile
+      # is ever switched back to Outlines (interegular rejects ``^``/``$`` with
+      # ``Unsupported``, which SIGQUITs SGLang's scheduler); the
+      # ``test_outlines_models_have_no_anchored_prewarm_regex`` guard enforces
+      # this. Use ``(yes|no)``.
       - name: yes_no
         kind: regex
         value: "(yes|no)"
@@ -97,6 +105,13 @@ profiles:
       loadtime:
         mem_fraction_static: 0.85
         served_model_name: Qwen/Qwen3-4B-Instruct-2507
+        # XGrammar (not the adapter-default Outlines): Outlines' interegular
+        # FSM engine raises ``Unsupported`` on regex anchors (``^``/``$``) and
+        # SIGQUITs SGLang's scheduler, so a user-supplied anchored ``regex``
+        # response_format crashed the whole lane. XGrammar tolerates anchors
+        # and serves json_schema + regex identically (GPU-verified on L4,
+        # SGLang 0.5.10.post1). Same backend the Gemma-4 profiles pin.
+        grammar_backend: xgrammar
         # speculative decoding (MTP/EAGLE/NGRAM) intentionally absent;
         # week-1 validation decides whether to promote a side-cell. See §4.9.
       runtime:
@@ -131,6 +146,9 @@ profiles:
       loadtime:
         mem_fraction_static: 0.85
         served_model_name: Qwen/Qwen3-4B-Instruct-2507
+        # XGrammar, matching the default profile — Outlines crashes SGLang's
+        # scheduler on anchored regexes (``^``/``$``). See the default profile.
+        grammar_backend: xgrammar
       runtime:
         first_chunk_timeout_s: 30
         inter_chunk_timeout_s: 10
@@ -156,6 +174,9 @@ profiles:
       loadtime:
         mem_fraction_static: 0.85
         served_model_name: Qwen/Qwen3-4B-Instruct-2507
+        # XGrammar, matching the default profile — Outlines crashes SGLang's
+        # scheduler on anchored regexes (``^``/``$``). See the default profile.
+        grammar_backend: xgrammar
       runtime:
         first_chunk_timeout_s: 30
         inter_chunk_timeout_s: 10

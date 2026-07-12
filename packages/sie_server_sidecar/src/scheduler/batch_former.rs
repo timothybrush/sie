@@ -65,6 +65,7 @@ pub struct FormattedBatch<I: HasCost, T> {
     pub items: Vec<I>,
     pub metadata: Vec<T>,
     pub total_cost: u64,
+    pub flush_reason: FlushReason,
 }
 
 impl<I: HasCost, T> FormattedBatch<I, T> {
@@ -103,6 +104,34 @@ impl<I: HasCost, T> FormattedBatch<I, T> {
             items,
             metadata,
             total_cost: self.total_cost,
+            flush_reason: self.flush_reason,
+        }
+    }
+}
+
+/// Reason a [`BatchFormer`] emitted a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushReason {
+    CostCap,
+    CountCap,
+    Timeout,
+    Coalesce,
+    SingleOversize,
+    IdleBypass,
+    Drain,
+}
+
+impl FlushReason {
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::CostCap => "cost_cap",
+            Self::CountCap => "count_cap",
+            Self::Timeout => "timeout",
+            Self::Coalesce => "coalesce",
+            Self::SingleOversize => "single_oversize",
+            Self::IdleBypass => "idle_bypass",
+            Self::Drain => "drain",
         }
     }
 }
@@ -256,8 +285,8 @@ impl<I: HasCost, T> BatchFormer<I, T> {
 
             let wait = {
                 let mut guard = self.inner.lock().await;
-                if !guard.pending.is_empty() && (should_yield_batch(&guard) || immediate) {
-                    return extract_batch(&mut guard);
+                if let Some(reason) = flush_reason(&guard, immediate) {
+                    return extract_batch(&mut guard, reason);
                 }
                 notified.as_mut().enable();
                 wait_timeout(&guard)
@@ -292,11 +321,8 @@ impl<I: HasCost, T> BatchFormer<I, T> {
     /// hold, else return `None`. Matches Python's `try_get_batch`.
     pub async fn try_get_batch(&self) -> Option<FormattedBatch<I, T>> {
         let mut guard = self.inner.lock().await;
-        if should_yield_batch(&guard) {
-            Some(extract_batch(&mut guard))
-        } else {
-            None
-        }
+        let reason = flush_reason(&guard, false)?;
+        Some(extract_batch(&mut guard, reason))
     }
 
     /// Drain whatever is pending right now, bypassing the flush
@@ -307,7 +333,7 @@ impl<I: HasCost, T> BatchFormer<I, T> {
         if guard.pending.is_empty() {
             None
         } else {
-            Some(extract_batch(&mut guard))
+            Some(extract_batch(&mut guard, FlushReason::Drain))
         }
     }
 }
@@ -341,11 +367,6 @@ fn append_item<I: HasCost, T>(inner: &mut Inner<I, T>, item: I, metadata: T) -> 
     should_yield_batch(inner) || is_first
 }
 
-fn batch_is_full<I: HasCost, T>(inner: &Inner<I, T>) -> bool {
-    inner.total_cost >= inner.config.max_batch_cost
-        || inner.pending.len() >= inner.config.max_batch_requests
-}
-
 fn batch_timeout_expired<I: HasCost, T>(inner: &Inner<I, T>) -> bool {
     let Some(first) = inner.first_request_time else {
         return false;
@@ -366,10 +387,32 @@ fn coalesce_expired<I: HasCost, T>(inner: &Inner<I, T>) -> bool {
 }
 
 fn should_yield_batch<I: HasCost, T>(inner: &Inner<I, T>) -> bool {
+    flush_reason(inner, false).is_some()
+}
+
+fn flush_reason<I: HasCost, T>(inner: &Inner<I, T>, immediate: bool) -> Option<FlushReason> {
     if inner.pending.is_empty() {
-        return false;
+        return None;
     }
-    batch_is_full(inner) || batch_timeout_expired(inner) || coalesce_expired(inner)
+    if inner.pending.len() == 1 && inner.total_cost > inner.config.max_batch_cost {
+        return Some(FlushReason::SingleOversize);
+    }
+    if inner.total_cost >= inner.config.max_batch_cost {
+        return Some(FlushReason::CostCap);
+    }
+    if inner.pending.len() >= inner.config.max_batch_requests {
+        return Some(FlushReason::CountCap);
+    }
+    if batch_timeout_expired(inner) {
+        return Some(FlushReason::Timeout);
+    }
+    if coalesce_expired(inner) {
+        return Some(FlushReason::Coalesce);
+    }
+    if immediate {
+        return Some(FlushReason::IdleBypass);
+    }
+    None
 }
 
 /// Time remaining until the next guaranteed flush, given current
@@ -395,7 +438,10 @@ fn wait_timeout<I: HasCost, T>(inner: &Inner<I, T>) -> Option<Duration> {
     Some(Duration::from_secs_f64(effective_ms.max(0.0) / 1000.0))
 }
 
-fn extract_batch<I: HasCost, T>(inner: &mut Inner<I, T>) -> FormattedBatch<I, T> {
+fn extract_batch<I: HasCost, T>(
+    inner: &mut Inner<I, T>,
+    flush_reason: FlushReason,
+) -> FormattedBatch<I, T> {
     // Cost-sort pending before slicing — keeps each sub-batch's
     // items close in length, minimising padding waste on the adapter
     // side. Stable sort preserves FIFO order within equal-cost items
@@ -448,6 +494,7 @@ fn extract_batch<I: HasCost, T>(inner: &mut Inner<I, T>) -> FormattedBatch<I, T>
         items,
         metadata,
         total_cost: batch_cost,
+        flush_reason,
     }
 }
 
@@ -494,6 +541,7 @@ mod tests {
         let batch = b.try_drain().await.expect("drain should succeed");
         assert_eq!(batch.size(), 2);
         assert_eq!(batch.total_cost, 30);
+        assert_eq!(batch.flush_reason, FlushReason::Drain);
         assert_eq!(b.pending_count().await, 0);
         assert_eq!(b.pending_cost().await, 0);
     }
@@ -514,6 +562,7 @@ mod tests {
         let batch = b.try_get_batch().await.expect("cost cap should trigger");
         assert_eq!(batch.size(), 2);
         assert_eq!(batch.total_cost, 30);
+        assert_eq!(batch.flush_reason, FlushReason::CostCap);
     }
 
     #[tokio::test]
@@ -531,6 +580,7 @@ mod tests {
         b.submit(StubItem::new(1), 3).await;
         let batch = b.try_get_batch().await.expect("count cap should trigger");
         assert_eq!(batch.size(), 3);
+        assert_eq!(batch.flush_reason, FlushReason::CountCap);
     }
 
     #[tokio::test]
@@ -561,10 +611,13 @@ mod tests {
         let b = BatchFormer::<StubItem, u32>::new(cfg);
         b.submit(StubItem::new(500), 1).await; // cost >> cap
 
-        // try_drain always returns, regardless of cap status.
-        let batch = b.try_drain().await.expect("oversize should still flush");
+        let batch = b
+            .try_get_batch()
+            .await
+            .expect("oversize should still flush");
         assert_eq!(batch.size(), 1);
         assert_eq!(batch.total_cost, 500);
+        assert_eq!(batch.flush_reason, FlushReason::SingleOversize);
     }
 
     #[tokio::test]
@@ -609,6 +662,7 @@ mod tests {
         // returns as soon as the single pending item is visible.
         let batch = b.get_batch(true).await;
         assert_eq!(batch.size(), 1);
+        assert_eq!(batch.flush_reason, FlushReason::IdleBypass);
     }
 
     #[tokio::test]
@@ -634,7 +688,7 @@ mod tests {
             max_batch_requests: 1000,
             max_batch_wait_ms: 20.0,
             coalesce_ms: 1_000.0,
-            coalesce_ratio: 0.99, // proportional ≈ 19.8 — fires at ~20 ms
+            coalesce_ratio: 1.0, // coalesce ties max-wait; timeout wins by priority
         };
         let b = BatchFormer::<StubItem, u32>::new(cfg);
         b.submit(StubItem::new(1), 1).await;
@@ -647,6 +701,7 @@ mod tests {
             .expect("must flush on timeout within 200 ms");
         let elapsed_ms = start.elapsed().as_millis();
         assert_eq!(batch.size(), 1);
+        assert_eq!(batch.flush_reason, FlushReason::Timeout);
         assert!(
             elapsed_ms >= 15,
             "must wait at least ~max_batch_wait_ms before flushing (waited {elapsed_ms} ms)"

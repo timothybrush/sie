@@ -1,3 +1,4 @@
+{{- $maxWorkerChildCount := int (include "sie-cluster.worker.maxChildCount" .) }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,6 +14,16 @@ spec:
       port: {{ .Values.workers.common.port }}
       targetPort: http
       protocol: TCP
+    {{- if gt $maxWorkerChildCount 1 }}
+    {{- range $i := until $maxWorkerChildCount }}
+    {{- if gt $i 0 }}
+    - name: http-{{ $i }}
+      port: {{ add $.Values.workers.common.port $i }}
+      targetPort: http-{{ $i }}
+      protocol: TCP
+    {{- end }}
+    {{- end }}
+    {{- end }}
     {{- if .Values.workers.common.workerSidecar.enabled }}
     - name: worker-metrics
       port: {{ .Values.workers.common.workerSidecar.metricsPort }}

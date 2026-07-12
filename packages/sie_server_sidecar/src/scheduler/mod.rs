@@ -48,7 +48,7 @@ pub mod trackers;
 
 pub use adaptive::{AdaptiveBatchController, AdaptiveBatchControllerBuilder, AdaptiveBatchState};
 pub use batch_config::BatchConfig;
-pub use batch_former::{BatchFormer, FormattedBatch, HasCost, PendingRequest};
+pub use batch_former::{BatchFormer, FlushReason, FormattedBatch, HasCost, PendingRequest};
 pub use engine::{LoraKey, Op, RecordCompletionOutcome, Scheduler, SchedulerBuilder};
 pub use item::{lora_from_options, SchedulerItem, SchedulerMeta};
 pub use metrics::{SchedulerMetrics, FLUSH_REASONS};

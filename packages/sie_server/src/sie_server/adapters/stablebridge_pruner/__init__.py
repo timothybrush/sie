@@ -75,6 +75,7 @@ class StablebridgePrunerAdapter(ModelAdapter):
         prune_threshold: float = DEFAULT_PRUNE_THRESHOLD,
         highlight_threshold: float = DEFAULT_HIGHLIGHT_THRESHOLD,
         trust_remote_code: bool = False,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         _ = kwargs
@@ -89,6 +90,7 @@ class StablebridgePrunerAdapter(ModelAdapter):
         self._prune_threshold = prune_threshold
         self._highlight_threshold = highlight_threshold
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
 
         self._model: Any | None = None
         self._pruning_head: PruningHead | None = None
@@ -113,9 +115,13 @@ class StablebridgePrunerAdapter(ModelAdapter):
         }
         dtype = dtype_map.get(self._compute_precision, torch.bfloat16)
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # ``output_hidden_states`` is requested per-call from ``extract``;
@@ -123,7 +129,7 @@ class StablebridgePrunerAdapter(ModelAdapter):
         self._model = AutoModelForSequenceClassification.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -187,6 +193,9 @@ class StablebridgePrunerAdapter(ModelAdapter):
             return str(local_path / self._pruning_head_file)
 
         try:
+            # The pruning head lives in a SEPARATE HuggingFace repo
+            # (``pruning_head_path``); the base-model ``revision`` pin does not
+            # apply here, so it is deliberately not forwarded.
             return hf_hub_download(
                 repo_id=self._pruning_head_path,
                 filename=self._pruning_head_file,

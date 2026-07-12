@@ -41,25 +41,38 @@ import logging
 import threading
 import time
 import weakref
-from collections.abc import Iterator
-from typing import Any, Literal, Self, overload
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import IO, Any, Literal, Self, overload
+from urllib.parse import urlencode
 
 import httpx
 import msgpack
 import msgpack_numpy as m
 
 from sie_sdk.documents import convert_item_document
+from sie_sdk.files import resolve_upload
 from sie_sdk.images import convert_item_images
+from sie_sdk.jobs import TERMINAL_JOB_STATES, build_job_body, decode_chunk_bytes, job_chunks
 from sie_sdk.types import (
+    Batch,
     CapacityInfo,
     ChatCompletion,
     ChatCompletionChunk,
     ChatMessage,
+    Connection,
+    ConnectionCreated,
+    ConnectionRevoked,
     EncodeResult,
     ExtractResult,
+    File,
+    FileDeleted,
     GenerateChunk,
     GenerateResult,
     Item,
+    JobResults,
+    JobStatus,
+    JobSubmitResult,
     ModelInfo,
     OutputType,
     PoolInfo,
@@ -314,6 +327,8 @@ class SIEClient:
         gpu: str | None = None,
         options: dict[str, Any] | None = None,
         pool: PoolSpec | None = None,
+        control_plane_url: str | None = None,
+        org: str | None = None,
     ) -> None:
         # Ensure msgpack-numpy hooks are installed (once per process).
         # Done lazily here instead of at module level to avoid monkey-patching
@@ -329,6 +344,10 @@ class SIEClient:
         self._default_gpu = gpu
         self._default_options = options
         self._api_key = api_key
+        # Control-plane base URL + org for the connections namespace (connector
+        # auth lives on the control plane, not the keyed gateway).
+        self._control_plane_url = control_plane_url.rstrip("/") if control_plane_url else None
+        self._org = org
 
         # Multi-pool state: track created pools and their lease renewal threads
         # Key: pool name, Value: (lease_thread, stop_event)
@@ -374,6 +393,14 @@ class SIEClient:
         # Register cleanup on interpreter exit
         if pool is not None:
             atexit.register(self._cleanup_pool)
+
+        # First-class batch + connector surface.
+        self.jobs = _SyncJobs(self)
+        self.connections = _SyncConnections(self)
+        # OpenAI-compatible Files + Batches surface — a
+        # `base_url` swap makes an `openai` batch caller work unchanged.
+        self.files = _SyncFiles(self)
+        self.batches = _SyncBatches(self)
 
     @property
     def base_url(self) -> str:
@@ -1506,11 +1533,23 @@ class SIEClient:
 
         workers: list[WorkerInfo] = [
             WorkerInfo(
+                name=w.get("name", ""),
                 url=w.get("url", ""),
                 gpu=w.get("gpu", ""),
+                gpu_count=w.get("gpu_count", 0),
+                ready_gpu_slots=w.get(
+                    "ready_gpu_slots",
+                    w.get("gpu_count", 1 if w.get("healthy", False) else 0),
+                ),
                 healthy=w.get("healthy", False),
                 queue_depth=w.get("queue_depth", 0),
+                pending_cost=w.get("pending_cost", 0),
+                inflight_batches=w.get("inflight_batches", 0),
                 loaded_models=w.get("loaded_models", []),
+                memory_used_bytes=w.get("memory_used_bytes", 0),
+                memory_total_bytes=w.get("memory_total_bytes", 0),
+                bundle=w.get("bundle", ""),
+                bundle_config_hash=w.get("bundle_config_hash", ""),
             )
             for w in workers_data
         ]
@@ -2720,3 +2759,353 @@ class SIEClient:
 
         # Return single result if single item was passed
         return results[0] if single_item else results
+
+
+# ---------------------------------------------------------------------------
+# Jobs + connections namespaces — reuse the client's transport
+# and bearer auth. Jobs ride the keyed gateway (`/v1/jobs`); connections ride
+# the control plane (`/internal/orgs/{org}/connections`).
+# ---------------------------------------------------------------------------
+
+
+class _SyncNamespace:
+    """Shared JSON transport for the sync jobs/connections namespaces."""
+
+    def __init__(self, client: SIEClient) -> None:
+        self._c = client
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: Any = None,
+        timeout_s: float | None = None,
+    ) -> Any:
+        """One JSON request over the client's httpx transport (bearer auth reused)."""
+        headers = {"Accept": JSON_CONTENT_TYPE, "Content-Type": JSON_CONTENT_TYPE}
+        try:
+            response = self._c._client.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+                timeout=timeout_s if timeout_s is not None else self._c._timeout,
+            )
+        except httpx.ConnectError as e:
+            msg = f"Failed to connect to {url}: {e}"
+            raise SIEConnectionError(msg) from e
+        except httpx.TimeoutException as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        self._c._check_server_version(response)
+        if not response.content:
+            return {}
+        return response.json()
+
+
+class _SyncJobs(_SyncNamespace):
+    """The batch class — ``POST/GET /v1/jobs`` on the keyed gateway.
+
+    ``submit``/``get``/``results`` bind to the shipped ``/v1/jobs`` contract;
+    ``list``/``cancel`` bind to the additive ``GET /v1/jobs`` /
+    ``POST /v1/jobs/{id}/cancel`` completion of that REST surface (``/v1``
+    additive-only — the shipped E2E is the ``sie.process`` submit/get/results
+    path).
+    """
+
+    def submit(
+        self,
+        *,
+        source: Any,
+        model: str,
+        operation: str = "encode",
+        sink: Any = None,
+        connection: str | None = None,
+        sink_connection: str | None = None,
+        field_map: Mapping[str, Any] | None = None,
+        output_field: str | None = None,
+        when: Any = None,
+        output_types: Sequence[str] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> JobSubmitResult:
+        """Submit a batch job (``POST /v1/jobs``); returns the created-job envelope.
+
+        ``source`` is either inline items (a list, or a bare string = one text
+        item) or a connector ``scheme://<connection>/…`` URI (incl.
+        the internal ``upload://<file-id>`` push-to-us source); ``sink``
+        is ``"return"`` (default), ``"inplace"``, or a connector URI; ``when`` is
+        ``"now"`` (default), ``"schedule:<cron>"``, or ``"watch:<source>"``.
+        ``field_map`` names the uniform source slots
+        (``{"id_field", "input_field", "carry", "input_type"}``) and
+        ``output_field`` the sink target — connector jobs only; the
+        per-connector URI params keep working as aliases. ``options`` carries
+        the per-item options plus the op inputs (operation matrix:
+        score → ``options["query"]``, extract → ``options["labels"]`` /
+        ``options["output_schema"]``, generate → sampling such as
+        ``max_new_tokens``), forwarded as-is.
+        """
+        body = build_job_body(
+            source=source,
+            operation=operation,
+            model=model,
+            sink=sink,
+            connection=connection,
+            sink_connection=sink_connection,
+            field_map=field_map,
+            output_field=output_field,
+            when=when,
+            output_types=output_types,
+            options=options,
+        )
+        return self._request_json("POST", "/v1/jobs", json_body=body, timeout_s=max(self._c._timeout, 120.0))
+
+    def get(self, job_id: str) -> JobStatus:
+        """Fetch a job's public status doc (``GET /v1/jobs/{id}``)."""
+        return self._request_json("GET", f"/v1/jobs/{job_id}")
+
+    def list(self) -> Sequence[JobStatus]:
+        """List the org's jobs (``GET /v1/jobs``; scoped to the key's org)."""
+        data = self._request_json("GET", "/v1/jobs")
+        if isinstance(data, dict):
+            return data.get("data", [])
+        return data if isinstance(data, list) else []
+
+    def cancel(self, job_id: str) -> JobStatus:
+        """Cancel a job (``POST /v1/jobs/{id}/cancel``); the hold's remainder releases."""
+        return self._request_json("POST", f"/v1/jobs/{job_id}/cancel")
+
+    def results(self, job_id: str) -> JobResults:
+        """Retrieve a finished job's chunk refs and decode the per-item results.
+
+        Reads each succeeded chunk's TTL'd payload-store ref (local path or
+        http(s) URL in the POC) and unpacks the msgpack ``WorkResult`` array;
+        dense embeddings decode to numpy arrays (like :meth:`encode`).
+        """
+        job = self.get(job_id)
+        chunks = job_chunks(job)
+        items = []
+        for chunk in chunks:
+            ref = chunk.get("ref")
+            if chunk.get("state") != "succeeded" or not ref:
+                continue
+            items.extend(decode_chunk_bytes(self._read_ref(ref)))
+        dims = next((it["dims"] for it in items if it.get("dims")), None)
+        return {
+            "job_id": job.get("id", job_id),
+            "state": job.get("state"),
+            "total_items": job.get("total_items"),
+            "settled_credits": job.get("settled_credits"),
+            "chunks": chunks,
+            "retrieved": len(items),
+            "dims": dims,
+            "items": items,
+        }
+
+    def wait(self, job_id: str, *, timeout_s: float = 600.0, poll_s: float = 2.0) -> JobStatus:
+        """Poll ``get`` until the job reaches a terminal state or ``timeout_s`` elapses."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            job = self.get(job_id)
+            if job.get("state") in TERMINAL_JOB_STATES:
+                return job
+            if time.monotonic() >= deadline:
+                msg = f"job {job_id} still {job.get('state')!r} after {timeout_s:.0f}s"
+                raise RequestError(msg, code="job_wait_timeout", status_code=504)
+            time.sleep(poll_s)
+
+    def _read_ref(self, ref: str) -> bytes:
+        """Retrieve a chunk's payload-store ref (local path or http(s) URL, POC).
+
+        http(s) refs are fetched with a bare request that does NOT carry the
+        client's ``Authorization`` header: a ref points at the payload store,
+        not the SIE API, so the bearer token must never leak to the ref host
+        (matches the TS SDK, which fetches refs with a plain ``fetch``).
+        """
+        if ref.startswith(("http://", "https://")):
+            response = httpx.get(
+                ref,
+                headers={"Accept": "application/octet-stream"},
+                timeout=self._c._client.timeout,
+            )
+            if response.status_code >= HTTP_CLIENT_ERROR:
+                handle_error(response)
+            return response.content
+        path = Path(ref)
+        if path.exists():
+            return path.read_bytes()
+        msg = f"cannot retrieve payload-store ref {ref!r} (POC reads local-path and http(s) refs)"
+        raise RequestError(msg, code="bad_ref", status_code=400)
+
+
+class _SyncConnections(_SyncNamespace):
+    """Org-scoped connections (connector auth by name) on the control plane.
+
+    Requires ``control_plane_url`` + ``org`` on the client; the secret is sent on
+    ``add`` and is never returned by ``list`` (only the job-runner resolve path
+    sees it).
+    """
+
+    def _base(self) -> str:
+        if not self._c._control_plane_url:
+            msg = "connections require control_plane_url on the client: SIEClient(..., control_plane_url=..., org=...)"
+            raise ValueError(msg)
+        if not self._c._org:
+            msg = "connections require org on the client: SIEClient(..., org=...)"
+            raise ValueError(msg)
+        return f"{self._c._control_plane_url}/internal/orgs/{self._c._org}/connections"
+
+    def add(self, name: str, type: str, secret: str) -> ConnectionCreated:
+        """Create an org-scoped connection (connector auth). ``type`` is the connector family."""
+        body = {"type": type, "name": name, "secret": secret}
+        return self._request_json("POST", self._base(), json_body=body)
+
+    def list(self) -> Sequence[Connection]:
+        """List the org's active connections (secrets redacted)."""
+        data = self._request_json("GET", self._base())
+        if isinstance(data, dict):
+            return data.get("connections", [])
+        return data if isinstance(data, list) else []
+
+    def revoke(self, name: str) -> ConnectionRevoked:
+        """Revoke (soft-delete) a connection; frees the name for reuse."""
+        return self._request_json("DELETE", f"{self._base()}/{name}")
+
+
+# ---------------------------------------------------------------------------
+# Files + batches namespaces — the OpenAI-compatible file/batch
+# surface on the keyed gateway. Method names/args mirror `openai.files` /
+# `openai.batches` so switching an OpenAI-batch caller to the SDK is mechanical.
+# ---------------------------------------------------------------------------
+
+
+class _SyncFiles(_SyncNamespace):
+    """OpenAI-compatible Files API — ``POST/GET /v1/files`` on the keyed gateway.
+
+    Mirrors ``openai.files``: :meth:`upload` (aliased :meth:`create` for a
+    byte-for-byte ``openai`` → ``sie_sdk`` swap), :meth:`retrieve`,
+    :meth:`content` (raw bytes), and :meth:`delete`. Bytes live in the gateway's
+    file store the batch path reads/writes; ``purpose="batch"`` is the only
+    purpose the store serves today. :meth:`delete` is the additive OpenAI-parity
+    completion of the surface (served when the delete-on-complete seam lands).
+    """
+
+    def upload(
+        self,
+        file: str | Path | bytes | bytearray | IO[bytes],
+        *,
+        purpose: str = "batch",
+        filename: str | None = None,
+    ) -> File:
+        """Upload a file (``POST /v1/files``); returns the created File object.
+
+        ``file`` is a filesystem path, raw bytes, or a binary file-like object
+        (the same inputs OpenAI's ``files.create(file=...)`` accepts);
+        ``purpose`` is ``"batch"`` (the only purpose the mode-B store serves).
+        """
+        content, name = resolve_upload(file, filename)
+        query = urlencode({"purpose": purpose, "filename": name})
+        headers = {"Accept": JSON_CONTENT_TYPE, "Content-Type": "application/jsonl"}
+        try:
+            response = self._c._client.post(
+                f"/v1/files?{query}",
+                content=content,
+                headers=headers,
+                timeout=max(self._c._timeout, 120.0),
+            )
+        except httpx.ConnectError as e:
+            msg = f"Failed to connect to {self._c._base_url}: {e}"
+            raise SIEConnectionError(msg) from e
+        except httpx.TimeoutException as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        self._c._check_server_version(response)
+        return response.json()
+
+    def create(
+        self,
+        *,
+        file: str | Path | bytes | bytearray | IO[bytes],
+        purpose: str = "batch",
+    ) -> File:
+        """OpenAI-exact alias for :meth:`upload` (``files.create(file=, purpose=)``)."""
+        return self.upload(file, purpose=purpose)
+
+    def retrieve(self, file_id: str) -> File:
+        """Fetch a file's metadata (``GET /v1/files/{id}``)."""
+        return self._request_json("GET", f"/v1/files/{file_id}")
+
+    def content(self, file_id: str) -> bytes:
+        """Download a file's raw bytes (``GET /v1/files/{id}/content``)."""
+        try:
+            response = self._c._client.get(
+                f"/v1/files/{file_id}/content",
+                headers={"Accept": "application/jsonl"},
+            )
+        except httpx.ConnectError as e:
+            msg = f"Failed to connect to {self._c._base_url}: {e}"
+            raise SIEConnectionError(msg) from e
+        except httpx.TimeoutException as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        return response.content
+
+    def delete(self, file_id: str) -> FileDeleted:
+        """Delete a file (``DELETE /v1/files/{id}``; additive OpenAI-parity surface)."""
+        return self._request_json("DELETE", f"/v1/files/{file_id}")
+
+
+class _SyncBatches(_SyncNamespace):
+    """OpenAI-compatible Batch API — ``POST/GET /v1/batches`` on the keyed gateway.
+
+    Mirrors ``openai.batches``: :meth:`create`, :meth:`retrieve`, :meth:`list`,
+    :meth:`cancel`. A batch is a job over an uploaded file's JSONL lines run
+    on the batch lane (same ``spawn_encode_job`` engine as
+    ``/v1/jobs``). :meth:`list` / :meth:`cancel` are the additive OpenAI-parity
+    completion of the surface (served when the batch store hardens; the shipped path is
+    create → retrieve → download the output file via ``client.files.content``).
+    """
+
+    def create(
+        self,
+        *,
+        input_file_id: str,
+        endpoint: str = "/v1/embeddings",
+        completion_window: str = "24h",
+        metadata: dict[str, Any] | None = None,
+    ) -> Batch:
+        """Create a batch (``POST /v1/batches``); returns the Batch object.
+
+        ``input_file_id`` is a ``file-…`` id from :meth:`SIEClient.files.upload`
+        with ``purpose="batch"``; ``endpoint`` is ``/v1/embeddings`` (the only
+        endpoint the encode-only jobs POC serves).
+        """
+        body: dict[str, Any] = {
+            "input_file_id": input_file_id,
+            "endpoint": endpoint,
+            "completion_window": completion_window,
+        }
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._request_json("POST", "/v1/batches", json_body=body, timeout_s=max(self._c._timeout, 120.0))
+
+    def retrieve(self, batch_id: str) -> Batch:
+        """Fetch a batch's status (``GET /v1/batches/{id}``)."""
+        return self._request_json("GET", f"/v1/batches/{batch_id}")
+
+    def list(self) -> Sequence[Batch]:
+        """List the org's batches (``GET /v1/batches``; additive OpenAI-parity)."""
+        data = self._request_json("GET", "/v1/batches")
+        if isinstance(data, dict):
+            return data.get("data", [])
+        return data if isinstance(data, list) else []
+
+    def cancel(self, batch_id: str) -> Batch:
+        """Cancel a batch (``POST /v1/batches/{id}/cancel``; additive OpenAI-parity)."""
+        return self._request_json("POST", f"/v1/batches/{batch_id}/cancel")

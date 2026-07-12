@@ -67,6 +67,7 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
         normalize: bool = True,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision | None = None,
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -78,6 +79,8 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
             compute_precision: Compute precision. None (default) selects fp32 off-CUDA
                 (safe on MPS) and bfloat16 on CUDA; set explicitly to override (e.g.
                 float16 to opt a curated model into fp16 on MPS).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -85,6 +88,7 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: XLMRobertaModel | None = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -113,14 +117,19 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
             attn_impl,
         )
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         # Load tokenizer (fast Rust tokenizer)
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load base model with Flash Attention 2 if available
         self._model = AutoModel.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=attn_impl,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -166,7 +175,7 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
         # Resolve the actual directory: could be a local path or HF model ID
         base_path = Path(model_path)
         if not base_path.is_dir():
-            base_path = Path(snapshot_download(model_path))
+            base_path = Path(snapshot_download(model_path, revision=self._revision))
 
         # ColBERT linear: hidden_size -> hidden_size (1024 -> 1024)
         colbert_path = base_path / "colbert_linear.pt"
@@ -246,7 +255,13 @@ class BGEM3Adapter(BGEM3ScoreMixin, BaseAdapter):
                 normalize=normalize,
             )
 
-        return self._to_encode_output(results, output_types, len(items), is_query)
+        output = self._to_encode_output(results, output_types, len(items), is_query)
+        # Unit-meter seam (same rationale as bge_m3_flash): this adapter owns
+        # tokenization, so the real per-item token counts exist only here.
+        # ``padding=True`` pads input_ids, so per-item counts come from the
+        # attention mask (identical to the unpadded tokenizer length).
+        output.extra["input_token_counts"] = [int(n) for n in inputs["attention_mask"].sum(dim=1).tolist()]
+        return output
 
     def _validate_output_types(self, output_types: list[str]) -> None:
         """Validate that output types are supported."""

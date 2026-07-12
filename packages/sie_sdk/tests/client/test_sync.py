@@ -117,6 +117,79 @@ class TestSIEClientInit:
             client.close()
 
 
+class TestCapacity:
+    """Tests for gateway capacity parsing."""
+
+    def test_get_capacity_preserves_worker_pressure_fields(self) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "type": "gateway",
+            "status": "healthy",
+            "cluster": {"worker_count": 1, "gpu_count": 4, "models_loaded": 1},
+            "workers": [
+                {
+                    "name": "worker-l4-0",
+                    "url": "http://worker-l4-0:8080",
+                    "gpu": "l4",
+                    "gpu_count": 4,
+                    "ready_gpu_slots": 3,
+                    "healthy": True,
+                    "queue_depth": 7,
+                    "pending_cost": 128,
+                    "inflight_batches": 2,
+                    "loaded_models": ["BAAI/bge-m3"],
+                    "memory_used_bytes": 1024,
+                    "memory_total_bytes": 4096,
+                    "bundle": "default",
+                    "bundle_config_hash": "hash-1",
+                }
+            ],
+        }
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.get.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            capacity = client.get_capacity()
+            client.close()
+
+        worker = capacity["workers"][0]
+        assert worker["gpu_count"] == 4
+        assert worker["ready_gpu_slots"] == 3
+        assert worker["queue_depth"] == 7
+        assert worker["pending_cost"] == 128
+        assert worker["inflight_batches"] == 2
+
+    def test_get_capacity_defaults_baseline_worker_to_one_ready_slot(self) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "type": "gateway",
+            "status": "healthy",
+            "cluster": {"worker_count": 1, "gpu_count": 1, "models_loaded": 0},
+            "workers": [
+                {
+                    "url": "http://worker-l4-0:8080",
+                    "gpu": "l4",
+                    "healthy": True,
+                    "queue_depth": 0,
+                    "loaded_models": [],
+                }
+            ],
+        }
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.get.return_value = mock_response
+            client = SIEClient("http://localhost:8080")
+            capacity = client.get_capacity()
+            client.close()
+
+        worker = capacity["workers"][0]
+        assert worker["ready_gpu_slots"] == 1
+        assert worker["pending_cost"] == 0
+        assert worker["inflight_batches"] == 0
+
+
 class TestEncode:
     """Tests for encode() method."""
 

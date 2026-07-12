@@ -43,6 +43,7 @@ from sie_server.ipc_types import (
     SetPinnedModelsRequest,
     SetPinnedModelsResponse,
     SparseOutput,
+    UnitCounts,
 )
 from sie_server.observability.metrics import record_ipc_batch_shape
 from sie_server.types.inputs import InvalidMediaError, Item, decode_item
@@ -906,6 +907,20 @@ class QueueExecutor:
                 # path (#1489). An unknown profile name raises ValueError, which
                 # the surrounding except turns into per-item failures.
                 options = merge_runtime_options(config, options)
+                # Profile-default ``output_types`` parity with the OSS HTTP path
+                # (api.encode resolves ``profile > request > default``). The
+                # gateway forwards only the request-level output_types, so a
+                # profile whose runtime declares an output_types default (e.g.
+                # the ``bge-m3:sparse`` variant, whose promoted "default" profile
+                # carries ``output_types: [sparse]``) would otherwise be served
+                # dense-only here — the managed path silently dropped it. Reuse
+                # the merged profile runtime (same resolver, no duplicated
+                # precedence) and apply it exactly as api.encode does. The group
+                # key already folded request→``["dense"]``, so this is precisely
+                # ``profile or request or default``, keeping managed == OSS (P6.6).
+                profile_output_types = options.get("output_types")
+                if profile_output_types:
+                    output_types = list(profile_output_types)
                 formatted_outputs, timing = await EncodePipeline.run_encode(
                     registry=self._registry,
                     model=model_id,
@@ -936,6 +951,28 @@ class QueueExecutor:
                             "adapter returned fewer outputs than items",
                         )
                 else:
+                    # Authoritative unit counts for metering: per-item real
+                    # tokenizer counts recorded by the pipeline during
+                    # tokenization (see ``RequestTiming.input_token_counts``).
+                    # ``None`` (image path / char-count estimators) leaves
+                    # ``ItemOutcome.units`` unset — metering edges fall back
+                    # to their reserve estimate rather than bill an estimate
+                    # as a count.
+                    token_counts = timing.input_token_counts
+                    if token_counts is not None and len(token_counts) != len(good_group):
+                        token_counts = None  # misaligned — never mis-attribute counts
+                    # Authoritative per-image counts for the §7 "$ per image"
+                    # dimension: any vision adapter (CLIP/SigLIP) inherits the
+                    # base ``count_input_images`` hook, so an image-input encode
+                    # bills per image the same way a text encode bills per
+                    # token. ``None`` (adapter evicted, or an all-text batch)
+                    # leaves ``images`` unset. Aligned 1:1 with ``server_items``
+                    # (== ``good_group`` order).
+                    try:
+                        encode_adapter = self._registry.get(model_id)
+                    except KeyError:
+                        encode_adapter = None
+                    image_counts = _per_item_image_counts(encode_adapter, server_items, len(good_group))
                     for idx, bi in enumerate(good_group):
                         raw_output: RawOutput | None = None
                         result_msgpack: bytes | None = None
@@ -966,6 +1003,19 @@ class QueueExecutor:
                             )
                         if raw_output is None:
                             output = _wrap_encode_output(formatted_outputs[idx], config)
+                            # Echo the caller's item id (G2b, P2.8 finding): the
+                            # HTTP path stamps ``result["id"] = item.id`` in
+                            # ``api.encode._build_response_items`` and the SDK
+                            # copies it back (``parse_encode_results``), but the
+                            # queue-path result blob dropped it. Bake it into the
+                            # legacy blob here so it round-trips like SCORE's
+                            # ``item_id``. The RawOutput fast paths carry the id
+                            # at framing time instead (frame_raw_output on the
+                            # lane); this branch is the multi-output / non-f32
+                            # fallback.
+                            item_id = server_items[idx].id
+                            if item_id is not None:
+                                output = {"id": item_id, **output}
                             result_msgpack = msgpack.packb(output, use_bin_type=True)
                         outcomes[bi.work_item_id] = ItemOutcome(
                             work_item_id=bi.work_item_id,
@@ -977,6 +1027,10 @@ class QueueExecutor:
                             inference_ms=timing.inference_ms,
                             tokenization_ms=timing.tokenization_ms if timing.tokenization_ms > 0 else None,
                             postprocessing_ms=timing.postprocessing_ms if timing.postprocessing_ms > 0 else None,
+                            units=_encode_units(
+                                token_counts[idx] if token_counts is not None else None,
+                                image_counts[idx] if image_counts is not None else None,
+                            ),
                         )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Encode sub-batch failed for model %s: %s", model_id, e)
@@ -1013,7 +1067,7 @@ class QueueExecutor:
 
         outcomes: dict[str, ItemOutcome] = {}
         requests: list[PreformedScoreRequest] = []
-        request_context: list[tuple[ScoreBatchItem, list[Item]]] = []
+        request_context: list[tuple[ScoreBatchItem, Item, list[Item]]] = []
 
         for bi in req.items:
             try:
@@ -1022,6 +1076,11 @@ class QueueExecutor:
 
                 timing = RequestTiming()
                 timing.start_tokenization()
+                # ``score_pair_cost`` here is the char-count BATCHING proxy
+                # only. Authoritative billable counts (§7.3) are the reranker's
+                # real per-pair tokenizer lengths, surfaced on the resulting
+                # ScoreOutput and summed into ``ItemOutcome.units`` in
+                # ``_score_success_outcome`` — never this proxy.
                 prepared_items = build_score_prepared_items(query_item, score_items)
                 timing.end_tokenization()
 
@@ -1036,10 +1095,19 @@ class QueueExecutor:
                         timing=timing,
                     )
                 )
-                request_context.append((bi, score_items))
+                request_context.append((bi, query_item, score_items))
             except Exception as e:  # noqa: BLE001
                 logger.warning("Score preparation failed for %s: %s", bi.work_item_id, e)
                 outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
+
+        # Adapter for the metering backfill (§7.3). Read via the registry — the
+        # same sync accessor the encode seam uses — so a reranker that owns its
+        # tokenization can re-derive real per-pair counts. ``None`` (evicted
+        # mid-batch) simply leaves the meter on its reserve estimate.
+        try:
+            score_adapter = self._registry.get(model_id)
+        except KeyError:
+            score_adapter = None
 
         if requests:
             try:
@@ -1047,14 +1115,15 @@ class QueueExecutor:
                 results = await asyncio.gather(*futures, return_exceptions=True)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Score batch failed for model %s: %s", model_id, e)
-                for bi, _score_items in request_context:
+                for bi, _query_item, _score_items in request_context:
                     outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
             else:
-                for (bi, score_items), result in zip(request_context, results, strict=True):
+                for (bi, query_item, score_items), result in zip(request_context, results, strict=True):
                     if isinstance(result, BaseException):
                         logger.warning("Score failed for %s: %s", bi.work_item_id, result)
                         outcomes[bi.work_item_id] = _inference_exception_outcome(bi, result)
                     else:
+                        _backfill_score_units(score_adapter, bi, query_item, score_items, result)
                         outcomes[bi.work_item_id] = _score_success_outcome(
                             bi,
                             score_items,
@@ -1086,7 +1155,18 @@ class QueueExecutor:
 
         outcomes: dict[str, ItemOutcome] = {}
         grouped_requests: dict[str | None, list[PreformedExtractRequest]] = {}
-        grouped_context: dict[str | None, list[ExtractBatchItem]] = {}
+        # Carry the decoded ``Item`` alongside each ``ExtractBatchItem`` so the
+        # success path can bill vision extract (Florence-2) per image via the
+        # adapter's ``count_input_images`` hook (§7 "$ per image").
+        grouped_context: dict[str | None, list[tuple[ExtractBatchItem, Item]]] = {}
+
+        # Adapter for the per-image metering seam (§7), read via the registry —
+        # the same sync accessor the encode/score seams use. ``None`` (evicted
+        # mid-batch) simply leaves the images dimension unset.
+        try:
+            extract_adapter = self._registry.get(model_id)
+        except KeyError:
+            extract_adapter = None
 
         for bi in req.items:
             try:
@@ -1094,6 +1174,12 @@ class QueueExecutor:
 
                 timing = RequestTiming()
                 timing.start_tokenization()
+                # ``char_count`` here is the BATCHING cost proxy only.
+                # Authoritative billable counts (§7.3) are the extractor's real
+                # per-doc tokenizer length, surfaced on the resulting
+                # ExtractOutput and stamped into ``ItemOutcome.units`` in
+                # ``_extract_success_outcome`` — never this proxy. (``pages``
+                # for future docling/OCR inputs stays a separate seam.)
                 char_count = len(server_item.text) if server_item.text else 0
                 prepared_items = [ExtractPreparedItem(cost=char_count, original_index=0)]
                 timing.end_tokenization()
@@ -1111,7 +1197,7 @@ class QueueExecutor:
                         timing=timing,
                     )
                 )
-                grouped_context.setdefault(lora, []).append(bi)
+                grouped_context.setdefault(lora, []).append((bi, server_item))
             except Exception as e:  # noqa: BLE001
                 logger.warning("Extract preparation failed for %s: %s", bi.work_item_id, e)
                 outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
@@ -1123,17 +1209,156 @@ class QueueExecutor:
                 results = await asyncio.gather(*futures, return_exceptions=True)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Extract batch failed for model %s: %s", model_id, e)
-                for bi in context:
+                for bi, _server_item in context:
                     outcomes[bi.work_item_id] = _inference_exception_outcome(bi, e)
             else:
-                for bi, result in zip(context, results, strict=True):
+                for (bi, server_item), result in zip(context, results, strict=True):
                     if isinstance(result, BaseException):
                         logger.warning("Extract failed for %s: %s", bi.work_item_id, result)
                         outcomes[bi.work_item_id] = _inference_exception_outcome(bi, result)
                     else:
-                        outcomes[bi.work_item_id] = _extract_success_outcome(bi, result)
+                        outcomes[bi.work_item_id] = _extract_success_outcome(extract_adapter, bi, server_item, result)
 
         return BatchOutcome(outcomes=[outcomes[bi.work_item_id] for bi in req.items])
+
+
+def _per_item_image_counts(adapter: Any, items: list[Item], expected_len: int) -> list[int] | None:
+    """Per-item authoritative input-image counts via the adapter's shared
+    ``count_input_images`` hook (§7 "$ per image").
+
+    Returns ``None`` — leaving the images dimension unset so the metering edge
+    stays on its token/reserve basis — on a missing adapter or any misaligned /
+    malformed list, so a per-image count is never mis-attributed. Never raises:
+    metering must not fail inference.
+    """
+    if adapter is None:
+        return None
+    try:
+        counts = adapter.count_input_images(items)
+    except Exception:  # noqa: BLE001 — metering must never fail inference
+        return None
+    if (
+        isinstance(counts, list)
+        and len(counts) == expected_len
+        and all(isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in counts)
+    ):
+        return counts
+    return None
+
+
+def _encode_units(token_count: int | None, image_count: int | None) -> UnitCounts | None:
+    """Assemble one encode item's ``UnitCounts`` from its authoritative token
+    and image counts.
+
+    Each dimension is set only when present, and ``images`` only when ``> 0``
+    (a text-only item never emits ``images=0``). An item with neither yields
+    ``None`` so the metering edge falls back to its reserve estimate. Kept
+    byte-identical to the prior ``UnitCounts(input_tokens=...)`` emitter when
+    there are no images: ``images`` defaults to ``None`` on the struct.
+    """
+    images = image_count if (image_count is not None and image_count > 0) else None
+    if token_count is None and images is None:
+        return None
+    return UnitCounts(input_tokens=token_count, images=images)
+
+
+def _with_images(units: UnitCounts | None, image_count: int | None) -> UnitCounts | None:
+    """Fold an authoritative image count into an existing ``UnitCounts`` (§7
+    "$ per image"), minting one when only images are present.
+
+    ``image_count`` of ``None`` / ``<= 0`` is a no-op (never emits ``images=0``)
+    so text extract (GLiNER, …) is unchanged.
+    """
+    if image_count is None or image_count <= 0:
+        return units
+    if units is None:
+        return UnitCounts(images=image_count)
+    return UnitCounts(input_tokens=units.input_tokens, pages=units.pages, images=image_count)
+
+
+def _with_pages(units: UnitCounts | None, page_count: int | None) -> UnitCounts | None:
+    """Fold an authoritative page count into an existing ``UnitCounts`` — the §7
+    canonical parse/OCR dimension ("$ per 1k pages") — minting one when only
+    pages are present.
+
+    ``page_count`` of ``None`` / ``<= 0`` is a no-op (never emits ``pages=0``)
+    so token/vision extract is unchanged. Preserves the token and image
+    dimensions so folds compose in any order.
+    """
+    if page_count is None or page_count <= 0:
+        return units
+    if units is None:
+        return UnitCounts(pages=page_count)
+    return UnitCounts(input_tokens=units.input_tokens, pages=page_count, images=units.images)
+
+
+def _page_total(pages: Any, expected_len: int) -> int | None:
+    """Sum an adapter-surfaced per-item page list (``ExtractOutput.pages``) into a
+    single billable page count for the work item.
+
+    Returns ``None`` — leaving the pages dimension unset so the meter falls back
+    to its reserve estimate — unless the list is well-formed (aligned 1:1 with
+    the item's outputs, non-negative ints) and sums to ``> 0``. A misaligned or
+    malformed list is dropped rather than mis-attributed.
+    """
+    if not isinstance(pages, list) or len(pages) != expected_len:
+        return None
+    if not all(isinstance(p, int) and not isinstance(p, bool) and p >= 0 for p in pages):
+        return None
+    total = sum(pages)
+    return total if total > 0 else None
+
+
+def _units_from_token_counts(counts: Any, expected_len: int) -> UnitCounts | None:
+    """Sum authoritative per-item token counts into a work item's ``UnitCounts``.
+
+    Mirrors the encode metering contract (§7.3): billing counts, never
+    estimates. Returns ``None`` — leaving ``ItemOutcome.units`` unset so the
+    metering edge falls back to its reserve estimate — unless the adapter
+    surfaced a well-formed list aligned 1:1 with the item's outputs. A
+    misaligned or malformed list is dropped rather than mis-attributed.
+    """
+    if not isinstance(counts, list) or len(counts) != expected_len:
+        return None
+    if not all(isinstance(c, int) and not isinstance(c, bool) for c in counts):
+        return None
+    return UnitCounts(input_tokens=sum(int(c) for c in counts))
+
+
+def _backfill_score_units(
+    adapter: Any,
+    bi: ScoreBatchItem,
+    query_item: Item,
+    score_items: list[Item],
+    worker_result: Any,
+) -> None:
+    """Shared metering seam: stamp authoritative per-pair token counts onto the
+    ``ScoreOutput`` when the reranker did not surface them itself.
+
+    Rerankers that own their tokenization but don't populate
+    ``ScoreOutput.input_token_counts`` (every flash cross-encoder) otherwise
+    leave the meter blind. The base ``count_pair_input_tokens`` hook recovers
+    the real joint (query, doc) lengths with the adapter's own tokenizer — the
+    §7.3 basis the in-tree ``cross_encoder`` already surfaces. Pure fallback:
+    never overwrites counts an adapter already produced (so bge-m3 / cross_encoder
+    keep their exact values), and a ``None`` recovery (server-backed adapters)
+    leaves the meter on its reserve estimate.
+    """
+    if adapter is None:
+        return
+    output = getattr(worker_result, "output", None)
+    if output is None or getattr(output, "input_token_counts", None) is not None:
+        return
+    try:
+        counts = adapter.count_pair_input_tokens(query_item, score_items, instruction=bi.instruction)
+    except Exception:  # noqa: BLE001 — metering must never fail inference
+        return
+    if (
+        isinstance(counts, list)
+        and len(counts) == output.batch_size
+        and all(isinstance(count, int) and not isinstance(count, bool) for count in counts)
+    ):
+        output.input_token_counts = counts
 
 
 def _score_success_outcome(
@@ -1146,6 +1371,16 @@ def _score_success_outcome(
     item_ids: list[str] = [
         (sid if (sid := score_items[i].id) is not None else f"item-{i}") for i in range(score_output.batch_size)
     ]
+    # Authoritative unit counts (§7.3): the reranker tokenizes each (query, doc)
+    # pair, and the score handler carries those real per-pair counts on the
+    # assembled ScoreOutput. Bill their sum — the total input tokens the model
+    # processed for this query × N-docs work item — as $/1M input tokens
+    # (§7.1). ``None`` (char-proxy rerankers) leaves units unset → reserve
+    # fallback, never an estimate billed as a count.
+    units = _units_from_token_counts(
+        getattr(score_output, "input_token_counts", None),
+        score_output.batch_size,
+    )
 
     # Score output is always Rust-frameable: the Python and Rust
     # sort/rank paths produce byte-identical results (see the
@@ -1170,14 +1405,18 @@ def _score_success_outcome(
         postprocessing_ms=worker_result.timing.postprocessing_ms
         if worker_result.timing.postprocessing_ms > 0
         else None,
+        units=units,
     )
 
 
 def _extract_success_outcome(
+    adapter: Any,
     bi: ExtractBatchItem,
+    server_item: Item,
     worker_result: Any,
 ) -> ItemOutcome:
-    extraction_results = ExtractHandler.format_output(worker_result.output)
+    extract_output = worker_result.output
+    extraction_results = ExtractHandler.format_output(extract_output)
     if not extraction_results:
         # Adapter returned no results for a single-item request —
         # surface as an error instead of silently publishing an
@@ -1185,6 +1424,27 @@ def _extract_success_outcome(
         # with no fields").
         return _error_outcome(bi, "inference_error", "adapter returned no extraction results")
     result_msgpack = msgpack.packb(extraction_results[0], use_bin_type=True)
+
+    # Authoritative unit counts (§7.3): the extractor tokenizes the document
+    # and the extract handler carries that real per-doc count on the assembled
+    # ExtractOutput. Extract work items are single-doc, so ``batch_size == 1``;
+    # bill the count as $/1M input tokens (§7.1). ``None`` leaves units unset →
+    # reserve fallback, never an estimate billed as a count.
+    units = _units_from_token_counts(
+        getattr(extract_output, "input_token_counts", None),
+        extract_output.batch_size,
+    )
+    # Parse/OCR extract (docling) has no token count but parses document PAGES —
+    # bill it per page (§7 "$ per 1k pages", the canonical parse dimension) from
+    # the real page count the adapter surfaced on ``ExtractOutput.pages``. Folds
+    # alongside any token/image count; token/vision extract (no pages) unchanged.
+    units = _with_pages(units, _page_total(getattr(extract_output, "pages", None), extract_output.batch_size))
+    # Vision extract (Florence-2 caption/OCR/extract) has no token count but
+    # consumes image inputs — bill it per image (§7 "$ per image") via the
+    # shared ``count_input_images`` hook. Folds alongside any token count;
+    # text extract (GLiNER, single text doc, no images) is unchanged.
+    image_counts = _per_item_image_counts(adapter, [server_item], 1)
+    units = _with_images(units, image_counts[0] if image_counts is not None else None)
 
     return ItemOutcome(
         work_item_id=bi.work_item_id,
@@ -1197,6 +1457,7 @@ def _extract_success_outcome(
         postprocessing_ms=worker_result.timing.postprocessing_ms
         if worker_result.timing.postprocessing_ms > 0
         else None,
+        units=units,
     )
 
 

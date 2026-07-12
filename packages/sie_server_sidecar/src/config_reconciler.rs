@@ -18,10 +18,11 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::backend::AdapterWorkerPool;
 use crate::config_subscriber::{
     advertised_bundle_hash, replace_via_ipc_with_retry, ConfigApplyState, MAX_MODEL_CONFIG_BYTES,
 };
-use crate::ipc_client::{IpcClient, IpcError};
+use crate::ipc_client::IpcError;
 use crate::ipc_types::{
     ReplaceModelConfigEntry, ReplaceModelConfigsRequest, ReplaceModelConfigsResponse,
 };
@@ -152,7 +153,7 @@ struct ReconcileRuntime<'a> {
     client: &'a ReconcileClient,
     bundle: &'a str,
     pool: &'a str,
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,
@@ -286,7 +287,7 @@ fn compute_export_signature(
 /// and health publisher lifecycle.
 pub fn spawn(
     config: Option<ReconcilerConfig>,
-    ipc: Arc<IpcClient>,
+    ipc: Arc<AdapterWorkerPool>,
     state: Arc<ConfigApplyState>,
     metrics: Arc<MetricsRegistry>,
     shutdown: Arc<Shutdown>,

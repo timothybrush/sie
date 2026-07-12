@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgpack
 import numpy as np
 import pytest
-from sie_server.config.model import ModelConfig
+from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
+from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.types import WorkerResult
 from sie_server.ipc_types import (
@@ -31,6 +33,32 @@ def _make_registry(*, loaded: bool = True, loading: bool = False) -> MagicMock:
     reg.is_loading.return_value = loading
     reg.get_config.return_value = MagicMock()
     return reg
+
+
+def _make_config(name: str) -> ModelConfig:
+    return ModelConfig(
+        sie_id=name,
+        package_backed=True,
+        tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+        profiles={
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+                max_batch_tokens=8192,
+            )
+        },
+    )
+
+
+async def _wait_until_loaded(registry: ModelRegistry, *model_ids: str, timeout_s: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if all(registry.is_loaded(model_id) for model_id in model_ids):
+            return
+        await asyncio.sleep(0.01)
+    if all(registry.is_loaded(model_id) for model_id in model_ids):
+        return
+    missing = [model_id for model_id in model_ids if not registry.is_loaded(model_id)]
+    raise AssertionError(f"timed out waiting for models to load: {missing}")
 
 
 def _encode_item(
@@ -130,6 +158,42 @@ class TestEnsureModelReady:
         reg.start_load_async = AsyncMock(side_effect=KeyError("test/model"))
         ex = QueueExecutor(reg)
         assert await ex.ensure_model_ready("test/model") == "retry_later"
+
+    @pytest.mark.asyncio
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_concurrent_sidecar_ready_loads_use_distinct_configured_devices(
+        self,
+        mock_load_adapter: MagicMock,
+    ) -> None:
+        """Concurrent sidecar-triggered loads serialize placement through the registry lock."""
+        registry = ModelRegistry(device="cuda", devices=["cuda:0", "cuda:1"])
+        registry.add_config(_make_config("model-a"))
+        registry.add_config(_make_config("model-b"))
+
+        adapters = [MagicMock(), MagicMock()]
+        for adapter in adapters:
+            adapter.aclose_client = None
+            adapter.capabilities.outputs = ["dense"]
+            adapter.memory_footprint.return_value = 1000
+            adapter.requires_main_thread = False
+        mock_load_adapter.side_effect = adapters
+
+        with ExitStack() as stack:
+            for manager in registry.memory_managers.values():
+                stack.enter_context(patch.object(manager, "check_pressure", return_value=False))
+
+            executor = QueueExecutor(registry)
+            states = await asyncio.gather(
+                executor.ensure_model_ready("model-a"),
+                executor.ensure_model_ready("model-b"),
+            )
+            await _wait_until_loaded(registry, "model-a", "model-b")
+
+        assert states == ["loading_started", "loading_started"]
+        assert registry._loaded["model-a"].device == "cuda:0"
+        assert registry._loaded["model-b"].device == "cuda:1"
+        adapters[0].load.assert_called_once_with("cuda:0")
+        adapters[1].load.assert_called_once_with("cuda:1")
 
 
 class TestGetBatchBudget:
@@ -362,6 +426,121 @@ class TestProcessEncodeBatch:
         # The non-default profile's runtime wins, and "profile" is consumed.
         assert captured["query_template"] == "fast: {text}"
         assert "profile" not in captured
+
+    @pytest.mark.asyncio
+    async def test_profile_default_output_types_applied(self) -> None:
+        """Regression for dade77d64: a profile whose runtime declares an
+        ``output_types`` default must resolve on the managed path exactly as
+        OSS ``api.encode`` does (profile > request > default).
+
+        Mirrors the ``bge-m3:sparse`` synthetic variant — its promoted
+        "default" profile carries ``output_types: [sparse]``. A queued request
+        with NO request-level output_types must reach the engine as
+        ``["sparse"]`` and be served as sparse, not silently fall back to
+        dense-only (the managed path dropped the profile default).
+        """
+        config = ModelConfig.model_validate(
+            {
+                "sie_id": "test/bge-m3:sparse",
+                "hf_id": "test/bge-m3",
+                "inputs": {"text": True},
+                "tasks": {"encode": {"dense": {"dim": 8}, "sparse": {"dim": 250002}}},
+                "max_sequence_length": 512,
+                "profiles": {
+                    "default": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.bge_m3_flash:BGEM3FlashAdapter",
+                        "adapter_options": {
+                            "runtime": {"pooling": "cls", "normalize": True, "output_types": ["sparse"]},
+                        },
+                    },
+                },
+            }
+        )
+        reg = _make_registry()
+        reg.get_config.return_value = config
+        ex = QueueExecutor(reg)
+
+        observed: list[list[str]] = []
+
+        async def fake_run_encode(**kwargs):
+            observed.append(kwargs["output_types"])
+            sparse = {
+                "sparse": {
+                    "indices": np.array([1, 2], dtype=np.int32),
+                    "values": np.array([0.5, 0.25], dtype=np.float32),
+                }
+            }
+            return [sparse for _ in kwargs["items"]], RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new=AsyncMock(side_effect=fake_run_encode),
+        ):
+            outcome = await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(
+                    model_id="test/bge-m3:sparse",
+                    items=[_encode_item(options=None)],  # no request-level output_types
+                )
+            )
+
+        # Engine received the profile's head, not the ["dense"] fallback...
+        assert observed == [["sparse"]]
+        # ...and the item is served as sparse.
+        assert outcome.outcomes[0].disposition == "publish_and_ack"
+        assert outcome.outcomes[0].raw_output is not None
+        assert outcome.outcomes[0].raw_output.sparse is not None
+
+    @pytest.mark.asyncio
+    async def test_request_output_types_and_base_default_unchanged(self) -> None:
+        """The profile-default fix must not over-reach: with NO profile-level
+        ``output_types`` default, the managed path keeps OSS ``request >
+        default`` — an explicit request output_types is honoured, an absent one
+        falls back to ``["dense"]``.
+        """
+        config = ModelConfig.model_validate(
+            {
+                "sie_id": "test/plain-embedder",
+                "hf_id": "test/plain-embedder",
+                "inputs": {"text": True},
+                "tasks": {"encode": {"dense": {"dim": 8}, "multivector": {"dim": 8}}},
+                "max_sequence_length": 512,
+                "profiles": {
+                    "default": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.bge_m3_flash:BGEM3FlashAdapter",
+                        "adapter_options": {"runtime": {"pooling": "cls", "normalize": True}},
+                    },
+                },
+            }
+        )
+        reg = _make_registry()
+        reg.get_config.return_value = config
+        ex = QueueExecutor(reg)
+
+        observed: list[tuple[str, ...]] = []
+
+        async def fake_run_encode(**kwargs):
+            observed.append(tuple(kwargs["output_types"]))
+            return [{"dense": [0.0]} for _ in kwargs["items"]], RequestTiming()
+
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new=AsyncMock(side_effect=fake_run_encode),
+        ):
+            await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(
+                    model_id="test/plain-embedder",
+                    items=[
+                        # Explicit request output_types -> honoured (not clobbered).
+                        _encode_item(wiid="a.0", output_types=["multivector"], item_index=0),
+                        # No request output_types -> base ["dense"] default.
+                        _encode_item(wiid="b.0", output_types=None, item_index=1),
+                    ],
+                )
+            )
+
+        assert sorted(observed) == [("dense",), ("multivector",)]
 
     @pytest.mark.asyncio
     async def test_model_evicted_naks_all(self) -> None:
@@ -1021,3 +1200,28 @@ class TestWrapEncodeOutput:
         assert mv["token_dims"] == 128
         assert mv["num_tokens"] == 7
         assert mv["dtype"] == "binary"
+
+    def test_full_width_uint8_dense_stays_uint8(self) -> None:
+        """A full-width uint8 dense vector (NOT bit-packed) must keep the
+        ``uint8`` label — only the shape-based binary check may emit ``binary``,
+        else the SDK would bit-unpack values that were never packed.
+        """
+        from sie_server.queue_executor import _wrap_encode_output
+
+        arr = np.zeros(128, dtype=np.uint8)  # full width == dense_dim, not packed
+        wrapped = _wrap_encode_output({"dense": arr}, self._config(dense_dim=128))
+        assert wrapped["dense"]["dims"] == 128
+        assert wrapped["dense"]["dtype"] == "uint8"
+
+    def test_full_width_uint8_multivector_stays_uint8(self) -> None:
+        """A full-width uint8 multivector (shape[1] == mv_dim) is not bit-packed,
+        so it must keep the ``uint8`` label rather than fall through to binary.
+        """
+        from sie_server.queue_executor import _wrap_encode_output
+
+        arr = np.zeros((5, 128), dtype=np.uint8)  # full width == mv_dim, not packed
+        wrapped = _wrap_encode_output({"multivector": arr}, self._config(multivector_dim=128))
+        mv = wrapped["multivector"]
+        assert mv["token_dims"] == 128
+        assert mv["num_tokens"] == 5
+        assert mv["dtype"] == "uint8"

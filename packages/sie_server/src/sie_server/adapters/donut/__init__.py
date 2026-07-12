@@ -83,6 +83,7 @@ class DonutAdapter(BaseAdapter):
         max_new_tokens: int = 512,
         num_beams: int = 1,
         attn_implementation: str = "eager",
+        revision: str | None = None,
         **kwargs: Any,  # Accept and ignore extra kwargs (e.g., normalize, max_seq_length)
     ) -> None:
         """Initialize the adapter.
@@ -95,6 +96,8 @@ class DonutAdapter(BaseAdapter):
             num_beams: Number of beams for beam search (1 = greedy).
             attn_implementation: Attention implementation - "eager" or "sdpa".
                 Use "sdpa" for optimized inference with PyTorch's scaled dot-product attention.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when loading model artifacts.
+                Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Ignored extra arguments from the loader.
         """
         del kwargs  # Unused - accepts normalize, max_seq_length, etc.
@@ -104,6 +107,7 @@ class DonutAdapter(BaseAdapter):
         self._max_new_tokens = max_new_tokens
         self._num_beams = num_beams
         self._attn_implementation = attn_implementation
+        self._revision = revision
 
         self._model: Any = None
         self._processor: Any = None  # HuggingFace DonutProcessor
@@ -123,6 +127,10 @@ class DonutAdapter(BaseAdapter):
         # Determine dtype
         dtype = self._resolve_dtype()
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         logger.info(
             "Loading Donut model %s on device=%s with dtype=%s, attn=%s",
             self._model_name_or_path,
@@ -132,7 +140,10 @@ class DonutAdapter(BaseAdapter):
         )
 
         # Load processor
-        self._processor = DonutProcessor.from_pretrained(self._model_name_or_path)
+        self._processor = DonutProcessor.from_pretrained(
+            self._model_name_or_path,
+            **shared_kwargs,
+        )
 
         # Load model with optional SDPA
         # Note: VisionEncoderDecoderModel supports SDPA but not flash_attention_2
@@ -140,6 +151,7 @@ class DonutAdapter(BaseAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation=self._attn_implementation,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()

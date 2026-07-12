@@ -230,6 +230,11 @@ ignore = [
 "tools/loadtest/*.py" = [
     "INP001",  # Standalone loadtest CI scripts, not a package
 ]
+"packages/sie_tools/tests/test_auth.py" = [
+    "S105",    # Hardcoded "password" strings — device-flow session tokens are test doubles
+    "S106",    # Same, as function arguments (access_token=/refresh_token=)
+    "S107",    # Same, as function defaults
+]
 "**/tests/**/*" = [
     "ANN",     # Type annotations (tests don't need full typing)
     "ARG",     # Unused function arguments (fixtures)
@@ -446,6 +451,11 @@ python-version = "3.12"
 exclude = [
     # Test files - use mocks/fixtures that don't type-check well with ty
     "packages/*/tests/**",
+
+    # Standalone uv sub-projects (own lockfile/venv, not workspace members)
+    # are type-checked inside their own projects; the root interpreter
+    # cannot resolve their imports.
+    "packages/sie_cloud/**",
 
     # xformers/flash_attn optional (requires CUDA build)
     "packages/sie_server/src/sie_server/adapters/bert_flash/**",

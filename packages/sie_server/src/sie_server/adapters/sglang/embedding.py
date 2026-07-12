@@ -17,14 +17,18 @@ Engine API to avoid event loop conflicts with uvicorn/uvloop.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
@@ -37,6 +41,36 @@ if TYPE_CHECKING:
     from sie_server.types.inputs import Item
 
 logger = logging.getLogger(__name__)
+
+# Fan-out knob for the SGLang embedding HTTP client. A single blocking
+# ``requests.post`` per ``encode()`` presents only ONE request to SGLang's
+# continuous batcher at a time — on the single-threaded serving loop (local
+# ``sie-server serve`` / ``ModelWorker`` runs one forward at a time) that
+# starves the batcher and the served path lands far below the engine knee
+# (measured Qwen3-Embedding-4B: A100 ~13k served vs 30.8k engine @ C=16;
+# evidence: commit ``9ecae860a``). Sharding a
+# batch into ``concurrency`` concurrent POSTs keeps that many requests in
+# flight so SGLang's batcher fills. ``1`` restores the legacy single-post
+# behavior (used to A/B the lift). Overridable per-deploy via the env var.
+_EMBED_CONCURRENCY_ENV = "SIE_SGLANG_EMBED_CONCURRENCY"
+_DEFAULT_EMBED_CONCURRENCY = 8
+
+
+def _resolve_embed_concurrency(configured: int | None) -> int:
+    """Resolve the embedding POST concurrency (env override wins, then config)."""
+    raw = os.environ.get(_EMBED_CONCURRENCY_ENV)
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r; expected an integer", _EMBED_CONCURRENCY_ENV, raw)
+        else:
+            if value >= 1:
+                return value
+            logger.warning("Ignoring %s=%r; must be >= 1", _EMBED_CONCURRENCY_ENV, raw)
+    if configured is not None and configured >= 1:
+        return configured
+    return _DEFAULT_EMBED_CONCURRENCY
 
 
 class SGLangEmbeddingAdapter(BaseAdapter):
@@ -84,6 +118,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         mem_fraction_static: float = 0.85,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = True,
+        revision: str | None = None,
         query_template: str | None = None,
         doc_template: str | None = None,
         default_instruction: str | None = None,
@@ -93,6 +128,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         max_loras_per_batch: int = 8,
         dense_dim: int | None = None,
         startup_timeout_s: float | None = None,
+        embed_concurrency: int | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         r"""Initialize the adapter.
@@ -105,6 +141,9 @@ class SGLangEmbeddingAdapter(BaseAdapter):
                 Lower values leave more headroom for other models. Default 0.85.
             compute_precision: Compute precision (bfloat16 recommended).
             trust_remote_code: Whether to trust remote code in model files.
+            revision: Pinned HuggingFace revision (commit SHA / branch / tag) to serve.
+                Forwarded to ``sglang.launch_server`` as ``--revision`` so the served
+                weights match the YAML-pinned SHA. None serves the repo default.
             query_template: Template for formatting queries. Use {instruction} and
                 {text} placeholders. Example: "Instruct: {instruction}\nQuery:{text}"
             doc_template: Template for formatting documents. Use {text} placeholder.
@@ -138,6 +177,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._mem_fraction_static = mem_fraction_static
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._query_template = query_template
         self._doc_template = doc_template
         self._default_instruction = default_instruction
@@ -147,14 +187,27 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._lora_paths = lora_paths or {}
         self._max_loras_per_batch = max_loras_per_batch
         self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
+        self._embed_concurrency = _resolve_embed_concurrency(embed_concurrency)
 
         self._process: subprocess.Popen[bytes] | None = None
         self._server_url: str | None = None
+        # Shared HTTP client + thread pool for concurrent POSTs to SGLang. Only
+        # populated (in ``load``) when concurrency > 1; a single-post encode
+        # keeps using module-level ``requests.post`` so the concurrency=1 A/B
+        # baseline is byte-identical to the legacy path.
+        self._session: requests.Session | None = None
+        self._post_executor: ThreadPoolExecutor | None = None
         self._device: str | None = None
         self._configured_dense_dim: int | None = dense_dim
         self._dense_dim: int | None = dense_dim
         self._active_lora: str | None = None  # Set by set_active_lora() before encode()
         self._output_file: tempfile._TemporaryFileWrapper | None = None
+        # Lazy, weights-free tokenizer used ONLY for exact §7.3 input-token
+        # metering (see ``_get_metering_tokenizer`` / ``_stamp_input_token_counts``).
+        # Loaded on first ``encode`` and cached; a load failure degrades to the
+        # meter's reserve estimate rather than failing inference.
+        self._metering_tokenizer_obj: Any = None
+        self._metering_tokenizer_loaded: bool = False
 
     @property
     def available_loras(self) -> list[str]:
@@ -222,6 +275,9 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         if self._trust_remote_code:
             cmd.append("--trust-remote-code")
 
+        if self._revision is not None:
+            cmd.extend(["--revision", self._revision])
+
         if self._pooling_method:
             cmd.extend(["--pooling-method", self._pooling_method])
 
@@ -250,14 +306,37 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             self._process = None
             raise _server.startup_failure_error(self._output_file)
 
+        # Concurrent-POST fan-out: a keep-alive session with a connection pool
+        # sized to the concurrency and a matching thread pool, so a sharded
+        # ``encode`` keeps ``embed_concurrency`` requests in flight against
+        # SGLang's continuous batcher (see ``_embed_texts``). Left as ``None``
+        # for concurrency==1 (legacy single blocking post).
+        if self._embed_concurrency > 1:
+            self._session = requests.Session()
+            pool_size = max(self._embed_concurrency, 10)
+            http_adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+            self._session.mount("http://", http_adapter)
+            self._session.mount("https://", http_adapter)
+            self._post_executor = ThreadPoolExecutor(
+                max_workers=self._embed_concurrency,
+                thread_name_prefix="sglang-embed-post",
+            )
+
         logger.info(
-            "SGLang server ready: %s at %s",
+            "SGLang server ready: %s at %s (embed_concurrency=%d)",
             self._model_name_or_path,
             self._server_url,
+            self._embed_concurrency,
         )
 
     def unload(self) -> None:
         """Unload the model by stopping SGLang server subprocess."""
+        if self._post_executor is not None:
+            self._post_executor.shutdown(wait=False)
+            self._post_executor = None
+        if self._session is not None:
+            self._session.close()
+            self._session = None
         if self._process is not None:
             logger.info("Shutting down SGLang server for %s", self._model_name_or_path)
             _server.terminate_process(self._process)
@@ -357,38 +436,24 @@ class SGLangEmbeddingAdapter(BaseAdapter):
                 raise RuntimeError(msg)
             dim = self._dense_dim
             embeddings = np.zeros((len(items), dim), dtype=np.float32)
-            return EncodeOutput(
+            empty_output = EncodeOutput(
                 dense=embeddings,
                 batch_size=len(items),
                 is_query=is_query,
                 dense_dim=dim,
             )
+            # Nothing was posted to sglang, so every item bills zero input
+            # tokens — exact, since the zero-vector fallback runs no inference.
+            empty_output.extra["input_token_counts"] = [0] * len(items)
+            return empty_output
 
-        # Call SGLang HTTP API (OpenAI-compatible embeddings endpoint)
-        # When LoRA is specified, use it as the model name; otherwise use "default"
+        # Call SGLang HTTP API (OpenAI-compatible embeddings endpoint).
+        # When LoRA is specified, use it as the model name; otherwise "default".
+        # ``_embed_texts`` fans the batch out into ``embed_concurrency``
+        # concurrent POSTs so SGLang's continuous batcher stays fed (the serving
+        # loop is single-threaded, so a lone blocking POST under-drives it).
         model_name = lora if lora is not None else "default"
-        response = requests.post(
-            f"{self._server_url}/v1/embeddings",
-            json={
-                "model": model_name,
-                "input": non_empty_texts,
-                "encoding_format": "float",
-            },
-            timeout=60,
-        )
-        if response.status_code != 200:
-            logger.error(
-                "SGLang error %d for %d texts: %s",
-                response.status_code,
-                len(non_empty_texts),
-                response.text[:500],
-            )
-        response.raise_for_status()
-        result = response.json()
-
-        # Extract embeddings from OpenAI-format result
-        # Response format: {"data": [{"embedding": [...], "index": 0}, ...]}
-        non_empty_embeddings = self._extract_embeddings(result, len(non_empty_texts))
+        non_empty_embeddings = self._embed_texts(non_empty_texts, model_name)
 
         dense_dim = self._validate_or_set_dense_dim(non_empty_embeddings)
 
@@ -401,12 +466,147 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         for result_idx, original_idx in enumerate(non_empty_indices):
             embeddings[original_idx] = non_empty_embeddings[result_idx]
 
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=embeddings,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=dense_dim,
         )
+        # Unit-meter seam (§7.3): stamp exact per-item input-token counts for the
+        # texts we actually POSTed to sglang. Server-backed, so this is the only
+        # place the real counts exist (see ``_stamp_input_token_counts``).
+        self._stamp_input_token_counts(output, non_empty_texts, non_empty_indices, len(items))
+        return output
+
+    def _get_metering_tokenizer(self) -> Any | None:
+        """Lazily load a weights-free HF tokenizer for exact §7.3 metering.
+
+        SGLang runs the model in a subprocess, so this adapter has no
+        in-process tokenizer for the base ``count_input_tokens`` seam and
+        ``units.input_tokens`` would otherwise stay 0 (the meter's reserve
+        fallback) for this promoted dense-SMARTEST tier. Loading the served
+        model's own tokenizer is tokenizer-only (no weights) and cheap; it is
+        cached after the first call. Best-effort: a load failure is logged once
+        and degrades metering to the reserve estimate rather than failing
+        inference (mirrors ``_resolve_eos_token``).
+        """
+        if self._metering_tokenizer_loaded:
+            return self._metering_tokenizer_obj
+        self._metering_tokenizer_loaded = True
+        try:
+            self._metering_tokenizer_obj = load_tokenizer(
+                self._model_name_or_path, trust_remote_code=self._trust_remote_code
+            )
+        except Exception:  # noqa: BLE001 — metering must never take the model down
+            logger.warning(
+                "metering: could not load tokenizer for %s; units.input_tokens will "
+                "fall back to the meter's reserve estimate",
+                self._model_name_or_path,
+                exc_info=True,
+            )
+            self._metering_tokenizer_obj = None
+        return self._metering_tokenizer_obj
+
+    def _stamp_input_token_counts(
+        self,
+        output: EncodeOutput,
+        non_empty_texts: list[str],
+        non_empty_indices: list[int],
+        total: int,
+    ) -> None:
+        """Stamp exact per-item input-token counts (§7.3) onto ``output.extra``.
+
+        SGLang is server-backed, so the base ``count_input_tokens`` seam has no
+        in-process tokenizer and ``units.input_tokens`` would fall to the
+        meter's reserve estimate — never exact for this promoted dense tier. We
+        count the EXACT strings POSTed to sglang (``non_empty_texts`` — already
+        query/doc-template- and (when enabled) EOS-formatted by
+        ``_format_texts``, and truncated at ``max_seq_length`` the same way
+        sglang's ``--context-length`` truncates), then scatter them back to item
+        positions with ``0`` for the empty items that took the zero-vector
+        fallback and were never sent. The summed counts equal sglang's own
+        ``usage.prompt_tokens`` for the request. Mirrors the ``bert_flash`` /
+        ``bge_m3_flash`` seam; ``_token_counts_or_none`` is the shared base
+        helper. Best-effort: any tokenizer quirk (or a load failure) leaves
+        ``extra`` unstamped so the meter falls back to its reserve estimate
+        rather than billing an approximation.
+        """
+        tokenizer = self._get_metering_tokenizer()
+        if tokenizer is None:
+            return
+        counts = self._token_counts_or_none(tokenizer, non_empty_texts, expected_len=len(non_empty_texts))
+        if counts is None:
+            return
+        per_item = [0] * total
+        for result_idx, original_idx in enumerate(non_empty_indices):
+            per_item[original_idx] = counts[result_idx]
+        output.extra["input_token_counts"] = per_item
+
+    def _embed_texts(self, texts: list[str], model_name: str) -> np.ndarray:
+        """Embed ``texts`` via SGLang, fanning out concurrent POSTs.
+
+        A single blocking POST presents one request to SGLang's continuous
+        batcher; on the single-threaded serving loop that means the batcher
+        rarely sees more than one request at a time and the served throughput
+        lands far below the engine knee. Sharding the batch into up to
+        ``embed_concurrency`` contiguous chunks and POSTing them concurrently
+        keeps that many requests in flight, so the batcher fills.
+
+        Correctness is preserved: each shard's embeddings are re-ordered by the
+        response ``index`` inside :meth:`_extract_embeddings`, and the shards are
+        concatenated back in input order, so the returned rows align 1:1 with
+        ``texts`` exactly as the single-POST path did.
+        """
+        concurrency = self._embed_concurrency
+        if concurrency <= 1 or len(texts) <= 1:
+            return self._post_embedding_batch(texts, model_name, session=None)
+
+        n_shards = min(concurrency, len(texts))
+        shard_size = math.ceil(len(texts) / n_shards)
+        shards = [texts[i : i + shard_size] for i in range(0, len(texts), shard_size)]
+
+        executor = self._post_executor
+        session = self._session
+        if executor is None or session is None:
+            # Defensive: load() populates both when concurrency > 1. Fall back
+            # to a serial pass rather than fail if they are somehow missing.
+            return np.vstack([self._post_embedding_batch(shard, model_name, session=session) for shard in shards])
+
+        futures = [executor.submit(self._post_embedding_batch, shard, model_name, session) for shard in shards]
+        # Iterating in submission order preserves shard order; ``.result()``
+        # re-raises any shard error just like the single-POST path did.
+        parts = [future.result() for future in futures]
+        return np.vstack(parts)
+
+    def _post_embedding_batch(
+        self,
+        texts: list[str],
+        model_name: str,
+        session: requests.Session | None,
+    ) -> np.ndarray:
+        """POST one (possibly sharded) batch of texts and return its embeddings."""
+        poster = session.post if session is not None else requests.post
+        response = poster(
+            f"{self._server_url}/v1/embeddings",
+            json={
+                "model": model_name,
+                "input": texts,
+                "encoding_format": "float",
+            },
+            timeout=60,
+        )
+        if response.status_code != 200:
+            logger.error(
+                "SGLang error %d for %d texts: %s",
+                response.status_code,
+                len(texts),
+                response.text[:500],
+            )
+        response.raise_for_status()
+        result = response.json()
+
+        # Response format: {"data": [{"embedding": [...], "index": 0}, ...]}
+        return self._extract_embeddings(result, len(texts))
 
     def _validate_or_set_dense_dim(self, embeddings: np.ndarray) -> int:
         """Validate observed SGLang embedding width against configured dense_dim."""

@@ -10,7 +10,7 @@
 //!    `sidecar.dispatch` span on the result.
 //!
 //! 2. **In-process Context → outbound IPC item**. Before sending the
-//!    [`crate::ipc_types::RunBatchItem`] to the Python worker we
+//!    [`crate::ipc_types::RunBatchItem`] to the adapter worker we
 //!    serialise the active `sidecar.dispatch` span back into the two
 //!    header strings and write them onto the wire item, so the
 //!    worker's `worker.run_batch` span nests under the sidecar span.

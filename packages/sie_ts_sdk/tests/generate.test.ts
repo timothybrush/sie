@@ -9,7 +9,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SIEClient } from "../src/client.js";
-import { RequestError, SIEConnectionError } from "../src/errors.js";
+import {
+  RequestError,
+  ResourceExhaustedError,
+  SIEConnectionError,
+  ServerError,
+} from "../src/errors.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
@@ -306,6 +311,92 @@ describe("SIEClient.generate retry semantics (B1c)", () => {
     const result = await promise;
 
     expect(result.text).toBe("loaded");
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries the safe 503 RESOURCE_EXHAUSTED pre-execution signal", async () => {
+    vi.useFakeTimers();
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: "RESOURCE_EXHAUSTED", message: "out of memory" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          model: "m",
+          text: "recovered",
+          finish_reason: "stop",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          attempt_id: "a",
+        }),
+      );
+
+    const promise = client.generate("m", "hi", { maxNewTokens: 8 });
+    // First OOM backoff is jittered but never exceeds the 5s base.
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await promise;
+
+    expect(result.text).toBe("recovered");
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces sustained RESOURCE_EXHAUSTED as ResourceExhaustedError", async () => {
+    vi.useFakeTimers();
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockImplementation(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({ error: { code: "RESOURCE_EXHAUSTED", message: "out of memory" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const promise = client.generate("m", "hi", { maxNewTokens: 8 });
+    const expectation = expect(promise).rejects.toThrow(ResourceExhaustedError);
+
+    // Max backoff schedule (no Retry-After): ≤5s, ≤10s, ≤20s → ≤35s total.
+    await vi.advanceTimersByTimeAsync(35_000);
+    await expectation;
+
+    // RESOURCE_EXHAUSTED_MAX_RETRIES = 3 → 4 requests (initial + 3 retries).
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("does NOT retry a 504 gateway timeout even when waitForCapacity is true", async () => {
+    // 504 is post-publish: a worker may already be generating. Retrying
+    // could double-bill, so generate() must surface it terminally.
+    const client = new SIEClient("http://localhost:8080", {
+      timeout: 30_000,
+      provisionTimeout: 60_000,
+    });
+
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code: "GATEWAY_TIMEOUT", message: "result deadline" } }),
+        { status: 504, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await expect(
+      client.generate("m", "hi", { maxNewTokens: 8, waitForCapacity: true }),
+    ).rejects.toThrow(/non-idempotent/);
+    await expect(
+      client.generate("m", "hi", { maxNewTokens: 8, waitForCapacity: true }),
+    ).rejects.toBeInstanceOf(ServerError);
+
+    // Crucially: one call per generate() invocation, no retry.
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });

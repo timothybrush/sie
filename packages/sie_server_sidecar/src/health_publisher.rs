@@ -46,6 +46,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::metrics::MetricsRegistry;
 use crate::readiness::Readiness;
 use crate::shutdown::Shutdown;
 
@@ -64,13 +65,15 @@ pub const HEALTH_SUBJECT_PREFIX: &str = "sie.health";
 /// gateway flipping the worker unhealthy via `check_heartbeats`
 /// (default `heartbeat_timeout` is 30 s, so 5 s gives a 6× margin).
 pub const DEFAULT_PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
+const SATURATION_SET_PERCENT: i64 = 90;
+const SATURATION_CLEAR_PERCENT: i64 = 70;
 
 /// Static config for the heartbeat publisher.
 ///
 /// Most fields are captured at startup. The ready flag comes from
 /// [`Readiness`], and `bundle_config_hash` is shared with the live config
 /// subscriber so gateway readiness can observe successful worker-side apply.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HealthPublisherConfig {
     /// Stable identifier used as the subject leaf and as the
     /// fallback URL the gateway constructs. Should match
@@ -101,6 +104,8 @@ pub struct HealthPublisherConfig {
     /// Models the colocated backend reports as loaded. Updated by the IPC
     /// heartbeat, not by config apply.
     pub loaded_models: SharedLoadedModels,
+    /// Runtime pressure/capacity gauges mirrored into the heartbeat payload.
+    pub metrics: Arc<MetricsRegistry>,
     /// How often to publish. Defaults to [`DEFAULT_PUBLISH_INTERVAL`].
     pub interval: Duration,
 }
@@ -131,11 +136,17 @@ struct WorkerStatusPayload<'a> {
     ready: bool,
     terminated: bool,
     gpu_count: i32,
+    total_gpu_slots: i32,
+    ready_gpu_slots: i32,
     machine_profile: &'a str,
     pool_name: &'a str,
     bundle: &'a str,
     bundle_config_hash: &'a str,
     loaded_models: &'a [String],
+    queue_depth: i32,
+    pending_cost: i64,
+    inflight_batches: i32,
+    saturated: bool,
 }
 
 fn encode_payload(
@@ -158,18 +169,84 @@ fn encode_payload(
         Some(guard) => guard.as_slice(),
         None => &[],
     };
+    let configured_slots = config.gpu_count.max(1);
+    let total_gpu_slots = clamp_i64_to_i32(
+        config
+            .metrics
+            .worker_gpu_slots_total
+            .get()
+            .max(configured_slots.into()),
+    );
+    let ready_gpu_slots = if ready {
+        clamp_i64_to_i32(
+            config
+                .metrics
+                .worker_gpu_slots_ready
+                .get()
+                .clamp(0, total_gpu_slots.into()),
+        )
+    } else {
+        0
+    };
+    config
+        .metrics
+        .worker_gpu_slots_total
+        .set(total_gpu_slots.into());
+    config
+        .metrics
+        .worker_gpu_slots_ready
+        .set(ready_gpu_slots.into());
+    let queue_depth = clamp_i64_to_i32(config.metrics.worker_queue_depth.get().max(0));
+    let pending_cost = config.metrics.worker_pending_cost.get().max(0);
+    let inflight_batches = clamp_i64_to_i32(config.metrics.inflight_batches.get().max(0));
+    refresh_worker_saturation(&config.metrics);
+    let saturated = config.metrics.worker_saturated.get() > 0;
     let payload = WorkerStatusPayload {
         name: &config.worker_id,
         ready,
         terminated,
         gpu_count: config.gpu_count,
+        total_gpu_slots,
+        ready_gpu_slots,
         machine_profile: &config.machine_profile,
         pool_name: &config.pool_name,
         bundle: &config.bundle,
         bundle_config_hash: hash.as_str(),
         loaded_models,
+        queue_depth,
+        pending_cost,
+        inflight_batches,
+        saturated,
     };
     serde_json::to_vec(&payload)
+}
+
+fn clamp_i64_to_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or_else(|_| if value.is_negative() { 0 } else { i32::MAX })
+}
+
+fn refresh_worker_saturation(metrics: &MetricsRegistry) {
+    let ready_slots = metrics.worker_gpu_slots_ready.get().max(0);
+    if ready_slots == 0 {
+        metrics.worker_saturated.set(0);
+        return;
+    }
+
+    let capacity = ready_slots
+        .saturating_mul(crate::dispatcher::default_max_concurrent_batches().max(1) as i64)
+        .max(1);
+    let load = metrics
+        .worker_queue_depth
+        .get()
+        .max(0)
+        .saturating_add(metrics.inflight_batches.get().max(0));
+    let threshold = if metrics.worker_saturated.get() > 0 {
+        SATURATION_CLEAR_PERCENT
+    } else {
+        SATURATION_SET_PERCENT
+    };
+    let saturated = load.saturating_mul(100) >= capacity.saturating_mul(threshold);
+    metrics.worker_saturated.set(i64::from(saturated));
 }
 
 pub async fn publish_tombstone(
@@ -303,6 +380,7 @@ mod tests {
             gpu_count: 1,
             bundle_config_hash: Arc::new(RwLock::new("hash-abc".into())),
             loaded_models: Arc::new(RwLock::new(Vec::new())),
+            metrics: Arc::new(MetricsRegistry::new().unwrap()),
             interval: DEFAULT_PUBLISH_INTERVAL,
         }
     }
@@ -329,10 +407,16 @@ mod tests {
                 ready: true,
                 terminated: false,
                 gpu_count: c.gpu_count,
+                total_gpu_slots: 1,
+                ready_gpu_slots: 1,
                 machine_profile: &c.machine_profile,
                 pool_name: &c.pool_name,
                 bundle: &c.bundle,
                 bundle_config_hash: hash.as_str(),
+                queue_depth: 0,
+                pending_cost: 0,
+                inflight_batches: 0,
+                saturated: false,
                 loaded_models: &[],
             };
             serde_json::to_value(&payload).unwrap()
@@ -341,6 +425,12 @@ mod tests {
         assert_eq!(json["ready"], true);
         assert_eq!(json["terminated"], false);
         assert_eq!(json["gpu_count"], 1);
+        assert_eq!(json["total_gpu_slots"], 1);
+        assert_eq!(json["ready_gpu_slots"], 1);
+        assert_eq!(json["queue_depth"], 0);
+        assert_eq!(json["pending_cost"], 0);
+        assert_eq!(json["inflight_batches"], 0);
+        assert_eq!(json["saturated"], false);
         assert_eq!(json["machine_profile"], "l4");
         assert_eq!(json["pool_name"], "l4");
         assert_eq!(json["bundle"], "default");
@@ -362,10 +452,16 @@ mod tests {
                 ready: true,
                 terminated: false,
                 gpu_count: c.gpu_count,
+                total_gpu_slots: 1,
+                ready_gpu_slots: 1,
                 machine_profile: &c.machine_profile,
                 pool_name: &c.pool_name,
                 bundle: &c.bundle,
                 bundle_config_hash: hash.as_str(),
+                queue_depth: 0,
+                pending_cost: 0,
+                inflight_batches: 0,
+                saturated: false,
                 loaded_models: &[],
             };
             serde_json::to_value(&payload).unwrap()
@@ -398,11 +494,46 @@ mod tests {
         assert_eq!(json["ready"], false);
         assert_eq!(json["terminated"], true);
         assert_eq!(json["gpu_count"], 1);
+        assert_eq!(json["total_gpu_slots"], 1);
+        assert_eq!(json["ready_gpu_slots"], 0);
         assert_eq!(json["machine_profile"], "l4");
         assert_eq!(json["pool_name"], "l4");
         assert_eq!(json["bundle"], "default");
         assert_eq!(json["bundle_config_hash"], "hash-abc");
         assert_eq!(json["loaded_models"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn payload_includes_runtime_pressure_metrics() {
+        let c = cfg();
+        c.metrics.worker_gpu_slots_ready.set(1);
+        c.metrics.worker_queue_depth.set(1_000_000);
+        c.metrics.worker_pending_cost.set(1234);
+        c.metrics.inflight_batches.set(2);
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&encode_payload(&c, true, false).unwrap()).unwrap();
+
+        assert_eq!(json["queue_depth"], 1_000_000);
+        assert_eq!(json["pending_cost"], 1234);
+        assert_eq!(json["inflight_batches"], 2);
+        assert_eq!(json["saturated"], true);
+    }
+
+    #[test]
+    fn payload_derives_saturation_from_worker_pressure() {
+        let c = cfg();
+        c.metrics.worker_gpu_slots_ready.set(1);
+        c.metrics.worker_queue_depth.set(1_000_000);
+
+        let saturated: serde_json::Value =
+            serde_json::from_slice(&encode_payload(&c, true, false).unwrap()).unwrap();
+        assert_eq!(saturated["saturated"], true);
+
+        c.metrics.worker_queue_depth.set(0);
+        let cleared: serde_json::Value =
+            serde_json::from_slice(&encode_payload(&c, true, false).unwrap()).unwrap();
+        assert_eq!(cleared["saturated"], false);
     }
 
     #[test]

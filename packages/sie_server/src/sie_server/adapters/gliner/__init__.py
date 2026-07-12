@@ -65,6 +65,7 @@ class GLiNERAdapter(BaseAdapter):
         multi_label: bool = False,
         merge_adjacent_entities: bool = False,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -77,6 +78,8 @@ class GLiNERAdapter(BaseAdapter):
             merge_adjacent_entities: If True, merge adjacent entities with same label.
                 Required for token-based models like numind/NuNER_Zero.
             compute_precision: Compute precision for inference.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -86,6 +89,7 @@ class GLiNERAdapter(BaseAdapter):
         self._multi_label = multi_label
         self._merge_adjacent_entities = merge_adjacent_entities
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: Any = None  # GLiNER model type
         self._device: str | None = None
@@ -110,8 +114,12 @@ class GLiNERAdapter(BaseAdapter):
                 dtype = torch.bfloat16
 
         # Load model
+        load_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
         self._model = GLiNER.from_pretrained(
             self._model_name_or_path,
+            **load_kwargs,
         )
 
         # Move to device with precision
@@ -202,7 +210,39 @@ class GLiNERAdapter(BaseAdapter):
 
             all_entities.append(entity_results)
 
-        return ExtractOutput(entities=all_entities)
+        return ExtractOutput(entities=all_entities, input_token_counts=self._doc_input_token_counts(texts))
+
+    def _doc_input_token_counts(self, texts: list[str]) -> list[int] | None:
+        """Real per-document input-token counts for the unit meter (§7.3).
+
+        GLiNER's ``inference`` owns tokenization opaquely, so we recover the
+        billable count by running each document through the model's own
+        transformer tokenizer (``data_processor.transformer_tokenizer``) — the
+        same subword vocabulary the forward pass uses. We count the DOCUMENT
+        tokens only; the entity-type label prompt is request schema (re-used
+        across docs, not billed content), matching "$ per 1M input tokens" over
+        the document (§7.1). Best-effort: any tokenizer-shape quirk returns
+        ``None`` so the meter falls back to its reserve estimate rather than
+        billing an approximation as a count.
+        """
+        processor = getattr(self._model, "data_processor", None)
+        tokenizer = getattr(processor, "transformer_tokenizer", None)
+        if tokenizer is None:
+            return None
+        # Cap truncation at the tokenizer's own ``model_max_length`` when it
+        # declares a plausible one; HF sets an ``int(1e30)`` sentinel for
+        # uncapped tokenizers, which we treat as "no cap" (documents are short
+        # relative to that and counting the full length is still authoritative).
+        raw_max = getattr(tokenizer, "model_max_length", None)
+        max_length = raw_max if isinstance(raw_max, int) and 0 < raw_max < 1_000_000 else None
+        try:
+            encoded = tokenizer(texts, truncation=max_length is not None, max_length=max_length)
+            counts = [len(ids) for ids in encoded["input_ids"]]
+        except Exception:  # noqa: BLE001 — metering must never fail an extraction
+            return None
+        if len(counts) != len(texts):
+            return None
+        return counts
 
     def _merge_entities(self, entities: list[Entity], text: str) -> list[Entity]:
         """Merge adjacent entities with the same label.

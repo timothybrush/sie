@@ -36,6 +36,7 @@ class SIEEmbeddings(Embeddings):
             depend on the model - see model documentation for details.
         gpu: Target GPU type for routing (e.g., "l4", "a100-80gb").
         timeout_s: Request timeout in seconds.
+        api_key: Optional API key for authentication (sent as Bearer token).
     """
 
     def __init__(
@@ -50,6 +51,7 @@ class SIEEmbeddings(Embeddings):
         options: dict[str, object] | None = None,
         gpu: str | None = None,
         timeout_s: float = 180.0,
+        api_key: str | None = None,
     ) -> None:
         """Initialize SIE embeddings."""
         self._base_url = base_url
@@ -59,6 +61,7 @@ class SIEEmbeddings(Embeddings):
         self._options = options
         self._gpu = gpu
         self._timeout_s = timeout_s
+        self._api_key = api_key
 
         # Store provided clients or create lazily
         self._client = client
@@ -73,6 +76,7 @@ class SIEEmbeddings(Embeddings):
                 timeout_s=self._timeout_s,
                 gpu=self._gpu,
                 options=self._options,
+                api_key=self._api_key,
             )
         return self._client
 
@@ -85,6 +89,7 @@ class SIEEmbeddings(Embeddings):
                 timeout_s=self._timeout_s,
                 gpu=self._gpu,
                 options=self._options,
+                api_key=self._api_key,
             )
         return self._async_client
 
@@ -204,6 +209,7 @@ class SIESparseEncoder:
         model: Model name/ID to use for encoding. Must support sparse output.
         gpu: Target GPU type for routing (e.g., "l4", "a100-80gb").
         timeout_s: Request timeout in seconds.
+        api_key: Optional API key for authentication (sent as Bearer token).
     """
 
     def __init__(
@@ -213,12 +219,14 @@ class SIESparseEncoder:
         model: str = "BAAI/bge-m3",
         gpu: str | None = None,
         timeout_s: float = 180.0,
+        api_key: str | None = None,
     ) -> None:
         """Initialize SIE sparse encoder."""
         self._base_url = base_url
         self._model = model
         self._gpu = gpu
         self._timeout_s = timeout_s
+        self._api_key = api_key
         self._client: SIEClient | None = None
 
     @property
@@ -229,6 +237,7 @@ class SIESparseEncoder:
                 self._base_url,
                 timeout_s=self._timeout_s,
                 gpu=self._gpu,
+                api_key=self._api_key,
             )
         return self._client
 

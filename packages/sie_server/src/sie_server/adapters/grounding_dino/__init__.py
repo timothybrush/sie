@@ -81,6 +81,7 @@ class GroundingDINOAdapter(BaseAdapter):
         "_model_name_or_path",
         "_preprocessor",
         "_processor",
+        "_revision",
         "_text_threshold",
     )
 
@@ -89,6 +90,7 @@ class GroundingDINOAdapter(BaseAdapter):
         model_name_or_path: str | Path,
         *,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         box_threshold: float = 0.25,
         text_threshold: float = 0.25,
         **kwargs: Any,
@@ -96,6 +98,7 @@ class GroundingDINOAdapter(BaseAdapter):
         del kwargs
         self._model_name_or_path = str(model_name_or_path)
         self._compute_precision = compute_precision
+        self._revision = revision
         self._box_threshold = box_threshold
         self._text_threshold = text_threshold
 
@@ -115,6 +118,10 @@ class GroundingDINOAdapter(BaseAdapter):
         self._device_type = "cuda" if device.startswith("cuda") else "cpu"
         dtype = self._resolve_dtype()
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         logger.info(
             "Loading GroundingDINO model %s on device=%s with dtype=%s",
             self._model_name_or_path,
@@ -122,10 +129,11 @@ class GroundingDINOAdapter(BaseAdapter):
             dtype,
         )
 
-        self._processor = AutoProcessor.from_pretrained(self._model_name_or_path)
+        self._processor = AutoProcessor.from_pretrained(self._model_name_or_path, **shared_kwargs)
         self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()

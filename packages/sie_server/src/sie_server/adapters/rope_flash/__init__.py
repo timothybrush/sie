@@ -52,6 +52,7 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_template: str | None = None,
         doc_template: str | None = None,
         uses_legacy_transformers_cache: bool = False,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -67,6 +68,8 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             uses_legacy_transformers_cache: If True, disable the KV cache after
                 loading by setting model.config.use_cache = False. Required for
                 models that use the legacy transformers cache API (pre-4.54).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -78,6 +81,7 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._uses_legacy_transformers_cache = uses_legacy_transformers_cache
+        self._revision = revision
 
         self._model: Any = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -110,12 +114,16 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load config first to disable optional xformers features
         # Some models (e.g., stella_en_400M_v5) have these enabled in their saved config
         # but we replace attention with flash_attn_varlen_func anyway
-        config = AutoConfig.from_pretrained(self._model_name_or_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(self._model_name_or_path, trust_remote_code=True, **shared_kwargs)
         if hasattr(config, "use_memory_efficient_attention"):
             config.use_memory_efficient_attention = False
         if hasattr(config, "unpad_inputs"):
@@ -128,6 +136,7 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             torch_dtype=dtype,
             attn_implementation="eager",
             trust_remote_code=True,
+            **shared_kwargs,
         )
 
         # Disable KV cache for models using the legacy transformers cache API
@@ -240,12 +249,25 @@ class RoPEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Convert to numpy and return EncodeOutput
         dense_np = dense_vecs.float().cpu().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): this adapter owns tokenization (the registry
+        # preprocessor for flash adapters is a char-count ESTIMATOR) AND applies
+        # the model's query/doc template before tokenizing (e.g. arctic-embed-m's
+        # ``query: {text}``, stella's ``Instruct: ...``), so the real post-template,
+        # post-truncation per-item token counts exist only here. ``seq_lengths``
+        # is the exact ``len(input_ids)`` the model processed; expose it through
+        # ``EncodeOutput.extra`` (the designated adapter-extension point) aligned
+        # 1:1 with ``items``. The encode pipeline forwards these for metering, in
+        # preference to the base ``count_input_tokens`` fallback which re-tokenizes
+        # raw ``item.text`` and would undercount by the template's tokens (a no-op
+        # for templateless models like gte-multilingual-base). Mirrors ``bert_flash``.
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences.

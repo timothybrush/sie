@@ -199,6 +199,34 @@ export class ModelLoadingError extends SIEError {
 }
 
 /**
+ * Error when the server has exhausted its OOM-recovery strategies.
+ *
+ * Raised when:
+ * - Server returns 503 with RESOURCE_EXHAUSTED code
+ * - SDK retry limit is exceeded (or the next backoff would exhaust the
+ *   provision-timeout budget)
+ *
+ * Subclass of {@link ServerError} so callers that already catch
+ * `ServerError` continue to behave correctly; new code can catch
+ * `ResourceExhaustedError` specifically to react to sustained GPU
+ * pressure (e.g., back off, route elsewhere, scale up). Mirrors the
+ * Python SDK's `ResourceExhaustedError`.
+ */
+export class ResourceExhaustedError extends ServerError {
+  /** The model that was requested */
+  readonly model: string | undefined;
+  /** Number of retry attempts made before giving up */
+  readonly retries: number;
+
+  constructor(message: string, options?: { model?: string; retries?: number }) {
+    super(message, "RESOURCE_EXHAUSTED", 503);
+    this.name = "ResourceExhaustedError";
+    this.model = options?.model;
+    this.retries = options?.retries ?? 0;
+  }
+}
+
+/**
  * Error surfaced mid-stream from `streamChatCompletions` / `streamGenerate`.
  *
  * The SSE wire shape includes optional `error: {message, type, param, code}`

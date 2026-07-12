@@ -385,6 +385,7 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_DEVICES", raising=False)
         monkeypatch.delenv("SIE_POOL", raising=False)
         monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
 
@@ -392,6 +393,55 @@ class TestPreloadModelsEnvRoundTrip:
         config.save_to_env_vars()
         restored = AppStateConfig.from_env_vars()
         assert restored.preload_models == ["model-a", "model-b"]
+        assert restored.devices is None
+
+    def test_devices_env_round_trip(self, monkeypatch) -> None:
+        """Devices survives save_to_env_vars / from_env_vars cycle."""
+        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_DEVICES", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
+
+        config = AppStateConfig(device="cuda", devices=["cuda:0", "cuda:1"])
+        config.save_to_env_vars()
+        restored = AppStateConfig.from_env_vars()
+        assert restored.device == "cuda"
+        assert restored.devices == ["cuda:0", "cuda:1"]
+        assert restored.pool_name is None
+
+    def test_devices_env_derives_default_device_family(self, monkeypatch) -> None:
+        """SIE_DEVICES alone turns the default CPU family into the concrete device family."""
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.setenv("SIE_DEVICES", "cuda:0,cuda:1")
+
+        restored = AppStateConfig.from_env_vars()
+
+        assert restored.device == "cuda"
+        assert restored.devices == ["cuda:0", "cuda:1"]
+
+    def test_devices_reject_mismatched_device_family(self) -> None:
+        with pytest.raises(ValueError, match="must match SIE_DEVICES"):
+            AppStateConfig(device="mps", devices=["cuda:0"])
+
+    def test_devices_reject_mixed_families_with_default_device(self) -> None:
+        with pytest.raises(ValueError, match="must match SIE_DEVICES"):
+            AppStateConfig(devices=["cuda:0", "mps:0"])
+
+    def test_pool_name_env_round_trip(self, monkeypatch) -> None:
+        """SIE_POOL survives save_to_env_vars / from_env_vars cycle."""
+        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
+        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
+        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
+        monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_DEVICES", raising=False)
+        monkeypatch.delenv("SIE_POOL", raising=False)
+
+        config = AppStateConfig(pool_name="customer-a")
+        config.save_to_env_vars()
+        restored = AppStateConfig.from_env_vars()
+        assert restored.pool_name == "customer-a"
 
     def test_preload_models_none_round_trip(self, monkeypatch) -> None:
         """preload_models=None survives env round-trip."""
@@ -399,6 +449,7 @@ class TestPreloadModelsEnvRoundTrip:
         monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
         monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
         monkeypatch.delenv("SIE_DEVICE", raising=False)
+        monkeypatch.delenv("SIE_DEVICES", raising=False)
         monkeypatch.delenv("SIE_POOL", raising=False)
         monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
 
@@ -407,20 +458,7 @@ class TestPreloadModelsEnvRoundTrip:
         restored = AppStateConfig.from_env_vars()
         assert restored.preload_models is None
         assert restored.pool_name is None
-
-    def test_pool_name_env_round_trip(self, monkeypatch) -> None:
-        """SIE_POOL survives save_to_env_vars / from_env_vars cycle."""
-        monkeypatch.delenv("SIE_PRELOAD_MODELS", raising=False)
-        monkeypatch.delenv("SIE_MODELS_DIR", raising=False)
-        monkeypatch.delenv("SIE_MODEL_FILTER", raising=False)
-        monkeypatch.delenv("SIE_DEVICE", raising=False)
-        monkeypatch.delenv("SIE_POOL", raising=False)
-        monkeypatch.delenv("SIE_PINNED_MODELS", raising=False)
-
-        config = AppStateConfig(pool_name="customer-a")
-        config.save_to_env_vars()
-        restored = AppStateConfig.from_env_vars()
-        assert restored.pool_name == "customer-a"
+        assert restored.devices is None
 
     def test_pinned_models_env_round_trip(self, monkeypatch) -> None:
         """SIE_PINNED_MODELS='a,b' round-trips to pinned_models == ['a', 'b']."""

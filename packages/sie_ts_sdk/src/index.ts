@@ -21,6 +21,29 @@
 
 // Main client
 export { SIEClient } from "./client.js";
+export type {
+  JobsNamespace,
+  ConnectionsNamespace,
+  FilesNamespace,
+  BatchesNamespace,
+  FileUploadInput,
+} from "./client.js";
+
+// Jobs surface (client.jobs) — pure helpers + wire types
+export { buildJobBody, connectionName, TERMINAL_JOB_STATES } from "./jobs.js";
+export type {
+  JobState,
+  JobItem,
+  JobSource,
+  JobFieldMap,
+  SubmitJobOptions,
+  JobPreflight,
+  JobChunk,
+  JobSubmitResult,
+  JobStatus,
+  JobResultItem,
+  JobResults,
+} from "./jobs.js";
 
 // Version
 export { SDK_VERSION } from "./version.js";
@@ -57,9 +80,21 @@ export type {
   ClusterStatusMessage,
   StatusMessage,
   // Pool types
+  CreatePoolOptions,
   PoolSpec,
   PoolStatus,
   PoolInfo,
+  // Connections (client.connections)
+  Connection,
+  ConnectionCreated,
+  ConnectionRevoked,
+  // Files (client.files) — OpenAI-compatible file objects
+  File as SIEFile,
+  FileDeleted,
+  // Batches (client.batches) — OpenAI-compatible batch objects
+  Batch,
+  BatchList,
+  BatchRequestCounts,
   // Options
   DType,
   OutputType,
@@ -115,6 +150,7 @@ export {
   LoraLoadingError,
   ModelLoadingError,
   ModelLoadFailedError,
+  ResourceExhaustedError,
   SIEStreamError,
   InputTooLongError,
 } from "./errors.js";

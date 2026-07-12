@@ -61,6 +61,7 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         doc_prefix: str = "",
         query_expansion: bool = True,
         muvera_config: dict[str, Any] | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -80,6 +81,8 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 "virtual" query tokens. Default: True.
             muvera_config: MUVERA configuration dict with keys like num_repetitions,
                 num_simhash_projections, normalize. Used for FDE postprocessing.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored).
         """
         _ = kwargs
@@ -95,6 +98,7 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._doc_prefix = doc_prefix
         self._query_expansion = query_expansion
         self._muvera_config = muvera_config
+        self._revision = revision
 
         self._model: Any = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -125,9 +129,14 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             dtype,
         )
 
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
             trust_remote_code=True,
+            **shared_kwargs,
         )
 
         # Configure tokenizer for query expansion (pad queries with MASK tokens)
@@ -154,6 +163,7 @@ class ColBERTRotaryFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             torch_dtype=dtype,
             attn_implementation="eager",
             trust_remote_code=True,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()

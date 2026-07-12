@@ -60,6 +60,7 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_template: str | None = None,
         doc_template: str | None = None,
         trust_remote_code: bool = True,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -73,6 +74,8 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             query_template: Optional template for queries, e.g. "query: {text}".
             doc_template: Optional template for documents, e.g. "passage: {text}".
             trust_remote_code: Whether to trust remote code for model/tokenizer.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
@@ -84,6 +87,7 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
 
         self._model: Any = None
         self._tokenizer: PreTrainedTokenizerFast | None = None
@@ -115,9 +119,13 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # Load model with eager attention — we handle flash attention manually
@@ -125,7 +133,7 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation="eager",
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -261,12 +269,25 @@ class ModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Transfer 16-bit to CPU first, then upcast to float32 — halves GPU->CPU bandwidth
         dense_np = dense_vecs.cpu().float().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): this adapter owns tokenization (the registry
+        # preprocessor for flash adapters is a char-count ESTIMATOR) AND applies
+        # the model's query/doc template before tokenizing (e.g. modernbert-embed's
+        # ``search_query:``/``search_document:``), so the real post-template,
+        # post-truncation per-item token counts exist only here. ``seq_lengths``
+        # is the exact ``len(input_ids)`` the model processed; expose it through
+        # ``EncodeOutput.extra`` (the designated adapter-extension point) aligned
+        # 1:1 with ``items``. The encode pipeline forwards these for metering, in
+        # preference to the base ``count_input_tokens`` fallback which re-tokenizes
+        # raw ``item.text`` and would undercount by the template's tokens (a no-op
+        # for templateless models like gte-modernbert/granite). Mirrors ``bert_flash``.
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, seq_lengths_tensor: torch.Tensor, total_tokens: int) -> torch.Tensor:
         """Build position IDs for packed sequences (vectorized).

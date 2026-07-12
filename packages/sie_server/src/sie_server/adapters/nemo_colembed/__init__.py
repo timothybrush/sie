@@ -84,6 +84,7 @@ class NemoColEmbedAdapter(BaseAdapter):
         *,
         normalize: bool = True,
         compute_precision: ComputePrecision = "bfloat16",
+        revision: str | None = None,
         max_seq_length: int | None = None,
         batch_size: int = 8,
         muvera_config: dict[str, Any] | None = None,
@@ -95,6 +96,8 @@ class NemoColEmbedAdapter(BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path.
             normalize: Whether to L2-normalize embeddings.
             compute_precision: Compute precision for inference.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             max_seq_length: Ignored - model uses dynamic sequence length.
             batch_size: Batch size for encoding (passed to model methods).
             muvera_config: MUVERA configuration (passed to postprocessor, not used by adapter).
@@ -103,6 +106,7 @@ class NemoColEmbedAdapter(BaseAdapter):
         self._model_name_or_path = str(model_name_or_path)
         self._normalize = normalize
         self._compute_precision = compute_precision
+        self._revision = revision
         self._batch_size = batch_size
 
         self._model: Any = None
@@ -144,14 +148,19 @@ class NemoColEmbedAdapter(BaseAdapter):
         #    top (v1 ships its own modeling file that does this)
         #  - AttributeError: v1's config.to_dict() bug fires inside transformers'
         #    to_diff_dict() comparison when vision_config is absent
+        automodel_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "device_map": device,
+            "torch_dtype": dtype,
+            "attn_implementation": attn_impl,
+        }
+        if self._revision is not None:
+            automodel_kwargs["revision"] = self._revision
         loaded_via_v1_path = False
         try:
             self._model = AutoModel.from_pretrained(
                 self._model_name_or_path,
-                trust_remote_code=True,
-                device_map=device,
-                torch_dtype=dtype,
-                attn_implementation=attn_impl,
+                **automodel_kwargs,
             )
         except (KeyError, ValueError, ImportError, AttributeError) as automodel_err:
             logger.info(
@@ -226,6 +235,7 @@ class NemoColEmbedAdapter(BaseAdapter):
             "modeling_llama_nemoretrievercolembed.llama_NemoRetrieverColEmbed",
             self._model_name_or_path,
             trust_remote_code=True,
+            revision=self._revision,
         )
 
         # v1's config.to_dict() bug: assumes vision_config exists but it doesn't.
@@ -247,15 +257,20 @@ class NemoColEmbedAdapter(BaseAdapter):
             output["model_type"] = self.__class__.model_type
             return output
 
+        v1_kwargs: dict[str, Any] = {
+            "device_map": device,
+            "torch_dtype": dtype,
+            "attn_implementation": "flash_attention_2",
+        }
+        if self._revision is not None:
+            v1_kwargs["revision"] = self._revision
         with _V1_TO_DICT_PATCH_LOCK:
             original_to_dict = config_class.to_dict
             config_class.to_dict = patched_to_dict
             try:
                 return model_class.from_pretrained(  # ty:ignore[unresolved-attribute]
                     self._model_name_or_path,
-                    device_map=device,
-                    torch_dtype=dtype,
-                    attn_implementation="flash_attention_2",
+                    **v1_kwargs,
                 )
             finally:
                 config_class.to_dict = original_to_dict

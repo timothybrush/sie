@@ -89,9 +89,17 @@ class ScoreHandler(OperationHandler[ScoreOutput]):
         Returns:
             Single-item ScoreOutput.
         """
+        # Unit-meter counts (``input_token_counts``) are positional like
+        # ``scores``, so they must be sliced with the pair — dropping them
+        # here would strip the meter's real per-pair token count whenever
+        # the worker fuses score requests into one GPU batch (mirrors
+        # EncodeHandler.slice_output's handling of ``input_token_counts``).
+        counts = output.input_token_counts
+        sliced_counts = [counts[index]] if counts is not None and 0 <= index < len(counts) else None
         return ScoreOutput(
             scores=output.scores[index : index + 1],
             batch_size=1,
+            input_token_counts=sliced_counts,
         )
 
     def assemble_output(
@@ -112,4 +120,20 @@ class ScoreHandler(OperationHandler[ScoreOutput]):
             return ScoreOutput(scores=np.array([], dtype=np.float32), batch_size=0)
 
         scores = np.concatenate([partials[i].scores for i in range(batch_size)])
-        return ScoreOutput(scores=scores, batch_size=batch_size)
+
+        # Reassemble per-pair unit counts (see slice_output). All-or-nothing:
+        # a partial without a count means the meter cannot attribute the work
+        # item exactly, so no counts are surfaced (metering then falls back to
+        # its reserve estimate rather than under-counting).
+        assembled_counts: list[int] = []
+        for i in range(batch_size):
+            partial_counts = partials[i].input_token_counts
+            if not (isinstance(partial_counts, list) and len(partial_counts) == 1):
+                assembled_counts = []
+                break
+            assembled_counts.append(partial_counts[0])
+        return ScoreOutput(
+            scores=scores,
+            batch_size=batch_size,
+            input_token_counts=assembled_counts or None,
+        )

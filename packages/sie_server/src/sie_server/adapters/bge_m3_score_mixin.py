@@ -152,7 +152,32 @@ class BGEM3ScoreMixin:
             [self._compute_pair_score(queries_out, i, docs_out, i, score_mode, weights) for i in range(len(queries))],
             dtype=np.float32,
         )
-        return ScoreOutput(scores=scores)
+        return ScoreOutput(scores=scores, input_token_counts=self._pair_input_token_counts(queries_out, docs_out))
+
+    @staticmethod
+    def _pair_input_token_counts(queries_out: EncodeOutput, docs_out: EncodeOutput) -> list[int] | None:
+        """Real per-pair input-token counts for the unit meter (§7.3).
+
+        BGE-M3 scores are bi-encoder: each pair's input is the query encoded
+        plus the doc encoded, so the pair's real token count is the sum of the
+        two per-item encode counts. ``encode()`` already exposes those counts
+        via ``EncodeOutput.extra["input_token_counts"]`` (the same authoritative
+        seq lengths P3.5 records for /v1/encode). Returns ``None`` — leaving the
+        meter on its reserve estimate — unless BOTH encode outputs carry
+        well-formed, aligned counts, so a partial/estimated count can never
+        masquerade as an authoritative one.
+        """
+        q_counts = queries_out.extra.get("input_token_counts") if queries_out.extra else None
+        d_counts = docs_out.extra.get("input_token_counts") if docs_out.extra else None
+        if not (isinstance(q_counts, list) and isinstance(d_counts, list)):
+            return None
+        if len(q_counts) != len(d_counts):
+            return None
+        q_ints = [c for c in q_counts if isinstance(c, int) and not isinstance(c, bool)]
+        d_ints = [c for c in d_counts if isinstance(c, int) and not isinstance(c, bool)]
+        if len(q_ints) != len(q_counts) or len(d_ints) != len(d_counts):
+            return None
+        return [q + d for q, d in zip(q_ints, d_ints, strict=True)]
 
     # ------------------------------------------------------------ option resolve
 

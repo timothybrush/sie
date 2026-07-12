@@ -9,7 +9,7 @@ use crate::middleware::audit::AuditLayer;
 use crate::middleware::auth::AuthLayer;
 use crate::middleware::metrics::MetricsLayer;
 use crate::openapi;
-use crate::queue::publisher::WorkPublisher;
+use crate::queue::dispatch::WorkDispatcher;
 use crate::state::config_epoch::ConfigEpoch;
 use crate::state::demand_tracker::DemandTracker;
 use crate::state::model_registry::ModelRegistry;
@@ -21,7 +21,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub model_registry: Arc<ModelRegistry>,
     pub pool_manager: Arc<PoolManager>,
-    pub work_publisher: Option<Arc<WorkPublisher>>,
+    pub work_publisher: Option<Arc<dyn WorkDispatcher>>,
     pub demand_tracker: Arc<DemandTracker>,
     /// Monotonic view of the furthest-known control-plane epoch. Written by
     /// bootstrap, the NATS delta handler, and the epoch poller; read by
@@ -127,6 +127,9 @@ pub(crate) async fn metrics_handler(
             bundle: w.bundle.clone(),
             pool_name: w.pool_name.clone(),
             queue_depth: w.queue_depth,
+            ready_gpu_slots: w.ready_gpu_slots,
+            pending_cost: w.pending_cost,
+            inflight_batches: w.inflight_batches,
             memory_used_bytes: w.memory_used_bytes,
             healthy: w.healthy(),
         })

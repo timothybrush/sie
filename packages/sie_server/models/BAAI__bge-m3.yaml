@@ -1,5 +1,6 @@
 sie_id: BAAI/bge-m3
 hf_id: BAAI/bge-m3
+hf_revision: 5617a9f61b028005a4858fdac845db406aefb181
 inputs:
   text: true
   image: false

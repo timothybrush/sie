@@ -137,6 +137,13 @@ class WorkResult(_WorkResultRequired, total=False):
         tokenization_ms: Time spent tokenizing the input (ms).
         postprocessing_ms: Time spent on output post-processing (ms).
         payload_fetch_ms: Time spent fetching from payload store, 0 if inline (ms).
+
+        units: Authoritative billable-unit counts emitted by the engine
+            (``{"input_tokens": int, "pages": int, "images": int}``, every
+            key optional). ``input_tokens`` is the real tokenizer count
+            taken post-tokenization — never a bytes/4-style estimate.
+            Optional: absent on results from workers that don't emit it,
+            so the wire shape stays backward-compatible.
     """
 
     result_msgpack: bytes | None
@@ -152,6 +159,10 @@ class WorkResult(_WorkResultRequired, total=False):
     tokenization_ms: float
     postprocessing_ms: float
     payload_fetch_ms: float
+
+    # Authoritative unit counts for metering (see docstring). Optional —
+    # older workers omit it and decoders ignore unknown keys.
+    units: dict[str, int] | None
 
 
 # -- NATS subject helpers ---------------------------------------------------

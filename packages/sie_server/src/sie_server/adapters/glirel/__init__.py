@@ -65,6 +65,7 @@ class GLiRELAdapter(BaseAdapter):
         *,
         threshold: float = 0.3,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader
     ) -> None:
         """Initialize the adapter.
@@ -73,12 +74,15 @@ class GLiRELAdapter(BaseAdapter):
             model_name_or_path: HuggingFace model ID or local path to GLiREL model.
             threshold: Minimum confidence score for relation extraction (0-1).
             compute_precision: Compute precision for inference.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
         self._model_name_or_path = str(model_name_or_path)
         self._threshold = threshold
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: Any = None  # GLiREL model type
         self._device: str | None = None
@@ -95,7 +99,10 @@ class GLiRELAdapter(BaseAdapter):
         self._device = device
 
         # Load model
-        self._model = GLiREL.from_pretrained(self._model_name_or_path)
+        load_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
+        self._model = GLiREL.from_pretrained(self._model_name_or_path, **load_kwargs)
 
         # Move to device
         self._model = self._model.to(device)

@@ -414,8 +414,12 @@ describe("Capacity info parsing", () => {
         {
           url: "http://worker1:8080",
           gpu: "l4",
+          gpu_count: 4,
+          ready_gpu_slots: 3,
           healthy: true,
           queue_depth: 5,
+          pending_cost: 128,
+          inflight_batches: 2,
           loaded_models: ["bge-m3", "e5-large"],
         },
         {
@@ -439,8 +443,12 @@ describe("Capacity info parsing", () => {
     expect(result.workers).toHaveLength(2);
     expect(result.workers[0]?.url).toBe("http://worker1:8080");
     expect(result.workers[0]?.gpu).toBe("l4");
+    expect(result.workers[0]?.gpuCount).toBe(4);
+    expect(result.workers[0]?.readyGpuSlots).toBe(3);
     expect(result.workers[0]?.healthy).toBe(true);
     expect(result.workers[0]?.queueDepth).toBe(5);
+    expect(result.workers[0]?.pendingCost).toBe(128);
+    expect(result.workers[0]?.inflightBatches).toBe(2);
     expect(result.workers[0]?.loadedModels).toEqual(["bge-m3", "e5-large"]);
   });
 

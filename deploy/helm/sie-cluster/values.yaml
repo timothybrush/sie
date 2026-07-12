@@ -372,13 +372,6 @@ workers:
         # forward path; raise during GPU tuning to test whether Candle can
         # safely overlap same-model work without loading duplicate weights.
         maxConcurrentForwards: 1
-        # -- Candle-native workers run the model directly from the
-        # worker-sidecar IPC batch. Keep the default conservative for
-        # BGE-M3: larger coalesce/batch limits can form ~16k-token
-        # groups on L4 and hurt p99 without improving throughput.
-        batcher:
-          coalesceMs: 3
-          maxBatchRequests: 12
 
     # -- Platform variant for worker images (e.g. "cuda12", "cpu")
     platform: cuda12
@@ -486,7 +479,7 @@ workers:
     extraEnv: []
 
     # -- Shared model cold-start/ready timeout in seconds. The chart renders
-    # this into both containers as SIE_MODEL_READY_TIMEOUT_S: the Python worker
+    # this into both containers as SIE_MODEL_READY_TIMEOUT_S: the adapter worker
     # uses it as an SGLang startup-health timeout fallback, and the Rust
     # worker-sidecar uses it for EnsureModelReady IPC calls. Keep this >= any
     # SGLang profile adapter_options.loadtime.startup_timeout_s. Helm renders
@@ -556,12 +549,12 @@ workers:
       # -- Per-model-group batch concurrency cap for the dispatcher.
       # Leave empty to use the binary default (4).
       maxConcurrentBatches: ""
-      # -- Size of the sidecar-to-adapter IPC connection pool. Each slot is an
-      # independent Unix-domain socket; concurrent batches check out a
-      # slot, perform their round-trip, and return it to the pool.
+      # -- Size of the sidecar-to-adapter IPC connection pool per child
+      # socket. Concurrent batches check out a connection slot, perform
+      # their round-trip, and return it to the pool.
       # Should be >= maxConcurrentBatches so the IPC layer is never
       # the binding constraint. Leave empty to default to
-      # SIE_MAX_CONCURRENT_BATCHES (or its fallback of 4).
+      # SIE_MAX_CONCURRENT_BATCHES (or the binary default of 4).
       ipcPoolSize: ""
       # -- IPC heartbeat cadence. Must stay comfortably below Python's
       # SIE_IPC_STALE_AFTER_MS (default 10000); architecture guide
@@ -632,7 +625,7 @@ workers:
       pipelineDepth: 2
       # -- Rust scheduler batcher tuning for queue-mode workers. These
       # defaults keep sidecar-owned batch formation responsive while
-      # leaving the Python adapter process to execute each IPC frame as
+      # leaving the adapter worker process to execute each IPC frame as
       # one forward pass.
       batcher:
         # -- Coalesce window ceiling in ms. Lower = more responsive
@@ -643,10 +636,15 @@ workers:
         # headroom for short arrival bursts without unbounded
         # tail-batch growth.
         maxBatchRequests: 12
-      # -- FetchExpiryController tuning (the Rust sidecar pull-loop
-      # batch-coalesce quantum). The narrow 2/15/50 window keeps
-      # queue-path coalescing bounded while still allowing short bursts
-      # to batch.
+        # -- Flush the first item after an idle gap immediately.
+        # Default true preserves low-load p50. Disable selectively
+        # for passthrough GPU runtimes when multi-worker fanout
+        # under-fills local batches.
+        idleBypassEnabled: true
+      # -- FetchExpiryController tuning (the client-side batch-coalesce
+      # quantum that drives the NATS pull loop). The narrow 2/15/50
+      # window keeps queue-path coalescing bounded while still allowing
+      # short bursts to batch.
       adaptive:
         # -- Quantum floor in ms (`SIE_ADAPTIVE_MIN_QUANTUM_MS`).
         minQuantumMs: 2
@@ -667,7 +665,7 @@ workers:
       # liveness-budget validation stay in sync.
       extraEnv: []
       # -- Resource requests/limits for the sidecar. Conservative
-      # defaults; the heavy lifting still happens in the Python pod.
+      # defaults; the heavy lifting still happens in the adapter worker.
       resources:
         requests:
           cpu: "500m"
@@ -692,6 +690,12 @@ workers:
   #                    chart for image/label selection, not propagated as a
   #                    worker process env var.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
+  #                    Values >1 render one adapter child container per GPU
+  #                    plus one sidecar routing across child IPC sockets.
+  #   sidecar.emulatedChildCount:
+  #                    int. CPU-only local/dev fanout for exercising the same
+  #                    sidecar child routing without GPU resources. GPU pools
+  #                    must use gpu.count instead.
   #   gpu.product:     string. nvidia.com/gpu.product node-label match.
   #   gpuType:         GPU/node label used for node selection and display.
   #   machineProfile:  Optional queue-lane label used by KEDA scalers,
@@ -875,6 +879,10 @@ workers:
       gpu:
         count: 0
         product: ""
+      sidecar:
+        # CPU-only local/dev hook for rendering N worker children without
+        # GPU resources. Production GPU fanout is driven by gpu.count.
+        emulatedChildCount: 0
       resources:
         requests:
           cpu: "2"
@@ -913,7 +921,11 @@ autoscaling:
   # -- Scale-down stabilization window (seconds)
   scaleDownStabilization: 300
 
-  # -- Queue depth threshold per pod
+  # -- Queue depth threshold per worker replica.
+  # KEDA scales worker StatefulSet replicas, not adapter processes or containers
+  # inside a running pod. Multi-GPU workers therefore change capacity
+  # per replica; this threshold is evaluated against the gateway's aggregate
+  # worker queue-depth metric for the lane.
   queueDepthThreshold: 10
 
   # -- Queue depth to activate from zero

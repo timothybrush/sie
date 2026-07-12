@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::backend::AdapterWorkerPool;
 use crate::config::WorkerConfig;
-use crate::ipc_client::IpcClient;
 use crate::shutdown::Shutdown;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,12 +38,17 @@ struct PinnedReconciler {
     api_key: Option<String>,
     poll_interval: Duration,
     http: reqwest::Client,
-    ipc: Arc<IpcClient>,
+    worker_pool: Arc<AdapterWorkerPool>,
     /// Last set pushed to the worker (sorted), or `None` before the first
     /// successful push. Starts `None` so the first authoritative fetch always
     /// pushes — even an empty set — replacing any deploy-time `SIE_PINNED_MODELS`
     /// bootstrap baseline.
     last_pushed: Option<Vec<String>>,
+    /// Pool-side child-placement revision observed on the last successful push.
+    /// The pinned set can stay identical while a pinned model moves to a new
+    /// child after a child failure; in that case the per-child pin assignment must
+    /// be pushed again.
+    last_pushed_assignment_revision: u64,
     /// Whether the previous fetch failed, so we warn once on the transition into
     /// a failing state (a wedged gateway URL / api key) instead of only emitting
     /// debug logs that hide a never-converging reconciler.
@@ -53,7 +58,7 @@ struct PinnedReconciler {
 impl PinnedReconciler {
     fn from_worker_config(
         config: &WorkerConfig,
-        ipc: Arc<IpcClient>,
+        worker_pool: Arc<AdapterWorkerPool>,
     ) -> anyhow::Result<Option<Self>> {
         let Some(gateway_url) = config.gateway_url.as_deref().map(str::trim) else {
             debug!("pinned-reconciler: disabled because SIE_GATEWAY_URL is unset");
@@ -74,8 +79,9 @@ impl PinnedReconciler {
             // own field only if the cadences ever need to diverge.
             poll_interval: Duration::from_millis(config.pool_admission_check_interval_ms),
             http,
-            ipc,
+            worker_pool,
             last_pushed: None,
+            last_pushed_assignment_revision: 0,
             last_fetch_failed: false,
         }))
     }
@@ -134,12 +140,25 @@ impl PinnedReconciler {
                 );
             }
         }
-        if self.last_pushed.as_ref() == Some(&current) {
+        let assignment_revision = self.worker_pool.pinned_assignment_revision();
+        if self.last_pushed.as_ref() == Some(&current)
+            && self.last_pushed_assignment_revision == assignment_revision
+        {
             return;
         }
 
-        match self.ipc.set_pinned_models(current.clone()).await {
+        match self.worker_pool.set_pinned_models(current.clone()).await {
             Ok(resp) => {
+                if !resp.applied {
+                    warn!(
+                        pool = %self.pool_name,
+                        worker_id = %self.worker_id,
+                        count = current.len(),
+                        pinned_count = resp.pinned_count,
+                        "pinned-reconciler: worker pool rejected pinned set; will retry"
+                    );
+                    return;
+                }
                 info!(
                     pool = %self.pool_name,
                     worker_id = %self.worker_id,
@@ -148,6 +167,7 @@ impl PinnedReconciler {
                     "pinned-reconciler: pushed pinned set to worker"
                 );
                 self.last_pushed = Some(current);
+                self.last_pushed_assignment_revision = assignment_revision;
             }
             Err(error) => {
                 // Leave `last_pushed` unchanged so the next tick retries.
@@ -268,10 +288,10 @@ fn parse_pinned_models(pool: &Value) -> Vec<String> {
 /// where pinned models come only from the `SIE_PINNED_MODELS` env baseline.
 pub fn spawn(
     config: &WorkerConfig,
-    ipc: Arc<IpcClient>,
+    worker_pool: Arc<AdapterWorkerPool>,
     shutdown: Arc<Shutdown>,
 ) -> anyhow::Result<Option<JoinHandle<()>>> {
-    let Some(reconciler) = PinnedReconciler::from_worker_config(config, ipc)? else {
+    let Some(reconciler) = PinnedReconciler::from_worker_config(config, worker_pool)? else {
         return Ok(None);
     };
     Ok(Some(tokio::spawn(async move {

@@ -49,6 +49,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         normalize: bool = True,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision = "bfloat16",
+        revision: str | None = None,
         pooling: PoolingStrategy = "mean",
         query_template: str | None = None,
         doc_template: str | None = None,
@@ -64,6 +65,8 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             normalize: Whether to L2-normalize dense embeddings.
             max_seq_length: Maximum sequence length.
             compute_precision: Compute precision (bfloat16 recommended for Qwen2).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             pooling: Pooling strategy - "cls", "mean", or "last".
             query_template: Optional template for queries, e.g. "query: {text}".
             doc_template: Optional template for documents, e.g. "passage: {text}".
@@ -82,6 +85,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
         self._pooling = pooling
         self._query_template = query_template
         self._doc_template = doc_template
@@ -129,10 +133,14 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._pooling,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path, **shared_kwargs)
 
         # Load config first to disable optional xformers features
-        config = AutoConfig.from_pretrained(self._model_name_or_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(self._model_name_or_path, trust_remote_code=True, **shared_kwargs)
         if hasattr(config, "use_memory_efficient_attention"):
             config.use_memory_efficient_attention = False
         if hasattr(config, "unpad_inputs"):
@@ -145,6 +153,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             torch_dtype=dtype,
             attn_implementation="eager",
             trust_remote_code=True,
+            **shared_kwargs,
         )
 
         # Disable KV cache for models using the legacy transformers cache API
@@ -175,9 +184,17 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import EntryNotFoundError
 
+        # Dense projection artifacts live in the SAME base repo, so the pinned
+        # revision applies to these downloads too (but not to the local
+        # json/torch/safetensors reads of the already-downloaded files).
+        shared_kwargs: dict[str, Any] = {}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         config_file = hf_hub_download(
             self._model_name_or_path,
             f"{self._dense_projection_path}/config.json",
+            **shared_kwargs,
         )
 
         with open(config_file) as f:
@@ -193,12 +210,14 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             weights_path = hf_hub_download(
                 self._model_name_or_path,
                 f"{self._dense_projection_path}/model.safetensors",
+                **shared_kwargs,
             )
             state_dict = safetensors.torch.load_file(weights_path)
         except (EntryNotFoundError, OSError):
             weights_path = hf_hub_download(
                 self._model_name_or_path,
                 f"{self._dense_projection_path}/pytorch_model.bin",
+                **shared_kwargs,
             )
             state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
 
@@ -307,12 +326,22 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Convert to numpy and return EncodeOutput
         dense_np = dense_vecs.float().cpu().numpy()
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_np,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam: this adapter owns tokenization (the registry-level
+        # preprocessor for flash adapters is a char-count ESTIMATOR) and applies
+        # ``extract_texts`` templating/instruction before tokenizing, so the real
+        # per-item token counts — including those template/instruction tokens —
+        # exist only here. Expose them through ``EncodeOutput.extra`` — the
+        # designated adapter-extension point — aligned 1:1 with ``items``; the
+        # encode pipeline forwards them to the result path for metering (never
+        # estimates from raw ``item.text``).
+        output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
+        return output
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences (each restarts at 0)."""

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.6.17
+
+- chore(main): release 0.6.17
+- docs(gateway): clarify multi-gpu sidecar routing
+- fix(sidecar): refresh ready slots on cancel fanout failure
+- fix(sidecar): release cancelled scheduler pressure
+- fix(sidecar): wire local ingest through adapter pool
+- fix(req6): align candle chart after rebase
+- fix(server): keep ipc ping alive on gpu health errors
+- refactor(sidecar): name adapter worker pool generically
+- feat(worker): support multi-gpu sidecar children
+- fix(req6): harden multi-gpu worker review fixes
+- fix(req6): harden multi-gpu worker routing
+- fix(req6): resolve main rebase fallout
+- fix(req6): wire pressure-aware multi-gpu routing
+- test(tilt): emulate multi-child sidecar on cpu
+- feat(worker): route by child queue pressure
+- feat(worker): route multi-gpu sidecar children
+- docs: state req6 multi-gpu target directly
+- docs: clarify multi-gpu worker target topology
+- feat(server): support multi-gpu worker placement
+- feat(cloud): CLI WorkOS device-flow auth — retire the shared-token shortcut for customer commands (#1697)
+- chore(deps): bump the uv group across 3 directories with 12 updates
+- feat(oss): OSS amendments from the SIE Cloud build — engine, SDKs, gateway/sidecar seams (#1696)
+- fix(sidecar): bound queue admission through scheduler completion
+- chore(models): correct gte-Qwen2-1.5B compute_precision label to fp32 reality
+- fix(candle): address rope review feedback
+- fix(candle): repair rebase conflict resolution
+- fix(candle): remove rust worker forward coalescing
+- fix(sidecar): bulk enqueue scheduler items
+- fix(sidecar): expose scheduler flush reasons
+- feat(candle): add GTE RoPE embedding kernel
+- test(sdk): golden wire-contract fixture for ModelState + fix TS drift
+- refactor(server): move eviction-candidate decision into residency policy
+- refactor(gateway): unify worker-error retry semantics into one classifier
+- refactor(gateway): collapse header/pool/profile resolution into one seam
+
 ## v0.6.16
 
 - chore(main): release 0.6.16

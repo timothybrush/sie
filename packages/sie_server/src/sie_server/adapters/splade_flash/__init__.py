@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sie_server.adapters._flash_base import FlashBaseAdapter
+from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.adapters._utils import extract_texts, validate_output_types
@@ -72,6 +73,7 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_template: str | None = None,
         doc_template: str | None = None,
         trust_remote_code: bool = False,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         _ = kwargs
@@ -81,6 +83,7 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
 
         self._model: Any = None  # AutoModelForMaskedLM
         self._tokenizer: PreTrainedTokenizerBase | None = None
@@ -108,9 +111,13 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         # Use float32 on CPU/MPS for correctness; configured precision on CUDA
         dtype = self._resolve_dtype() if device.startswith("cuda") else torch.float32
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         # Load with eager attention — the flash path runs its own attention;
@@ -119,7 +126,7 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             self._model_name_or_path,
             torch_dtype=dtype,
             attn_implementation="eager",
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -128,11 +135,22 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._vocab_size = self._model.config.vocab_size
         self._use_flash = device.startswith("cuda") and _has_flash_attn()
 
-        # Disable packed flash path for RoBERTa until position-id parity is
-        # verified — fall back to native model forward which handles this
-        # correctly via its own embeddings module.
-        if self._arch == "roberta" and self._use_flash:
-            logger.warning("Disabling packed flash path for RoBERTa until position-id parity is verified")
+        # The packed flash path adds only *absolute* learned position embeddings
+        # (same assumption as bert_flash / xlm_roberta_flash). Relative/rotary
+        # position types inject a position-dependent bias *inside* attention that
+        # the varlen kernel does not reproduce, so those stay on the native
+        # forward. RoBERTa-family absolute-position SPLADE models (e.g.
+        # granite-embedding-30m-sparse) run packed: their only difference from
+        # BERT is the padding_idx+1 position offset, handled in
+        # ``_build_position_ids`` via the shared varlen packer (parity verified
+        # against the native padded path — see test_splade_packed_parity).
+        pos_emb_type = getattr(self._model.config, "position_embedding_type", "absolute")
+        if self._use_flash and pos_emb_type != "absolute":
+            logger.warning(
+                "Disabling packed flash path: position_embedding_type=%r is not 'absolute' "
+                "(the varlen path only supports absolute position embeddings)",
+                pos_emb_type,
+            )
             self._use_flash = False
 
         logger.info(
@@ -297,23 +315,19 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     # ------------------------------------------------------------------
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        """Build position IDs for packed sequences.
+        """Build position IDs for packed sequences, restarting per sequence.
 
-        BERT uses 0-based positions. RoBERTa offsets by padding_idx + 1.
+        BERT/DistilBERT use 0-based positions; RoBERTa offsets each sequence by
+        ``padding_idx + 1`` — bit-identical to HF
+        ``create_position_ids_from_input_ids`` for unpadded input. Delegates to
+        the shared varlen packer (``_flash_pack.build_position_ids``) that the
+        other RoBERTa-family flash adapter (``xlm_roberta_flash``) already uses,
+        so all packed encoders share one deep implementation.
         """
-        total_tokens = int(cu_seqlens[-1].item())
-        positions = torch.arange(total_tokens, device=self._device, dtype=torch.long)
-        offsets = torch.repeat_interleave(
-            cu_seqlens[:-1],
-            cu_seqlens[1:] - cu_seqlens[:-1],
-        )
-        position_ids = positions - offsets
-
+        offset = 0
         if self._arch == "roberta":
-            padding_idx = self._get_base_model().embeddings.padding_idx
-            position_ids = position_ids + padding_idx + 1
-
-        return position_ids
+            offset = self._get_base_model().embeddings.padding_idx + 1
+        return build_position_ids(cu_seqlens, offset=offset)
 
     def _get_base_model(self) -> Any:
         if self._arch == "bert":
@@ -475,7 +489,7 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             ("query_token_weights.txt", self._parse_query_token_weights),
             ("idf.json", self._parse_idf_json),
         ):
-            resolved = self._resolve_repo_file(Path(self._model_name_or_path), filename)
+            resolved = self._resolve_repo_file(Path(self._model_name_or_path), filename, self._revision)
             if resolved is None:
                 continue
             idf = loader(resolved)
@@ -501,19 +515,19 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         return None
 
     @staticmethod
-    def _resolve_repo_file(model_path: Path, filename: str) -> str | None:
+    def _resolve_repo_file(model_path: Path, filename: str, revision: str | None = None) -> str | None:
         if model_path.exists() and model_path.is_dir():
             candidate = model_path / filename
             return str(candidate) if candidate.exists() else None
         try:
             from huggingface_hub import try_to_load_from_cache
 
-            cached = try_to_load_from_cache(repo_id=str(model_path), filename=filename)
+            cached = try_to_load_from_cache(repo_id=str(model_path), filename=filename, revision=revision)
             if isinstance(cached, str):
                 return cached
             from huggingface_hub import hf_hub_download
 
-            downloaded = hf_hub_download(repo_id=str(model_path), filename=filename)
+            downloaded = hf_hub_download(repo_id=str(model_path), filename=filename, revision=revision)
             return downloaded if isinstance(downloaded, str) else None
         except Exception:  # noqa: BLE001
             return None

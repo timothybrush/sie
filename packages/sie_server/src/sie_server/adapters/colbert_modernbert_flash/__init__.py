@@ -76,6 +76,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_prefix: str = "",
         doc_prefix: str = "",
         muvera_config: dict[str, Any] | None = None,
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -92,10 +93,14 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             doc_prefix: Prefix to prepend to documents.
             muvera_config: MUVERA configuration dict with keys like num_repetitions,
                 num_simhash_projections, normalize. Used for FDE postprocessing.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading the tokenizer, model, and Dense-chain artifacts.
+                Forwarded to ``from_pretrained(..., revision=...)``.
             **kwargs: Additional arguments (ignored).
         """
         _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
+        self._revision = revision
         self._token_dim = token_dim
         self._multivector_dim = token_dim
         self._normalize = normalize
@@ -144,6 +149,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             torch_dtype=dtype,
             attn_implementation="eager",
             trust_remote_code=True,
+            revision=self._revision,
         )
         self._model.to(device)
         self._model.eval()
@@ -154,6 +160,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             token_dim=self._token_dim,
             device=self._device,
             dtype=dtype,
+            revision=self._revision,
         )
         if self._dense_chain is None:
             logger.warning(
@@ -185,6 +192,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             return AutoTokenizer.from_pretrained(
                 self._model_name_or_path,
                 trust_remote_code=True,
+                revision=self._revision,
             )
         except (ValueError, KeyError) as exc:
             logger.warning(
@@ -193,7 +201,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 self._model_name_or_path,
                 exc,
             )
-            return PreTrainedTokenizerFast.from_pretrained(self._model_name_or_path)
+            return PreTrainedTokenizerFast.from_pretrained(self._model_name_or_path, revision=self._revision)
 
     def _resolve_dtype(self) -> torch.dtype:
         """Resolve compute dtype (default: bfloat16)."""

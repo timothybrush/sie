@@ -3,10 +3,11 @@
  *
  * Both {@link SIEClient.generate} and {@link SIEClient.chatCompletions}
  * receive identical pre-execution capacity signals from the gateway —
- * `503` with a known error code (`PROVISIONING` or `MODEL_LOADING`).
- * They both need to retry those SAFE pre-execution signals while
- * honouring a caller-supplied `waitForCapacity` flag plus a
- * `provisionTimeout` budget.
+ * `503` with a known error code (`PROVISIONING`, `MODEL_LOADING` or
+ * `RESOURCE_EXHAUSTED`). They both need to retry those SAFE
+ * pre-execution signals while honouring a caller-supplied
+ * `waitForCapacity` flag plus a `provisionTimeout` budget. A `504` is
+ * post-publish and therefore terminal here (non-idempotent generation).
  *
  * This helper centralises that loop. Callers supply a `performFetch`
  * callback that issues a fresh `fetch` per attempt (the request must be
@@ -19,15 +20,24 @@
  * `consumeSseStream` in `client.ts`).
  */
 
-import { ModelLoadingError, ProvisioningError, RequestError } from "../errors.js";
+import {
+  ModelLoadingError,
+  ProvisioningError,
+  RequestError,
+  ResourceExhaustedError,
+  ServerError,
+} from "../errors.js";
 import {
   DEFAULT_RETRY_DELAY,
+  HTTP_GATEWAY_TIMEOUT,
   MODEL_LOADING_DEFAULT_DELAY,
   MODEL_LOADING_ERROR_CODE,
   PROVISIONING_ERROR_CODE,
+  RESOURCE_EXHAUSTED_ERROR_CODE,
+  RESOURCE_EXHAUSTED_MAX_RETRIES,
 } from "./constants.js";
 import { getErrorCode, getRetryAfter, handleError, throwIfModelLoadFailed } from "./parsing.js";
-import { applyRetryJitter } from "./retry.js";
+import { applyRetryJitter, computeOomBackoff } from "./retry.js";
 
 /** Options controlling the provisioning retry loop. */
 export interface ProvisioningOptions {
@@ -55,6 +65,45 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Budget check + backoff for one `503 RESOURCE_EXHAUSTED` retry.
+ *
+ * Mirrors the Python SDK's `_handle_oom_retry`: throws
+ * {@link ResourceExhaustedError} when the retry budget is exhausted
+ * (`oomRetries >= maxOomRetries`), the provision budget has elapsed, or
+ * the next backoff would consume the remaining budget without leaving
+ * room for the retried request to run (surfacing the *root cause* now
+ * instead of a later "provisioning timeout"). Otherwise returns the
+ * delay (ms) to sleep before the next attempt.
+ *
+ * Distinct from MODEL_LOADING: the model is already resident, the
+ * request just lost the race for compute resources. This is a SAFE
+ * pre-execution signal (the worker rejected the request before running
+ * it), so on the buffered paths it is retried regardless of
+ * `waitForCapacity`, matching the Python SDK.
+ *
+ * @internal
+ */
+export function nextOomRetryDelay(opts: {
+  retryAfter: number | undefined;
+  oomRetries: number;
+  maxOomRetries: number;
+  elapsedMs: number;
+  provisionTimeoutMs: number;
+  model: string;
+}): number {
+  const { retryAfter, oomRetries, maxOomRetries, elapsedMs, provisionTimeoutMs, model } = opts;
+  const message = `Server resource exhausted after ${oomRetries} retry attempt(s) for model '${model}'`;
+  if (oomRetries >= maxOomRetries || elapsedMs >= provisionTimeoutMs) {
+    throw new ResourceExhaustedError(message, { model, retries: oomRetries });
+  }
+  const delay = computeOomBackoff(retryAfter, oomRetries);
+  if (delay >= provisionTimeoutMs - elapsedMs) {
+    throw new ResourceExhaustedError(message, { model, retries: oomRetries });
+  }
+  return delay;
+}
+
+/**
  * Wrap a non-streaming POST attempt in the shared provisioning retry loop.
  *
  * The `performFetch` callback MUST re-issue the request from scratch on
@@ -73,6 +122,7 @@ export async function withProvisioningRetry(
   opts: ProvisioningOptions,
 ): Promise<Response> {
   const startTime = Date.now();
+  let oomRetries = 0;
 
   while (true) {
     const response = await performFetch();
@@ -112,6 +162,37 @@ export async function withProvisioningRetry(
         await sleep(Math.min(delay, opts.provisionTimeoutMs - elapsed));
         continue;
       }
+      if (errorCode === RESOURCE_EXHAUSTED_ERROR_CODE) {
+        // Retried regardless of `waitForCapacity` (bounded budget), matching
+        // the Python SDK: the signal fires before any generation starts.
+        const delay = nextOomRetryDelay({
+          retryAfter: getRetryAfter(response),
+          oomRetries,
+          maxOomRetries: RESOURCE_EXHAUSTED_MAX_RETRIES,
+          elapsedMs: Date.now() - startTime,
+          provisionTimeoutMs: opts.provisionTimeoutMs,
+          model: opts.model,
+        });
+        oomRetries += 1;
+        await sleep(delay);
+        continue;
+      }
+    }
+
+    // Do NOT retry 504. A 504 GATEWAY_TIMEOUT is a *post-publish* timeout:
+    // the work item is already on the queue and a worker may be — or have
+    // finished — generating. Generation is non-idempotent and carries no
+    // dedup key, so retrying could issue a SECOND billable generation.
+    // The pre-execution 503 signals above remain retryable because those
+    // fire before any generation can have started (Python SDK parity).
+    if (response.status === HTTP_GATEWAY_TIMEOUT) {
+      throw new ServerError(
+        "Gateway timed out (504) after the request was published to the queue; " +
+          "a worker may already be generating. Not retried because generation is " +
+          "non-idempotent (retrying could double-bill). Re-issue manually if needed.",
+        await getErrorCode(response.clone()),
+        HTTP_GATEWAY_TIMEOUT,
+      );
     }
 
     if (!response.ok) {

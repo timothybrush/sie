@@ -13,8 +13,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -83,6 +83,16 @@ pub struct MetricsRegistry {
     pub ipc_requests_total: IntCounter,
     pub ipc_failures_total: IntCounter,
     pub inflight_batches: IntGauge,
+    pub worker_gpu_slots_total: IntGauge,
+    pub worker_gpu_slots_ready: IntGauge,
+    pub worker_queue_depth: IntGauge,
+    pub worker_pending_cost: IntGauge,
+    pub worker_saturated: IntGauge,
+    pub worker_child_ready: IntGaugeVec,
+    pub worker_child_models: IntGaugeVec,
+    pub worker_child_queue_depth: IntGaugeVec,
+    pub worker_child_pending_cost: IntGaugeVec,
+    pub worker_child_inflight_batches: IntGaugeVec,
 
     pub pull_items_fetched: HistogramVec,
     pub pull_batch_process_seconds: HistogramVec,
@@ -104,7 +114,7 @@ pub struct MetricsRegistry {
     /// `tokenization_ms` / `postprocessing_ms` fields on each
     /// `ItemOutcome`.
     ///
-    /// IPC backends report the backend sub-group wall time on every
+    /// Adapter IPC reports the backend sub-group wall time on every
     /// item in that sub-group, so percentiles are request-volume
     /// weighted backend times, not amortised per-item costs. Backends
     /// may use different timing semantics; compare distributions
@@ -210,6 +220,61 @@ impl MetricsRegistry {
         let inflight_batches = IntGauge::new(
             "sie_worker_inflight_batches",
             "Number of batches currently in flight through IPC",
+        )?;
+        let worker_gpu_slots_total = IntGauge::new(
+            "sie_worker_gpu_slots_total",
+            "GPU slots assigned to this worker pod",
+        )?;
+        let worker_gpu_slots_ready = IntGauge::new(
+            "sie_worker_gpu_slots_ready",
+            "GPU slots currently ready to receive work in this worker pod",
+        )?;
+        let worker_queue_depth = IntGauge::new(
+            "sie_worker_queue_depth",
+            "Worker-local scheduler pending item count",
+        )?;
+        let worker_pending_cost = IntGauge::new(
+            "sie_worker_pending_cost",
+            "Worker-local scheduler pending cost across all models",
+        )?;
+        let worker_saturated = IntGauge::new(
+            "sie_worker_saturated",
+            "Worker admission saturation flag: 1 means the gateway should avoid direct dispatch",
+        )?;
+        let worker_child_ready = IntGaugeVec::new(
+            Opts::new(
+                "sie_worker_child_ready",
+                "Per-child GPU slot readiness inside this worker pod",
+            ),
+            &["child"],
+        )?;
+        let worker_child_models = IntGaugeVec::new(
+            Opts::new(
+                "sie_worker_child_models",
+                "Number of models placed on each adapter worker child",
+            ),
+            &["child"],
+        )?;
+        let worker_child_queue_depth = IntGaugeVec::new(
+            Opts::new(
+                "sie_worker_child_queue_depth",
+                "Pending scheduler item count attributed to each adapter worker child",
+            ),
+            &["child"],
+        )?;
+        let worker_child_pending_cost = IntGaugeVec::new(
+            Opts::new(
+                "sie_worker_child_pending_cost",
+                "Pending scheduler cost attributed to each adapter worker child",
+            ),
+            &["child"],
+        )?;
+        let worker_child_inflight_batches = IntGaugeVec::new(
+            Opts::new(
+                "sie_worker_child_inflight_batches",
+                "Batches currently in flight on each adapter worker child",
+            ),
+            &["child"],
         )?;
 
         let pull_items_fetched = HistogramVec::new(
@@ -462,6 +527,16 @@ impl MetricsRegistry {
         registry.register(Box::new(ipc_requests_total.clone()))?;
         registry.register(Box::new(ipc_failures_total.clone()))?;
         registry.register(Box::new(inflight_batches.clone()))?;
+        registry.register(Box::new(worker_gpu_slots_total.clone()))?;
+        registry.register(Box::new(worker_gpu_slots_ready.clone()))?;
+        registry.register(Box::new(worker_queue_depth.clone()))?;
+        registry.register(Box::new(worker_pending_cost.clone()))?;
+        registry.register(Box::new(worker_saturated.clone()))?;
+        registry.register(Box::new(worker_child_ready.clone()))?;
+        registry.register(Box::new(worker_child_models.clone()))?;
+        registry.register(Box::new(worker_child_queue_depth.clone()))?;
+        registry.register(Box::new(worker_child_pending_cost.clone()))?;
+        registry.register(Box::new(worker_child_inflight_batches.clone()))?;
         registry.register(Box::new(pull_items_fetched.clone()))?;
         registry.register(Box::new(pull_batch_process_seconds.clone()))?;
         registry.register(Box::new(pull_nak_unloaded_total.clone()))?;
@@ -524,6 +599,16 @@ impl MetricsRegistry {
             ipc_requests_total,
             ipc_failures_total,
             inflight_batches,
+            worker_gpu_slots_total,
+            worker_gpu_slots_ready,
+            worker_queue_depth,
+            worker_pending_cost,
+            worker_saturated,
+            worker_child_ready,
+            worker_child_models,
+            worker_child_queue_depth,
+            worker_child_pending_cost,
+            worker_child_inflight_batches,
             pull_items_fetched,
             pull_batch_process_seconds,
             pull_nak_unloaded_total,
@@ -730,9 +815,26 @@ mod tests {
         m.messages_received_total.inc();
         m.messages_acked_total.inc_by(5);
         m.inflight_batches.set(3);
+        m.worker_gpu_slots_total.set(4);
+        m.worker_gpu_slots_ready.set(2);
+        m.worker_queue_depth.set(7);
+        m.worker_pending_cost.set(128);
+        m.worker_child_ready.with_label_values(&["0"]).set(1);
+        m.worker_child_models.with_label_values(&["0"]).set(1);
+        m.worker_child_queue_depth.with_label_values(&["0"]).set(3);
+        m.worker_child_pending_cost
+            .with_label_values(&["0"])
+            .set(64);
+        m.worker_child_inflight_batches
+            .with_label_values(&["0"])
+            .set(2);
         assert_eq!(m.messages_received_total.get(), 1);
         assert_eq!(m.messages_acked_total.get(), 5);
         assert_eq!(m.inflight_batches.get(), 3);
+        assert_eq!(m.worker_gpu_slots_total.get(), 4);
+        assert_eq!(m.worker_gpu_slots_ready.get(), 2);
+        assert_eq!(m.worker_queue_depth.get(), 7);
+        assert_eq!(m.worker_pending_cost.get(), 128);
 
         m.pull_items_fetched.with_label_values(&["m1"]).observe(4.0);
         m.pull_batch_process_seconds
@@ -750,6 +852,15 @@ mod tests {
         let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
         for expected in [
             "sie_worker_messages_received_total",
+            "sie_worker_gpu_slots_total",
+            "sie_worker_gpu_slots_ready",
+            "sie_worker_queue_depth",
+            "sie_worker_pending_cost",
+            "sie_worker_child_ready",
+            "sie_worker_child_models",
+            "sie_worker_child_queue_depth",
+            "sie_worker_child_pending_cost",
+            "sie_worker_child_inflight_batches",
             "sie_pull_loop_items_fetched",
             "sie_pull_loop_batch_process_seconds",
             "sie_pull_loop_nak_unloaded_total",

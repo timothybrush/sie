@@ -9,13 +9,22 @@ export const HTTP_CLIENT_ERROR_MIN = 400;
 export const HTTP_CLIENT_ERROR_MAX = 499;
 export const HTTP_SERVER_ERROR_MIN = 500;
 export const HTTP_SERVER_ERROR_MAX = 599;
+export const HTTP_GATEWAY_TIMEOUT = 504;
 
 // Default timeouts and delays
 export const DEFAULT_TIMEOUT = 30_000; // 30 seconds
+// Floor for long-running POSTs (jobs.submit / files.upload / batches.create) so
+// a large upload / connector preflight / batch creation does not abort while the
+// server keeps working. Matches the Python SDK's 120s floor.
+export const DEFAULT_LONG_RUNNING_TIMEOUT = 120_000; // 2 minutes
 export const DEFAULT_PROVISION_TIMEOUT = 300_000; // 5 minutes (300s matches Python SDK)
 export const DEFAULT_RETRY_DELAY = 5_000; // 5 seconds (matches Python SDK)
 export const DEFAULT_MAX_RETRY_DELAY = 30_000; // 30 seconds
 export const DEFAULT_LEASE_RENEWAL_INTERVAL = 60_000; // 1 minute
+
+// jobs.wait() polling — mirrors the Python SDK's jobs.wait defaults.
+export const DEFAULT_JOB_WAIT_TIMEOUT = 600_000; // 10 minutes
+export const DEFAULT_JOB_WAIT_POLL = 2_000; // 2 seconds
 
 // LoRA loading retry settings
 export const LORA_LOADING_MAX_RETRIES = 10; // Max retries for LoRA loading
@@ -27,6 +36,13 @@ export const MODEL_LOADING_MAX_RETRIES = 60; // Max retries (60 * 5s = 5 min)
 export const MODEL_LOADING_DEFAULT_DELAY = 5_000; // 5 seconds default retry delay
 export const MODEL_LOADING_ERROR_CODE = "MODEL_LOADING"; // Error code from server
 export const PROVISIONING_ERROR_CODE = "PROVISIONING"; // Error code from gateway provisioning
+
+// RESOURCE_EXHAUSTED (server-side OOM) retry settings — mirror the Python SDK
+// (packages/sie_sdk/src/sie_sdk/client/_shared.py).
+export const RESOURCE_EXHAUSTED_MAX_RETRIES = 3; // Max bounded retries
+export const RESOURCE_EXHAUSTED_DEFAULT_DELAY = 5_000; // Base backoff (ms)
+export const RESOURCE_EXHAUSTED_MAX_DELAY = 30_000; // Backoff ceiling (ms)
+export const RESOURCE_EXHAUSTED_ERROR_CODE = "RESOURCE_EXHAUSTED"; // Error code from server
 
 // Version negotiation headers
 export const SDK_VERSION_HEADER = "X-SIE-SDK-Version";

@@ -150,6 +150,7 @@ class ColQwen2Adapter(BaseAdapter):
         normalize: bool = True,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = False,
+        revision: str | None = None,
         max_seq_length: int | None = None,
         muvera_config: dict[str, Any] | None = None,
         token_dim: int = 128,
@@ -161,6 +162,8 @@ class ColQwen2Adapter(BaseAdapter):
             normalize: Not used — ColQwen2.5 normalizes internally.
             compute_precision: Compute precision for inference.
             trust_remote_code: Whether to trust remote code.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
             max_seq_length: Ignored — ColQwen2.5 uses dynamic sequence length.
             muvera_config: MUVERA config (passed to postprocessor).
             token_dim: Token embedding dimension (fixed at 128).
@@ -169,6 +172,7 @@ class ColQwen2Adapter(BaseAdapter):
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
 
         self._model: Any = None
         self._processor: Any = None
@@ -196,11 +200,13 @@ class ColQwen2Adapter(BaseAdapter):
         # Reduce max_pixels to limit visual token count for faster inference.
         # Default 1280*28*28 produces 2000-4000 tokens through the 3B decoder;
         # 768*28*28 caps at ~768 tokens for a ~2-3x speedup with modest quality impact.
-        self._processor = Qwen2VLProcessor.from_pretrained(
-            self._model_name_or_path,
-            min_pixels=256 * 28 * 28,
-            max_pixels=768 * 28 * 28,
-        )
+        proc_kwargs: dict[str, Any] = {
+            "min_pixels": 256 * 28 * 28,
+            "max_pixels": 768 * 28 * 28,
+        }
+        if self._revision is not None:
+            proc_kwargs["revision"] = self._revision
+        self._processor = Qwen2VLProcessor.from_pretrained(self._model_name_or_path, **proc_kwargs)
         tokenizer = self._processor.tokenizer  # ty: ignore[unresolved-attribute]
         tokenizer.padding_side = "left"
 
@@ -213,6 +219,8 @@ class ColQwen2Adapter(BaseAdapter):
         }
         if attn_impl is not None:
             load_kwargs["attn_implementation"] = attn_impl
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
 
         self._model = ColQwen2_5.from_pretrained(  # ty: ignore[unresolved-attribute]
             self._model_name_or_path,

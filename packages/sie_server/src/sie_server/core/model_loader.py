@@ -620,9 +620,15 @@ class ModelLoader:
             max_loras=self._max_loras_per_model,
         )
 
-        # Preload profile LoRAs if adapter supports LoRA
+        # Preload profile LoRAs if adapter supports LoRA. Engine-owned adapters
+        # (sglang: ``supports_hot_lora_reload() == False``) consume
+        # ``loadtime.lora_paths`` themselves at engine launch, so only
+        # hot-reload (PEFT) adapters take the loadtime declarations from here.
         if adapter.supports_lora():
-            profile_loras = self._collect_profile_loras(config)
+            profile_loras = self._collect_profile_loras(
+                config,
+                include_loadtime_paths=adapter.supports_hot_lora_reload(),
+            )
             if profile_loras:
                 logger.info(
                     "Preloading %d profile LoRAs for model '%s': %s",
@@ -654,28 +660,70 @@ class ModelLoader:
         logger.info("Model '%s' loaded successfully", name)
         return loaded_model
 
-    def _collect_profile_loras(self, config: ModelConfig) -> set[str]:
+    def _collect_profile_loras(
+        self,
+        config: ModelConfig,
+        *,
+        include_loadtime_paths: bool = True,
+    ) -> set[str]:
         """Collect all LoRA paths from model profiles.
 
-        Profiles can specify a `lora_id` in `adapter_options.runtime` that points
-        to a HuggingFace path or local path for a LoRA adapter. This method
-        collects all unique LoRA paths across all profiles for preloading.
+        The canonical spelling is
+        ``adapter_options.loadtime["lora_paths"]`` — either a list of
+        HuggingFace/local paths (each path doubles as the public LoRA id on
+        the PEFT path) or a dict of served-name → path (the sglang shape,
+        whose paths are what a PEFT adapter would load). The scalar
+        ``adapter_options.runtime["lora_id"]`` is the DEPRECATED legacy alias:
+        it is still accepted here for existing embedding profiles, but new
+        profiles should declare ``loadtime.lora_paths`` (the scalar form is
+        already rejected outright on generation models — see
+        ``core.pool_isolation.validate_no_legacy_scalar_lora_id``).
 
         Args:
             config: Model configuration.
+            include_loadtime_paths: Collect the canonical
+                ``loadtime.lora_paths`` declarations. Pass ``False`` for
+                engine-owned adapters (sglang) that load those at engine
+                launch themselves — preloading them again here would
+                double-load.
 
         Returns:
             Set of unique LoRA paths from profiles.
         """
         loras: set[str] = set()
 
-        # Collect LoRAs from profiles (lora_id lives in adapter_options.runtime)
         for profile_name, profile_config in config.profiles.items():
+            # Canonical key: adapter_options.loadtime["lora_paths"].
+            if include_loadtime_paths:
+                lora_paths = profile_config.adapter_options.loadtime.get("lora_paths")
+                entries: list[str] = []
+                if isinstance(lora_paths, dict):
+                    entries = [str(path) for path in lora_paths.values() if path]
+                elif isinstance(lora_paths, (list, tuple)):
+                    entries = [str(path) for path in lora_paths if path]
+                elif lora_paths:
+                    logger.warning(
+                        "Profile '%s' declares loadtime.lora_paths with unexpected "
+                        "shape %s (expected list of paths or dict name->path); ignoring",
+                        profile_name,
+                        type(lora_paths).__name__,
+                    )
+                for lora_path in entries:
+                    loras.add(lora_path)
+                    logger.debug(
+                        "Found LoRA '%s' in profile '%s' (loadtime.lora_paths)",
+                        lora_path,
+                        profile_name,
+                    )
+
+            # DEPRECATED alias: the scalar runtime["lora_id"] predates the
+            # canonical loadtime.lora_paths spelling and is kept only for
+            # backward compatibility with existing embedding profiles.
             lora_id = profile_config.adapter_options.runtime.get("lora_id")
             if lora_id:
                 loras.add(lora_id)
                 logger.debug(
-                    "Found LoRA '%s' in profile '%s'",
+                    "Found LoRA '%s' in profile '%s' (legacy runtime.lora_id)",
                     lora_id,
                     profile_name,
                 )

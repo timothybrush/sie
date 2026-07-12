@@ -34,13 +34,13 @@ from safetensors.torch import load_file
 logger = logging.getLogger(__name__)
 
 
-def _repo_file(model_name_or_path: str, rel: str) -> str | None:
+def _repo_file(model_name_or_path: str, rel: str, *, revision: str | None = None) -> str | None:
     """Resolve a repo-relative file locally or via the HF hub; None if absent."""
     local = Path(model_name_or_path) / rel
     if local.is_file():
         return str(local)
     try:
-        return hf_hub_download(model_name_or_path, rel)
+        return hf_hub_download(model_name_or_path, rel, revision=revision)
     except Exception:  # noqa: BLE001 - missing file/offline -> caller decides severity
         return None
 
@@ -52,6 +52,7 @@ def load_pylate_dense_chain(
     token_dim: int,
     device: str | torch.device | None,
     dtype: torch.dtype,
+    revision: str | None = None,
 ) -> list[torch.Tensor] | None:
     """Load the trained pylate Dense chain for a checkpoint.
 
@@ -64,13 +65,18 @@ def load_pylate_dense_chain(
             truncation, preserving the old single-head semantics).
         device: Device to move the weights to.
         dtype: Dtype to cast the weights to.
+        revision: Optional HuggingFace revision/branch/commit SHA to pin when
+            downloading the checkpoint's Dense-chain artifacts (``modules.json``,
+            per-module config/weights) from the Hub. The head lives in the same
+            repo as the backbone, so callers pass their pinned model revision so
+            the whole snapshot is version-consistent.
 
     Returns:
         The chain weights in modules.json order, or None to signal the caller
         to fall back to its existing behavior (backbone truncation / legacy
         projection probes).
     """
-    modules_path = _repo_file(model_name_or_path, "modules.json")
+    modules_path = _repo_file(model_name_or_path, "modules.json", revision=revision)
     if modules_path is None:
         # Normal for stanford-format ColBERT repos (no modules.json shipped).
         logger.debug("No modules.json for %s; no pylate Dense chain to load", model_name_or_path)
@@ -122,7 +128,7 @@ def load_pylate_dense_chain(
     weights: list[torch.Tensor] = []
     for module in dense_modules:
         rel_dir = str(module.get("path", ""))
-        config_path = _repo_file(model_name_or_path, f"{rel_dir}/config.json")
+        config_path = _repo_file(model_name_or_path, f"{rel_dir}/config.json", revision=revision)
         if config_path is None:
             logger.warning("Missing %s/config.json for %s; using backbone truncation", rel_dir, model_name_or_path)
             return None
@@ -162,7 +168,7 @@ def load_pylate_dense_chain(
             )
             return None
 
-        weights_path = _repo_file(model_name_or_path, f"{rel_dir}/model.safetensors")
+        weights_path = _repo_file(model_name_or_path, f"{rel_dir}/model.safetensors", revision=revision)
         if weights_path is None:
             logger.warning(
                 "Missing %s/model.safetensors for %s; using backbone truncation. "

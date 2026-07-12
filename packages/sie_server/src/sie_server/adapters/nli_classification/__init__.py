@@ -52,6 +52,7 @@ class NLIClassificationAdapter(BaseAdapter):
         hypothesis_template: str = "This text is about {}.",
         multi_label: bool = False,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize NLI classification adapter.
@@ -64,12 +65,15 @@ class NLIClassificationAdapter(BaseAdapter):
             multi_label: If True, allows multiple labels per text.
                 If False, forces single-label classification.
             compute_precision: Precision for inference (float16, float32, bfloat16).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading model artifacts. Forwarded to ``pipeline(..., revision=...)``.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._model_name_or_path = str(model_name_or_path)
         self._hypothesis_template = hypothesis_template
         self._multi_label = multi_label
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._pipeline: Pipeline | None = None
         self._device: str | None = None
@@ -102,12 +106,14 @@ class NLIClassificationAdapter(BaseAdapter):
         else:
             torch_dtype = torch.float32
 
-        self._pipeline = pipeline(
-            "zero-shot-classification",
-            model=self._model_name_or_path,
-            device=device_idx,
-            dtype=torch_dtype,
-        )
+        pipeline_kwargs: dict[str, Any] = {
+            "model": self._model_name_or_path,
+            "device": device_idx,
+            "dtype": torch_dtype,
+        }
+        if self._revision is not None:
+            pipeline_kwargs["revision"] = self._revision
+        self._pipeline = pipeline("zero-shot-classification", **pipeline_kwargs)
 
     def _extract_text(self, item: Item) -> str:
         """Extract text from an item.

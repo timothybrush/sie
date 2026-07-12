@@ -118,6 +118,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         normalize: bool = True,
         compute_precision: ComputePrecision = "bfloat16",
         trust_remote_code: bool = False,
+        revision: str | None = None,
         max_seq_length: int | None = None,
         pooling: str = "last",
         default_instruction: str = _DEFAULT_INSTRUCTION,
@@ -131,6 +132,7 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._max_seq_length = max_seq_length
         self._pooling = pooling
         self._default_instruction = default_instruction
@@ -163,6 +165,8 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
             "min_pixels": 256 * 28 * 28,
             "max_pixels": 1280 * 28 * 28,
         }
+        if self._revision is not None:
+            proc_kwargs["revision"] = self._revision
         self._processor = AutoProcessor.from_pretrained(
             self._model_name_or_path,
             **proc_kwargs,
@@ -177,6 +181,8 @@ class Qwen3VLEmbeddingAdapter(BaseAdapter):
         }
         if attn_impl is not None:
             load_kwargs["attn_implementation"] = attn_impl
+        if self._revision is not None:
+            load_kwargs["revision"] = self._revision
 
         self._model = Qwen3VLForConditionalGeneration.from_pretrained(
             self._model_name_or_path,

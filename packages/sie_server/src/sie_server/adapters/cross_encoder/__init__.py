@@ -60,6 +60,7 @@ class CrossEncoderAdapter(BaseAdapter):
         max_length: int | None = None,
         compute_precision: ComputePrecision | None = None,
         attn_implementation: AttnImplementation = "sdpa",
+        revision: str | None = None,
         **kwargs: Any,  # Accept extra args from loader (e.g., pooling)
     ) -> None:
         """Initialize the adapter.
@@ -72,6 +73,9 @@ class CrossEncoderAdapter(BaseAdapter):
                 fp32 off-CUDA (safe on MPS) and fp16 on CUDA; set explicitly to override
                 (e.g. float16 to opt a curated model into fp16 on MPS).
             attn_implementation: Attention implementation ("sdpa" for optimized, "eager" for baseline).
+            revision: Optional HuggingFace revision/branch/commit SHA to pin when
+                loading the model. If None, the default branch is used. Forwarded
+                to ``CrossEncoder(..., revision=...)``.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -80,6 +84,7 @@ class CrossEncoderAdapter(BaseAdapter):
         self._max_length = max_length
         self._compute_precision = compute_precision
         self._attn_implementation = attn_implementation
+        self._revision = revision
 
         self._model: CrossEncoder | None = None
         self._device: str | None = None
@@ -123,6 +128,7 @@ class CrossEncoderAdapter(BaseAdapter):
             self._model_name_or_path,
             device=device,
             trust_remote_code=self._trust_remote_code,
+            revision=self._revision,
             model_kwargs=model_kwargs or None,
         )
 
@@ -215,7 +221,65 @@ class CrossEncoderAdapter(BaseAdapter):
         # Convert to float32 numpy array and wrap in ScoreOutput
         import numpy as np
 
-        return ScoreOutput(scores=np.asarray(scores, dtype=np.float32))
+        return ScoreOutput(
+            scores=np.asarray(scores, dtype=np.float32),
+            input_token_counts=self._pair_input_token_counts(pairs),
+        )
+
+    def _metering_tokenizer(self) -> Any | None:
+        """Return the CrossEncoder's own tokenizer for §7.3 pair counting.
+
+        Unlike in-tree text adapters, this adapter keeps no ``self._tokenizer``:
+        the tokenizer lives inside the sentence-transformers ``CrossEncoder``
+        (``self._model``). Sourcing it here lets the shared BaseAdapter counting
+        helpers (:meth:`count_pair_input_tokens`, :meth:`_token_counts_or_none`)
+        operate over the exact tokenizer the forward pass uses.
+        """
+        return getattr(self._model, "tokenizer", None)
+
+    def _metering_max_length(self) -> int | None:
+        """Resolve the truncation cap ``predict()`` applies, for §7.3 counting.
+
+        ``CrossEncoder.predict`` always tokenizes with ``truncation=True`` at the
+        model's ``max_length`` (falling back to the tokenizer's
+        ``model_max_length`` when unset). Returning that same cap keeps the
+        shared counter's truncation ON and its length equal to the forward
+        pass's real joint-pair length — reusing BaseAdapter's tokenizer/count
+        core without under- or over-billing long pairs. ``None`` only when no
+        real cap exists (the base counter then leaves truncation off, matching
+        ``predict`` tokenizing to an effectively-unbounded ``model_max_length``).
+        """
+        max_length = getattr(self._model, "max_length", None) or self._max_length
+        if isinstance(max_length, int) and not isinstance(max_length, bool) and max_length > 0:
+            return max_length
+        model_max = getattr(self._metering_tokenizer(), "model_max_length", None)
+        if isinstance(model_max, int) and not isinstance(model_max, bool) and 0 < model_max <= 100_000:
+            return model_max
+        return None
+
+    def _pair_input_token_counts(self, pairs: list[tuple[str, str]]) -> list[int] | None:
+        """Real per-pair input-token counts for the unit meter (§7.3).
+
+        A cross-encoder tokenizes each (query, doc) pair JOINTLY (query and doc
+        packed into one sequence with the model's separators), so the pair's
+        billable input tokens is the length of that joint encoding. ``predict``
+        owns the forward-pass tokenization opaquely; we recover the count by
+        reusing BaseAdapter's shared joint-encoding counter
+        (:meth:`_token_counts_or_none`) over the model's own tokenizer
+        (:meth:`_metering_tokenizer`) and the same truncation cap ``predict``
+        applies (:meth:`_metering_max_length`). Best-effort: any tokenizer quirk
+        returns ``None`` so the meter falls back to its reserve estimate rather
+        than failing the score or billing an approximation as a count.
+        """
+        tokenizer = self._metering_tokenizer()
+        if tokenizer is None:
+            return None
+        return self._token_counts_or_none(
+            tokenizer,
+            [q for q, _ in pairs],
+            [d for _, d in pairs],
+            expected_len=len(pairs),
+        )
 
     def _extract_text(self, item: Item) -> str:
         """Extract text from an item."""

@@ -3,6 +3,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -28,6 +29,22 @@ logger = logging.getLogger(__name__)
 # Error messages
 _ERR_CONFIG_NOT_FOUND = "Config file not found: {path}"
 
+# Served-model version identity. An *immutable* HF revision is a
+# full 40-char git commit SHA (SHA-1, lowercase hex). Branch/tag names ("main",
+# "v1.0") resolve to *moving* targets on the Hub, so they are NOT acceptable
+# pins for a promoted/served model — the immutable-id contract is that a given
+# ``sie_id`` maps to identical weights forever. This regex is the single
+# authoritative rule; the staging/deploy tooling mirrors it rather than
+# importing this module, which would pull the adapter/torch stack into the
+# deploy tool.
+_IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def is_immutable_revision(revision: str | None) -> bool:
+    """Return True when ``revision`` is a full 40-char git commit SHA (immutable)."""
+    return revision is not None and _IMMUTABLE_REVISION_RE.match(revision) is not None
+
+
 # Local cache for downloaded configs (used when models_dir is cloud)
 _CONFIG_CACHE_DIR: Path | None = None
 
@@ -46,24 +63,68 @@ def _get_config_cache_dir() -> Path:
     return _CONFIG_CACHE_DIR
 
 
-def load_model_configs(models_dir: Path | str) -> dict[str, ModelConfig]:
+def validate_pinned_revision(config: ModelConfig) -> None:
+    """Enforce the served-model version-identity contract.
+
+    A promoted/served, HF-backed model MUST pin ``hf_revision`` to an immutable
+    commit SHA so its ``sie_id`` maps to identical weights forever. ``weights_path``
+    and ``package_backed`` models are exempt: they carry their own immutable
+    weights / package version and have no Hub revision that can drift. Raises
+    ``ValueError`` naming the fix.
+    """
+    if config.hf_id is None:
+        # weights_path or package_backed: nothing on the Hub to pin.
+        return
+    revision = config.hf_revision
+    if revision is None:
+        msg = (
+            f"Served model '{config.sie_id}' (hf_id '{config.hf_id}') has no 'hf_revision'. "
+            "A promoted/served model must pin an immutable HF commit SHA so its id maps to "
+            "identical weights forever. Resolve the current SHA and pin it."
+        )
+        raise ValueError(msg)
+    if not is_immutable_revision(revision):
+        msg = (
+            f"Served model '{config.sie_id}' pins hf_revision={revision!r}, which is not an "
+            "immutable 40-char commit SHA — a branch/tag name (e.g. 'main') drifts on the Hub. "
+            "Pin the resolved commit SHA instead."
+        )
+        raise ValueError(msg)
+
+
+def require_pinned_revisions(configs: Mapping[str, ModelConfig]) -> None:
+    """Apply :func:`validate_pinned_revision` across a catalog; raise on the first violation."""
+    for config in configs.values():
+        validate_pinned_revision(config)
+
+
+def load_model_configs(models_dir: Path | str, *, require_pinned_revision: bool = False) -> dict[str, ModelConfig]:
     """Load all model configs from a directory (local or cloud).
 
     Args:
         models_dir: Path to the models directory (local path, s3://, gs://, abfs://, or abfss://).
+        require_pinned_revision: When True, reject any HF-backed config that does not pin an
+            immutable ``hf_revision``. Off by default so the full dev catalog
+            (which carries an unpinned long tail) still loads; the managed serving/staging
+            path opts in.
 
     Returns:
         Dictionary mapping model names to their ModelConfig objects.
 
     Raises:
         FileNotFoundError: If models_dir doesn't exist (local only).
-        ValueError: If a config file is invalid.
+        ValueError: If a config file is invalid, or (when ``require_pinned_revision``)
+            a served model is missing an immutable revision pin.
     """
     models_dir_str = str(models_dir)
 
     if is_cloud_path(models_dir_str):
-        return _load_configs_from_cloud(models_dir_str)
-    return _load_configs_from_local(Path(models_dir_str))
+        configs = _load_configs_from_cloud(models_dir_str)
+    else:
+        configs = _load_configs_from_local(Path(models_dir_str))
+    if require_pinned_revision:
+        require_pinned_revisions(configs)
+    return configs
 
 
 def _load_configs_from_local(models_dir: Path) -> dict[str, ModelConfig]:

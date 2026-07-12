@@ -70,6 +70,7 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
         normalize: bool = True,
         max_seq_length: int = 8192,
         compute_precision: ComputePrecision = "float16",
+        revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -79,6 +80,10 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
             normalize: Whether to L2-normalize dense embeddings.
             max_seq_length: Maximum sequence length (default 8192).
             compute_precision: Compute precision (float16, bfloat16, float32).
+            revision: Accepted for loader compatibility but NOT honored on this
+                path — FlagEmbedding's ``BGEM3FlagModel`` exposes no revision seam
+                (see the note in ``load()``). Use the ``bge_m3`` / ``bge_m3_flash``
+                adapters to actually pin a revision.
             **kwargs: Additional arguments (ignored, for loader compatibility).
         """
         _ = kwargs
@@ -86,6 +91,7 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
         self._normalize = normalize
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
+        self._revision = revision
 
         self._model: BGEM3FlagModel | None = None
         self._device: str | None = None
@@ -112,6 +118,10 @@ class BGEM3FlagAdapter(BGEM3ScoreMixin, BaseAdapter):
             self._compute_precision,
         )
 
+        # NOTE: FlagEmbedding's BGEM3FlagModel (pinned 1.4.0) exposes no ``revision``
+        # kwarg — its constructor forwards nothing to the internal
+        # ``from_pretrained`` load — so ``self._revision`` cannot be honored on this
+        # path. Use the ``bge_m3`` / ``bge_m3_flash`` adapters to pin a revision.
         self._model = BGEM3FlagModel(
             self._model_name_or_path,
             use_fp16=use_fp16,

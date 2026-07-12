@@ -6,17 +6,25 @@ Tests cover:
 3. PEFTLoRAMixin methods
 4. Registry LoRA management
 5. Worker per-LoRA batching (covered in test_worker.py)
+6. Honest capability + typed rejection for adapters whose forward cannot
+   honor a LoRA (bert_flash, nomic_flash — LoRA capability audit)
+7. Staging-side target_modules validation (audit §3 negative control)
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
-from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
+from sie_server.adapters.bert_flash import BertFlashAdapter
+from sie_server.adapters.nomic_flash import NomicFlashAdapter
+from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin, validate_lora_target_modules
 from sie_server.core.model_loader import DEFAULT_MAX_LORAS, LoadedLora, LoadedModel
+from sie_server.core.registry import ModelRegistry
 from sie_server.types.responses import ErrorCode
 
 # =============================================================================
@@ -470,6 +478,84 @@ class TestModelLoaderProfileLoras:
         result = loader._collect_profile_loras(config)
         assert result == {"org/shared-lora"}
 
+    @staticmethod
+    def _make_loader() -> Any:
+        from sie_server.core.model_loader import ModelLoader
+
+        return ModelLoader(
+            preprocessor_registry=MagicMock(),
+            postprocessor_registry=MagicMock(),
+            all_configs={},
+        )
+
+    @staticmethod
+    def _profile(runtime: dict | None = None, loadtime: dict | None = None) -> MagicMock:
+        profile = MagicMock()
+        profile.adapter_options.runtime = runtime or {}
+        profile.adapter_options.loadtime = loadtime or {}
+        return profile
+
+    def test_collect_canonical_loadtime_lora_paths_list(self) -> None:
+        """Canonical key: adapter_options.loadtime["lora_paths"] as a list of paths."""
+        loader = self._make_loader()
+        config = MagicMock()
+        config.profiles = {
+            "byo": self._profile(loadtime={"lora_paths": ["org/lora-a", "org/lora-b"]}),
+        }
+
+        assert loader._collect_profile_loras(config) == {"org/lora-a", "org/lora-b"}
+
+    def test_collect_canonical_loadtime_lora_paths_dict(self) -> None:
+        """The sglang dict shape (served-name -> path) contributes its paths."""
+        loader = self._make_loader()
+        config = MagicMock()
+        config.profiles = {
+            "byo": self._profile(loadtime={"lora_paths": {"banking": "org/lora-a"}}),
+        }
+
+        assert loader._collect_profile_loras(config) == {"org/lora-a"}
+
+    def test_collect_canonical_and_legacy_alias_union(self) -> None:
+        """Canonical loadtime.lora_paths and the deprecated runtime.lora_id merge."""
+        loader = self._make_loader()
+        config = MagicMock()
+        config.profiles = {
+            "new-style": self._profile(loadtime={"lora_paths": ["org/lora-new"]}),
+            "legacy": self._profile(runtime={"lora_id": "org/lora-legacy"}),
+        }
+
+        assert loader._collect_profile_loras(config) == {"org/lora-new", "org/lora-legacy"}
+
+    def test_include_loadtime_paths_false_skips_canonical_only(self) -> None:
+        """Engine-owned adapters (sglang) must not double-load loadtime.lora_paths.
+
+        The loader passes include_loadtime_paths=adapter.supports_hot_lora_reload();
+        sglang consumes its loadtime declarations at engine launch itself, so
+        only the legacy runtime.lora_id survives collection for it.
+        """
+        loader = self._make_loader()
+        config = MagicMock()
+        config.profiles = {
+            "engine-owned": self._profile(
+                runtime={"lora_id": "org/lora-legacy"},
+                loadtime={"lora_paths": ["org/lora-engine"]},
+            ),
+        }
+
+        result = loader._collect_profile_loras(config, include_loadtime_paths=False)
+        assert result == {"org/lora-legacy"}
+
+    def test_collect_ignores_empty_lora_paths_entries(self) -> None:
+        """Empty entries and non-list/dict shapes are skipped, not crashed on."""
+        loader = self._make_loader()
+        config = MagicMock()
+        config.profiles = {
+            "empties": self._profile(loadtime={"lora_paths": ["", None]}),
+            "scalar-shape": self._profile(loadtime={"lora_paths": "org/not-a-list"}),
+        }
+
+        assert loader._collect_profile_loras(config) == set()
+
 
 # =============================================================================
 # SDK LoraLoadingError Tests
@@ -487,3 +573,193 @@ class TestSDKLoraLoadingError:
         assert str(error) == "Test error"
         assert error.lora == "org/my-lora"
         assert error.model == "bge-m3"
+
+
+# =============================================================================
+# Honest LoRA capability for forwards that cannot honor a LoRA (audit fix)
+# =============================================================================
+
+
+class TestBrokenFlashAdaptersHonestLoraCapability:
+    """bert_flash and nomic_flash must NOT advertise LoRA support.
+
+    LoRA capability audit: ``bert_flash`` fuses Q/K/V weights at load and runs
+    attention via ``functional.linear`` on the cached tensors; ``nomic_flash``
+    hand-loads raw safetensors into tensor dicts with no wrappable
+    ``self._model``. In both cases a PEFT LoRA would be silently dropped
+    (served without the customer's adapter, no error) — the worst failure
+    class. Honest capability = base-default ``supports_lora() == False`` so
+    the request path rejects with the typed 400 instead.
+
+    Constructors only — no model weights are loaded (no heavy local compute).
+    """
+
+    @pytest.mark.parametrize("adapter_cls", [BertFlashAdapter, NomicFlashAdapter])
+    def test_supports_lora_is_false(self, adapter_cls: type) -> None:
+        adapter = adapter_cls(model_name_or_path="stub/model")
+        assert adapter.supports_lora() is False
+        assert adapter.supports_hot_lora_reload() is False
+
+    @pytest.mark.parametrize("adapter_cls", [BertFlashAdapter, NomicFlashAdapter])
+    def test_not_a_peft_mixin(self, adapter_cls: type) -> None:
+        """The PEFT mixin must not be re-added without fixing the forward."""
+        assert not issubclass(adapter_cls, PEFTLoRAMixin)
+
+    @pytest.mark.parametrize("adapter_cls", [BertFlashAdapter, NomicFlashAdapter])
+    def test_load_lora_raises_not_implemented(self, adapter_cls: type) -> None:
+        adapter = adapter_cls(model_name_or_path="stub/model")
+        with pytest.raises(NotImplementedError, match="does not support LoRA"):
+            adapter.load_lora("org/customer-lora")
+        with pytest.raises(NotImplementedError, match="does not support LoRA"):
+            adapter.unload_lora("org/customer-lora")
+
+    @pytest.mark.parametrize("adapter_cls", [BertFlashAdapter, NomicFlashAdapter])
+    def test_set_active_lora_is_noop(self, adapter_cls: type) -> None:
+        """Base-class no-op — the worker may call this with lora=None freely."""
+        adapter = adapter_cls(model_name_or_path="stub/model")
+        assert adapter.set_active_lora(None) is None
+
+
+class TestLoraRejectionOnNonSupportingAdapters:
+    """The registry must raise the typed ValueError for these adapters.
+
+    This is the real rejection seam: ``api/encode.py`` translates this exact
+    ``ValueError`` into HTTP 400 INVALID_INPUT (locked by
+    ``tests/api/test_encode_endpoint.py::TestEncodeLoraRouting::``
+    ``test_lora_on_non_supporting_model_returns_typed_400``). Together they
+    prove a lora_id aimed at bert_flash/nomic_flash is rejected loudly instead
+    of silently served from base weights.
+    """
+
+    @pytest.mark.parametrize("adapter_cls", [BertFlashAdapter, NomicFlashAdapter])
+    async def test_ensure_lora_loaded_async_raises_value_error(self, adapter_cls: type) -> None:
+        registry = ModelRegistry()
+        adapter = adapter_cls(model_name_or_path="stub/model")
+        loaded = MagicMock()
+        loaded.adapter = adapter
+        registry._configs["stub-model"] = MagicMock()
+        registry._loaded["stub-model"] = loaded
+
+        with pytest.raises(ValueError, match="does not support LoRA"):
+            await registry.ensure_lora_loaded_async("stub-model", "org/customer-lora")
+
+
+# =============================================================================
+# Staging-side target_modules validation (audit §3 negative control)
+# =============================================================================
+
+
+class TestValidateLoraTargetModules:
+    """Direct tests for validate_lora_target_modules."""
+
+    CALLED = frozenset({"query", "key", "value", "dense"})
+
+    def test_no_intersection_rejects(self) -> None:
+        """The audit's negative control: LoRA on modules the forward never calls."""
+        with pytest.raises(ValueError, match="silently ignored"):
+            validate_lora_target_modules("org/lora", ["pooler.dense2", "classifier"], self.CALLED)
+
+    def test_intersection_passes(self) -> None:
+        validate_lora_target_modules("org/lora", ["query", "value"], self.CALLED)
+
+    def test_partial_intersection_passes(self) -> None:
+        """One honored target is enough to have an effect (not zero-effect)."""
+        validate_lora_target_modules("org/lora", ["classifier", "query"], self.CALLED)
+
+    def test_dotted_target_matches_by_leaf_name(self) -> None:
+        validate_lora_target_modules(
+            "org/lora",
+            ["encoder.layer.0.attention.self.query"],
+            self.CALLED,
+        )
+
+    def test_set_shape_accepted(self) -> None:
+        validate_lora_target_modules("org/lora", {"value"}, self.CALLED)
+
+    def test_regex_string_matching_a_called_module_passes(self) -> None:
+        validate_lora_target_modules("org/lora", ".*query", self.CALLED)
+
+    def test_regex_string_matching_nothing_warns_but_does_not_raise(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Regexes may target full dotted paths we cannot resolve — warn only."""
+        with caplog.at_level("WARNING"):
+            validate_lora_target_modules("org/lora", r"pooler\.dense2", self.CALLED)
+        assert "matches none" in caplog.text
+
+    def test_empty_target_modules_skips_check(self) -> None:
+        validate_lora_target_modules("org/lora", None, self.CALLED)
+        validate_lora_target_modules("org/lora", [], self.CALLED)
+
+    def test_empty_called_set_skips_check(self) -> None:
+        validate_lora_target_modules("org/lora", ["anything"], frozenset())
+
+
+class MockAdapterWithCalledModules(MockAdapterWithLoRA):
+    """PEFT mixin adapter declaring the modules its forward actually calls."""
+
+    lora_called_module_names = frozenset({"query", "value"})
+
+
+class TestMixinTargetModulesValidation:
+    """load_lora must consult the LoRA's PEFT config against the called set."""
+
+    @staticmethod
+    def _peft_module(target_modules: object) -> MagicMock:
+        peft = MagicMock()
+        peft.PeftConfig.from_pretrained.return_value = SimpleNamespace(target_modules=target_modules)
+        mock_peft_model = MagicMock()
+        mock_peft_model.named_parameters.return_value = []
+        peft.PeftModel.from_pretrained.return_value = mock_peft_model
+        return peft
+
+    def test_mismatched_lora_rejected_before_wrapping(self) -> None:
+        peft = self._peft_module(["pooler.dense2"])
+        with patch.dict("sys.modules", {"peft": peft}):
+            adapter = MockAdapterWithCalledModules()
+            adapter.load("cuda:0")
+
+            with pytest.raises(ValueError, match="silently ignored"):
+                adapter.load_lora("org/mismatched-lora")
+
+            # Rejected before any PEFT wrapping or tracking.
+            peft.PeftModel.from_pretrained.assert_not_called()
+            assert "org/mismatched-lora" not in adapter._loaded_loras
+            assert adapter._peft_model is None
+
+    def test_matching_lora_loads(self) -> None:
+        peft = self._peft_module(["query"])
+        with patch.dict("sys.modules", {"peft": peft}):
+            adapter = MockAdapterWithCalledModules()
+            adapter.load("cuda:0")
+
+            adapter.load_lora("org/matching-lora")
+
+            peft.PeftConfig.from_pretrained.assert_called_once_with("org/matching-lora")
+            peft.PeftModel.from_pretrained.assert_called_once()
+            assert "org/matching-lora" in adapter._loaded_loras
+
+    def test_config_fetch_failure_skips_check_and_proceeds(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A config-fetch error must not mask the real load error path."""
+        peft = self._peft_module(["query"])
+        peft.PeftConfig.from_pretrained.side_effect = RuntimeError("offline")
+        with patch.dict("sys.modules", {"peft": peft}):
+            adapter = MockAdapterWithCalledModules()
+            adapter.load("cuda:0")
+
+            with caplog.at_level("WARNING"):
+                adapter.load_lora("org/unfetchable-lora")
+
+            assert "skipping the check" in caplog.text
+            peft.PeftModel.from_pretrained.assert_called_once()
+            assert "org/unfetchable-lora" in adapter._loaded_loras
+
+    def test_default_none_declaration_skips_check(self) -> None:
+        """Standard-forward adapters (no declaration) never consult PeftConfig."""
+        peft = self._peft_module(["anything"])
+        with patch.dict("sys.modules", {"peft": peft}):
+            adapter = MockAdapterWithLoRA()
+            adapter.load("cuda:0")
+
+            adapter.load_lora("org/any-lora")
+
+            peft.PeftConfig.from_pretrained.assert_not_called()
+            peft.PeftModel.from_pretrained.assert_called_once()

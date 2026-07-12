@@ -109,6 +109,11 @@ pub struct WorkResult {
     pub postprocessing_ms: Option<f64>,
     #[serde(default)]
     pub payload_fetch_ms: Option<f64>,
+    /// Authoritative billable-unit counts passed through from the engine's
+    /// `ItemOutcome.units` (P3.5, design §7.3). `skip_serializing_if` keeps
+    /// legacy consumers' maps unchanged when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units: Option<crate::ipc_types::UnitCounts>,
     #[serde(default)]
     pub worker_direct: bool,
 }
@@ -254,6 +259,7 @@ mod tests {
             tokenization_ms: None,
             postprocessing_ms: None,
             payload_fetch_ms: None,
+            units: None,
             worker_direct: true,
         };
         let bytes = rmp_serde::to_vec_named(&result).unwrap();

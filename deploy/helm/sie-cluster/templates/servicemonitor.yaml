@@ -1,4 +1,5 @@
 {{- if .Values.serviceMonitor.enabled }}
+{{- $maxWorkerChildCount := int (include "sie-cluster.worker.maxChildCount" .) }}
 {{/*
 Per-component ServiceMonitors. A single monitor with the shared
 `sie-cluster.selectorLabels` selector matches the gateway, config, and
@@ -33,7 +34,7 @@ spec:
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics
 ---
-# Worker ServiceMonitor (Python + optional worker-sidecar)
+# Worker ServiceMonitor (adapter workers + optional worker-sidecar)
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -56,6 +57,16 @@ spec:
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics
+    {{- if gt $maxWorkerChildCount 1 }}
+    {{- range $i := until $maxWorkerChildCount }}
+    {{- if gt $i 0 }}
+    - port: http-{{ $i }}
+      interval: {{ $.Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+    {{- end }}
+    {{- end }}
+    {{- end }}
     {{- if .Values.workers.common.workerSidecar.enabled }}
     # worker-sidecar metrics (NATS pull loop, backend routing,
     # circuit breaker state, per-backend latency histograms).

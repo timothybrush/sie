@@ -13,6 +13,8 @@ from typing import Any, Self
 import msgpack
 
 from sie_server.adapter_call_loop import handle_run_batch
+from sie_server.core.gpu_health import gpu_is_healthy_async
+from sie_server.core.readiness import is_ready
 from sie_server.ipc_types import (
     IPC_VERSION,
     METHOD_APPLY_MODEL_CONFIG,
@@ -516,6 +518,11 @@ class IpcServer:
 
     async def _handle_ping(self, req: PingRequest) -> PingResponse:
         self._last_ping_monotonic = time.monotonic()
+        ready = False
+        try:
+            ready = is_ready() and await gpu_is_healthy_async()
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not compute readiness for ping", exc_info=True)
         bundle_config_hash = ""
         if self._bundle_id:
             try:
@@ -530,6 +537,7 @@ class IpcServer:
         return PingResponse(
             timestamp_ms=req.timestamp_ms,
             worker_id=self._worker_id,
+            ready=ready,
             bundle_config_hash=bundle_config_hash,
             loaded_models=loaded_models,
         )

@@ -324,7 +324,7 @@ class ExtractResult(TypedDict, total=False):
 # Streaming generation result. Streaming happens inside the gateway/worker;
 # the SDK surfaces the aggregated outcome plus SIE-native timing metadata
 # (TTFT, TPOT, attempt_id). Future SDK additions may surface chunks as an
-# async iterator — see the POC plan §4.5.4.
+# async iterator.
 FinishReason = Literal["stop", "length", "cancelled", "content_filter", "error"]
 
 
@@ -509,8 +509,11 @@ class WorkerInfo(TypedDict, total=False):
         url: Worker base URL.
         gpu: GPU type (e.g., "l4", "a100-80gb").
         gpu_count: Number of GPUs on this worker.
+        ready_gpu_slots: Number of worker GPU slots ready to receive work.
         healthy: Whether the worker is healthy.
         queue_depth: Number of items in the worker's queue.
+        pending_cost: Worker-local scheduler pending cost.
+        inflight_batches: Number of batches currently executing on the worker.
         loaded_models: List of model names loaded on this worker.
         memory_used_bytes: Total GPU memory in use.
         memory_total_bytes: Total GPU memory available.
@@ -522,8 +525,11 @@ class WorkerInfo(TypedDict, total=False):
     url: str
     gpu: str
     gpu_count: int
+    ready_gpu_slots: int
     healthy: bool
     queue_depth: int
+    pending_cost: int
+    inflight_batches: int
     loaded_models: list[str]
     memory_used_bytes: int
     memory_total_bytes: int
@@ -942,3 +948,236 @@ class ClusterStatusMessage(TypedDict, total=False):
 
 
 StatusMessage = WorkerStatusMessage | ClusterStatusMessage
+
+
+# ---------------------------------------------------------------------------
+# Jobs API (client.jobs) — the gateway's batch class.
+# ---------------------------------------------------------------------------
+
+# A job's lifecycle state (queued → running → terminal).
+JobState = Literal["queued", "running", "succeeded", "failed", "suspended", "cancelled"]
+
+
+class JobFieldMap(TypedDict, total=False):
+    """The uniform source-mapping slots for ``jobs.submit(field_map=...)``.
+
+    ``id_field`` ≈ ``custom_id``, ``input_field`` ≈ ``body.input``, ``carry`` =
+    source fields echoed to the sink keyed by id, ``input_type`` pins the item
+    shape (``"text"`` | ``"document"``). The sink slot rides separately as
+    ``output_field``. All optional — per-connector params stay as aliases.
+    """
+
+    id_field: str
+    input_field: str
+    carry: list[str]
+    input_type: str
+
+
+class JobPreflight(TypedDict, total=False):
+    """The preflight reservation echoed on submit / status."""
+
+    estimated_credits: int
+    estimate_basis: str
+
+
+class JobChunk(TypedDict, total=False):
+    """One spawned chunk's settle metadata (``output.chunks[]``; results-as-refs).
+
+    ``ref`` is a TTL'd payload-store location holding the chunk's msgpack
+    ``WorkResult`` array — never the payload itself.
+    """
+
+    seq: int
+    items: int
+    state: str
+    ref: str | None
+    units: int | None
+    credits: int | None
+    error: Any
+
+
+class JobSubmitResult(TypedDict, total=False):
+    """The ``201`` envelope from ``POST /v1/jobs`` (inline or connector job)."""
+
+    id: str
+    object: str
+    operation: str
+    model: str
+    state: JobState
+    total_items: int
+    chunks: int
+    preflight: JobPreflight
+    # Connector jobs echo the resolved ends instead of total_items.
+    input_source: str
+    source: str
+    sink: str
+
+
+class JobStatus(TypedDict, total=False):
+    """A job's public status doc from ``GET /v1/jobs/{id}`` (refs, never payloads)."""
+
+    id: str
+    object: str
+    operation: str
+    model: str
+    state: JobState
+    total_items: int
+    completed_items: int
+    preflight: JobPreflight
+    settled_credits: int
+    created_at: float
+    finished_at: float | None
+    output: dict[str, Any]
+
+
+class JobList(TypedDict, total=False):
+    """The listing envelope from ``GET /v1/jobs`` (the org's jobs, keyed by bearer)."""
+
+    object: str
+    data: list[JobStatus]
+
+
+class JobResultItem(TypedDict, total=False):
+    """One decoded per-item result retrieved from a finished job's chunk refs."""
+
+    id: str | None
+    success: bool | None
+    units: Any
+    dims: int | None
+    dense: Any
+
+
+class JobResults(TypedDict, total=False):
+    """A finished job's decoded results — the chunk refs read and unpacked."""
+
+    job_id: str
+    state: JobState | None
+    total_items: int | None
+    settled_credits: int | None
+    chunks: list[JobChunk]
+    retrieved: int
+    dims: int | None
+    items: list[JobResultItem]
+
+
+# ---------------------------------------------------------------------------
+# Connections API (client.connections) — org-scoped connector auth by name.
+# ---------------------------------------------------------------------------
+
+
+class Connection(TypedDict, total=False):
+    """An org-scoped connection (connector auth by name). The secret is never returned."""
+
+    id: int
+    type: str
+    name: str
+    created_at: float
+
+
+class ConnectionCreated(TypedDict, total=False):
+    """The ``201`` envelope from creating a connection (org + connection, no secret)."""
+
+    org: str
+    account_id: int
+    id: int
+    type: str
+    name: str
+    created_at: float
+
+
+class ConnectionRevoked(TypedDict, total=False):
+    """The envelope from revoking (soft-deleting) a connection."""
+
+    org: str
+    account_id: int
+    name: str
+    state: str
+
+
+# ---------------------------------------------------------------------------
+# Files API (client.files) — the OpenAI-compatible file store. Byte-for-byte the
+# OpenAI File object, so switching `openai` → `sie_sdk` is a base_url-swap
+# drop-in for the batch flow.
+# ---------------------------------------------------------------------------
+
+
+class File(TypedDict, total=False):
+    """An OpenAI-shaped file object (``POST/GET /v1/files``).
+
+    Mirrors OpenAI's ``FileObject``: the gateway emits ``{id, object:"file",
+    bytes, created_at, filename, purpose}``. ``status`` /
+    ``expires_at`` are the optional OpenAI fields surfaced when the TTL-GC
+    lands (batch files expire, matching OpenAI's 30-day window).
+    """
+
+    id: str
+    object: str
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    status: str
+    expires_at: int
+
+
+class FileDeleted(TypedDict, total=False):
+    """The envelope from deleting a file (OpenAI ``FileDeleted``)."""
+
+    id: str
+    object: str
+    deleted: bool
+
+
+# ---------------------------------------------------------------------------
+# Batches API (client.batches) — the OpenAI-compatible batch surface. Runs on
+# the same jobs engine as /v1/jobs (`spawn_encode_job`), one engine two front
+# doors: a `base_url` swap makes an OpenAI-batch caller work unchanged.
+# ---------------------------------------------------------------------------
+
+
+class BatchRequestCounts(TypedDict, total=False):
+    """Per-batch request tally (OpenAI ``request_counts``)."""
+
+    total: int
+    completed: int
+    failed: int
+
+
+class Batch(TypedDict, total=False):
+    """An OpenAI-shaped batch object (``POST/GET /v1/batches``).
+
+    Mirrors OpenAI's ``Batch``: the gateway emits ``{id, object:"batch",
+    endpoint, input_file_id, completion_window, status, output_file_id,
+    error_file_id, created_at, finished_at, request_counts, errors}``
+    (``batches.rs``). The granular OpenAI timestamps (``completed_at`` etc.) are
+    optional — a strict OpenAI SDK reads them when the gateway surfaces them.
+    """
+
+    id: str
+    object: str
+    endpoint: str
+    input_file_id: str
+    completion_window: str
+    status: str
+    output_file_id: str | None
+    error_file_id: str | None
+    created_at: int
+    finished_at: int | None
+    in_progress_at: int | None
+    completed_at: int | None
+    failed_at: int | None
+    expired_at: int | None
+    cancelled_at: int | None
+    request_counts: BatchRequestCounts
+    errors: Any
+    metadata: dict[str, Any] | None
+
+
+class BatchList(TypedDict, total=False):
+    """The listing envelope from ``GET /v1/batches`` (OpenAI cursor page)."""
+
+    object: str
+    data: list[Batch]
+    first_id: str
+    last_id: str
+    has_more: bool

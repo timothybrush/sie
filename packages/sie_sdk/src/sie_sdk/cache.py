@@ -351,14 +351,21 @@ def populate_cluster_cache(
 ) -> bool:
     """Upload model from local cache to cluster cache.
 
-    Used by sie-admin to pre-populate cluster cache.
+    Used by sie-admin to pre-populate cluster cache. Inverse of
+    :func:`_download_from_cluster_cache`: the model's HF-style cache
+    directory (``models--{org}--{name}``) is mirrored recursively to the
+    same folder name under ``config.cluster_cache``, so workers hydrating
+    via :func:`ensure_model_cached` see an identical layout.
 
     Args:
         model_id: HuggingFace model ID.
-        config: Cache configuration.
+        config: Cache configuration. If None, reads from environment.
 
     Returns:
-        True if successfully uploaded, False if model not in local cache.
+        True if at least one file was uploaded, False if no cluster cache
+        is configured, the model is not in local cache, or nothing was
+        uploaded (per-file upload failures are logged by the backend and
+        reflected in its returned count).
     """
     if config is None:
         config = get_cache_config()
@@ -371,7 +378,16 @@ def populate_cluster_cache(
         logger.warning("Model %s not in local cache, cannot populate cluster", model_id)
         return False
 
-    # TODO: Implement upload to cluster cache
-    # This requires adding upload methods to storage backends
-    logger.info("populate_cluster_cache not yet implemented")
-    return False
+    backend = get_storage_backend(config.cluster_cache)
+
+    model_folder = f"models--{model_id.replace('/', '--')}"
+    local_model_path = config.local_cache / model_folder
+    cluster_model_path = join_path(config.cluster_cache, model_folder)
+
+    file_count = backend.upload_directory(local_model_path, cluster_model_path)
+    if file_count == 0:
+        logger.warning("No files uploaded for %s to %s", model_id, cluster_model_path)
+        return False
+
+    logger.info("Uploaded %d file(s) for %s to cluster cache %s", file_count, model_id, cluster_model_path)
+    return True

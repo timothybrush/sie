@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,6 +8,7 @@ import pytest
 from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.memory import MemoryConfig, MemoryStats
 from sie_server.core.registry import ModelRegistry
+from sie_server.core.residency import EvictionResult
 
 
 def _make_config(
@@ -297,14 +300,159 @@ class TestAsyncLoading:
             await registry_with_model.load_async("test-model", "cpu")
 
 
+class TestMultiDevicePlacement:
+    """Tests for whole-model placement across multiple configured devices."""
+
+    @pytest.fixture
+    def registry_with_three_models(self) -> Iterator[ModelRegistry]:
+        with ExitStack() as stack:
+            registry = ModelRegistry(device="cuda", devices=["cuda:0", "cuda:1"])
+            for name in ["model-a", "model-b", "model-c"]:
+                registry.add_config(_make_config(name=name, hf_id=f"org/{name}"))
+            for manager in registry.memory_managers.values():
+                stack.enter_context(patch.object(manager, "check_pressure", return_value=False))
+            yield registry
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_load_async_places_models_across_devices(
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_three_models: ModelRegistry,
+    ) -> None:
+        """Lazy loads distribute whole models across configured devices."""
+        adapters = [MagicMock() for _ in range(3)]
+        for adapter in adapters:
+            adapter.capabilities.outputs = ["dense"]
+            adapter.memory_footprint.return_value = 1000
+        mock_load_adapter.side_effect = adapters
+
+        await registry_with_three_models.load_async("model-a", "cuda")
+        await registry_with_three_models.load_async("model-b", "cuda")
+        await registry_with_three_models.load_async("model-c", "cuda")
+
+        assert registry_with_three_models._loaded["model-a"].device == "cuda:0"
+        assert registry_with_three_models._loaded["model-b"].device == "cuda:1"
+        assert registry_with_three_models._loaded["model-c"].device == "cuda:0"
+        adapters[0].load.assert_called_once_with("cuda:0")
+        adapters[1].load.assert_called_once_with("cuda:1")
+        adapters[2].load.assert_called_once_with("cuda:0")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_family_request_only_scores_matching_devices(self, mock_load_adapter: MagicMock) -> None:
+        """A cuda family request must not select another configured device family."""
+        registry = ModelRegistry(device="cuda", devices=["cuda:0", "mps:0"])
+        registry.add_config(_make_config(name="model-a", hf_id="org/model-a"))
+        for manager in registry.memory_managers.values():
+            manager.check_pressure = MagicMock(return_value=False)  # type: ignore[method-assign]
+        registry.memory_managers["cuda:0"].register_model("already-loaded")
+
+        adapter = MagicMock()
+        adapter.capabilities.outputs = ["dense"]
+        adapter.memory_footprint.return_value = 1000
+        mock_load_adapter.return_value = adapter
+
+        await registry.load_async("model-a", "cuda")
+
+        assert registry._loaded["model-a"].device == "cuda:0"
+        adapter.load.assert_called_once_with("cuda:0")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_oom_recovery_evicts_only_same_device_siblings(
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_three_models: ModelRegistry,
+    ) -> None:
+        """Worker OOM recovery frees memory on the caller's device only."""
+        adapters = [MagicMock() for _ in range(3)]
+        for adapter in adapters:
+            adapter.capabilities.outputs = ["dense"]
+            adapter.memory_footprint.return_value = 1000
+        mock_load_adapter.side_effect = adapters
+
+        await registry_with_three_models.load_async("model-a", "cuda:0")
+        await registry_with_three_models.load_async("model-b", "cuda:1")
+
+        assert (
+            await registry_with_three_models.evict_lru_excluding("model-b", timeout_s=1.0)
+            == EvictionResult.NO_CANDIDATE
+        )
+        assert registry_with_three_models.is_loaded("model-a")
+        assert registry_with_three_models.is_loaded("model-b")
+
+        await registry_with_three_models.load_async("model-c", "cuda:1")
+        assert await registry_with_three_models.evict_lru_excluding("model-b", timeout_s=1.0) == EvictionResult.EVICTED
+        assert registry_with_three_models.is_loaded("model-a")
+        assert registry_with_three_models.is_loaded("model-b")
+        assert not registry_with_three_models.is_loaded("model-c")
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_lru_touch_uses_loaded_model_device_manager(
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_three_models: ModelRegistry,
+    ) -> None:
+        """Hot-path LRU touches update the concrete device a model loaded on."""
+        adapters = [MagicMock() for _ in range(2)]
+        for adapter in adapters:
+            adapter.capabilities.outputs = ["dense"]
+            adapter.memory_footprint.return_value = 1000
+        mock_load_adapter.side_effect = adapters
+
+        await registry_with_three_models.load_async("model-a", "cuda:1")
+        await registry_with_three_models.load_async("model-b", "cuda:1")
+        manager = registry_with_three_models.memory_managers["cuda:1"]
+        assert manager.get_lru_model() == "model-a"
+
+        worker = MagicMock()
+        worker.is_running = True
+        worker.start = AsyncMock()
+        registry_with_three_models._loaded["model-a"].worker = worker
+        assert await registry_with_three_models.start_worker("model-a") is worker
+        worker.start.assert_not_awaited()
+        assert manager.get_lru_model() == "model-b"
+
+        registry_with_three_models.touch_lru("model-b")
+        assert manager.get_lru_model() == "model-a"
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_replace_configs_unloads_from_concrete_device_manager(
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_three_models: ModelRegistry,
+    ) -> None:
+        """Authoritative config replacement cleans up the loaded model's device LRU."""
+        adapter = MagicMock()
+        adapter.aclose_client = None
+        adapter.capabilities.outputs = ["dense"]
+        adapter.memory_footprint.return_value = 1000
+        adapter.requires_main_thread = False
+        mock_load_adapter.return_value = adapter
+
+        await registry_with_three_models.load_async("model-a", "cuda:1")
+        assert registry_with_three_models.memory_managers["cuda:1"].loaded_models == ["model-a"]
+
+        current_configs = registry_with_three_models.get_configs_snapshot()
+        invalidated = await registry_with_three_models.replace_configs_async(
+            [
+                _make_config(name="model-a", hf_id="org/model-a", dense_dim=1024),
+                current_configs["model-b"],
+                current_configs["model-c"],
+            ]
+        )
+
+        assert invalidated == {"model-a"}
+        assert not registry_with_three_models.is_loaded("model-a")
+        assert registry_with_three_models.memory_managers["cuda:1"].loaded_models == []
+
+
 class TestProactiveEviction:
     """Tests for proactive memory eviction (pre-load and background monitor)."""
 
     @pytest.fixture
-    def mock_adapter_factory(self) -> MagicMock:
+    def mock_adapter_factory(self) -> Callable[[], MagicMock]:
         """Create a factory that returns fresh mock adapters."""
 
-        def make_mock():
+        def make_mock() -> MagicMock:
             mock = MagicMock()
             mock.capabilities.outputs = ["dense"]
             mock.memory_footprint.return_value = 1000
@@ -313,7 +461,7 @@ class TestProactiveEviction:
         return make_mock
 
     @pytest.fixture
-    def registry_with_models(self, mock_adapter_factory: MagicMock) -> ModelRegistry:
+    def registry_with_models(self, mock_adapter_factory: Callable[[], MagicMock]) -> ModelRegistry:
         """Create registry with 3 model configs."""
         from sie_server.core.memory import MemoryConfig
 
@@ -329,7 +477,10 @@ class TestProactiveEviction:
 
     @patch("sie_server.core.model_loader.load_adapter")
     async def test_pre_load_eviction_triggers_when_above_threshold(
-        self, mock_load_adapter: MagicMock, registry_with_models: ModelRegistry, mock_adapter_factory: MagicMock
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_models: ModelRegistry,
+        mock_adapter_factory: Callable[[], MagicMock],
     ) -> None:
         """Pre-load eviction evicts LRU when memory is above threshold."""
         adapters = [mock_adapter_factory() for _ in range(3)]
@@ -354,7 +505,10 @@ class TestProactiveEviction:
 
     @patch("sie_server.core.model_loader.load_adapter")
     async def test_pre_load_eviction_loop_evicts_multiple(
-        self, mock_load_adapter: MagicMock, registry_with_models: ModelRegistry, mock_adapter_factory: MagicMock
+        self,
+        mock_load_adapter: MagicMock,
+        registry_with_models: ModelRegistry,
+        mock_adapter_factory: Callable[[], MagicMock],
     ) -> None:
         """Pre-load eviction can evict multiple models until below threshold."""
         adapters = [mock_adapter_factory() for _ in range(3)]
@@ -455,16 +609,15 @@ class TestProactiveEviction:
             check_count += 1
             return False  # No pressure, so no eviction needed
 
-        registry._memory_manager.check_pressure = counting_check
-
-        await registry.start_memory_monitor()
-        try:
-            # Wait for a few check cycles
-            await asyncio.sleep(0.02)
-            # Should have been called multiple times
-            assert check_count >= 2
-        finally:
-            await registry.stop_memory_monitor()
+        with patch.object(registry._memory_manager, "check_pressure", side_effect=counting_check):
+            await registry.start_memory_monitor()
+            try:
+                # Wait for a few check cycles
+                await asyncio.sleep(0.02)
+                # Should have been called multiple times
+                assert check_count >= 2
+            finally:
+                await registry.stop_memory_monitor()
 
     @patch("sie_server.core.model_loader.load_adapter")
     async def test_memory_monitor_does_not_evict_only_loaded_model(
@@ -492,6 +645,39 @@ class TestProactiveEviction:
 
         assert registry.is_loaded("model-a")
         mock_adapter.unload.assert_not_called()
+
+    @patch("sie_server.core.model_loader.load_adapter")
+    async def test_memory_monitor_skips_pinned_lru_model(
+        self, mock_load_adapter: MagicMock, mock_adapter_factory: MagicMock
+    ) -> None:
+        """Pressure monitor evicts the oldest non-pinned model, never a pinned LRU."""
+        registry = ModelRegistry(
+            pinned_models=["model-pinned"],
+            memory_config=MemoryConfig(
+                pressure_threshold=0.95,
+                memory_check_interval_s=0.005,
+            ),
+        )
+        registry.add_config(_make_config(name="model-pinned", hf_id="org/model-pinned"))
+        registry.add_config(_make_config(name="model-other", hf_id="org/model-other"))
+        adapter_pinned = mock_adapter_factory()
+        adapter_other = mock_adapter_factory()
+        mock_load_adapter.side_effect = [adapter_pinned, adapter_other]
+
+        await registry.load_async("model-pinned", "cpu")
+        await registry.load_async("model-other", "cpu")
+        registry._memory_manager.check_pressure = MagicMock(return_value=True)
+
+        await registry.start_memory_monitor()
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            await registry.stop_memory_monitor()
+
+        assert registry.is_loaded("model-pinned")
+        assert not registry.is_loaded("model-other")
+        adapter_pinned.unload.assert_not_called()
+        adapter_other.unload.assert_called_once()
 
     async def test_memory_monitor_starts_and_stops(self) -> None:
         """Memory monitor can be started and stopped cleanly."""

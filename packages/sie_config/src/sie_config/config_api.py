@@ -260,12 +260,35 @@ def _load_filesystem_yaml(models_dir: Any, model_name: str) -> str | None:
     return None
 
 
+# A config service reachable at a public URL with NO token is world-readable and
+# (for writes) world-writable — a catalog-poisoning vector. A production deploy
+# MUST configure a token; refuse to serve open when it hasn't. Self-host / dev
+# (no prod env signal) keeps the open-localhost posture.
+_PROD_ENVS = frozenset({"prod", "production"})
+# The deployment-environment signal. `SIE_DEPLOYMENT_ENV` is what the Helm charts
+# set (worker/config deployments, from telemetry.deploymentEnv); `SIE_ENV` is the
+# managed control-plane convention (mirrors encryption.py's prod gate). Honor both
+# so the guard is armed by whichever the deploy vehicle already sets.
+_ENV_SIGNAL_VARS = ("SIE_DEPLOYMENT_ENV", "SIE_ENV")
+
+
+def _refuse_open_in_prod() -> None:
+    """Raise 403 when no auth token is configured in a production environment."""
+    if any(os.environ.get(var, "").strip().lower() in _PROD_ENVS for var in _ENV_SIGNAL_VARS):
+        raise HTTPException(
+            status_code=403,
+            detail="config service requires SIE_ADMIN_TOKEN/SIE_AUTH_TOKEN in production "
+            "(refusing to serve unauthenticated)",
+        )
+
+
 def _check_read_auth(request: Request) -> None:
     """Validate read auth (inference token or admin token)."""
     auth_token = os.environ.get("SIE_AUTH_TOKEN")
     admin_token = os.environ.get("SIE_ADMIN_TOKEN")
     if auth_token is None and admin_token is None:
-        return  # No auth configured
+        _refuse_open_in_prod()
+        return  # No auth configured (dev / self-host localhost posture)
 
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if not token:
@@ -288,7 +311,8 @@ def _check_write_auth(request: Request) -> None:
                 status_code=403,
                 detail="Write operations require SIE_ADMIN_TOKEN (inference token is not sufficient).",
             )
-        return  # No auth configured at all
+        _refuse_open_in_prod()
+        return  # No auth configured at all (dev / self-host localhost posture)
 
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if not token:

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
-use crate::routing::hrw::RingSnapshot;
+use crate::routing::hrw::{RingEntry, RingSnapshot};
 use crate::state::pool_manager::normalize_pool_name;
 use crate::types::{
     ClusterStatus, ModelInfo, WorkerHealth, WorkerInfo, WorkerState, WorkerStatusMessage,
@@ -192,11 +192,14 @@ impl WorkerRegistry {
                     name: String::new(),
                     health: WorkerHealth::Unknown,
                     gpu_count: 1,
+                    ready_gpu_slots: 0,
                     machine_profile: String::new(),
                     bundle: "default".to_string(),
                     bundle_config_hash: String::new(),
                     models: Vec::new(),
                     queue_depth: 0,
+                    pending_cost: 0,
+                    inflight_batches: 0,
                     memory_used_bytes: 0,
                     memory_total_bytes: 0,
                     last_heartbeat: Instant::now(),
@@ -212,7 +215,8 @@ impl WorkerRegistry {
             } else {
                 msg.name.clone()
             };
-            w.gpu_count = if msg.gpu_count == 0 { 1 } else { msg.gpu_count };
+            let reported_gpu_slots = msg.total_gpu_slots.unwrap_or(msg.gpu_count);
+            w.gpu_count = reported_gpu_slots.max(1);
             w.bundle = if msg.bundle.is_empty() {
                 "default".to_string()
             } else {
@@ -229,6 +233,12 @@ impl WorkerRegistry {
             } else {
                 msg.queue_depth.unwrap_or(0)
             };
+            w.pending_cost = msg.pending_cost.unwrap_or(0).max(0);
+            w.inflight_batches = msg.inflight_batches.unwrap_or(0).max(0);
+            w.ready_gpu_slots = msg
+                .ready_gpu_slots
+                .unwrap_or(if msg.ready { w.gpu_count } else { 0 })
+                .clamp(0, w.gpu_count);
 
             // Aggregate GPU memory (fallback to compact top-level fields)
             if !msg.gpus.is_empty() {
@@ -241,12 +251,12 @@ impl WorkerRegistry {
 
             w.last_heartbeat = Instant::now();
 
-            // A worker that heartbeats `ready: false` is no longer serviceable
-            // and must leave the dispatch set / HRW ring promptly — waiting for
-            // the heartbeat timeout would keep routing direct dispatches to a
-            // worker that has declared itself not ready. The exact transition
-            // depends on its prior state (see the per-branch notes below).
-            if msg.ready {
+            // A worker that heartbeats `ready: false` or has zero ready GPU
+            // slots is no longer serviceable and must leave the dispatch set /
+            // HRW ring promptly. Waiting for the heartbeat timeout would keep
+            // routing direct dispatches to a worker that has declared no usable
+            // child capacity. The exact transition depends on its prior state.
+            if msg.ready && w.ready_gpu_slots > 0 {
                 w.health = WorkerHealth::Healthy;
             } else if w.health == WorkerHealth::Healthy {
                 // Was serving and now reports not-ready: the worker has
@@ -268,7 +278,7 @@ impl WorkerRegistry {
             // edge so the HRW ring cache can invalidate.
             w.saturated = msg.saturated;
 
-            let became_healthy = msg.ready && (!exists || !was_healthy);
+            let became_healthy = w.healthy() && (!exists || !was_healthy);
             // Falling edge into "ineligible for HRW dispatch", reported
             // exactly once so the degrade callback (ring invalidation)
             // fires the same way regardless of the trigger. Two triggers
@@ -479,7 +489,15 @@ impl WorkerRegistry {
         if workers.len() != before {
             warn_duplicate_worker_names(model, pool, before - workers.len());
         }
-        RingSnapshot::new(workers.into_iter().map(|w| w.name))
+        RingSnapshot::from_entries(workers.into_iter().map(|w| {
+            RingEntry::with_pressure(
+                w.name,
+                w.ready_gpu_slots,
+                w.queue_depth,
+                w.pending_cost,
+                w.inflight_batches,
+            )
+        }))
     }
 
     /// Build a [`RingSnapshot`] for the given concrete queue lane. Uses
@@ -563,7 +581,15 @@ impl WorkerRegistry {
         if workers.len() != before {
             warn_duplicate_worker_names(model, pool, before - workers.len());
         }
-        RingSnapshot::new(workers.into_iter().map(|w| w.name))
+        RingSnapshot::from_entries(workers.into_iter().map(|w| {
+            RingEntry::with_pressure(
+                w.name,
+                w.ready_gpu_slots,
+                w.queue_depth,
+                w.pending_cost,
+                w.inflight_batches,
+            )
+        }))
     }
 
     pub async fn check_heartbeats(&self) -> HeartbeatSweep {
@@ -747,8 +773,11 @@ impl WorkerRegistry {
                 url: w.url.clone(),
                 gpu: w.machine_profile.clone(),
                 gpu_count: w.gpu_count,
+                ready_gpu_slots: w.ready_gpu_slots,
                 loaded_models: w.models.clone(),
                 queue_depth: w.queue_depth,
+                pending_cost: w.pending_cost,
+                inflight_batches: w.inflight_batches,
                 memory_used_bytes: w.memory_used_bytes,
                 memory_total_bytes: w.memory_total_bytes,
                 healthy: w.healthy(),
@@ -829,6 +858,8 @@ mod tests {
             name: "worker-1".into(),
             ready,
             gpu_count: 1,
+            total_gpu_slots: None,
+            ready_gpu_slots: None,
             machine_profile: "l4-spot".into(),
             pool_name: String::new(),
             bundle: "default".into(),
@@ -840,6 +871,8 @@ mod tests {
                 memory_total_bytes: 4000,
             }],
             queue_depth: None,
+            pending_cost: None,
+            inflight_batches: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
@@ -870,6 +903,28 @@ mod tests {
         assert_eq!(w.queue_depth, 2);
         assert_eq!(w.memory_used_bytes, 1000);
         assert_eq!(w.memory_total_bytes, 4000);
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_ready_with_zero_ready_slots_is_not_healthy() {
+        let reg = registry();
+        let mut msg = make_msg(true);
+        msg.pool_name = "default".into();
+        msg.total_gpu_slots = Some(4);
+        msg.ready_gpu_slots = Some(0);
+
+        let became_healthy = reg.update_worker("http://w1:8080", msg).await;
+
+        assert!(!became_healthy);
+        let workers = reg.workers().await;
+        let w = &workers["http://w1:8080"];
+        assert_eq!(w.gpu_count, 4);
+        assert_eq!(w.ready_gpu_slots, 0);
+        assert_eq!(w.health, WorkerHealth::Unknown);
+        assert!(reg
+            .resolve_queue_route_in_pool("default", "l4-spot", "default", "abc123")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -1061,6 +1116,8 @@ mod tests {
             name: "w-compact".into(),
             ready: true,
             gpu_count: 1,
+            total_gpu_slots: Some(1),
+            ready_gpu_slots: Some(1),
             machine_profile: "l4".into(),
             pool_name: String::new(),
             bundle: "default".into(),
@@ -1069,6 +1126,8 @@ mod tests {
             models: vec![], // empty — should use compact fallback
             gpus: vec![],   // empty — should use compact fallback
             queue_depth: Some(7),
+            pending_cost: Some(42),
+            inflight_batches: Some(3),
             memory_used_bytes: Some(2000),
             memory_total_bytes: Some(8000),
             saturated: false,
@@ -1078,6 +1137,9 @@ mod tests {
 
         let w = &reg.workers().await["http://w1:8080"];
         assert_eq!(w.queue_depth, 7);
+        assert_eq!(w.ready_gpu_slots, 1);
+        assert_eq!(w.pending_cost, 42);
+        assert_eq!(w.inflight_batches, 3);
         assert_eq!(w.memory_used_bytes, 2000);
         assert_eq!(w.memory_total_bytes, 8000);
     }
@@ -1089,6 +1151,8 @@ mod tests {
             name: "w-none".into(),
             ready: true,
             gpu_count: 1,
+            total_gpu_slots: None,
+            ready_gpu_slots: None,
             machine_profile: "l4".into(),
             pool_name: String::new(),
             bundle: "default".into(),
@@ -1097,6 +1161,8 @@ mod tests {
             models: vec![],
             gpus: vec![],
             queue_depth: None,
+            pending_cost: None,
+            inflight_batches: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated: false,
@@ -1106,6 +1172,9 @@ mod tests {
 
         let w = &reg.workers().await["http://w1:8080"];
         assert_eq!(w.queue_depth, 0);
+        assert_eq!(w.ready_gpu_slots, 1);
+        assert_eq!(w.pending_cost, 0);
+        assert_eq!(w.inflight_batches, 0);
         assert_eq!(w.memory_used_bytes, 0);
         assert_eq!(w.memory_total_bytes, 0);
     }
@@ -1654,6 +1723,8 @@ mod tests {
             name: "w".into(),
             ready,
             gpu_count: 1,
+            total_gpu_slots: None,
+            ready_gpu_slots: None,
             machine_profile: "l4".into(),
             pool_name: pool.into(),
             bundle: "default".into(),
@@ -1662,6 +1733,8 @@ mod tests {
             models: vec![],
             gpus: vec![],
             queue_depth: None,
+            pending_cost: None,
+            inflight_batches: None,
             memory_used_bytes: None,
             memory_total_bytes: None,
             saturated,
@@ -1867,6 +1940,28 @@ mod tests {
         assert!(ids.contains(&"w-0".to_string()));
         assert!(!ids.contains(&"w-1".to_string()));
         assert!(ids.contains(&"w-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_ring_snapshot_carries_worker_pressure() {
+        let reg = registry();
+        let mut msg = make_dispatch_msg(true, false, "p1", &["m"]).await;
+        msg.name = "pressured".into();
+        msg.total_gpu_slots = Some(4);
+        msg.ready_gpu_slots = Some(3);
+        msg.queue_depth = Some(9);
+        msg.pending_cost = Some(90);
+        msg.inflight_batches = Some(6);
+        reg.update_worker("http://pressured:8080", msg).await;
+
+        let snap = reg.ring_snapshot_for("m", "p1", "l4", "default", "");
+
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.entries[0].worker_id, "pressured");
+        assert_eq!(snap.entries[0].ready_gpu_slots, 3);
+        assert_eq!(snap.entries[0].queue_depth, 9);
+        assert_eq!(snap.entries[0].pending_cost, 90);
+        assert_eq!(snap.entries[0].inflight_batches, 6);
     }
 
     #[tokio::test]

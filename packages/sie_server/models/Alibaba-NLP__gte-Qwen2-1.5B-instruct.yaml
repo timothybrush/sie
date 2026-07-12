@@ -17,7 +17,13 @@ max_sequence_length: 32768
 profiles:
   default:
     max_batch_tokens: 16384
-    compute_precision: bfloat16
+    # The sentence_transformer adapter ignores compute_precision: the model
+    # loads in its stored checkpoint dtype, which is float32 here (fp32
+    # safetensors, config.json torch_dtype float32). The committed floors are
+    # therefore fp32 self-measures — no higher-precision serving mode exists
+    # to close the ~3.6% CosQA/CQADupstackPhysics gap vs the official
+    # leaderboard numbers (#1625).
+    compute_precision: null
     # gte-Qwen2 is a decoder converted to BIDIRECTIONAL attention (config
     # is_causal=false) with last-token pooling, served via its custom
     # trust_remote_code modeling. The qwen2_flash adapter reimplements the

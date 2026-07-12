@@ -41,6 +41,9 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -53,11 +56,48 @@ from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import media_bytes
 
 if TYPE_CHECKING:
-    from PIL import Image
-
     from sie_server.types.inputs import Item
 
 logger = logging.getLogger(__name__)
+
+
+def _open_clip_token_counts(input_ids: Any) -> list[int] | None:
+    """Per-row non-pad token counts for an ``open_clip`` tokenizer batch (§7.3).
+
+    open_clip pads every text to the fixed context length with id ``0``, so the
+    count of non-zero ids per row is the real billable length (content plus the
+    sot/eot markers) the text tower encoded. Best-effort: any tensor quirk
+    yields ``None`` so the meter falls back to its reserve estimate rather than
+    mis-billing — metering must never fail inference.
+    """
+    try:
+        return [int((row != 0).sum().item()) for row in input_ids]
+    except Exception:  # noqa: BLE001 — metering must never fail inference
+        return None
+
+
+# Cross-item preprocessing is CPU-bound (PIL decode + resize). Fan the flat
+# image set across a small bounded thread pool so decode/resize overlaps.
+_MAX_PREPROCESS_THREADS = 8
+
+
+def _feature_tensor(out: Any) -> torch.Tensor:
+    """Return the pooled feature tensor from a ``get_*_features`` result.
+
+    transformers <= 4.57.x (the Modal lane pin) returns the ``[B, dim]`` feature
+    tensor directly; transformers 5.x wraps it in a ``BaseModelOutputWithPooling``
+    whose ``pooler_output`` is that *same* tensor. Unwrap so the transformers
+    backend is robust across the pin instead of raising ``AttributeError`` in
+    ``functional.normalize``. (open_clip's ``encode_*`` always returns a tensor.)
+    """
+    if isinstance(out, torch.Tensor):
+        return out
+    pooled = getattr(out, "pooler_output", None)
+    if isinstance(pooled, torch.Tensor):
+        return pooled
+    msg = f"unexpected get_*_features return type: {type(out).__name__}"
+    raise TypeError(msg)
+
 
 # Error messages
 _ERR_NO_INPUT = "SiglipAdapter requires either text or images input"
@@ -106,6 +146,7 @@ class SiglipAdapter(BaseAdapter):
         compute_precision: ComputePrecision = "float16",
         trust_remote_code: bool = False,
         max_seq_length: int | None = None,
+        revision: str | None = None,
         backend: SiglipBackend = "transformers",
         open_clip_model_id: str | None = None,
         dense_dim: int | None = None,
@@ -123,6 +164,11 @@ class SiglipAdapter(BaseAdapter):
                 ``SiglipProcessor.from_pretrained`` in the transformers
                 backend. Ignored by the ``open_clip`` backend.
             max_seq_length: Ignored - SigLIP uses fixed token length from model config.
+            revision: Optional HuggingFace revision/branch/commit SHA to pin
+                when loading the processor and model in the ``transformers``
+                backend. If None, the default branch is used. Forwarded to
+                ``from_pretrained(..., revision=...)``. Ignored by the
+                ``open_clip`` backend, which pins via its own model identifier.
             backend: Which loader to use. ``transformers`` (default) for stock
                 SigLIP checkpoints; ``open_clip`` for open_clip-distributed
                 SigLIP checkpoints (e.g. Marqo).
@@ -139,6 +185,7 @@ class SiglipAdapter(BaseAdapter):
         self._normalize = normalize
         self._compute_precision = compute_precision
         self._trust_remote_code = trust_remote_code
+        self._revision = revision
         self._backend: SiglipBackend = backend
         self._open_clip_model_id = open_clip_model_id
         self._dense_dim_override = dense_dim
@@ -157,6 +204,20 @@ class SiglipAdapter(BaseAdapter):
         self._open_clip_tokenizer: Any | None = None
         self._device: str | None = None
         self._dense_dim: int | None = None
+        # HF fast tokenizers are NOT thread-safe: applying per-call
+        # padding/truncation flags reconfigures the underlying Rust tokenizer,
+        # which takes a mutable borrow. Concurrent text encodes (e.g. the
+        # managed lane's ``@modal.concurrent`` inputs dispatched to a thread
+        # pool) otherwise race with ``RuntimeError: Already borrowed``.
+        # Serialise the tokenizer call — microseconds vs the GPU forward.
+        # Guards both backends' tokenizers.
+        self._tokenizer_lock = threading.Lock()
+        # Lazily-created bounded pool used to overlap per-image CPU
+        # preprocessing (decode + resize) within a batched encode call.
+        # Guards lazy pool creation against concurrent first callers (same
+        # hazard class as ``_tokenizer_lock``) so a race can't orphan a pool.
+        self._preprocess_pool_lock = threading.Lock()
+        self._preprocess_pool: ThreadPoolExecutor | None = None
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -200,15 +261,19 @@ class SiglipAdapter(BaseAdapter):
         """Load via transformers SiglipModel/SiglipProcessor."""
         from transformers import SiglipModel, SiglipProcessor
 
+        shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
+        if self._revision is not None:
+            shared_kwargs["revision"] = self._revision
+
         self._processor = SiglipProcessor.from_pretrained(
             self._model_name_or_path,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
 
         self._model = SiglipModel.from_pretrained(
             self._model_name_or_path,
             torch_dtype=dtype,
-            trust_remote_code=self._trust_remote_code,
+            **shared_kwargs,
         )
         self._model.to(device)
         self._model.eval()
@@ -291,11 +356,11 @@ class SiglipAdapter(BaseAdapter):
         self._validate_output_types(output_types)
 
         # Index prepared image tensors by the original item index so the
-        # per-item loop can reuse them. Only the open_clip backend currently
-        # consumes these; the transformers ImagePreprocessor produces tensors
-        # in a layout matching SiglipProcessor, but the existing transformers
-        # code path re-runs the processor inline — left untouched here to
-        # avoid behavioral drift on the google/siglip* regression tests.
+        # batched image path can reuse them. Only the open_clip backend
+        # currently consumes these; the transformers ImagePreprocessor produces
+        # tensors in a layout matching SiglipProcessor, but the transformers
+        # code path re-runs the processor inline — left untouched here to avoid
+        # behavioral drift on the google/siglip* regression tests.
         prepared_by_index: dict[int, Any] = {}
         if self._backend == "open_clip" and prepared_items:
             for prepared in prepared_items:
@@ -307,153 +372,182 @@ class SiglipAdapter(BaseAdapter):
                     continue
                 prepared_by_index[prepared.original_index] = pixel_values
 
-        # Encode each item individually and stack into batch
         import numpy as np
 
-        embeddings_list = []
+        # Partition items by modality (image takes precedence over text),
+        # preserving original positions so the stacked output stays in order.
+        image_indices: list[int] = []
+        text_indices: list[int] = []
         for i, item in enumerate(items):
-            embedding = self._encode_single_item(item, prepared_pixel_values=prepared_by_index.get(i))
-            embeddings_list.append(embedding)
+            has_text = item.text is not None
+            images = item.images
+            has_images = images is not None and len(images) > 0
+            if not has_text and not has_images:
+                raise ValueError(_ERR_NO_INPUT)
+            if has_images:
+                image_indices.append(i)
+            else:
+                text_indices.append(i)
+
+        embeddings: list[Any] = [None] * len(items)
+
+        if image_indices:
+            image_vecs = self._encode_image_items(image_indices, items, prepared_by_index)
+            for slot, i in enumerate(image_indices):
+                embeddings[i] = image_vecs[slot]
+
+        per_item_token_counts: list[int] | None = None
+        if text_indices:
+            text_vecs, text_counts = self._encode_texts([items[i].text for i in text_indices])  # ty: ignore[invalid-argument-type]
+            for slot, i in enumerate(text_indices):
+                embeddings[i] = text_vecs[slot]
+            # Scatter the per-text token counts back to their item positions
+            # (image items → 0 text tokens), aligned 1:1 with ``items``.
+            if isinstance(text_counts, list) and len(text_counts) == len(text_indices):
+                per_item_token_counts = [0] * len(items)
+                for slot, i in enumerate(text_indices):
+                    per_item_token_counts[i] = text_counts[slot]
 
         # Stack into batched array [batch, dim]
-        dense_batch = np.stack(embeddings_list, axis=0)
+        dense_batch = np.stack(embeddings, axis=0)
 
-        return EncodeOutput(
+        output = EncodeOutput(
             dense=dense_batch,
             batch_size=len(items),
             is_query=is_query,
             dense_dim=self._dense_dim,
         )
+        # Unit-meter seam (§7.3): stamp exact per-item TEXT-tower token counts
+        # (both backends). Image items took the image tower (metered per image
+        # via ``count_input_images``) and contribute 0 text tokens; only stamp
+        # when at least one text item was encoded so a pure-image batch stays on
+        # the image dimension. The encode pipeline forwards ``extra`` to the
+        # result path for metering (§P3.5).
+        if per_item_token_counts is not None:
+            output.extra["input_token_counts"] = per_item_token_counts
+        return output
 
-    def _encode_single_item(self, item: Item, prepared_pixel_values: Any = None) -> Any:
-        """Encode a single item (text, image, or both).
+    def _get_preprocess_pool(self) -> ThreadPoolExecutor:
+        """Return the lazily-created bounded preprocessing thread pool."""
+        pool = self._preprocess_pool
+        if pool is None:
+            with self._preprocess_pool_lock:
+                pool = self._preprocess_pool
+                if pool is None:
+                    workers = min(_MAX_PREPROCESS_THREADS, os.cpu_count() or 1)
+                    pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="siglip-preproc")
+                    self._preprocess_pool = pool
+        return pool
 
-        Args:
-            item: Input item.
-            prepared_pixel_values: Optional pre-processed ``[C, H, W]`` tensor
-                from the framework's image preprocessor. Only honored on the
-                ``open_clip`` backend and only when the item has exactly one
-                image (matching what the preprocessor consumed). Falls back
-                to inline preprocessing otherwise.
+    def _preprocess_one(self, img_input: Any) -> torch.Tensor:
+        """Decode + preprocess a single image input into a ``[C, H, W]`` tensor.
 
-        Returns:
-            Numpy array of shape [dense_dim].
-        """
-        has_text = item.text is not None
-        images = item.images
-        has_images = images is not None and len(images) > 0
-
-        if not has_text and not has_images:
-            raise ValueError(_ERR_NO_INPUT)
-
-        # Determine what to encode
-        if has_images:
-            # Image encoding (or image+text where image takes precedence).
-            # The framework's preprocessor only handles the first image per
-            # item, so we can only reuse it when the item has exactly one.
-            if (
-                self._backend == "open_clip"
-                and prepared_pixel_values is not None
-                and images is not None
-                and len(images) == 1
-            ):
-                return self._encode_images([], prepared_pixel_values=prepared_pixel_values)
-            pil_images = self._load_images(item)
-            return self._encode_images(pil_images)
-        # Text-only encoding (text is guaranteed non-None if no images)
-        return self._encode_text(item.text)  # type: ignore
-
-    def _load_images(self, item: Item) -> list[Image.Image]:
-        """Load images from item into PIL Images.
-
-        Args:
-            item: Item with images field.
-
-        Returns:
-            List of PIL Images.
+        Stateless per call (PIL / processor / val_preproc release the GIL on
+        the heavy work), so this is safe to fan across the preprocessing pool.
         """
         from PIL import Image
 
-        pil_images = []
-        for img_input in item.images or []:
-            # img_input is ImageInput TypedDict with data (bytes) and optional format
-            img_bytes = media_bytes(img_input, kind="image")
-            pil_img = Image.open(io.BytesIO(img_bytes))
-            # Convert to RGB if necessary
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            pil_images.append(pil_img)
+        img_bytes = media_bytes(img_input, kind="image")
+        pil_img = Image.open(io.BytesIO(img_bytes))
+        # Convert to RGB if necessary
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        if self._backend == "open_clip":
+            assert self._open_clip_preprocess is not None
+            return self._open_clip_preprocess(pil_img)
+        assert self._processor is not None
+        processed = self._processor(images=pil_img, return_tensors="pt")
+        return processed["pixel_values"][0]
 
-        return pil_images
-
-    def _encode_images(
+    def _preprocess_image_batch(
         self,
-        images: list[Image.Image],
-        prepared_pixel_values: Any = None,
+        image_indices: list[int],
+        items: list[Item],
+        prepared_by_index: dict[int, Any],
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Build a stacked ``[N, C, H, W]`` pixel tensor + per-item image counts.
+
+        Reuses the framework's prepared ``[C, H, W]`` tensor for single-image
+        items on the open_clip backend (matching the previous fast path); every
+        other image is decoded + preprocessed, fanned across the pool. Per-image
+        preprocessing is independent, so the stacked tensor is identical to
+        preprocessing each image serially.
+        """
+        # Build the flat list of preprocessing jobs in stacked order. A job is
+        # either a ready ``[C, H, W]`` tensor (open_clip prepared fast path) or
+        # a raw image input to decode + preprocess.
+        jobs: list[tuple[str, Any]] = []
+        counts: list[int] = []
+        for slot, item in enumerate(items):
+            item_images = item.images or []
+            counts.append(len(item_images))
+            orig_index = image_indices[slot]
+            prepared = prepared_by_index.get(orig_index)
+            if self._backend == "open_clip" and prepared is not None and len(item_images) == 1:
+                jobs.append(("ready", prepared))
+            else:
+                jobs.extend(("decode", img_input) for img_input in item_images)
+
+        def run(job: tuple[str, Any]) -> torch.Tensor:
+            kind, payload = job
+            return payload if kind == "ready" else self._preprocess_one(payload)
+
+        if len(jobs) == 1:
+            tensors = [run(jobs[0])]
+        else:
+            pool = self._get_preprocess_pool()
+            tensors = list(pool.map(run, jobs))
+        return torch.stack(tensors, dim=0), counts
+
+    def _encode_image_items(
+        self,
+        image_indices: list[int],
+        all_items: list[Item],
+        prepared_by_index: dict[int, Any],
     ) -> Any:
-        """Encode images into embeddings.
+        """Encode image items as one stacked forward, mean-pooling per item.
 
-        Args:
-            images: List of PIL Images. Ignored on the ``open_clip`` backend
-                when ``prepared_pixel_values`` is supplied.
-            prepared_pixel_values: Optional pre-processed ``[C, H, W]`` tensor
-                from the framework's preprocessor. Only the ``open_clip``
-                backend uses this fast path; when supplied, ``val_preproc``
-                is skipped and the tensor is moved to device and batched
-                directly.
-
-        Returns:
-            Numpy array of shape [dense_dim] (averaged if multiple images).
+        Returns a ``[len(image_indices), dim]`` float32 array, one row per item.
         """
         assert self._model is not None
 
         from torch.nn import functional
 
+        items = [all_items[i] for i in image_indices]
+        pixel_values, counts = self._preprocess_image_batch(image_indices, items, prepared_by_index)
+
         if self._backend == "open_clip":
-            # ``val_preproc`` and the framework preprocessor both return
-            # float32 tensors. The open_clip model was cast to ``dtype`` at
-            # load time (e.g. fp16 on CUDA), so we must match here — unlike
-            # ``transformers.SiglipModel``, ``open_clip``'s ``encode_image``
-            # does not auto-cast inputs.
+            # open_clip's encode_image does not auto-cast inputs; match the
+            # model dtype (e.g. fp16 on CUDA) as the serial path did.
             model_dtype = next(self._model.parameters()).dtype
-            if prepared_pixel_values is not None:
-                # Fast path: framework preprocessor already produced a
-                # [C, H, W] tensor in the val_preproc layout. Add the batch
-                # dim, move to device, and cast to the model's dtype.
-                pixel_values = prepared_pixel_values.unsqueeze(0).to(device=self._device, dtype=model_dtype)
-                effective_count = 1
-            else:
-                assert self._open_clip_preprocess is not None
-                pixel_values = torch.stack([self._open_clip_preprocess(img) for img in images]).to(
-                    device=self._device, dtype=model_dtype
-                )
-                effective_count = len(images)
+            pixel_values = pixel_values.to(device=self._device, dtype=model_dtype)
             with torch.inference_mode():
                 image_features = self._model.encode_image(pixel_values, normalize=self._normalize)
         else:
-            assert self._processor is not None
-            inputs = self._processor(images=images, return_tensors="pt")
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            pixel_values = pixel_values.to(self._device)
             with torch.inference_mode():
-                image_features = self._model.get_image_features(**inputs)
+                image_features = _feature_tensor(self._model.get_image_features(pixel_values=pixel_values))
                 if self._normalize:
                     image_features = functional.normalize(image_features, p=2, dim=-1)
-            effective_count = len(images)
 
-        # If multiple images, average the embeddings
-        if effective_count > 1:
-            image_features = image_features.mean(dim=0, keepdim=True)
+        # Split by per-item image counts; mean-pool multi-image items on-device
+        # in the model dtype, exactly as the serial path did.
+        vecs = []
+        offset = 0
+        for count in counts:
+            group = image_features[offset : offset + count]
+            offset += count
+            vecs.append(group[0] if count == 1 else group.mean(dim=0))
 
-        return image_features[0].float().cpu().numpy()
+        return torch.stack(vecs, dim=0).float().cpu().numpy()
 
-    def _encode_text(self, text: str) -> Any:
-        """Encode text into embeddings.
+    def _encode_texts(self, texts: list[str]) -> tuple[Any, list[int] | None]:
+        """Encode a list of texts as one stacked forward.
 
-        Args:
-            text: Text string to encode.
-
-        Returns:
-            Numpy array of shape [dense_dim].
+        Returns ``(embeddings, token_counts)``: a ``[len(texts), dim]`` float32
+        array (one row per text) and the exact per-text token counts the text
+        tower encoded (§7.3, both backends), or ``None`` when no clean count
+        could be surfaced.
         """
         assert self._model is not None
 
@@ -461,21 +555,45 @@ class SiglipAdapter(BaseAdapter):
 
         if self._backend == "open_clip":
             assert self._open_clip_tokenizer is not None
-            input_ids = self._open_clip_tokenizer([text]).to(self._device)
+            # Serialise tokenization: fast tokenizers are not thread-safe.
+            with self._tokenizer_lock:
+                input_ids = self._open_clip_tokenizer(list(texts))
+                # Unit-meter seam (§7.3): open_clip pads to a fixed context
+                # length with id 0, so the non-pad count per row is the real
+                # billable length (content + sot/eot) the tower encoded.
+                token_counts = _open_clip_token_counts(input_ids)
+                input_ids = input_ids.to(self._device)
             with torch.inference_mode():
                 text_features = self._model.encode_text(input_ids, normalize=self._normalize)
         else:
             assert self._processor is not None
-            # Process text - use max_length padding to match MTEB behavior
-            # SigLIP text embeddings depend on sequence length, so consistent padding is required
-            inputs = self._processor(text=[text], return_tensors="pt", padding="max_length", truncation=True)
+            # Process text as one batch - use max_length padding to match MTEB
+            # behavior. SigLIP text embeddings depend on sequence length, so
+            # consistent padding is required (per-item results are unchanged by
+            # batching since max_length pads every item to the same length).
+            # The HF fast tokenizer is not thread-safe under the per-call
+            # padding/truncation reconfiguration, so serialise this call.
+            with self._tokenizer_lock:
+                inputs = self._processor(text=list(texts), return_tensors="pt", padding="max_length", truncation=True)
+                # Unit-meter seam (§7.3): SigLIP pads every text to a fixed
+                # length (and its tokenizer omits an attention mask), so count
+                # the exact content tokens via a padding-free recount over the
+                # processor tokenizer (capped at the model context window,
+                # SigLIP 64) — the real billable length, excluding padding.
+                token_counts = self._token_counts_or_none(
+                    self._processor.tokenizer, list(texts), expected_len=len(texts)
+                )
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
             with torch.inference_mode():
-                text_features = self._model.get_text_features(**inputs)
+                text_features = _feature_tensor(self._model.get_text_features(**inputs))
                 if self._normalize:
                     text_features = functional.normalize(text_features, p=2, dim=-1)
 
-        return text_features[0].float().cpu().numpy()
+        return text_features.float().cpu().numpy(), token_counts
+
+    def _encode_text(self, text: str) -> Any:
+        """Encode a single text into a ``[dim]`` embedding (thin batch wrapper)."""
+        return self._encode_texts([text])[0][0]
 
     def _validate_output_types(self, output_types: list[str]) -> None:
         """Validate that output types are supported."""
@@ -506,3 +624,11 @@ class SiglipAdapter(BaseAdapter):
         from sie_server.core.preprocessor import ImagePreprocessor
 
         return ImagePreprocessor(self._processor, self._model_name_or_path)
+
+    def unload(self) -> None:
+        """Shut down the preprocessing pool, then unload model weights."""
+        pool = self._preprocess_pool
+        self._preprocess_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False)
+        super().unload()

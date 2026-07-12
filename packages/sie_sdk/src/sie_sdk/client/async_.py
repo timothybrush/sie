@@ -34,25 +34,38 @@ import json
 import logging
 import time
 import warnings
-from collections.abc import AsyncIterator
-from typing import Any, Literal, Self, overload
+from collections.abc import AsyncIterator, Mapping, Sequence
+from pathlib import Path
+from typing import IO, Any, Literal, Self, overload
+from urllib.parse import urlencode
 
 import aiohttp
 import msgpack
 import msgpack_numpy as m
 
 from sie_sdk.documents import convert_item_document
+from sie_sdk.files import resolve_upload
 from sie_sdk.images import convert_item_images
+from sie_sdk.jobs import TERMINAL_JOB_STATES, build_job_body, decode_chunk_bytes, job_chunks
 from sie_sdk.types import (
+    Batch,
     CapacityInfo,
     ChatCompletion,
     ChatCompletionChunk,
     ChatMessage,
+    Connection,
+    ConnectionCreated,
+    ConnectionRevoked,
     EncodeResult,
     ExtractResult,
+    File,
+    FileDeleted,
     GenerateChunk,
     GenerateResult,
     Item,
+    JobResults,
+    JobStatus,
+    JobSubmitResult,
     ModelInfo,
     OutputType,
     PoolInfo,
@@ -358,6 +371,8 @@ class SIEAsyncClient:
         pool: PoolSpec | None = None,
         max_connections: int | None = None,
         max_concurrency: int | None = None,
+        control_plane_url: str | None = None,
+        org: str | None = None,
     ) -> None:
         # Ensure msgpack-numpy hooks are installed (once per process).
         # Done lazily here instead of at module level to avoid monkey-patching
@@ -373,6 +388,10 @@ class SIEAsyncClient:
         self._default_gpu = gpu
         self._default_options = options
         self._api_key = api_key
+        # Control-plane base URL + org for the connections namespace (connector
+        # auth lives on the control plane, not the keyed gateway).
+        self._control_plane_url = control_plane_url.rstrip("/") if control_plane_url else None
+        self._org = org
 
         # Multi-pool state: track in-flight creations and lease renewal tasks
         self._pools: dict[str, _PoolTaskEntry] = {}
@@ -406,6 +425,14 @@ class SIEAsyncClient:
         )
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
+
+        # First-class batch + connector surface.
+        self.jobs = _AsyncJobs(self)
+        self.connections = _AsyncConnections(self)
+        # OpenAI-compatible Files + Batches surface — a
+        # `base_url` swap makes an `openai` batch caller work unchanged.
+        self.files = _AsyncFiles(self)
+        self.batches = _AsyncBatches(self)
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Lazily create the aiohttp session on first use (requires a running loop)."""
@@ -1477,11 +1504,23 @@ class SIEAsyncClient:
 
         workers: list[WorkerInfo] = [
             WorkerInfo(
+                name=w.get("name", ""),
                 url=w.get("url", ""),
                 gpu=w.get("gpu", ""),
+                gpu_count=w.get("gpu_count", 0),
+                ready_gpu_slots=w.get(
+                    "ready_gpu_slots",
+                    w.get("gpu_count", 1 if w.get("healthy", False) else 0),
+                ),
                 healthy=w.get("healthy", False),
                 queue_depth=w.get("queue_depth", 0),
+                pending_cost=w.get("pending_cost", 0),
+                inflight_batches=w.get("inflight_batches", 0),
                 loaded_models=w.get("loaded_models", []),
+                memory_used_bytes=w.get("memory_used_bytes", 0),
+                memory_total_bytes=w.get("memory_total_bytes", 0),
+                bundle=w.get("bundle", ""),
+                bundle_config_hash=w.get("bundle_config_hash", ""),
             )
             for w in workers_data
         ]
@@ -2484,3 +2523,300 @@ class SIEAsyncClient:
         results = parse_extract_results(response_data["items"])
 
         return results[0] if single_item else results
+
+
+# ---------------------------------------------------------------------------
+# Jobs + connections namespaces — async variants of the sync
+# namespaces; reuse the client's aiohttp session and bearer auth.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncNamespace:
+    """Shared JSON transport for the async jobs/connections namespaces."""
+
+    def __init__(self, client: SIEAsyncClient) -> None:
+        self._c = client
+
+    async def _request_json(
+        self, method: str, url: str, *, json_body: Any = None, timeout_s: float | None = None
+    ) -> Any:
+        """One JSON request over the client's aiohttp session (bearer auth reused).
+
+        ``timeout_s`` overrides the session default for a single call — long-running
+        POSTs (jobs.submit / batches.create) floor it to 120s so a large preflight
+        does not abort while the server keeps working.
+        """
+        try:
+            if method == "GET":
+                response = await self._c._get(url, headers={"Accept": JSON_CONTENT_TYPE})
+            elif method == "DELETE":
+                response = await self._c._delete(url, headers={"Accept": JSON_CONTENT_TYPE})
+            else:
+                # Pre-serialize so the Content-Type is unambiguously application/json.
+                response = await self._c._post(
+                    url,
+                    data=json.dumps(json_body).encode("utf-8"),
+                    headers={"Accept": JSON_CONTENT_TYPE, "Content-Type": JSON_CONTENT_TYPE},
+                    timeout_s=timeout_s,
+                )
+        except TimeoutError as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        except (aiohttp.ClientError, OSError) as e:
+            msg = f"Failed to connect to {url}: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        self._c._check_server_version(response)
+        if not response.content:
+            return {}
+        return response.json()
+
+
+class _AsyncJobs(_AsyncNamespace):
+    """Async batch class — see :class:`SIEClient` ``.jobs`` for the contract."""
+
+    async def submit(
+        self,
+        *,
+        source: Any,
+        model: str,
+        operation: str = "encode",
+        sink: Any = None,
+        connection: str | None = None,
+        sink_connection: str | None = None,
+        field_map: Mapping[str, Any] | None = None,
+        output_field: str | None = None,
+        when: Any = None,
+        output_types: Sequence[str] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> JobSubmitResult:
+        """Async ``jobs.submit``. See :class:`SIEClient` ``.jobs.submit`` for details."""
+        body = build_job_body(
+            source=source,
+            operation=operation,
+            model=model,
+            sink=sink,
+            connection=connection,
+            sink_connection=sink_connection,
+            field_map=field_map,
+            output_field=output_field,
+            when=when,
+            output_types=output_types,
+            options=options,
+        )
+        return await self._request_json("POST", "/v1/jobs", json_body=body, timeout_s=max(self._c._timeout, 120.0))
+
+    async def get(self, job_id: str) -> JobStatus:
+        """Async ``jobs.get``."""
+        return await self._request_json("GET", f"/v1/jobs/{job_id}")
+
+    async def list(self) -> Sequence[JobStatus]:
+        """Async ``jobs.list``."""
+        data = await self._request_json("GET", "/v1/jobs")
+        if isinstance(data, dict):
+            return data.get("data", [])
+        return data if isinstance(data, list) else []
+
+    async def cancel(self, job_id: str) -> JobStatus:
+        """Async ``jobs.cancel``."""
+        return await self._request_json("POST", f"/v1/jobs/{job_id}/cancel")
+
+    async def results(self, job_id: str) -> JobResults:
+        """Async ``jobs.results`` — read + decode the finished job's chunk refs."""
+        job = await self.get(job_id)
+        chunks = job_chunks(job)
+        items = []
+        for chunk in chunks:
+            ref = chunk.get("ref")
+            if chunk.get("state") != "succeeded" or not ref:
+                continue
+            items.extend(decode_chunk_bytes(await self._read_ref(ref)))
+        dims = next((it["dims"] for it in items if it.get("dims")), None)
+        return {
+            "job_id": job.get("id", job_id),
+            "state": job.get("state"),
+            "total_items": job.get("total_items"),
+            "settled_credits": job.get("settled_credits"),
+            "chunks": chunks,
+            "retrieved": len(items),
+            "dims": dims,
+            "items": items,
+        }
+
+    async def wait(self, job_id: str, *, timeout_s: float = 600.0, poll_s: float = 2.0) -> JobStatus:
+        """Poll ``get`` until the job reaches a terminal state or ``timeout_s`` elapses."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            job = await self.get(job_id)
+            if job.get("state") in TERMINAL_JOB_STATES:
+                return job
+            if time.monotonic() >= deadline:
+                msg = f"job {job_id} still {job.get('state')!r} after {timeout_s:.0f}s"
+                raise RequestError(msg, code="job_wait_timeout", status_code=504)
+            await asyncio.sleep(poll_s)
+
+    async def _read_ref(self, ref: str) -> bytes:
+        """Retrieve a chunk's payload-store ref (local path or http(s) URL, POC).
+
+        http(s) refs are fetched on a bare session that does NOT carry the
+        client's ``Authorization`` header: a ref points at the payload store,
+        not the SIE API, so the bearer token must never leak to the ref host
+        (matches the TS SDK, which fetches refs with a plain ``fetch``).
+        """
+        if ref.startswith(("http://", "https://")):
+            timeout = aiohttp.ClientTimeout(total=self._c._timeout)
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.get(ref, headers={"Accept": "application/octet-stream"}) as resp,
+            ):
+                response = _AioResponse(resp.status, await resp.read(), resp.headers)
+            if response.status_code >= HTTP_CLIENT_ERROR:
+                handle_error(response)
+            return response.content
+        path = Path(ref)
+        if await asyncio.to_thread(path.exists):
+            return await asyncio.to_thread(path.read_bytes)
+        msg = f"cannot retrieve payload-store ref {ref!r} (POC reads local-path and http(s) refs)"
+        raise RequestError(msg, code="bad_ref", status_code=400)
+
+
+class _AsyncConnections(_AsyncNamespace):
+    """Async org-scoped connections — see :class:`SIEClient` ``.connections``."""
+
+    def _base(self) -> str:
+        if not self._c._control_plane_url:
+            msg = "connections require control_plane_url on the client: SIEAsyncClient(..., control_plane_url=..., org=...)"
+            raise ValueError(msg)
+        if not self._c._org:
+            msg = "connections require org on the client: SIEAsyncClient(..., org=...)"
+            raise ValueError(msg)
+        return f"{self._c._control_plane_url}/internal/orgs/{self._c._org}/connections"
+
+    async def add(self, name: str, type: str, secret: str) -> ConnectionCreated:
+        """Async ``connections.add``."""
+        body = {"type": type, "name": name, "secret": secret}
+        return await self._request_json("POST", self._base(), json_body=body)
+
+    async def list(self) -> Sequence[Connection]:
+        """Async ``connections.list`` (secrets redacted)."""
+        data = await self._request_json("GET", self._base())
+        if isinstance(data, dict):
+            return data.get("connections", [])
+        return data if isinstance(data, list) else []
+
+    async def revoke(self, name: str) -> ConnectionRevoked:
+        """Async ``connections.revoke``."""
+        return await self._request_json("DELETE", f"{self._base()}/{name}")
+
+
+# ---------------------------------------------------------------------------
+# Files + batches namespaces — async variants of the sync
+# namespaces; reuse the client's aiohttp session and bearer auth. Method
+# names/args mirror `openai.files` / `openai.batches`.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncFiles(_AsyncNamespace):
+    """Async OpenAI-compatible Files API — see :class:`SIEClient` ``.files``."""
+
+    async def upload(
+        self,
+        file: str | Path | bytes | bytearray | IO[bytes],
+        *,
+        purpose: str = "batch",
+        filename: str | None = None,
+    ) -> File:
+        """Async ``files.upload`` (``POST /v1/files``)."""
+        # resolve_upload does blocking path/file-like reads; off-load it so a
+        # large upload does not stall the event loop.
+        content, name = await asyncio.to_thread(resolve_upload, file, filename)
+        query = urlencode({"purpose": purpose, "filename": name})
+        try:
+            response = await self._c._post(
+                f"/v1/files?{query}",
+                data=content,
+                headers={"Accept": JSON_CONTENT_TYPE, "Content-Type": "application/jsonl"},
+                timeout_s=max(self._c._timeout, 120.0),
+            )
+        except TimeoutError as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        except (aiohttp.ClientError, OSError) as e:
+            msg = f"Failed to connect to {self._c._base_url}: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        self._c._check_server_version(response)
+        return response.json()
+
+    async def create(
+        self,
+        *,
+        file: str | Path | bytes | bytearray | IO[bytes],
+        purpose: str = "batch",
+    ) -> File:
+        """OpenAI-exact alias for :meth:`upload` (``files.create(file=, purpose=)``)."""
+        return await self.upload(file, purpose=purpose)
+
+    async def retrieve(self, file_id: str) -> File:
+        """Async ``files.retrieve`` (``GET /v1/files/{id}``)."""
+        return await self._request_json("GET", f"/v1/files/{file_id}")
+
+    async def content(self, file_id: str) -> bytes:
+        """Async ``files.content`` — download a file's raw bytes (``GET /v1/files/{id}/content``)."""
+        try:
+            response = await self._c._get(
+                f"/v1/files/{file_id}/content",
+                headers={"Accept": "application/jsonl"},
+            )
+        except TimeoutError as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+        except (aiohttp.ClientError, OSError) as e:
+            msg = f"Failed to connect to {self._c._base_url}: {e}"
+            raise SIEConnectionError(msg) from e
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+        return response.content
+
+    async def delete(self, file_id: str) -> FileDeleted:
+        """Async ``files.delete`` (``DELETE /v1/files/{id}``; additive OpenAI-parity)."""
+        return await self._request_json("DELETE", f"/v1/files/{file_id}")
+
+
+class _AsyncBatches(_AsyncNamespace):
+    """Async OpenAI-compatible Batch API — see :class:`SIEClient` ``.batches``."""
+
+    async def create(
+        self,
+        *,
+        input_file_id: str,
+        endpoint: str = "/v1/embeddings",
+        completion_window: str = "24h",
+        metadata: dict[str, Any] | None = None,
+    ) -> Batch:
+        """Async ``batches.create`` (``POST /v1/batches``)."""
+        body: dict[str, Any] = {
+            "input_file_id": input_file_id,
+            "endpoint": endpoint,
+            "completion_window": completion_window,
+        }
+        if metadata is not None:
+            body["metadata"] = metadata
+        return await self._request_json("POST", "/v1/batches", json_body=body, timeout_s=max(self._c._timeout, 120.0))
+
+    async def retrieve(self, batch_id: str) -> Batch:
+        """Async ``batches.retrieve`` (``GET /v1/batches/{id}``)."""
+        return await self._request_json("GET", f"/v1/batches/{batch_id}")
+
+    async def list(self) -> Sequence[Batch]:
+        """Async ``batches.list`` (``GET /v1/batches``; additive OpenAI-parity)."""
+        data = await self._request_json("GET", "/v1/batches")
+        if isinstance(data, dict):
+            return data.get("data", [])
+        return data if isinstance(data, list) else []
+
+    async def cancel(self, batch_id: str) -> Batch:
+        """Async ``batches.cancel`` (``POST /v1/batches/{id}/cancel``; additive OpenAI-parity)."""
+        return await self._request_json("POST", f"/v1/batches/{batch_id}/cancel")
