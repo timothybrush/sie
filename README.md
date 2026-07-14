@@ -166,7 +166,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 ### Explore
 
-[**Model catalog**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
+[**Model catalog**](https://superlinked.com/models): every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its Hugging Face ID to the SDK.
 
 [**Integrations**](https://superlinked.com/docs/integrations/): setup guides for all nine framework and vector-store integrations, in Python and TypeScript.
 
