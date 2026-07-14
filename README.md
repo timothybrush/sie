@@ -172,7 +172,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 [**Examples**](examples/): A quickstart notebook and an end-to-end project gallery.
 
-[**MCP edge**](packages/sie_mcp/): offload document work from Claude and other MCP clients to your cluster and save agent tokens; PII stays in your VPC.
+[**MCP edge**](packages/sie_mcp/): offload document work from Claude and other MCP clients to your cluster and save agent tokens.
 
 [**Why we built SIE**](https://www.youtube.com/watch?v=qdh_x-uRs9g): The motivation, told at AI Engineer Europe 2026.
 
