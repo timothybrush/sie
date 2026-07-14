@@ -144,6 +144,20 @@ For generation on Apple Silicon (MLX), the TypeScript walkthrough, and every con
 
 ---
 
+### Connect Claude to your GPUs (MCP)
+
+[`packages/sie_mcp`](packages/sie_mcp/) is a lightweight MCP edge for the cluster (`mcpEdge` in the Helm chart). Claude Code, the Claude desktop app, and claude.ai connect to it and offload heavy document work to open models on your GPUs: PDF, scan, and Office-to-markdown conversion, summarization, entity extraction, PII redaction, and schema-valid JSON. Raw bytes and PII stay in your VPC: the edge holds the one cluster credential, and clients authenticate with a separate connector secret.
+
+```bash
+claude mcp add --scope user --transport http superlinked-docs \
+  "https://<mcp-host>/mcp" \
+  --header "Authorization: Bearer <connector-secret>"
+```
+
+`sie-mcp plugin-pack` also generates a Claude Code skill pack and a claude.ai skill ZIP for the same tools; see the [sie-mcp README](packages/sie_mcp/README.md).
+
+---
+
 ### Production
 
 The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for [GKE](https://github.com/superlinked/terraform-google-sie), [EKS](https://github.com/superlinked/terraform-aws-sie), and [AKS](https://github.com/superlinked/terraform-azure-sie). Not just the server, the whole stack. All Apache 2.0.
