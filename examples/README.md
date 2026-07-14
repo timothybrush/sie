@@ -2,6 +2,8 @@
 
 A project gallery of full end-to-end applications built with SIE. Each project lives in its own subdirectory. Clone it, run it, learn from it.
 
+New to SIE? Start with the **[quickstart notebook](./quickstart.ipynb)** [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/superlinked/sie/blob/main/examples/quickstart.ipynb): encode, score, and extract in 5 minutes, then pick a project below.
+
 ## Gallery
 
 Use this table to pick the right starting point. "Runnable" means the
