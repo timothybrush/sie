@@ -27,7 +27,7 @@
 
 ## About
 
-SIE is an open-source inference engine that runs the models behind every agent task through one API: search and retrieval, document-to-markdown conversion, structured output, content safety, and the agent loop itself. It replaces the patchwork of a separate model server per task with one system that serves 85+ models, loading each on demand.
+SIE is an open-source inference engine that runs the models behind every agent task through one API: search and retrieval, document-to-markdown conversion, structured output, content safety, and the agent loop itself. It replaces the patchwork of a separate model server per task with one system that serves 100+ models, loading each on demand.
 
 - OpenAI-compatible API for drop-in migration: `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
 - Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more, all quality-verified against MTEB
@@ -66,11 +66,20 @@ docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlin
 curl http://localhost:8080/readyz   # expect: ok
 ```
 
+The server speaks the OpenAI API out of the box; your first embedding needs nothing but curl:
+
+```bash
+curl http://localhost:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "sentence-transformers/all-MiniLM-L6-v2", "input": "Hello world"}'
+# {"object": "list", "data": [{"object": "embedding", "embedding": [-0.0344, 0.0310, ...
+```
+
 **2. Install the SDK**
 
 ```bash
-pip install sie-sdk           # Python
-pnpm add @superlinked/sie-sdk # TypeScript
+pip install sie-sdk                # Python
+npm install @superlinked/sie-sdk   # TypeScript (pnpm and yarn work too)
 ```
 
 **3. Call models**
@@ -102,7 +111,7 @@ result = client.extract(
 print(result["entities"][0])  # {'text': 'Tim Cook', 'label': 'person', 'score': 0.991}
 ```
 
-The first call to a model downloads its weights from Hugging Face; after that, calls are warm. Text generation runs on the GPU generation image:
+The first call to a model downloads its weights from Hugging Face and loads them (one to three minutes each for the models above on a home connection, with progress visible in the serve terminal); after that, calls return in milliseconds. Text generation runs on the GPU generation image:
 
 ```bash
 docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-sglang
@@ -137,7 +146,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 ### Explore
 
-[**85+ models**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
+[**100+ models**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
 
 [**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
 
