@@ -32,7 +32,7 @@ SIE is an open-source inference engine that runs the models behind every agent t
 
 - 85+ pre-configured models, hot-swappable, all quality-verified against MTEB in CI
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
-- Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE/EKS
+- Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE/EKS/AKS
 - Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, and Weaviate
 - OpenAI-compatible `/v1/embeddings` endpoint for drop-in migration
 
@@ -144,14 +144,14 @@ For the equivalent TypeScript example, see the [TypeScript SDK docs](https://sup
 
 ### Production
 
-The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for GKE and EKS. Not just the server, the whole stack. All Apache 2.0.
+The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for GKE, EKS, and AKS. Not just the server, the whole stack. All Apache 2.0.
 
 ```bash
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
   --set hfToken.create=true \
   --set hfToken.value=YOUR_HF_TOKEN \
-  -f deploy/helm/sie-cluster/values-{gke|aws}.yaml
+  -f deploy/helm/sie-cluster/values-{gke|aws|aks}.yaml
 ```
 
 See the [deployment guide](https://superlinked.com/docs/deployment/).
