@@ -111,7 +111,7 @@ result = client.extract(
 print(result["entities"][0])  # {'text': 'Tim Cook', 'label': 'person', 'score': 0.991}
 ```
 
-The first call to a model downloads its weights from Hugging Face and loads them (one to three minutes each for the models above on a home connection, with progress visible in the serve terminal); after that, calls return in milliseconds. Text generation runs on the GPU generation image:
+The first call to a model downloads its weights from Hugging Face and loads them (one to three minutes each for the models above on a home connection, with progress visible in the server terminal); after that, calls return in milliseconds. Text generation runs on the GPU generation image; stop the first server, then start this one on the same port:
 
 ```bash
 docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-sglang
@@ -131,11 +131,13 @@ For generation on Apple Silicon (MLX), the TypeScript walkthrough, and every con
 The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for [GKE](https://github.com/superlinked/terraform-google-sie), [EKS](https://github.com/superlinked/terraform-aws-sie), and [AKS](https://github.com/superlinked/terraform-azure-sie). Not just the server, the whole stack. All Apache 2.0.
 
 ```bash
+# pick one values overlay: values-gke.yaml / values-aws.yaml / values-aks.yaml
+# (pin --version to a release tag for reproducible installs)
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
   --set hfToken.create=true \
   --set hfToken.value=YOUR_HF_TOKEN \
-  -f deploy/helm/sie-cluster/values-{gke|aws|aks}.yaml
+  -f https://raw.githubusercontent.com/superlinked/sie/main/deploy/helm/sie-cluster/values-gke.yaml
 ```
 
 See the [deployment guide](https://superlinked.com/docs/deployment/).
@@ -146,7 +148,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 ### Explore
 
-[**100+ models**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
+[**Model catalog**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
 
 [**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
 
