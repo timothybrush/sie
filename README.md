@@ -73,7 +73,7 @@ docker run -p 8080:8080 \
 curl http://localhost:8080/readyz   # expect: ok
 ```
 
-The server speaks the OpenAI API out of the box, and not only for embeddings: a cluster gateway serves `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` too, and on Apple Silicon chat completions run locally through MLX. Your first call needs nothing but curl:
+The server speaks the OpenAI API out of the box, embeddings and generation alike (the cluster gateway serves `/v1/chat/completions`, `/v1/completions`, and `/v1/responses`). Your first call needs nothing but curl:
 
 ```bash
 curl http://localhost:8080/v1/embeddings \
@@ -82,7 +82,7 @@ curl http://localhost:8080/v1/embeddings \
 # {"object": "list", "data": [{"object": "embedding", "embedding": [-0.0344, 0.0310, ...
 ```
 
-This first call downloads the model's weights from Hugging Face (a minute or three on a home connection, with progress in the server terminal); every call after that returns in milliseconds. The same goes for each model below on its first use.
+Each model's first call downloads its weights (a minute or three, progress in the server terminal); after that, calls return in milliseconds.
 
 **2. Install the SDK**
 
@@ -144,20 +144,6 @@ For generation on Apple Silicon (MLX), the TypeScript walkthrough, and every con
 
 ---
 
-### Offload document work over MCP, save agent tokens
-
-Instead of reading large documents into an agent's context and paying frontier-model token rates for it, MCP clients like Claude Code, the Claude desktop app, and claude.ai hand the heavy work to open models on your cluster and get a small artifact back. [`packages/sie_mcp`](packages/sie_mcp/) is the lightweight edge that routes those calls (`mcpEdge` in the Helm chart): PDF, scan, and Office-to-markdown conversion, summarization, entity extraction, PII redaction, and schema-valid JSON. Raw bytes and PII stay in your VPC: the edge holds the one cluster credential, and clients authenticate with a separate connector secret.
-
-```bash
-claude mcp add --scope user --transport http superlinked-docs \
-  "https://<mcp-host>/mcp" \
-  --header "Authorization: Bearer <connector-secret>"
-```
-
-`sie-mcp plugin-pack` also generates a Claude Code skill pack and a claude.ai skill ZIP for the same tools; see the [sie-mcp README](packages/sie_mcp/README.md).
-
----
-
 ### Production
 
 The same code works against a production cluster. SIE ships a load-balancing gateway, KEDA autoscaling (scale to zero), Grafana dashboards, and Terraform modules for [GKE](https://github.com/superlinked/terraform-google-sie), [EKS](https://github.com/superlinked/terraform-aws-sie), and [AKS](https://github.com/superlinked/terraform-azure-sie). Not just the server, the whole stack. All Apache 2.0.
@@ -185,6 +171,8 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 [**Integrations**](https://superlinked.com/docs/integrations/): setup guides for all nine framework and vector-store integrations, in Python and TypeScript.
 
 [**Examples**](examples/): A quickstart notebook and an end-to-end project gallery.
+
+[**MCP edge**](packages/sie_mcp/): offload document work from Claude and other MCP clients to your cluster and save agent tokens; PII stays in your VPC.
 
 [**Why we built SIE**](https://www.youtube.com/watch?v=qdh_x-uRs9g): The motivation, told at AI Engineer Europe 2026.
 
