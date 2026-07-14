@@ -10,7 +10,7 @@
 
 <h1>SIE: Superlinked Inference Engine</h1>
 
-<p><strong>Self-hosted inference for agents. Every model your agents call, served from one open-source cluster in your cloud.</strong></p>
+<p><strong>Self-hosted inference for agents. Every open model your agents call, served from one cluster in your cloud.</strong></p>
 
 <p>
   <a href="https://superlinked.com/docs/">Docs</a> |
@@ -30,10 +30,10 @@
 SIE is an open-source inference engine that runs the models behind every agent task through one API: search and retrieval, document-to-markdown conversion, structured output, content safety, and the agent loop itself. It replaces the patchwork of a separate model server per task with one system that serves 100+ models, loading each on demand.
 
 - OpenAI-compatible API for drop-in migration: `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
-- Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more, all quality-verified against MTEB
+- Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more; embedding and retrieval models benchmarked on MTEB
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
 - Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE, EKS, and AKS
-- Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, and Weaviate
+- Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate, and LanceDB
 
 ## Tasks
 
@@ -49,6 +49,8 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 
 ## Quickstart
 
+Prefer a notebook? [`examples/quickstart.ipynb`](examples/quickstart.ipynb) runs this same flow, on your machine or a free Colab GPU.
+
 **1. Start the server**
 
 ```bash
@@ -56,13 +58,18 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 pip install "sie-server[local]" && sie-server serve
 
 # Linux, NVIDIA GPU
-docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-default
+docker run --gpus all -p 8080:8080 \
+  -v sie-hf-cache:/app/.cache/huggingface \
+  ghcr.io/superlinked/sie-server:latest-cuda12-default
 
 # Linux, CPU
-docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
+docker run -p 8080:8080 \
+  -v sie-hf-cache:/app/.cache/huggingface \
+  ghcr.io/superlinked/sie-server:latest-cpu-default
 ```
 
 ```bash
+# in a second terminal
 curl http://localhost:8080/readyz   # expect: ok
 ```
 
@@ -74,6 +81,8 @@ curl http://localhost:8080/v1/embeddings \
   -d '{"model": "sentence-transformers/all-MiniLM-L6-v2", "input": "Hello world"}'
 # {"object": "list", "data": [{"object": "embedding", "embedding": [-0.0344, 0.0310, ...
 ```
+
+This first call downloads the model's weights from Hugging Face (a minute or three on a home connection, with progress in the server terminal); every call after that returns in milliseconds. The same goes for each model below on its first use.
 
 **2. Install the SDK**
 
@@ -108,17 +117,26 @@ result = client.extract(
     Item(text="Tim Cook is the CEO of Apple."),
     labels=["person", "organization"],
 )
-print(result["entities"][0])  # {'text': 'Tim Cook', 'label': 'person', 'score': 0.991}
+print(result["entities"][0])
+# {'text': 'Tim Cook', 'label': 'person', 'score': 0.992, 'start': 0, 'end': 8, ...}
 ```
 
-The first call to a model downloads its weights from Hugging Face and loads them (one to three minutes each for the models above on a home connection, with progress visible in the server terminal); after that, calls return in milliseconds. Text generation runs on the GPU generation image; stop the first server, then start this one on the same port:
+Text generation runs on the GPU generation image; stop the first server, then start this one on the same port:
 
 ```bash
-docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-sglang
+# Linux, NVIDIA GPU (for generation on Apple Silicon via MLX, see the docs below)
+docker run --gpus all -p 8080:8080 \
+  -v sie-hf-cache:/app/.cache/huggingface \
+  ghcr.io/superlinked/sie-server:latest-cuda12-sglang
 ```
 
 ```python
-result = client.generate("Qwen/Qwen3-0.6B", "Reply with a single word: the capital of France.", max_new_tokens=16)
+result = client.generate(
+    "Qwen/Qwen3-0.6B",
+    "Reply with a single word: the capital of France.",
+    max_new_tokens=16,
+    temperature=0.0,
+)
 print(result["text"])  # Paris
 ```
 
@@ -132,7 +150,7 @@ The same code works against a production cluster. SIE ships a load-balancing gat
 
 ```bash
 # pick one values overlay: values-gke.yaml / values-aws.yaml / values-aks.yaml
-# (pin --version to a release tag for reproducible installs)
+# (pin a chart version for reproducible installs, e.g. --version 0.6.18)
 helm upgrade --install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --namespace sie --create-namespace \
   --set hfToken.create=true \
@@ -150,7 +168,7 @@ See the [deployment guide](https://superlinked.com/docs/deployment/).
 
 [**Model catalog**](https://superlinked.com/models): dense, sparse, multi-vector, vision, cross-encoder, and generative architectures. Every model is a config in [`packages/sie_server/models/`](https://github.com/superlinked/sie/tree/main/packages/sie_server/models); pass its full Hugging Face ID to the SDK (e.g. `sentence-transformers/all-MiniLM-L6-v2`, `Qwen/Qwen3-4B-Instruct-2507`).
 
-[**Integrations**](https://superlinked.com/docs/integrations/): LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, Weaviate.
+[**Integrations**](https://superlinked.com/docs/integrations/): setup guides for all nine framework and vector-store integrations, in Python and TypeScript.
 
 [**Examples**](examples/): A quickstart notebook and an end-to-end project gallery.
 
