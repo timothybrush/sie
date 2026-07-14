@@ -30,7 +30,7 @@
 SIE is an open-source inference engine that runs the models behind every agent task through one API: search and retrieval, document-to-markdown conversion, structured output, content safety, and the agent loop itself. It replaces the patchwork of a separate model server per task with one system that serves 85+ models, loading each on demand.
 
 - OpenAI-compatible API for drop-in migration: `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
-- Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more, all quality-verified against MTEB in CI
+- Pre-configured model catalog: Stella, SPLADE, Qwen3, GLiNER, SigLIP, and more, all quality-verified against MTEB
 - Serves multiple models simultaneously with on-demand loading and LRU eviction
 - Ships the full production stack: load-balancing gateway, KEDA autoscaling, Grafana dashboards, Terraform for GKE, EKS, and AKS
 - Integrates with LangChain, LlamaIndex, Haystack, DSPy, CrewAI, Chroma, Qdrant, and Weaviate
@@ -52,14 +52,14 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 **1. Start the engine**
 
 ```bash
+# macOS (Apple Silicon) or Linux, native (requires Python 3.12)
+pip install "sie-server[local]" && sie-server serve
+
 # Linux, NVIDIA GPU
 docker run --gpus all -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cuda12-default
 
 # Linux, CPU
 docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlinked/sie-server:latest-cpu-default
-
-# macOS (Apple Silicon), native on Metal (requires Python 3.12)
-pip install "sie-server[local]" && sie-server serve
 ```
 
 ```bash
