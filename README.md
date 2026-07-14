@@ -49,7 +49,7 @@ One SIE cluster runs the inference behind a whole agent. Each task is a handful 
 
 ## Quickstart
 
-**1. Start the engine**
+**1. Start the server**
 
 ```bash
 # macOS (Apple Silicon) or Linux, native (requires Python 3.12)
@@ -66,7 +66,7 @@ docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface ghcr.io/superlin
 curl http://localhost:8080/readyz   # expect: ok
 ```
 
-The server speaks the OpenAI API out of the box; your first embedding needs nothing but curl:
+The server speaks the OpenAI API out of the box, and not only for embeddings: a cluster gateway serves `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` too, and on Apple Silicon chat completions run locally through MLX. Your first call needs nothing but curl:
 
 ```bash
 curl http://localhost:8080/v1/embeddings \
@@ -82,7 +82,7 @@ pip install sie-sdk                # Python
 npm install @superlinked/sie-sdk   # TypeScript (pnpm and yarn work too)
 ```
 
-**3. Call models**
+**3. Generate embeddings, rerank, and extract entities**
 
 ```python
 from sie_sdk import SIEClient
@@ -90,11 +90,11 @@ from sie_sdk.types import Item
 
 client = SIEClient("http://localhost:8080")
 
-# Dense embeddings
+# Generate embeddings
 result = client.encode("sentence-transformers/all-MiniLM-L6-v2", Item(text="Hello world"))
 print(result["dense"].shape)  # (384,)
 
-# Rerank documents against a query
+# Rerank search results
 scores = client.score(
     "cross-encoder/ms-marco-MiniLM-L-6-v2",
     Item(text="What is machine learning?"),
@@ -102,7 +102,7 @@ scores = client.score(
 )
 print(scores["scores"][0])  # {'item_id': 'item-0', 'score': -7.1, 'rank': 0}
 
-# Zero-shot entity extraction
+# Extract entities
 result = client.extract(
     "urchade/gliner_multi-v2.1",
     Item(text="Tim Cook is the CEO of Apple."),
