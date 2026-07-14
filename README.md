@@ -144,9 +144,9 @@ For generation on Apple Silicon (MLX), the TypeScript walkthrough, and every con
 
 ---
 
-### Connect Claude to your GPUs (MCP)
+### Offload document work over MCP, save agent tokens
 
-[`packages/sie_mcp`](packages/sie_mcp/) is a lightweight MCP edge for the cluster (`mcpEdge` in the Helm chart). Claude Code, the Claude desktop app, and claude.ai connect to it and offload heavy document work to open models on your GPUs: PDF, scan, and Office-to-markdown conversion, summarization, entity extraction, PII redaction, and schema-valid JSON. Raw bytes and PII stay in your VPC: the edge holds the one cluster credential, and clients authenticate with a separate connector secret.
+Instead of reading large documents into an agent's context and paying frontier-model token rates for it, MCP clients like Claude Code, the Claude desktop app, and claude.ai hand the heavy work to open models on your cluster and get a small artifact back. [`packages/sie_mcp`](packages/sie_mcp/) is the lightweight edge that routes those calls (`mcpEdge` in the Helm chart): PDF, scan, and Office-to-markdown conversion, summarization, entity extraction, PII redaction, and schema-valid JSON. Raw bytes and PII stay in your VPC: the edge holds the one cluster credential, and clients authenticate with a separate connector secret.
 
 ```bash
 claude mcp add --scope user --transport http superlinked-docs \
