@@ -11,7 +11,6 @@ from sie_server.api.helpers import (
     ModelStateChecker,
     RequestParser,
     ResponseBuilder,
-    extract_request_context,
     oom_retry_after_from_registry,
 )
 from sie_server.api.options import resolve_runtime_options
@@ -20,8 +19,8 @@ from sie_server.api.validation import validate_machine_profile_header
 from sie_server.config.model import ModelConfig
 from sie_server.core.encode_pipeline import EncodePipeline
 from sie_server.core.worker import QueueFullError
-from sie_server.observability.metrics import record_request
 from sie_server.observability.tracing import tracer
+from sie_server.observability.worker_telemetry import worker_telemetry, worker_telemetry_enabled
 from sie_server.types.inputs import Item
 from sie_server.types.openapi import EncodeResponseModel
 from sie_server.types.outputs import DenseVector, EncodeResult, MultiVector, SparseVector
@@ -241,9 +240,6 @@ async def encode(
         registry = http_request.app.state.registry
         device = registry.device
 
-        # Extract request context for structured logging
-        ctx = extract_request_context(http_request, model, registry)
-
         # Validate model state using helper
         model_checker = ModelStateChecker(registry, model, span)
         model_checker.check_exists()
@@ -364,8 +360,9 @@ async def encode(
             model,
             "encode",
             span,
-            ctx=ctx,
             oom_retry_after_s=oom_retry_after_from_registry(registry),
+            profile=profile_name or "default",
+            item_count=len(items),
         )
         try:
             results, timing = await EncodePipeline.run_encode(
@@ -410,16 +407,26 @@ async def encode(
 
         response = EncodeResponse(model=model, items=response_items, timing=timing_info)
 
-        # Record metrics for successful request
-        record_request(
-            model=model,
-            endpoint="encode",
-            status="success",
-            timing=timing,
-            request_id=ctx.request_id,
-            api_key=ctx.api_key,
-            queue_depth=ctx.queue_depth,
-        )
+        if worker_telemetry_enabled():
+            units = None
+            if timing is not None and timing.input_token_counts is not None:
+                counts = timing.input_token_counts
+                if len(counts) == len(items) and all(
+                    isinstance(count, int) and not isinstance(count, bool) for count in counts
+                ):
+                    units = {"input_tokens": sum(counts)}
+            worker_telemetry().item_completed(
+                operation="encode",
+                outcome="success",
+                model=model,
+                profile=profile_name or "default",
+                duration_s=timing.total_ms / 1000.0 if timing is not None else None,
+                item_count=len(items),
+                tokenization_s=timing.tokenization_ms / 1000.0 if timing is not None else None,
+                inference_s=timing.inference_ms / 1000.0 if timing is not None else None,
+                postprocessing_s=timing.postprocessing_ms / 1000.0 if timing is not None else None,
+                units=units,
+            )
 
         # Build response headers and return
         headers = ResponseBuilder.build_headers(timing)

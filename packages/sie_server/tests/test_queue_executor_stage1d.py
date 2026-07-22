@@ -2,7 +2,7 @@
 
 The gate is per-request: ``_maybe_*_raw_output`` returns a typed
 ``RawOutput`` whenever the adapter's response is the exact single-key,
-float32, well-shaped form the Rust framing path knows how to encode
+supported-dtype, well-shaped form the Rust framing path knows how to encode
 byte-identically; otherwise the legacy ``msgpack.packb`` path runs. See
 the sidecar runtime architecture guide at
 ``packages/sie_server_sidecar/docs/architecture-guide.md`` (component/crate
@@ -10,12 +10,12 @@ name ``sie_server_sidecar``) for the full rationale.
 
 These tests pin:
 
-* The per-helper safety rules (single output key, float32 dtype,
+* The per-helper safety rules (single output key, supported dtype,
   multi-output items fall back, dim-mismatch falls back, ...).
 * End-to-end wiring of ``process_encode_batch`` /
   ``process_score_batch``: dense / sparse / multivector / score requests
   that meet the safety rules emit a typed ``RawOutput``. Multi-output /
-  non-float32 / float16 paths continue to fall back to ``result_msgpack``.
+  unsupported dtype paths continue to fall back to ``result_msgpack``.
 """
 
 from __future__ import annotations
@@ -329,9 +329,14 @@ class TestMultivectorFastPathGate:
         assert raw.multivector.num_tokens == 3
         assert raw.multivector.token_dims == 4
 
-    def test_float16_2d_array_falls_back(self) -> None:
+    def test_float16_2d_array_eligible(self) -> None:
         arr = np.zeros((2, 4), dtype=np.float16)
-        assert _maybe_multivector_raw_output({"multivector": arr}, self._config(), ["multivector"]) is None
+        raw = _maybe_multivector_raw_output({"multivector": arr}, self._config(), ["multivector"])
+        assert raw is not None
+        assert raw.multivector is not None
+        assert raw.multivector.num_tokens == 2
+        assert raw.multivector.token_dims == 4
+        assert raw.multivector.dtype == "float16"
 
     def test_bit_packed_binary_falls_back(self) -> None:
         # ``shape[1] < mv_dim`` signals binary multivector packed into
@@ -428,10 +433,9 @@ class TestProcessEncodeBatchSparseMV:
         assert len(mv.values) == 12
 
     @pytest.mark.asyncio
-    async def test_float16_multivector_falls_back(self) -> None:
-        """Per-request safety net: a model that returns a dtype the
-        Rust shaper doesn't yet understand must produce correct bytes
-        via the legacy path — never a silent mis-frame.
+    async def test_float16_multivector_emits_raw_output(self) -> None:
+        """Float16 multivectors stay on RawOutput so the sidecar can
+        write the compact f16 msgpack-numpy sentinel.
         """
         reg = self._mv_registry()
         ex = QueueExecutor(reg)
@@ -450,8 +454,11 @@ class TestProcessEncodeBatchSparseMV:
             )
 
         o = outcome.outcomes[0]
-        assert o.raw_output is None
-        assert o.result_msgpack is not None
+        assert o.disposition == "publish_and_ack"
+        assert o.result_msgpack is None
+        assert o.raw_output is not None
+        assert o.raw_output.multivector is not None
+        assert o.raw_output.multivector.dtype == "float16"
 
 
 # -----------------------------------------------------------------------------

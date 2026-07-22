@@ -19,7 +19,7 @@ profiles:
   default:
     max_batch_tokens: 16384
     compute_precision: null
-    adapter_path: sie_server.adapters.colbert_modernbert_flash:ColBERTModernBERTFlashAdapter
+    adapter_path: sie_server.adapters.colbert_modernbert_flash.adapter:ColBERTModernBERTFlashAdapter
     adapter_options:
       loadtime:
         muvera_config:

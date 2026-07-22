@@ -1287,6 +1287,11 @@ class ModelRegistry:
             msg = f"Adapter(s) not in any known bundle: {', '.join(sorted(unroutable))}"
             raise ValueError(msg)
 
+    def validate_model_config_replacement(self, config: dict) -> None:
+        """Validate a wholesale replacement without mutating registry state."""
+        with self._lock:
+            self._validate_structure_locked(config)
+
     def replace_model_config(self, config: dict) -> list[str]:
         """Replace a model's config wholesale (the catalog-convergence path).
 
@@ -1407,6 +1412,70 @@ class ModelRegistry:
             )
             return affected_bundles
 
+    def remove_model_config(self, model_id: str, *, fallback_config: dict | None = None) -> list[str]:
+        """Remove one API-backed model from the live registry.
+
+        ``fallback_config`` is the baked filesystem config, when one exists.
+        Removing an API override must reveal that baseline immediately just as
+        the next process restart would; in that case this delegates to the
+        wholesale replace path. Without a fallback, all base/profile route
+        identities and hash inputs for the model are removed atomically.
+
+        Returns the sorted union of bundles whose hashes may have changed. A
+        missing model with no fallback is an idempotent no-op.
+        """
+        with self._lock:
+            if fallback_config is not None:
+                if fallback_config.get("sie_id") != model_id:
+                    raise ValueError("fallback config sie_id must match the removed model id")
+                return self.replace_model_config(fallback_config)
+            if model_id not in self._models:
+                return []
+
+            affected_bundles = _matching_bundle_names(
+                self._model_adapter_modules.get(model_id, set()),
+                self._bundles,
+            )
+            removed_variants = {name for name, base in self._profile_variant_base_models.items() if base == model_id}
+            for variant in removed_variants:
+                info = self._profile_variant_models.get(variant)
+                if info is not None:
+                    affected_bundles.extend(info.bundles)
+
+            self._models = {name: info for name, info in self._models.items() if name != model_id}
+            self._model_names_lower = {
+                lower: name for lower, name in self._model_names_lower.items() if name != model_id
+            }
+            self._profile_variant_models = {
+                name: info for name, info in self._profile_variant_models.items() if name not in removed_variants
+            }
+            self._profile_variant_names_lower = {
+                lower: name for lower, name in self._profile_variant_names_lower.items() if name not in removed_variants
+            }
+            self._profile_variant_base_models = {
+                name: base for name, base in self._profile_variant_base_models.items() if base != model_id
+            }
+            self._model_adapter_modules = {
+                name: modules for name, modules in self._model_adapter_modules.items() if name != model_id
+            }
+            self._model_profiles = {
+                name: profiles for name, profiles in self._model_profiles.items() if name != model_id
+            }
+            self._model_profile_configs = {
+                name: profiles for name, profiles in self._model_profile_configs.items() if name != model_id
+            }
+            self._model_full_configs = {
+                name: config for name, config in self._model_full_configs.items() if name != model_id
+            }
+            self._unrouteable_models = {
+                name: modules for name, modules in self._unrouteable_models.items() if name != model_id
+            }
+            self._bundle_hash_cache = {}
+
+            affected_bundles = sorted(set(affected_bundles))
+            logger.info("Removed model config: %s (bundles=%s)", model_id, affected_bundles)
+            return affected_bundles
+
     def get_model_profile_names(self, model_name: str) -> set[str]:
         """Get known profile names for a model."""
         with self._lock:
@@ -1518,6 +1587,7 @@ class ModelRegistry:
                 items.append(
                     {
                         "sie_id": model_name,
+                        "revision": full_config.get("hf_revision"),
                         "profiles": profiles_for_hash,
                     }
                 )

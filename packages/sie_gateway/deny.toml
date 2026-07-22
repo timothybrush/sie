@@ -11,8 +11,8 @@ no-default-features = false
 version = 2
 yanked = "deny"
 # Each ignored entry must carry a reason and an upstream-fix path. When
-# the corresponding transitive bump lands (kube-rs, async-nats,
-# prometheus), drop the entry — `cargo-deny` warns on unmatched ignores.
+# the corresponding transitive bump lands (kube-rs, async-nats), drop the
+# entry — `cargo-deny` warns on unmatched ignores.
 ignore = [
     # Two quick-xml 0.40.1 DoS advisories, both fixed in the breaking 0.41.0
     # release. quick-xml comes in only transitively via object_store 0.14.0

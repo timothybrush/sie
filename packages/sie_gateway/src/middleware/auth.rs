@@ -9,6 +9,7 @@ use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 
 use crate::http_error::code as err_code;
+use crate::observability::metrics::{AdmissionOutcome, AdmissionOutcomeSlot};
 
 use crate::config::Config;
 
@@ -25,10 +26,10 @@ const EXEMPT_PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 /// so exempting it carries no token-leak risk.
 const EXEMPT_DOC_PATHS: &[&str] = &["/openapi.json", "/docs", "/docs/redoc.standalone.js"];
 
-/// Paths that expose operational data (status page, rich `/health`,
-/// `/metrics`, `/ws/*`). Exempt from auth only when
+/// Paths that expose operational data (status page, rich `/health`, `/ws/*`).
+/// Exempt from auth only when
 /// `SIE_AUTH_EXEMPT_OPERATIONAL=true`; default is fail-closed.
-const EXEMPT_OPERATIONAL_PATHS: &[&str] = &["/", "/health", "/metrics"];
+const EXEMPT_OPERATIONAL_PATHS: &[&str] = &["/", "/health"];
 
 #[derive(Clone)]
 pub struct AuthLayer {
@@ -93,6 +94,7 @@ where
             }
 
             if config.auth_tokens.is_empty() {
+                record_admission_rejection(&req, AdmissionOutcome::AuthMisconfigured);
                 return Ok(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     err_code::GATEWAY_AUTH_MISCONFIGURED,
@@ -103,6 +105,7 @@ where
             let token = match extract_bearer_token(req.headers()) {
                 Some(t) => t,
                 None => {
+                    record_admission_rejection(&req, AdmissionOutcome::Unauthenticated);
                     return Ok(error_response(
                         StatusCode::UNAUTHORIZED,
                         err_code::UNAUTHORIZED,
@@ -115,6 +118,7 @@ where
 
             if is_admin {
                 if config.admin_token.is_empty() {
+                    record_admission_rejection(&req, AdmissionOutcome::Forbidden);
                     return Ok(error_response(
                         StatusCode::FORBIDDEN,
                         err_code::FORBIDDEN,
@@ -123,6 +127,7 @@ where
                 }
 
                 if !constant_time_eq_str(&token, &config.admin_token) {
+                    record_admission_rejection(&req, AdmissionOutcome::Forbidden);
                     return Ok(error_response(
                         StatusCode::FORBIDDEN,
                         err_code::FORBIDDEN,
@@ -139,6 +144,7 @@ where
                 .any(|valid_token| constant_time_eq_str(&token, valid_token));
 
             if !valid {
+                record_admission_rejection(&req, AdmissionOutcome::Unauthenticated);
                 return Ok(error_response(
                     StatusCode::UNAUTHORIZED,
                     err_code::UNAUTHORIZED,
@@ -148,6 +154,12 @@ where
 
             inner.call(req).await
         })
+    }
+}
+
+fn record_admission_rejection(req: &Request<Body>, outcome: AdmissionOutcome) {
+    if let Some(slot) = req.extensions().get::<AdmissionOutcomeSlot>() {
+        slot.set(outcome);
     }
 }
 
@@ -292,9 +304,7 @@ mod tests {
         assert!(EXEMPT_DOC_PATHS.contains(&"/docs"));
         assert!(EXEMPT_DOC_PATHS.contains(&"/docs/redoc.standalone.js"));
         assert!(!EXEMPT_PROBE_PATHS.contains(&"/health"));
-        assert!(!EXEMPT_PROBE_PATHS.contains(&"/metrics"));
         assert!(EXEMPT_OPERATIONAL_PATHS.contains(&"/"));
-        assert!(EXEMPT_OPERATIONAL_PATHS.contains(&"/metrics"));
         assert!(EXEMPT_OPERATIONAL_PATHS.contains(&"/health"));
     }
 
@@ -323,7 +333,6 @@ mod tests {
         Arc::new(Config {
             host: String::new(),
             port: 0,
-            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: String::new(),
@@ -347,6 +356,7 @@ mod tests {
             stream_max_age_s: 0,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            configured_physical_lanes: Default::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
             bundles_dir: String::new(),
@@ -355,6 +365,7 @@ mod tests {
             config_service_token: None,
             config_modal_proxy_token: None,
             payload_store_url: String::new(),
+            public_base_url: None,
         })
     }
 
@@ -367,7 +378,6 @@ mod tests {
             .route("/readyz", get(|| async { "ready" }))
             .route("/", get(|| async { "index" }))
             .route("/health", get(|| async { "rich-health" }))
-            .route("/metrics", get(|| async { "metrics" }))
             .route("/openapi.json", get(|| async { "{}" }))
             .route("/ws/cluster-status", get(|| async { "ws" }))
             .route("/v1/encode/{*model}", post(|| async { "encoded" }))
@@ -427,11 +437,6 @@ mod tests {
         );
         let r = test_router(Arc::clone(&cfg));
         assert_eq!(
-            send(r, Method::GET, "/metrics", None).await,
-            StatusCode::UNAUTHORIZED
-        );
-        let r = test_router(Arc::clone(&cfg));
-        assert_eq!(
             send(r, Method::GET, "/", None).await,
             StatusCode::UNAUTHORIZED
         );
@@ -447,8 +452,6 @@ mod tests {
         let cfg = cfg_for_middleware("token", vec!["user"], "admin", true);
         let r = test_router(Arc::clone(&cfg));
         assert_eq!(send(r, Method::GET, "/health", None).await, StatusCode::OK);
-        let r = test_router(Arc::clone(&cfg));
-        assert_eq!(send(r, Method::GET, "/metrics", None).await, StatusCode::OK);
         let r = test_router(Arc::clone(&cfg));
         assert_eq!(send(r, Method::GET, "/", None).await, StatusCode::OK);
         let r = test_router(cfg);
@@ -476,6 +479,33 @@ mod tests {
         assert_eq!(
             send(r, Method::POST, "/v1/encode/any", None).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_marks_bounded_admission_outcomes_when_outer_slot_is_present() {
+        let unauthenticated = AdmissionOutcomeSlot::default();
+        let r = test_router(cfg_for_middleware("token", vec!["user"], "admin", false))
+            .layer(axum::Extension(unauthenticated.clone()));
+        assert_eq!(
+            send(r, Method::POST, "/v1/encode/any", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            unauthenticated.get(),
+            Some(AdmissionOutcome::Unauthenticated)
+        );
+
+        let misconfigured = AdmissionOutcomeSlot::default();
+        let r = test_router(cfg_for_middleware("token", vec![], "admin", false))
+            .layer(axum::Extension(misconfigured.clone()));
+        assert_eq!(
+            send(r, Method::POST, "/v1/encode/any", Some("whatever")).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            misconfigured.get(),
+            Some(AdmissionOutcome::AuthMisconfigured)
         );
     }
 

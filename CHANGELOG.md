@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.22
+
+- chore(main): release 0.6.22
+- feat(server): pin immutable Docling artifacts
+- feat(server): support immutable Docling model artifacts
+
 ## v0.6.19
 
 - chore(main): release 0.6.19

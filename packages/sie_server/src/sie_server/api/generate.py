@@ -53,8 +53,14 @@ from sie_sdk.queue_types import denormalize_model_id
 
 from sie_server.adapters._generation_base import GenerationAdapter, collect_generation
 from sie_server.api.helpers import ModelStateChecker
-from sie_server.api.validation import validate_machine_profile_header
+from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
+from sie_server.core.runtime_options import apply_generation_runtime_options
 from sie_server.observability.tracing import tracer
+from sie_server.types.openapi import (
+    GenerateInputTooLongErrorResponse,
+    GenerateModelLoadFailedErrorResponse,
+    GenerateResponseModel,
+)
 from sie_server.types.responses import ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -74,23 +80,14 @@ router = APIRouter(prefix="/v1", tags=["generate"])
 #
 # * Forwarded to the adapter and surfaced in the blocking response:
 #   ``prompt`` / ``max_new_tokens`` / ``temperature`` / ``top_p`` /
-#   ``stop``, plus ``seed`` / ``logit_bias`` — the last two change the
-#   sampled text, which the blocking ``GenerationResult`` does surface,
-#   and the adapter's ``generate()`` genuinely accepts both (the
-#   production queue path forwards them too — see
-#   ``processors/streaming.py``).
-# * Validated then dropped because the blocking shape can't surface
-#   them: ``grammar`` / ``frequency_penalty`` / ``presence_penalty``,
-#   plus ``logprobs`` / ``top_logprobs`` (per-token logprobs have no
-#   field in the aggregate ``GenerationResult``).
+#   ``stop``, plus ``seed`` / ``logit_bias``. The adapter's ``generate()``
+#   accepts both and the production queue path forwards them too (see
+#   ``processors/streaming.py``); their exact effect is backend-specific.
+# * Forwarded only for streaming requests: ``logprobs`` /
+#   ``top_logprobs``. Blocking requests reject them because the aggregate
+#   ``GenerationResult`` has no logprob field.
 # * Inert / accept-and-drop transport hints: ``routing_key`` /
 #   ``prompt_cache_key`` / ``safety_identifier``.
-#
-# ``seed`` / ``logit_bias`` / ``logprobs`` / ``top_logprobs`` are not in
-# the ``GenerateRequest`` OpenAPI schema (they belong to the gateway's
-# chat-completions contract) but the adapter forwards them, so they are
-# whitelisted and validated here for parity rather than 400'd as an
-# ``unsupported_field``.
 _SUPPORTED_FIELDS = {
     "prompt",
     "max_new_tokens",
@@ -98,7 +95,6 @@ _SUPPORTED_FIELDS = {
     "top_p",
     "stop",
     "stream",
-    "grammar",
     "frequency_penalty",
     "presence_penalty",
     "seed",
@@ -108,6 +104,7 @@ _SUPPORTED_FIELDS = {
     "routing_key",
     "prompt_cache_key",
     "safety_identifier",
+    "options",
 }
 
 
@@ -148,79 +145,36 @@ def _bad_request(message: str, *, param: str | None = None, code: str | None = N
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
-def _validate_penalty(value: Any, *, param: str) -> None:
+def _validate_penalty(value: Any, *, param: str) -> float | None:
     """Validate ``frequency_penalty`` / ``presence_penalty`` (gateway parity).
 
     Mirrors ``proxy.rs::parse_penalty``: ``None`` is allowed (field absent →
     worker default); otherwise the value must be a finite JSON number in
     ``[-2.0, 2.0]``. Booleans are rejected explicitly (``isinstance(True,
     int)`` is True in Python) and so are strings / NaN / inf. The value is
-    dropped after validation (the blocking dev route doesn't surface it), so
-    no parsed result is returned — this is validation-only.
+    returned value is forwarded to the generation adapter.
     """
     if value is None:
-        return
+        return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _bad_request(f"'{param}' must be a number in [-2.0, 2.0]", param=param)
     f = float(value)
     if not math.isfinite(f) or not (_PENALTY_MIN <= f <= _PENALTY_MAX):
         raise _bad_request(f"'{param}' must be a number in [-2.0, 2.0]", param=param)
-
-
-def _validate_grammar_shape(value: Any) -> None:
-    """Validate the basic ``grammar`` wire shape (gateway parity, minimal).
-
-    Mirrors the *structural* contract of ``grammar.rs::parse_grammar``:
-    ``grammar`` must be a JSON object containing exactly one of
-    ``json_schema`` / ``regex`` / ``ebnf``, and the chosen variant's value
-    must be the right type (dict for ``json_schema``, str for ``regex`` /
-    ``ebnf``). ``None`` (absent) is allowed.
-
-    Divergence from the gateway is intentional and bounded: the gateway also
-    enforces payload-size caps and a JSON-Schema depth walk. Those are NOT
-    re-implemented here because (a) this dev route *drops* ``grammar`` rather
-    than compiling it, so the deeper checks add no safety on this path, and
-    (b) duplicating the recursive walker would invite drift. The basic-shape
-    check is enough to reject the obviously-malformed grammar the gateway
-    400s on while keeping a schema-compliant body's 200.
-    """
-    if value is None:
-        return
-    if not isinstance(value, dict):
-        raise _bad_request("'grammar' must be a JSON object", param="grammar")
-    variants = [k for k in ("json_schema", "regex", "ebnf") if k in value]
-    if len(variants) > 1:
-        raise _bad_request(
-            "'grammar.json_schema', 'grammar.regex' and 'grammar.ebnf' are mutually exclusive",
-            param="grammar",
-        )
-    if not variants:
-        raise _bad_request(
-            "'grammar' must contain exactly one of 'json_schema', 'regex' or 'ebnf'",
-            param="grammar",
-        )
-    variant = variants[0]
-    payload = value[variant]
-    if variant == "json_schema":
-        if not isinstance(payload, dict):
-            raise _bad_request("'grammar.json_schema' must be a JSON object", param="grammar.json_schema")
-    elif not isinstance(payload, str):
-        raise _bad_request(f"'grammar.{variant}' must be a string", param=f"grammar.{variant}")
+    return f
 
 
 def _validate_seed(value: Any) -> int | None:
     """Validate ``seed`` (gateway parity) and return the parsed value.
 
     Mirrors ``proxy.rs``: ``None`` (absent) is allowed; otherwise the value
-    must be an integer. Booleans are rejected explicitly (``isinstance(True,
-    int)`` is True in Python). The adapter forwards ``seed`` to SGLang's
-    ``sampling_params["seed"]`` so it is returned (not dropped).
+    must be a signed 64-bit integer and is returned unchanged. Booleans are
+    rejected explicitly (``isinstance(True, int)`` is True in Python).
     """
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise _bad_request("'seed' must be an integer", param="seed")
-    return value
+    try:
+        return validate_signed_i64(value, param="seed")
+    except ValueError as exc:
+        raise _bad_request(str(exc), param="seed") from exc
 
 
 def _validate_logit_bias(value: Any) -> dict[str, float] | None:
@@ -261,14 +215,14 @@ def _validate_logit_bias(value: Any) -> dict[str, float] | None:
     return out or None
 
 
-def _validate_logprobs(logprobs_value: Any, top_logprobs_value: Any) -> None:
-    """Validate ``logprobs`` / ``top_logprobs`` (gateway parity), validate-only.
+def _validate_logprobs(logprobs_value: Any, top_logprobs_value: Any) -> tuple[bool, int | None]:
+    """Validate and return native streaming logprob controls.
 
     Mirrors ``proxy.rs``: ``logprobs`` must be a boolean (or absent);
     ``top_logprobs`` must be an integer in ``[0, 20]`` (or absent) and
     requires ``logprobs: true`` when ``> 0``. The blocking dev-route shape
-    has no per-token logprob field, so the values are validated then dropped
-    (no parsed result is returned).
+    has no per-token logprob field, so the caller rejects them on the blocking
+    path.
     """
     logprobs_enabled: bool | None
     if logprobs_value is None:
@@ -279,13 +233,14 @@ def _validate_logprobs(logprobs_value: Any, top_logprobs_value: Any) -> None:
         raise _bad_request("'logprobs' must be a boolean", param="logprobs")
 
     if top_logprobs_value is None:
-        return
+        return bool(logprobs_enabled), None
     if isinstance(top_logprobs_value, bool) or not isinstance(top_logprobs_value, int):
         raise _bad_request("'top_logprobs' must be an integer in [0, 20]", param="top_logprobs")
     if not (0 <= top_logprobs_value <= _TOP_LOGPROBS_MAX):
         raise _bad_request("'top_logprobs' must be an integer in [0, 20]", param="top_logprobs")
     if top_logprobs_value > 0 and logprobs_enabled is not True:
         raise _bad_request("'top_logprobs' requires 'logprobs: true'", param="top_logprobs")
+    return bool(logprobs_enabled), top_logprobs_value
 
 
 def _payload_too_large(message: str, *, param: str | None = None) -> HTTPException:
@@ -307,8 +262,14 @@ async def _stream_generate_events(
     temperature: float,
     top_p: float,
     stop: list[str] | None,
+    frequency_penalty: float | None,
+    presence_penalty: float | None,
+    top_k: int | None,
+    min_new_tokens: int | None,
     seed: int | None,
     logit_bias: dict[str, float] | None,
+    logprobs: bool,
+    top_logprobs: int | None,
 ) -> AsyncIterator[str]:
     """Yield SIE-native ``GenerateChunk`` SSE lines for ``SIEClient.stream_generate``.
 
@@ -327,6 +288,8 @@ async def _stream_generate_events(
     finish_reason = "stop"
     prompt_tokens = 0
     completion_tokens = 0
+    saw_terminal = False
+    terminal_error: dict[str, str] | None = None
     try:
         async for chunk in adapter.generate(
             prompt=prompt,
@@ -334,11 +297,24 @@ async def _stream_generate_events(
             temperature=temperature,
             top_p=top_p,
             stop=stop,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_k=top_k,
+            min_new_tokens=min_new_tokens,
             seed=seed,
             logit_bias=logit_bias,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
         ):
             if chunk.done:
+                saw_terminal = True
                 finish_reason = chunk.finish_reason or "stop"
+                if chunk.error_code is not None or chunk.error_message is not None or finish_reason == "error":
+                    finish_reason = "error"
+                    terminal_error = {
+                        "code": chunk.error_code or "inference_error",
+                        "message": chunk.error_message or "generation terminated with an upstream error",
+                    }
                 if chunk.prompt_tokens is not None:
                     prompt_tokens = chunk.prompt_tokens
                 if chunk.completion_tokens is not None:
@@ -346,16 +322,31 @@ async def _stream_generate_events(
                 # The contract allows a terminal chunk to also carry final text; emit it as a
                 # delta so it isn't dropped (MLX's terminal text is always empty, but SGLang
                 # and future adapters may pack final tokens here).
-                if chunk.text_delta:
-                    if ttft_ms is None:
+                if chunk.text_delta or chunk.logprobs:
+                    if chunk.text_delta and ttft_ms is None:
                         ttft_ms = (time.perf_counter() - t0) * 1000.0
-                    yield f"data: {json.dumps({'request_id': request_id, 'seq': seq, 'text_delta': chunk.text_delta})}\n\n"
+                    event: dict[str, Any] = {
+                        "request_id": request_id,
+                        "seq": seq,
+                        "text_delta": chunk.text_delta,
+                        "done": False,
+                    }
+                    if chunk.logprobs:
+                        event["logprobs"] = list(chunk.logprobs)
+                    yield f"data: {json.dumps(event)}\n\n"
                     seq += 1
-                continue
-            if chunk.text_delta:
-                if ttft_ms is None:
+                break
+            if chunk.text_delta or chunk.logprobs:
+                if chunk.text_delta and ttft_ms is None:
                     ttft_ms = (time.perf_counter() - t0) * 1000.0
-                event = {"request_id": request_id, "seq": seq, "text_delta": chunk.text_delta}
+                event: dict[str, Any] = {
+                    "request_id": request_id,
+                    "seq": seq,
+                    "text_delta": chunk.text_delta,
+                    "done": False,
+                }
+                if chunk.logprobs:
+                    event["logprobs"] = list(chunk.logprobs)
                 seq += 1
                 yield f"data: {json.dumps(event)}\n\n"
     except Exception:  # noqa: BLE001 — surface as a terminal error chunk, never 500 mid-stream
@@ -374,6 +365,13 @@ async def _stream_generate_events(
         yield "data: [DONE]\n\n"
         return
 
+    if not saw_terminal:
+        finish_reason = "error"
+        terminal_error = {
+            "code": "inference_error",
+            "message": "generation stream ended before a terminal event",
+        }
+
     terminal: dict[str, Any] = {
         "request_id": request_id,
         "seq": seq,
@@ -388,6 +386,8 @@ async def _stream_generate_events(
     }
     if ttft_ms is not None:
         terminal["ttft_ms"] = ttft_ms
+    if terminal_error is not None:
+        terminal["error"] = terminal_error
     yield f"data: {json.dumps(terminal)}\n\n"
     yield "data: [DONE]\n\n"
 
@@ -396,10 +396,44 @@ async def _stream_generate_events(
     "/generate/{model:path}",
     response_model=None,
     responses={
-        200: {"description": "Generated text"},
+        200: {
+            "description": "Generated text, or a Server-Sent Event stream when stream is true",
+            "model": GenerateResponseModel,
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "description": "SIE-native GenerateChunk events terminated by data: [DONE]",
+                    },
+                    "x-sie-event-schema": {"$ref": "#/components/schemas/GenerateChunk"},
+                }
+            },
+        },
         400: {"description": "Invalid request"},
         404: {"description": "Model not found"},
+        413: {
+            "description": "Prompt exceeds the configured UTF-8 size limit (INPUT_TOO_LONG)",
+            "model": GenerateInputTooLongErrorResponse,
+        },
+        502: {
+            "description": (
+                "Terminal model-load failure (MODEL_LOAD_FAILED). "
+                "Carried in the detail envelope: {code, message, error_class, permanent, attempts}. "
+                "No Retry-After header; clients must not auto-retry."
+            ),
+            "model": GenerateModelLoadFailedErrorResponse,
+        },
         503: {"description": "Model loading or unavailable"},
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/GenerateRequestModel"},
+                }
+            },
+        },
     },
 )
 async def generate(
@@ -455,6 +489,11 @@ async def generate(
                 code="unsupported_field",
             )
 
+        for field in ("routing_key", "prompt_cache_key", "safety_identifier"):
+            value = body.get(field)
+            if value is not None and not isinstance(value, str):
+                raise _bad_request(f"'{field}' must be a string", param=field)
+
         prompt = body.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise _bad_request("'prompt' must be a non-empty string", param="prompt")
@@ -487,7 +526,6 @@ async def generate(
         checker.check_not_failed()
         checker.check_not_unloading()
         checker.check_not_loading()
-        await checker.ensure_loaded(device)
 
         config = registry.get_config(registry_key)
         # Enforce the gateway-side cap mirror: max_new_tokens ≤
@@ -506,15 +544,18 @@ async def generate(
                 code="context_exceeded",
             )
 
-        adapter = registry.get(registry_key)
-        registry.touch_lru(registry_key)
-        if not isinstance(adapter, GenerationAdapter):
-            raise _bad_request(
-                f"Model '{model}' adapter does not support generate (not a GenerationAdapter)",
-                code=ErrorCode.MODEL_NOT_FOUND.value,
-            )
+        try:
+            body = apply_generation_runtime_options(config, body.get("options"), body)
+        except ValueError as exc:
+            message = str(exc)
+            param = "options.profile" if "options.profile" in message else "options"
+            raise _bad_request(message, param=param) from exc
 
-        temperature_raw = body.get("temperature", 1.0)
+        # Explicit top-level sampler fields win; omitted values now carry the
+        # resolved profile/request runtime defaults applied above.
+        temperature_raw = body.get("temperature")
+        if temperature_raw is None:
+            temperature_raw = 1.0
         if isinstance(temperature_raw, bool) or not isinstance(temperature_raw, int | float):
             raise _bad_request("temperature must be a number", param="temperature")
         temperature = float(temperature_raw)
@@ -522,13 +563,27 @@ async def generate(
         # engine (parity with the gateway-side numeric validation).
         if not math.isfinite(temperature) or temperature < 0.0:
             raise _bad_request("temperature must be a finite number >= 0", param="temperature")
-        top_p_raw = body.get("top_p", 1.0)
+        top_p_raw = body.get("top_p")
+        if top_p_raw is None:
+            top_p_raw = 1.0
         if isinstance(top_p_raw, bool) or not isinstance(top_p_raw, int | float):
             raise _bad_request("top_p must be a number", param="top_p")
         top_p = float(top_p_raw)
         if not math.isfinite(top_p) or not (0.0 < top_p <= 1.0):
             raise _bad_request("top_p must be in (0, 1]", param="top_p")
         stop_raw = body.get("stop")
+        top_k_raw = body.get("top_k")
+        if top_k_raw is not None and (isinstance(top_k_raw, bool) or not isinstance(top_k_raw, int) or top_k_raw < 1):
+            raise _bad_request("top_k must be an integer >= 1", param="options.default_sampling.top_k")
+        top_k = top_k_raw
+        min_tokens_raw = body.get("min_tokens")
+        if min_tokens_raw is not None and (
+            isinstance(min_tokens_raw, bool) or not isinstance(min_tokens_raw, int) or min_tokens_raw < 0
+        ):
+            raise _bad_request(
+                "min_new_tokens must be an integer >= 0", param="options.default_sampling.min_new_tokens"
+            )
+        min_new_tokens = min_tokens_raw
         if stop_raw is not None and (not isinstance(stop_raw, list) or not all(isinstance(s, str) for s in stop_raw)):
             raise _bad_request("'stop' must be a list of strings", param="stop")
         # Reject empty-string stop sequences. SGLang treats ``""`` as a
@@ -540,32 +595,40 @@ async def generate(
             raise _bad_request("'stop' must not contain empty strings", param="stop")
         stop = [str(s) for s in stop_raw] if stop_raw else None
 
-        # ``frequency_penalty`` / ``presence_penalty`` / ``grammar`` are
-        # whitelisted (so a schema-compliant body still 200s) but the
-        # blocking dev-route shape doesn't surface them — they're validated
-        # then dropped. Validate identically to the gateway
-        # (``proxy.rs::parse_penalty`` / ``grammar.rs::parse_grammar``) so the
-        # worker-local route reports the same 400 the gateway would, instead
-        # of silently accepting an out-of-range / malformed value.
-        for penalty_field in ("frequency_penalty", "presence_penalty"):
-            _validate_penalty(body.get(penalty_field), param=penalty_field)
-        _validate_grammar_shape(body.get("grammar"))
+        frequency_penalty = _validate_penalty(body.get("frequency_penalty"), param="frequency_penalty")
+        presence_penalty = _validate_penalty(body.get("presence_penalty"), param="presence_penalty")
 
-        # ``seed`` / ``logit_bias`` are validated *and forwarded* — the
-        # adapter's ``generate()`` accepts both and they change the sampled
-        # text, which the blocking response surfaces. ``logprobs`` /
-        # ``top_logprobs`` are validated then dropped: the aggregate
-        # ``GenerationResult`` has no per-token logprob field. All four are
-        # validated with gateway parity (``proxy.rs``).
+        # Sampler controls are validated and forwarded. Per-token logprobs
+        # are native streaming output; the blocking response has no faithful
+        # field for them and rejects the request instead of dropping data.
         seed = _validate_seed(body.get("seed"))
         logit_bias = _validate_logit_bias(body.get("logit_bias"))
-        _validate_logprobs(body.get("logprobs"), body.get("top_logprobs"))
 
         # Streaming path: emit SIE-native GenerateChunk SSE (drives
         # SIEClient.stream_generate). The blocking JSON path below is unchanged.
         stream_raw = body.get("stream", False)
         if stream_raw is not None and not isinstance(stream_raw, bool):
             raise _bad_request("'stream' must be a boolean", param="stream")
+        for field in ("logprobs", "top_logprobs"):
+            if not stream_raw and body.get(field) is not None:
+                raise _bad_request(
+                    f"'{field}' is supported only with 'stream: true' on the native endpoint",
+                    param=field,
+                    code="unsupported_field",
+                )
+        logprobs, top_logprobs = _validate_logprobs(body.get("logprobs"), body.get("top_logprobs"))
+
+        # Do not start a potentially expensive model load until the complete
+        # request has passed validation.
+        await checker.ensure_loaded(device)
+        adapter = registry.get(registry_key)
+        registry.touch_lru(registry_key)
+        if not isinstance(adapter, GenerationAdapter):
+            raise _bad_request(
+                f"Model '{model}' adapter does not support generate (not a GenerationAdapter)",
+                code=ErrorCode.MODEL_NOT_FOUND.value,
+            )
+
         if stream_raw:
             return StreamingResponse(
                 _stream_generate_events(
@@ -575,8 +638,14 @@ async def generate(
                     temperature=temperature,
                     top_p=top_p,
                     stop=stop,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
                     seed=seed,
                     logit_bias=logit_bias,
+                    top_k=top_k,
+                    min_new_tokens=min_new_tokens,
+                    logprobs=logprobs,
+                    top_logprobs=top_logprobs,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -593,6 +662,10 @@ async def generate(
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                top_k=top_k,
+                min_new_tokens=min_new_tokens,
                 seed=seed,
                 logit_bias=logit_bias,
             )

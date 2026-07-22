@@ -370,6 +370,12 @@ class TestSyncTransportErrorRetryScoreExtract:
 
             assert len(result["scores"]) == 2
             assert mock_client.return_value.post.call_count == 2
+            assert client.last_retry_count == 1
+
+            mock_client.return_value.post.side_effect = None
+            mock_client.return_value.post.return_value = _mock_score_response_200()
+            client.score("bge-reranker-v2-m3", query={"text": "q"}, items=[{"text": "a"}])
+            assert client.last_retry_count == 0
             client.close()
 
     def test_extract_retries_on_remote_protocol_error(self) -> None:
@@ -390,6 +396,12 @@ class TestSyncTransportErrorRetryScoreExtract:
 
             assert "entities" in result
             assert mock_client.return_value.post.call_count == 2
+            assert client.last_retry_count == 1
+
+            mock_client.return_value.post.side_effect = None
+            mock_client.return_value.post.return_value = _mock_extract_response_200()
+            client.extract("gliner_small-v2.1", {"text": "again"}, labels=["person"])
+            assert client.last_retry_count == 0
             client.close()
 
     def test_score_retries_on_connect_error(self) -> None:

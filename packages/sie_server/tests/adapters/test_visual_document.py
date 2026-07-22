@@ -4,6 +4,7 @@ These adapters encode document images into multi-vector representations
 for late interaction retrieval using MaxSim scoring.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -68,6 +69,89 @@ class TestColPaliAdapter:
 
         with pytest.raises(ValueError, match="Unsupported output types"):
             adapter.encode(items, output_types=["sparse"])
+
+    @staticmethod
+    def _wire_fake_model(adapter: ColPaliAdapter, forward: Any) -> MagicMock:
+        """Install a fake model/processor pair that satisfies all forward paths."""
+        import torch
+
+        model = MagicMock(side_effect=forward)
+        adapter._model = model
+        adapter._processor = MagicMock(return_value={"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+        adapter._device = "cpu"
+        # Prepared-batch path uses load()-cached placeholder tokens.
+        adapter._cached_input_ids = torch.zeros(1, 4, dtype=torch.long)
+        adapter._cached_attention_mask = torch.ones(1, 4, dtype=torch.long)
+        return model
+
+    @staticmethod
+    def _call_each_forward_path(adapter: ColPaliAdapter, path: str) -> None:
+        """Invoke one of the three model-forward entry points."""
+        import torch
+
+        if path == "text":
+            adapter._encode_text("q")
+        elif path == "images":
+            adapter._encode_images([MagicMock()])
+        else:
+            prepared = SimpleNamespace(payload=SimpleNamespace(pixel_values=torch.zeros(3, 4, 4)))
+            adapter._encode_prepared_batch([Item(text="d")], [prepared], is_query=False)
+
+    def test_forward_passes_use_cache_false(self, adapter: ColPaliAdapter) -> None:
+        """All three forward entry points must suppress the KV cache (#2144).
+
+        PaliGemma's inner Gemma config defaults to use_cache=True and the
+        load-time config edit cannot reach it, so the per-forward kwarg is
+        the only reliable suppression.
+        """
+        import torch
+
+        def forward(**kwargs: Any) -> Any:
+            return SimpleNamespace(embeddings=torch.zeros(1, 4, 128))
+
+        model = self._wire_fake_model(adapter, forward)
+
+        for path in ("text", "images", "prepared"):
+            model.call_args = None
+            self._call_each_forward_path(adapter, path)
+            assert model.call_args.kwargs["use_cache"] is False, path
+
+    def test_concurrent_forwards_serialize(self, adapter: ColPaliAdapter) -> None:
+        """Model forwards never overlap across threads, on any path (#2144).
+
+        transformers' output recorder monkey-patches each decoder layer's
+        forward per call with no locking; overlapping forwards race the
+        patch/restore and leak every later layer output. The adapter's
+        forward lock must serialize all three entry points against each
+        other, not just same-path calls.
+        """
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        import torch
+
+        counter_guard = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def forward(**kwargs: Any) -> Any:
+            nonlocal active, max_active
+            with counter_guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with counter_guard:
+                active -= 1
+            return SimpleNamespace(embeddings=torch.zeros(1, 4, 128))
+
+        self._wire_fake_model(adapter, forward)
+
+        paths = ["text", "images", "prepared"] * 3
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda p: self._call_each_forward_path(adapter, p), paths))
+
+        assert max_active == 1
 
 
 class TestColQwen2Adapter:

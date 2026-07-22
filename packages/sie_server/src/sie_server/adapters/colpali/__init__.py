@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -102,6 +103,15 @@ class ColPaliAdapter(BaseAdapter):
         self._processor: ColPaliProcessor | None = None
         self._device: str | None = None
         self._multivector_dim: int = token_dim or 128  # ColPali uses 128-dim per patch
+        # ColPaliForRetrieval.forward hardcodes output_hidden_states=True into
+        # its inner vlm call, which makes transformers' output recorder
+        # monkey-patch every decoder layer's ``forward`` for the duration of
+        # the call and restore it afterwards — with no locking. Two concurrent
+        # forwards interleave patch/restore and leave a capture wrapper
+        # permanently installed; its closure then accumulates every later
+        # layer output (~0.6 GiB per batch) until OOM (#2144). Serializing
+        # forwards costs nothing — they serialize on the GPU anyway.
+        self._forward_lock = threading.Lock()
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -158,6 +168,18 @@ class ColPaliAdapter(BaseAdapter):
             trust_remote_code=self._trust_remote_code,
             revision=self._revision,
         ).eval()
+
+        # Embeddings never need a KV cache. The runtime decision lives on the
+        # inner Gemma config, which is ``config.vlm_config.text_config`` — the
+        # same object as ``vlm.model.language_model.config`` (id-verified);
+        # ``config.text_config`` does not exist on ColPaliConfig, so guard all
+        # three spellings. The per-forward ``use_cache=False`` kwarg is the
+        # belt to this suspenders (#2144).
+        self._model.config.use_cache = False
+        for cfg_parent in (self._model.config, getattr(self._model.config, "vlm_config", None)):
+            text_config = getattr(cfg_parent, "text_config", None) if cfg_parent is not None else None
+            if text_config is not None:
+                text_config.use_cache = False
 
         # Get embedding dimension from model config
         # ColPali projects to 128-dim embeddings
@@ -364,8 +386,8 @@ class ColPaliAdapter(BaseAdapter):
         batch = self._processor(images=images, return_tensors="pt")
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
-        with torch.inference_mode():
-            outputs = self._model(**batch)
+        with self._forward_lock, torch.inference_mode():
+            outputs = self._model(**batch, use_cache=False)
             embeddings = outputs.embeddings  # [batch, num_patches, 128]
 
             # L2 normalize if configured
@@ -385,7 +407,9 @@ class ColPaliAdapter(BaseAdapter):
 
         # Free GPU memory from intermediate tensors to prevent OOM on
         # subsequent batches (L4 22GB GPUs are tight for VLM models).
-        del embeddings, batch
+        # `outputs` must be dropped too: it pins embeddings (and any
+        # past_key_values), making empty_cache a no-op otherwise (#2144).
+        del outputs, embeddings, batch
         if self._device and self._device.startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -409,15 +433,19 @@ class ColPaliAdapter(BaseAdapter):
         batch = self._processor(text=[text], return_tensors="pt")
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
-        with torch.inference_mode():
-            outputs = self._model(**batch)
+        with self._forward_lock, torch.inference_mode():
+            outputs = self._model(**batch, use_cache=False)
             embeddings = outputs.embeddings  # [1, num_tokens, 128]
 
             # L2 normalize if configured
             if self._normalize:
                 embeddings = functional.normalize(embeddings, p=2, dim=-1)
 
-        return embeddings[0].float().cpu().numpy()
+        result = embeddings[0].float().cpu().numpy()
+        # Drop the ModelOutput before returning so no KV cache / activation
+        # tensors outlive the request (#2144).
+        del outputs, embeddings, batch
+        return result
 
     def _has_prepared_pixel_values(self, prepared_items: list[Any]) -> bool:
         """Check if prepared items have valid pixel_values for batched inference.
@@ -488,11 +516,12 @@ class ColPaliAdapter(BaseAdapter):
         attention_mask = self._cached_attention_mask.expand(batch_size, -1).to(self._device)
 
         # Run batched inference
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             outputs = self._model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=batch_pixel_values,
+                use_cache=False,
             )
             embeddings = outputs.embeddings  # [batch, num_patches, 128]
 
@@ -508,7 +537,10 @@ class ColPaliAdapter(BaseAdapter):
 
         # Free GPU memory from intermediate tensors to prevent OOM on
         # subsequent batches (L4 22GB GPUs are tight for VLM models).
-        del embeddings, batch_pixel_values, input_ids, attention_mask
+        # `outputs` must be in the del: the ModelOutput pins embeddings (and
+        # any past_key_values), so empty_cache reclaimed nothing while it was
+        # live — the ~92 GiB accumulation of #2144.
+        del outputs, embeddings, batch_pixel_values, input_ids, attention_mask
         if self._device and self._device.startswith("cuda"):
             torch.cuda.empty_cache()
 

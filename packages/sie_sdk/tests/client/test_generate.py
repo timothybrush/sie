@@ -19,10 +19,10 @@ from sie_sdk import SIEAsyncClient, SIEClient, SIEConnectionError
 from sie_sdk.client.errors import ProvisioningError, RequestError, ServerError
 
 
-def _ok_response(payload: dict) -> MagicMock:
+def _ok_response(payload: dict, headers: dict[str, str] | None = None) -> MagicMock:
     response = MagicMock()
     response.status_code = 200
-    response.headers = {}
+    response.headers = headers or {}
     response.content = json.dumps(payload).encode("utf-8")
     response.json.return_value = payload
     return response
@@ -33,7 +33,13 @@ def _resp_504() -> MagicMock:
     # paths; generate() must NOT retry it (post-publish, non-idempotent).
     response = MagicMock()
     response.status_code = 504
-    response.headers = {"Retry-After": "0.01", "content-type": "application/json"}
+    response.headers = {
+        "Retry-After": "0.01",
+        "content-type": "application/json",
+        "X-SIE-Request-ID": "req-generate-timeout",
+        "X-SIE-Units-Output-Tokens": "5",
+        "X-SIE-Credits-Debited": "13",
+    }
     response.json.return_value = {"detail": {"code": "GATEWAY_TIMEOUT", "message": "Timeout waiting for queue result"}}
     response.content = json.dumps(response.json.return_value).encode("utf-8")
     return response
@@ -80,7 +86,7 @@ def _ok_envelope() -> dict:
     }
 
 
-def _aio_resp(status: int, body: dict, headers: dict | None = None) -> object:
+def _aio_resp(status: int, body: object, headers: dict | None = None) -> object:
     from sie_sdk.client.async_ import _AioResponse
 
     return _AioResponse(status, json.dumps(body).encode("utf-8"), headers or {"content-type": "application/json"})
@@ -135,7 +141,15 @@ class TestSyncGenerate:
             "tpot_ms": 45.2,
         }
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
-            mock_client.return_value.post.return_value = _ok_response(envelope)
+            mock_client.return_value.post.return_value = _ok_response(
+                envelope,
+                {
+                    "X-SIE-Request-ID": "req-generate",
+                    "X-SIE-Units-Input-Tokens": "5",
+                    "X-SIE-Units-Output-Tokens": "3",
+                    "X-SIE-Credits-Debited": "13",
+                },
+            )
             client = SIEClient("http://localhost:8080")
             result = client.generate(
                 "Qwen__Qwen3-4B-Instruct-2507",
@@ -149,6 +163,15 @@ class TestSyncGenerate:
             assert result["attempt_id"] == "att-abc"
             assert result["ttft_ms"] == 120.5
             assert result["tpot_ms"] == 45.2
+            assert result["request"] == {
+                "id": "req-generate",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+                "credits_debited": 13,
+            }
+            sent = json.loads(mock_client.return_value.post.call_args.kwargs["content"].decode("utf-8"))
+            assert "temperature" not in sent
+            assert "top_p" not in sent
+
             client.close()
 
     def test_generate_request_body_uses_json_shape(self) -> None:
@@ -161,14 +184,24 @@ class TestSyncGenerate:
         }
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post.return_value = _ok_response(envelope)
-            client = SIEClient("http://localhost:8080")
+            client = SIEClient("http://localhost:8080", options={"first_chunk_timeout_s": 10, "overall_timeout_s": 60})
             client.generate(
                 "m",
                 prompt="Hi",
                 max_new_tokens=8,
-                temperature=0.7,
-                top_p=0.9,
+                temperature=1.0,
+                top_p=1.0,
                 stop=["</s>"],
+                frequency_penalty=0.25,
+                presence_penalty=-0.5,
+                grammar={"regex": "[a-z]+"},
+                seed=-1,
+                logit_bias={"123": 1.5},
+                routing_key="tenant-7",
+                prompt_cache_key="prompt-9",
+                safety_identifier="safety-3",
+                lora_adapter="sql-adapter",
+                options={"overall_timeout_s": 30},
             )
             call = mock_client.return_value.post.call_args
             assert call.args[0] == "/v1/generate/m"
@@ -176,9 +209,19 @@ class TestSyncGenerate:
             assert sent == {
                 "prompt": "Hi",
                 "max_new_tokens": 8,
-                "temperature": 0.7,
-                "top_p": 0.9,
+                "temperature": 1.0,
+                "options": {"first_chunk_timeout_s": 10, "overall_timeout_s": 30},
+                "top_p": 1.0,
                 "stop": ["</s>"],
+                "frequency_penalty": 0.25,
+                "presence_penalty": -0.5,
+                "grammar": {"regex": "[a-z]+"},
+                "seed": -1,
+                "logit_bias": {"123": 1.5},
+                "routing_key": "tenant-7",
+                "prompt_cache_key": "prompt-9",
+                "safety_identifier": "safety-3",
+                "lora_adapter": "sql-adapter",
             }
             assert call.kwargs["headers"]["content-type"] == "application/json"
             assert call.kwargs["headers"]["accept"] == "application/json"
@@ -204,7 +247,11 @@ class TestSyncGenerate:
         # First response: 503 MODEL_LOADING; second: 200 envelope.
         loading_response = MagicMock()
         loading_response.status_code = 503
-        loading_response.headers = {"X-SIE-Error-Code": "MODEL_LOADING"}
+        loading_response.headers = {
+            "X-SIE-Error-Code": "MODEL_LOADING",
+            "X-SIE-Request-ID": "retry-intermediate",
+            "X-SIE-Credits-Debited": "999",
+        }
         loading_response.content = b'{"error":{"code":"MODEL_LOADING","message":"loading"}}'
         loading_response.json.return_value = {"error": {"code": "MODEL_LOADING", "message": "loading"}}
 
@@ -215,27 +262,69 @@ class TestSyncGenerate:
                 "finish_reason": "stop",
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 "attempt_id": "a",
-            }
+            },
+            {
+                "X-SIE-Request-ID": "retry-terminal",
+                "X-SIE-Credits-Debited": "3",
+            },
         )
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client, patch("sie_sdk.client.sync.time.sleep"):
             mock_client.return_value.post.side_effect = [loading_response, ok]
             client = SIEClient("http://localhost:8080")
             result = client.generate("m", prompt="hi", max_new_tokens=8, provision_timeout_s=10)
             assert result["text"] == "ok"
+            assert result["request"] == {"id": "retry-terminal", "credits_debited": 3}
             assert mock_client.return_value.post.call_count == 2
+            assert client.last_retry_count == 1
+
+            mock_client.return_value.post.side_effect = None
+            mock_client.return_value.post.return_value = ok
+            client.generate("m", prompt="again", max_new_tokens=8)
+            assert client.last_retry_count == 0
             client.close()
 
     def test_generate_non_dict_response_raises_request_error(self) -> None:
         response = MagicMock()
         response.status_code = 200
-        response.headers = {}
+        response.headers = {
+            "X-SIE-Request-ID": "req-generate-malformed",
+            "X-SIE-Units-Output-Tokens": "3",
+            "X-SIE-Credits-Debited": "8",
+        }
         response.content = b'"not a dict"'
         response.json.return_value = "not a dict"
         with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
             mock_client.return_value.post.return_value = response
             client = SIEClient("http://localhost:8080")
-            with pytest.raises(RequestError):
+            with pytest.raises(RequestError) as excinfo:
                 client.generate("m", prompt="hi", max_new_tokens=4)
+            assert excinfo.value.request == {
+                "id": "req-generate-malformed",
+                "usage": {"output_tokens": 3},
+                "credits_debited": 8,
+            }
+            client.close()
+
+    @pytest.mark.parametrize("body", [{"text": "ok"}, {"model": "m"}])
+    def test_generate_invalid_object_retains_request_metadata(self, body: dict) -> None:
+        response = _ok_response(
+            body,
+            {
+                "X-SIE-Request-ID": "req-generate-invalid-object",
+                "X-SIE-Units-Output-Tokens": "3",
+                "X-SIE-Credits-Debited": "8",
+            },
+        )
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.return_value = response
+            client = SIEClient("http://localhost:8080")
+            with pytest.raises(RequestError) as excinfo:
+                client.generate("m", prompt="hi", max_new_tokens=4)
+            assert excinfo.value.request == {
+                "id": "req-generate-invalid-object",
+                "usage": {"output_tokens": 3},
+                "credits_debited": 8,
+            }
             client.close()
 
     def test_generate_does_not_retry_504_and_raises(self) -> None:
@@ -257,6 +346,11 @@ class TestSyncGenerate:
             # No backoff sleep happened for the 504.
             mock_sleep.assert_not_called()
             assert excinfo.value.status_code == 504
+            assert excinfo.value.request == {
+                "id": "req-generate-timeout",
+                "usage": {"output_tokens": 5},
+                "credits_debited": 13,
+            }
             client.close()
 
     def test_generate_still_retries_503_provisioning(self) -> None:
@@ -294,6 +388,61 @@ class TestSyncGenerate:
 
 class TestAsyncGenerate:
     @pytest.mark.asyncio
+    async def test_generate_non_dict_response_retains_request_metadata(self) -> None:
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(  # type: ignore[method-assign]
+            return_value=_aio_resp(
+                200,
+                ["not a dict"],
+                {
+                    "X-SIE-Request-ID": "req-async-generate-malformed",
+                    "X-SIE-Units-Output-Tokens": "3",
+                    "X-SIE-Credits-Debited": "8",
+                },
+            )
+        )
+        with patch.object(client, "_ensure_session") as ensure:
+            ensure.return_value.post = _make_session_post(client._post)
+            try:
+                with pytest.raises(RequestError) as excinfo:
+                    await client.generate("m", prompt="hi", max_new_tokens=4)
+            finally:
+                await client.close()
+        assert excinfo.value.request == {
+            "id": "req-async-generate-malformed",
+            "usage": {"output_tokens": 3},
+            "credits_debited": 8,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [{"text": "ok"}, {"model": "m"}])
+    async def test_generate_invalid_object_retains_request_metadata(self, body: dict) -> None:
+        client = SIEAsyncClient("http://localhost:8080")
+        client._post = AsyncMock(  # type: ignore[method-assign]
+            return_value=_aio_resp(
+                200,
+                body,
+                {
+                    "X-SIE-Request-ID": "req-async-generate-invalid-object",
+                    "X-SIE-Units-Output-Tokens": "3",
+                    "X-SIE-Credits-Debited": "8",
+                },
+            )
+        )
+        with patch.object(client, "_ensure_session") as ensure:
+            ensure.return_value.post = _make_session_post(client._post)
+            try:
+                with pytest.raises(RequestError) as excinfo:
+                    await client.generate("m", prompt="hi", max_new_tokens=4)
+            finally:
+                await client.close()
+        assert excinfo.value.request == {
+            "id": "req-async-generate-invalid-object",
+            "usage": {"output_tokens": 3},
+            "credits_debited": 8,
+        }
+
+    @pytest.mark.asyncio
     async def test_generate_happy_path(self) -> None:
         envelope = {
             "model": "m",
@@ -308,7 +457,12 @@ class TestAsyncGenerate:
         # Mock the aiohttp session and the post context manager.
         raw = MagicMock()
         raw.status = 200
-        raw.headers = {}
+        raw.headers = {
+            "X-SIE-Request-ID": "req-async-generate",
+            "X-SIE-Units-Input-Tokens": "1",
+            "X-SIE-Units-Output-Tokens": "2",
+            "X-SIE-Credits-Debited": "9",
+        }
         raw.read = AsyncMock(return_value=json.dumps(envelope).encode("utf-8"))
 
         post_ctx = MagicMock()
@@ -320,20 +474,52 @@ class TestAsyncGenerate:
         session.close = AsyncMock()
 
         with patch("sie_sdk.client.async_.aiohttp.ClientSession", return_value=session):
-            client = SIEAsyncClient("http://localhost:8080")
+            client = SIEAsyncClient("http://localhost:8080", options={"first_chunk_timeout_s": 10})
             try:
-                result = await client.generate("Qwen/Qwen3-4B-Instruct-2507", prompt="Hi", max_new_tokens=16)
+                result = await client.generate(
+                    "Qwen/Qwen3-4B-Instruct-2507",
+                    prompt="Hi",
+                    max_new_tokens=16,
+                    frequency_penalty=0.25,
+                    presence_penalty=-0.5,
+                    grammar={"regex": "[a-z]+"},
+                    seed=-(1 << 63),
+                    logit_bias={"123": 1.5},
+                    routing_key="tenant-7",
+                    prompt_cache_key="prompt-9",
+                    safety_identifier="safety-3",
+                    lora_adapter="sql-adapter",
+                    options={"overall_timeout_s": 30},
+                )
             finally:
                 await client.close()
             assert result["text"] == "Hello!"
             assert result["usage"]["total_tokens"] == 3
             assert result["attempt_id"] == "att-1"
             assert result["ttft_ms"] == 80.0
+            assert result["request"] == {
+                "id": "req-async-generate",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+                "credits_debited": 9,
+            }
             call = session.post.call_args
             # Async client normalises HF model IDs to the SIE-safe path
             # (mirrors the sync client) so the gateway route matches.
             assert call.args[0] == "/v1/generate/Qwen__Qwen3-4B-Instruct-2507"
+            sent = json.loads(call.kwargs["data"].decode("utf-8"))
+            assert sent["seed"] == -(1 << 63)
+            assert sent["frequency_penalty"] == 0.25
+            assert sent["presence_penalty"] == -0.5
+            assert sent["grammar"] == {"regex": "[a-z]+"}
+            assert sent["logit_bias"] == {"123": 1.5}
+            assert sent["routing_key"] == "tenant-7"
+            assert sent["prompt_cache_key"] == "prompt-9"
+            assert sent["safety_identifier"] == "safety-3"
+            assert sent["lora_adapter"] == "sql-adapter"
             assert call.kwargs["headers"]["content-type"] == "application/json"
+            assert sent["options"] == {"first_chunk_timeout_s": 10, "overall_timeout_s": 30}
+            assert "temperature" not in sent
+            assert "top_p" not in sent
             assert call.kwargs["headers"]["accept"] == "application/json"
 
     @pytest.mark.asyncio
@@ -347,7 +533,13 @@ class TestAsyncGenerate:
                 _aio_resp(
                     504,
                     {"error": {"code": "MODEL_LOADING", "message": "timeout"}},
-                    {"Retry-After": "0.01", "content-type": "application/json"},
+                    {
+                        "Retry-After": "0.01",
+                        "content-type": "application/json",
+                        "X-SIE-Request-ID": "req-async-generate-timeout",
+                        "X-SIE-Units-Output-Tokens": "5",
+                        "X-SIE-Credits-Debited": "13",
+                    },
                 ),
                 _aio_resp(200, _ok_envelope()),
             ]
@@ -367,6 +559,11 @@ class TestAsyncGenerate:
         assert client._post.call_count == 1
         mock_sleep.assert_not_called()
         assert excinfo.value.status_code == 504
+        assert excinfo.value.request == {
+            "id": "req-async-generate-timeout",
+            "usage": {"output_tokens": 5},
+            "credits_debited": 13,
+        }
 
     @pytest.mark.asyncio
     async def test_generate_still_retries_503_model_loading(self) -> None:
@@ -374,8 +571,23 @@ class TestAsyncGenerate:
         client = SIEAsyncClient("http://localhost:8080")
         client._post = AsyncMock(  # type: ignore[method-assign]
             side_effect=[
-                _aio_resp(503, {"error": {"code": "MODEL_LOADING", "message": "loading"}}),
-                _aio_resp(200, _ok_envelope()),
+                _aio_resp(
+                    503,
+                    {"error": {"code": "MODEL_LOADING", "message": "loading"}},
+                    {
+                        "X-SIE-Error-Code": "MODEL_LOADING",
+                        "X-SIE-Request-ID": "async-retry-intermediate",
+                        "X-SIE-Credits-Debited": "999",
+                    },
+                ),
+                _aio_resp(
+                    200,
+                    _ok_envelope(),
+                    {
+                        "X-SIE-Request-ID": "async-retry-terminal",
+                        "X-SIE-Credits-Debited": "3",
+                    },
+                ),
             ]
         )
         with patch.object(client, "_ensure_session") as ensure:
@@ -386,6 +598,7 @@ class TestAsyncGenerate:
                 finally:
                     await client.close()
         assert result["text"] == "ok"
+        assert result["request"] == {"id": "async-retry-terminal", "credits_debited": 3}
         assert client._post.call_count == 2
 
     @pytest.mark.asyncio

@@ -126,7 +126,7 @@ class TestRevisionReachesFromPretrained:
         assert "revision" not in mock_mdl.from_pretrained.call_args.kwargs
 
     def test_siglip_transformers_backend_forwards_revision(self) -> None:
-        from sie_server.adapters.siglip import SiglipAdapter
+        from sie_server.adapters.siglip.adapter import SiglipAdapter
 
         adapter = SiglipAdapter("google/siglip-so400m-patch14-384", revision="cafef00d")
         assert adapter._revision == "cafef00d"

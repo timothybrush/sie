@@ -22,6 +22,13 @@ from sie_server.adapters._generation_base import GenerationAdapter
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.engine import ComputePrecision
 from sie_server.config.model import AdapterOptions, ModelConfig, ProfileConfig, ResolvedProfile
+from sie_server.config.package_artifacts import (
+    PACKAGE_ARTIFACT_MANIFEST_PATH_KEY,
+    PACKAGE_ARTIFACT_MANIFEST_SHA256_KEY,
+    PACKAGE_ARTIFACT_MODE_KEY,
+    PackageArtifactMode,
+    verify_staged_package_artifacts,
+)
 from sie_server.core.inference import AttentionBackend
 
 logger = logging.getLogger(__name__)
@@ -68,12 +75,24 @@ def validate_pinned_revision(config: ModelConfig) -> None:
 
     A promoted/served, HF-backed model MUST pin ``hf_revision`` to an immutable
     commit SHA so its ``sie_id`` maps to identical weights forever. ``weights_path``
-    and ``package_backed`` models are exempt: they carry their own immutable
-    weights / package version and have no Hub revision that can drift. Raises
-    ``ValueError`` naming the fix.
+    models have no Hub revision to pin. Promoted package-backed models must name
+    a digest-verified staged manifest; bundled packages and live external
+    downloads do not by themselves establish immutable model identity. The
+    package lock is not treated as a model revision. Raises ``ValueError`` naming
+    the fix.
     """
+    if config.package_backed:
+        declaration = config.package_artifact_declaration
+        if declaration.mode != PackageArtifactMode.STAGED:
+            msg = (
+                f"Served package-backed model '{config.sie_id}' does not declare a staged artifact manifest. "
+                "Promoted serving requires an exact manifest and per-file digests; a package lock is not a "
+                "model-weights revision."
+            )
+            raise ValueError(msg)
+        return
     if config.hf_id is None:
-        # weights_path or package_backed: nothing on the Hub to pin.
+        # weights_path: nothing on the Hub to pin.
         return
     revision = config.hf_revision
     if revision is None:
@@ -600,5 +619,26 @@ def _build_adapter_kwargs(
         kwargs["revision"] = config.hf_revision
 
     kwargs.update(resolved.loadtime)
+
+    if config.package_backed:
+        declaration = config.package_artifact_declaration
+        offline = any(
+            os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+            for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+        )
+        if declaration.mode == PackageArtifactMode.LIVE and offline:
+            raise ValueError(
+                f"Package-backed model '{config.sie_id}' permits live external downloads but offline mode is enabled"
+            )
+        for key in (
+            PACKAGE_ARTIFACT_MODE_KEY,
+            PACKAGE_ARTIFACT_MANIFEST_PATH_KEY,
+            PACKAGE_ARTIFACT_MANIFEST_SHA256_KEY,
+        ):
+            kwargs.pop(key, None)
+        if declaration.mode == PackageArtifactMode.STAGED:
+            verified = verify_staged_package_artifacts(declaration)
+            kwargs["package_artifact_root"] = verified.root
+            kwargs[PACKAGE_ARTIFACT_MANIFEST_SHA256_KEY] = verified.manifest_sha256
 
     return kwargs

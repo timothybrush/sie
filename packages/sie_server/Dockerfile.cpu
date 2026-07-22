@@ -7,6 +7,13 @@
 
 ARG BUNDLE=default
 
+# Build the checked-in Rust extension once so standalone images do not depend
+# on the matching sie-audio-prep release already existing on PyPI.
+FROM ghcr.io/pyo3/maturin:v1.13.3 AS audio-prep-builder
+WORKDIR /io
+COPY packages/sie_audio_prep .
+RUN maturin build --release --locked --out /dist
+
 # =============================================================================
 # Dependency image: pyproject-only cache seed
 # =============================================================================
@@ -38,6 +45,7 @@ WORKDIR /app
 # Dependency specs first — this layer caches as long as pyproject.toml is unchanged.
 COPY packages/sie_sdk/pyproject.toml /tmp/sie_sdk/pyproject.toml
 COPY packages/sie_server/pyproject.toml ./pyproject.toml
+COPY --from=audio-prep-builder /dist /tmp/audio-prep-dist
 
 # Stub source trees so pip accepts the editable installs during dep resolution.
 # Also create empty bundles/ and models/ — referenced by force-include in
@@ -53,8 +61,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && .venv/bin/pip install \
         --index-url https://download.pytorch.org/whl/cpu \
         --extra-index-url https://pypi.org/simple \
+        /tmp/audio-prep-dist/*.whl \
         -e "/tmp/sie_sdk[storage]" \
-        -e ".[gpu-metrics]"
+        -e ".[gpu-metrics,audio]"
 
 # =============================================================================
 # Shared runtime base: source install and venv finalization
@@ -84,7 +93,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Sanity-check shared venv imports — catches breakage introduced by the
 # shared-deps resolver.
-RUN .venv/bin/python -c "import torch; print(torch.__version__)"
+RUN .venv/bin/python -c "import sie_audio_prep, torch; print(torch.__version__)"
 
 # Register bundle-libs on sys.path. Content is identical across bundles.
 RUN echo "import sys; sys.path.insert(0, '/app/bundle-libs')" \

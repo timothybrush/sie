@@ -28,7 +28,6 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use crate::http_error::{json_openai_error, openai_code as oai_code, openai_type as oai_type};
-use crate::metrics;
 use crate::queue::publisher::GrammarSpec;
 
 /// Helper that maps a :class:`GrammarSpec` variant back to the string
@@ -60,7 +59,6 @@ pub fn check_capability(
     if allowed {
         return Ok(());
     }
-    metrics::record_grammar_reject("capability");
     let param = format!("grammar.{kind}");
     let message = if capabilities.is_none() {
         format!("Model '{model}' does not support grammar (no generate task)")
@@ -165,7 +163,6 @@ fn bad_request(message: String, param: &str, code: &'static str) -> Response {
 /// cache key — see :func:`sie_server.types.grammar.hash_grammar`.
 pub fn parse_grammar(v: &Value) -> GrammarParseResult {
     let Some(obj) = v.as_object() else {
-        metrics::record_grammar_reject("malformed");
         return GrammarParseResult::Err(bad_request(
             "'grammar' must be a JSON object".to_string(),
             "grammar",
@@ -184,7 +181,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
     // many.
     let serialized_len = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);
     if serialized_len > MAX_GRAMMAR_BYTES {
-        metrics::record_grammar_reject("payload_size");
         return GrammarParseResult::Err(bad_request(
             format!(
                 "grammar payload {serialized_len} bytes exceeds limit ({MAX_GRAMMAR_BYTES} bytes)"
@@ -202,7 +198,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
         .filter(|p| **p)
         .count();
     if variants_present > 1 {
-        metrics::record_grammar_reject("mutex");
         return GrammarParseResult::Err(bad_request(
             "'grammar.json_schema', 'grammar.regex' and 'grammar.ebnf' are mutually exclusive"
                 .to_string(),
@@ -211,7 +206,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
         ));
     }
     if variants_present == 0 {
-        metrics::record_grammar_reject("malformed");
         return GrammarParseResult::Err(bad_request(
             "'grammar' must contain exactly one of 'json_schema', 'regex' or 'ebnf'".to_string(),
             "grammar",
@@ -231,7 +225,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
         let serialized_len =
             json_schema_grammar_len(&resolved_schema, label.as_deref(), strict).unwrap_or(0);
         if serialized_len > MAX_GRAMMAR_BYTES {
-            metrics::record_grammar_reject("payload_size");
             return GrammarParseResult::Err(bad_request(
                 format!(
                     "grammar payload {serialized_len} bytes exceeds limit ({MAX_GRAMMAR_BYTES} bytes)"
@@ -251,7 +244,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
     } else if has_regex {
         let regex_val = obj.get("regex").expect("checked above");
         let Some(regex) = regex_val.as_str() else {
-            metrics::record_grammar_reject("malformed");
             return GrammarParseResult::Err(bad_request(
                 "'grammar.regex' must be a string".to_string(),
                 "grammar.regex",
@@ -259,7 +251,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
             ));
         };
         if regex.len() > MAX_REGEX_LEN {
-            metrics::record_grammar_reject("regex_len");
             return GrammarParseResult::Err(bad_request(
                 format!(
                     "regex length {} exceeds limit ({MAX_REGEX_LEN})",
@@ -281,7 +272,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
         // MAX_EBNF_LEN at the source level bound compile cost.
         let ebnf_val = obj.get("ebnf").expect("checked above");
         let Some(ebnf) = ebnf_val.as_str() else {
-            metrics::record_grammar_reject("malformed");
             return GrammarParseResult::Err(bad_request(
                 "'grammar.ebnf' must be a string".to_string(),
                 "grammar.ebnf",
@@ -289,7 +279,6 @@ pub fn parse_grammar(v: &Value) -> GrammarParseResult {
             ));
         };
         if ebnf.len() > MAX_EBNF_LEN {
-            metrics::record_grammar_reject("ebnf_len");
             return GrammarParseResult::Err(bad_request(
                 format!("ebnf length {} exceeds limit ({MAX_EBNF_LEN})", ebnf.len()),
                 "grammar.ebnf",
@@ -353,7 +342,6 @@ fn dereference_schema_refs_inner(
 ) -> Result<Value, Response> {
     *visited = visited.saturating_add(1);
     if *visited > MAX_SCHEMA_NODES {
-        metrics::record_grammar_reject("node_count");
         return Err(bad_request(
             format!("JSON Schema node count exceeds limit ({MAX_SCHEMA_NODES})"),
             path,
@@ -367,7 +355,6 @@ fn dereference_schema_refs_inner(
                 let ref_value = map.get("$ref").expect("checked above");
                 let ref_param = format!("{path}.$ref");
                 let Some(ref_str) = ref_value.as_str() else {
-                    metrics::record_grammar_reject("malformed");
                     return Err(bad_request(
                         "'$ref' must be a string".to_string(),
                         &ref_param,
@@ -375,7 +362,6 @@ fn dereference_schema_refs_inner(
                     ));
                 };
                 let Some(pointer) = ref_str.strip_prefix('#') else {
-                    metrics::record_grammar_reject("unsupported_keyword");
                     return Err(bad_request(
                         "external '$ref' is not supported".to_string(),
                         &ref_param,
@@ -383,7 +369,6 @@ fn dereference_schema_refs_inner(
                     ));
                 };
                 if !pointer.is_empty() && !pointer.starts_with('/') {
-                    metrics::record_grammar_reject("unsupported_keyword");
                     return Err(bad_request(
                         "only internal JSON-pointer '$ref' values are supported".to_string(),
                         &ref_param,
@@ -391,7 +376,6 @@ fn dereference_schema_refs_inner(
                     ));
                 }
                 if stack.iter().any(|p| p == pointer) {
-                    metrics::record_grammar_reject("ref_cycle");
                     return Err(bad_request(
                         format!("recursive '$ref' cycle detected at {ref_str:?}"),
                         &ref_param,
@@ -399,7 +383,6 @@ fn dereference_schema_refs_inner(
                     ));
                 }
                 let Some(target) = root.pointer(pointer) else {
-                    metrics::record_grammar_reject("ref_unresolved");
                     return Err(bad_request(
                         format!("unresolved internal '$ref' {ref_str:?}"),
                         &ref_param,
@@ -545,7 +528,6 @@ fn walk_schema_inner(
 ) -> Result<(), Response> {
     *visited = visited.saturating_add(1);
     if *visited > MAX_SCHEMA_NODES {
-        metrics::record_grammar_reject("node_count");
         return Err(bad_request(
             format!("JSON Schema node count exceeds limit ({MAX_SCHEMA_NODES})"),
             path,
@@ -553,7 +535,6 @@ fn walk_schema_inner(
         ));
     }
     if depth > MAX_SCHEMA_DEPTH {
-        metrics::record_grammar_reject("depth");
         return Err(bad_request(
             format!("JSON Schema depth exceeds limit ({MAX_SCHEMA_DEPTH})"),
             path,
@@ -567,7 +548,6 @@ fn walk_schema_inner(
             // at the shallowest occurrence.
             for &kw in UNSUPPORTED_KEYWORDS {
                 if map.contains_key(kw) {
-                    metrics::record_grammar_reject("unsupported_keyword");
                     let param = format!("{path}.{kw}");
                     let message = format!("JSON Schema keyword '{kw}' is not supported");
                     return Err(bad_request(message, &param, oai_code::UNSUPPORTED_FIELD));

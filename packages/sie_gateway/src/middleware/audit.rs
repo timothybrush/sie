@@ -111,7 +111,7 @@ where
                 .unwrap_or("")
                 .to_string();
 
-            // Only audit non-health/metrics endpoints to reduce noise
+            // Only audit non-health endpoints to reduce noise
             if !is_infrastructure_path(&path) {
                 info!(
                     event = "api_request",
@@ -135,7 +135,7 @@ where
 }
 
 fn is_infrastructure_path(path: &str) -> bool {
-    matches!(path, "/health" | "/healthz" | "/readyz" | "/metrics")
+    matches!(path, "/health" | "/healthz" | "/readyz")
 }
 
 fn mask_token(token: &str) -> String {
@@ -180,7 +180,6 @@ mod tests {
         assert!(is_infrastructure_path("/health"));
         assert!(is_infrastructure_path("/healthz"));
         assert!(is_infrastructure_path("/readyz"));
-        assert!(is_infrastructure_path("/metrics"));
         assert!(!is_infrastructure_path("/v1/encode/model"));
     }
 }

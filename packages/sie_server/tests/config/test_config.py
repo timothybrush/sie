@@ -17,6 +17,7 @@ from sie_server.config.model import (
     ScoreTask,
     Tasks,
 )
+from sie_server.config.package_artifacts import PackageArtifactMode
 
 
 class TestEngineConfig:
@@ -280,6 +281,113 @@ class TestModelConfig:
                 hf_revision="abc123",
                 tasks=Tasks(extract=ExtractTask()),
                 profiles={"default": ProfileConfig(adapter_path="mod:Cls", max_batch_tokens=1)},
+            )
+
+    def test_package_backed_declares_live_external_artifacts(self) -> None:
+        config = ModelConfig(
+            sie_id="package/model",
+            package_backed=True,
+            tasks=Tasks(extract=ExtractTask()),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="mod:Cls",
+                    max_batch_tokens=1,
+                    adapter_options=AdapterOptions(loadtime={"package_artifact_mode": "live"}),
+                )
+            },
+        )
+
+        assert config.package_artifact_declaration.mode == PackageArtifactMode.LIVE
+
+    def test_staged_package_artifacts_require_complete_manifest_identity(self) -> None:
+        with pytest.raises(ValidationError, match="64-hex manifest sha256"):
+            ModelConfig(
+                sie_id="package/model",
+                package_backed=True,
+                tasks=Tasks(extract=ExtractTask()),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=1,
+                        adapter_options=AdapterOptions(
+                            loadtime={
+                                "package_artifact_mode": "staged",
+                                "package_artifact_manifest_path": "/models/package/model/manifest.json",
+                            }
+                        ),
+                    )
+                },
+            )
+
+    def test_package_artifact_declaration_must_match_across_profiles(self) -> None:
+        with pytest.raises(ValidationError, match="identical package artifacts"):
+            ModelConfig(
+                sie_id="package/model",
+                package_backed=True,
+                tasks=Tasks(extract=ExtractTask()),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=1,
+                        adapter_options=AdapterOptions(loadtime={"package_artifact_mode": "live"}),
+                    ),
+                    "bundled": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=1,
+                    ),
+                },
+            )
+
+    def test_package_artifact_declaration_uses_resolved_profile_loadtime(self) -> None:
+        config = ModelConfig(
+            sie_id="package/model",
+            package_backed=True,
+            tasks=Tasks(extract=ExtractTask()),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="mod:Cls",
+                    max_batch_tokens=1,
+                    adapter_options=AdapterOptions(loadtime={"package_artifact_mode": "live"}),
+                ),
+                "inherited": ProfileConfig(extends="default"),
+            },
+        )
+
+        assert config.resolve_profile("inherited").loadtime["package_artifact_mode"] == "live"
+        assert config.package_artifact_declaration.mode == PackageArtifactMode.LIVE
+
+    def test_child_loadtime_replacement_must_repeat_package_artifact_declaration(self) -> None:
+        with pytest.raises(ValidationError, match="identical package artifacts"):
+            ModelConfig(
+                sie_id="package/model",
+                package_backed=True,
+                tasks=Tasks(extract=ExtractTask()),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=1,
+                        adapter_options=AdapterOptions(loadtime={"package_artifact_mode": "live"}),
+                    ),
+                    "replacement": ProfileConfig(
+                        extends="default",
+                        adapter_options=AdapterOptions(loadtime={"unrelated_option": True}),
+                    ),
+                },
+            )
+
+    def test_non_package_model_rejects_package_artifact_declaration(self) -> None:
+        with pytest.raises(ValidationError, match="require 'package_backed: true'"):
+            ModelConfig(
+                sie_id="org/model",
+                hf_id="org/model",
+                tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+                profiles={
+                    "default": ProfileConfig(
+                        adapter_path="mod:Cls",
+                        max_batch_tokens=1,
+                        adapter_options=AdapterOptions(loadtime={"package_artifact_mode": "live"}),
+                    )
+                },
             )
 
     def test_empty_profiles_rejected(self) -> None:

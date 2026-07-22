@@ -450,7 +450,6 @@ mod tests {
         Config {
             host: "127.0.0.1".to_string(),
             port: 0,
-            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: "default".to_string(),
@@ -474,11 +473,13 @@ mod tests {
             stream_max_age_s: 1_800,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            configured_physical_lanes: Default::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
+            public_base_url: None,
             config_service_url: config_service_url.map(str::to_string),
             config_service_token: None,
             config_modal_proxy_token: None,
@@ -512,7 +513,8 @@ mod tests {
             model_registry,
             pool_manager: Arc::new(PoolManager::new(Vec::new())),
             work_publisher: None,
-            demand_tracker: Arc::new(DemandTracker::new()),
+            lane_backlog_source: None,
+            demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
         });
 
@@ -548,7 +550,8 @@ mod tests {
             model_registry,
             pool_manager: Arc::new(PoolManager::new(Vec::new())),
             work_publisher: None,
-            demand_tracker: Arc::new(DemandTracker::new()),
+            lane_backlog_source: None,
+            demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
         });
         let router = create_router(Arc::clone(&state), config);
@@ -739,6 +742,7 @@ mod tests {
             .model_registry
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
+                hf_revision: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -941,6 +945,7 @@ mod tests {
         // against an empty bundles dir.
         let _ = state.model_registry.add_model_config(ModelConfig {
             name: "empty/model".to_string(),
+            hf_revision: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,
@@ -1094,7 +1099,8 @@ mod tests {
             model_registry,
             pool_manager: Arc::new(PoolManager::new(Vec::new())),
             work_publisher: None,
-            demand_tracker: Arc::new(DemandTracker::new()),
+            lane_backlog_source: None,
+            demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
         });
         seed_model(&state, "BAAI/bge-m3");

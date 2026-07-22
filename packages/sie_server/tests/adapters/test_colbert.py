@@ -13,7 +13,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 from sie_server.adapters.colbert import ColBERTAdapter
-from sie_server.adapters.colbert_modernbert_flash import ColBERTModernBERTFlashAdapter
+from sie_server.adapters.colbert_modernbert_flash.adapter import ColBERTModernBERTFlashAdapter
 from sie_server.adapters.colbert_rotary_flash import ColBERTRotaryFlashAdapter
 from sie_server.core.inference_output import ScoreOutput
 from sie_server.types.inputs import Item
@@ -668,6 +668,19 @@ class TestColBERTScorePairsOptions:
 
         assert isinstance(out, ScoreOutput)
         assert out.scores.shape == (2,)
+
+    def test_modernbert_flash_empty_encode_returns_empty_output(self) -> None:
+        adapter = ColBERTModernBERTFlashAdapter("test-model")
+        adapter._model = MagicMock()
+        adapter._tokenizer = MagicMock()
+        adapter._device = "cuda"
+
+        output = adapter.encode([], ["multivector"])
+
+        assert output.multivector == []
+        assert output.batch_size == 0
+        assert output.multivector_token_dim == 128
+        assert output.extra == {"input_token_counts": []}
 
     def test_rotary_flash_score_pairs_with_nonempty_options_does_not_raise(self) -> None:
         """Rotary-flash ColBERT adapter (jina-colbert-v2) accepts-and-ignores options."""

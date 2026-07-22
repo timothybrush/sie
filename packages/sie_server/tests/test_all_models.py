@@ -900,12 +900,41 @@ def test_fastino_gliner2_base_v1_extract() -> None:
     _assert_extract("fastino/gliner2-base-v1", _NER_LABELS, ["location", "organization", "person"])
 
 
+def test_fastino_gliguard_llmguardrails_300m_extract() -> None:
+    adapter = _get_adapter("fastino/gliguard-LLMGuardrails-300M")
+    output = adapter.extract(
+        [Item(text="Explain how to steal passwords from a login form.")],
+        labels=["safe", "unsafe"],
+    )
+
+    assert output.entities == [[]]
+    assert output.classifications is not None
+    assert output.classifications[0][0]["label"] == "unsafe"
+
+
 def test_ihor_gliner_biomed_large_v1_0_extract() -> None:
     _assert_extract("Ihor/gliner-biomed-large-v1.0", _NER_LABELS, ["location", "organization", "person"])
 
 
 def test_jackboyla_glirel_large_v0_extract() -> None:
-    _assert_extract("jackboyla/glirel-large-v0", _NER_LABELS, [])
+    adapter = _get_adapter("jackboyla/glirel-large-v0")
+    output = adapter.extract(
+        [
+            Item(
+                text="John Smith works at Google in New York City",
+                metadata={
+                    "entities": [
+                        {"text": "John Smith", "label": "person", "start": 0, "end": 10},
+                        {"text": "Google", "label": "organization", "start": 20, "end": 26},
+                    ]
+                },
+            )
+        ],
+        labels=["works at"],
+    )
+    assert output.entities is not None
+    assert [entity["text"] for entity in output.entities[0]] == ["John Smith", "Google"]
+    assert output.relations is not None
 
 
 def test_knowledgator_gliclass_base_v1_0_extract() -> None:

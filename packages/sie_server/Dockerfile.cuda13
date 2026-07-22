@@ -25,6 +25,13 @@
 ARG BUNDLE=gemma
 ARG UV_VERSION=0.9.28
 
+# Build the checked-in Rust extension once so standalone images do not depend
+# on the matching sie-audio-prep release already existing on PyPI.
+FROM ghcr.io/pyo3/maturin:v1.13.3 AS audio-prep-builder
+WORKDIR /io
+COPY packages/sie_audio_prep .
+RUN maturin build --release --locked --out /dist
+
 # =============================================================================
 # Dependency image: uv and standalone Python 3.12 (CUDA 13 devel base)
 # =============================================================================
@@ -61,6 +68,7 @@ WORKDIR /app
 
 COPY packages/sie_sdk/pyproject.toml /tmp/sie_sdk/pyproject.toml
 COPY packages/sie_server/pyproject.toml ./pyproject.toml
+COPY --from=audio-prep-builder /dist /tmp/audio-prep-dist
 
 # Stubs for editable metadata generation — bundles/ and models/ are referenced
 # by force-include in pyproject.toml and must exist; real contents are copied
@@ -73,8 +81,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3.12 -m venv .venv \
     && .venv/bin/pip install --upgrade pip \
     && .venv/bin/pip install \
+        /tmp/audio-prep-dist/*.whl \
         -e "/tmp/sie_sdk[storage]" \
-        -e ".[gpu-metrics]"
+        -e ".[gpu-metrics,audio]"
 
 # =============================================================================
 # Shared CUDA base: source install and venv finalization
@@ -100,7 +109,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -e .
 
 # Sanity-check shared venv imports.
-RUN .venv/bin/python -c "import torch; print(torch.__version__)"
+RUN .venv/bin/python -c "import sie_audio_prep, torch; print(torch.__version__)"
 
 # Register bundle-libs on sys.path via a .pth executed by site.py at startup.
 # sys.path.insert(0, ...) puts bundle-libs at position 0 so bundle-specific

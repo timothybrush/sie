@@ -18,11 +18,7 @@ from sie_server.core.loader import load_adapter
 from sie_server.core.oom import OomRecoveryConfig
 from sie_server.core.worker import ModelWorker, WorkerConfig
 from sie_server.core.worker.types import AdaptiveBatchingParams
-from sie_server.observability.metrics import (
-    increment_model_load_timeout,
-    set_model_loaded,
-    set_model_memory,
-)
+from sie_server.observability.worker_telemetry import worker_telemetry
 
 if TYPE_CHECKING:
     from sie_server.core.disk_cache import ModelDiskCacheManager
@@ -386,7 +382,7 @@ class ModelLoader:
         Bounded by ``SIE_MODEL_LOAD_TIMEOUT_S``. The executor thread runs
         ONLY ``_run_load_with_markers`` (weight deserialization + warmup);
         the registry-state side effects (``_finish_load``: pre/postprocessor
-        registration, ``MODEL_LOADED`` gauge, worker creation, LoRA
+        registration, OTel residency event, worker creation, LoRA
         preloading) run on the awaiting coroutine AFTER the future
         resolves cleanly.
 
@@ -394,7 +390,7 @@ class ModelLoader:
         ``wait_for`` cancels, the orphaned thread keeps running but can
         only mutate the adapter object itself (which the registry will
         discard along with the LoadedModel that never gets created). It
-        cannot register stale preprocessors or set ``sie_model_loaded=1``
+        cannot register stale preprocessors or publish model residency
         for a model the registry has marked failed.
 
         Adapters that set ``manages_own_load_timeout`` are also run in this
@@ -449,11 +445,11 @@ class ModelLoader:
              queue behind the leaked thread (the registry holds
              ``_load_lock`` while awaiting us, so this happens with the
              registry quiesced).
-          3. ``sie_model_load_timeouts_total{model, stage}`` is incremented
-             and a structured error is logged.
+          3. A structured error is logged.
           4. :class:`ModelLoadTimeoutError` is raised; the registry's
-             ``_record_load_failure`` will classify it as ``TIMEOUT`` and
-             install a 30 s cooldown.
+             ``_record_load_failure`` classifies it as ``TIMEOUT``, records
+             ``sie.worker.model.load.duration{outcome="timeout"}``, and installs
+             a 30 s cooldown.
         """
         loop = asyncio.get_running_loop()
         timeout = self._model_load_timeout_s
@@ -475,7 +471,6 @@ class ModelLoader:
                 elapsed,
                 timeout,
             )
-            increment_model_load_timeout(name, stage)
             # The thread keeps running with a stale adapter/config; we
             # cannot kill it. Replace the executor so the next load is
             # not queued behind the leaked worker.
@@ -489,7 +484,8 @@ class ModelLoader:
         we orphan it (``shutdown(wait=False)`` returns immediately without
         joining) and bind ``self._load_executor`` to a new single-worker
         pool. The orphan thread continues to consume RAM/GPU until process
-        exit; ``sie_model_load_timeouts_total`` lets ops observe the rate.
+        exit; the timeout outcome on `sie.worker.model.load.duration` lets ops
+        observe the rate.
         """
         old = self._load_executor
         self._load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
@@ -561,11 +557,14 @@ class ModelLoader:
                 continue
             modality = getattr(preprocessor, "modality", None)
             if modality == "text":
-                self._preprocessor_registry._register(name, preprocessor)
+                self._preprocessor_registry.register(name, preprocessor)
                 logger.info("Registered text preprocessor for model '%s'", name)
             elif modality == "image":
                 self._preprocessor_registry.register_image(name, preprocessor)
                 logger.info("Registered image preprocessor for model '%s'", name)
+            elif modality == "audio":
+                self._preprocessor_registry.register(name, preprocessor)
+                logger.info("Registered audio preprocessor for model '%s'", name)
 
         # Register postprocessors if adapter provides them.
         if hasattr(adapter, "get_postprocessors"):
@@ -606,9 +605,12 @@ class ModelLoader:
             registry_callbacks=self._registry_callbacks,
         )
 
-        # Record Prometheus metrics
-        set_model_loaded(name, device, loaded=True)
-        set_model_memory(name, device, memory_bytes)
+        # One authoritative lifecycle event expands to loaded + memory gauges.
+        worker_telemetry().model_residency_changed(
+            model=name,
+            loaded=True,
+            memory_bytes=memory_bytes,
+        )
 
         # Create LoadedModel instance
         loaded_model = LoadedModel(
@@ -620,14 +622,14 @@ class ModelLoader:
             max_loras=self._max_loras_per_model,
         )
 
-        # Preload profile LoRAs if adapter supports LoRA. Engine-owned adapters
-        # (sglang: ``supports_hot_lora_reload() == False``) consume
-        # ``loadtime.lora_paths`` themselves at engine launch, so only
+        # Preload profile LoRAs if the adapter exposes a LoRA capability.
+        # Engine-owned adapters (sglang: ``supports_hot_lora_reload() == False``)
+        # consume ``loadtime.lora_paths`` themselves at engine launch, so only
         # hot-reload (PEFT) adapters take the loadtime declarations from here.
-        if adapter.supports_lora():
+        if (lora_cap := adapter.lora_capability()) is not None:
             profile_loras = self._collect_profile_loras(
                 config,
-                include_loadtime_paths=adapter.supports_hot_lora_reload(),
+                include_loadtime_paths=lora_cap.supports_hot_lora_reload(),
             )
             if profile_loras:
                 logger.info(
@@ -638,7 +640,7 @@ class ModelLoader:
                 )
                 for lora_path in profile_loras:
                     try:
-                        lora_memory = adapter.load_lora(lora_path)
+                        lora_memory = lora_cap.load_lora(lora_path)
                         loaded_model.loras[lora_path] = LoadedLora(
                             adapter_id=lora_path,
                             memory_bytes=lora_memory,
@@ -737,9 +739,11 @@ class ModelLoader:
             name: Model name.
             device: Device string (for metrics).
         """
-        # Clear Prometheus metrics
-        set_model_loaded(name, device, loaded=False)
-        set_model_memory(name, device, 0)
+        worker_telemetry().model_residency_changed(
+            model=name,
+            loaded=False,
+            memory_bytes=0,
+        )
 
         # Unregister all preprocessors (text and image)
         self._preprocessor_registry.unregister(name)
@@ -789,7 +793,6 @@ def _raise_if_adapter_startup_timeout(name: str, started: float, exc: RuntimeErr
         return
 
     elapsed = time.monotonic() - started
-    increment_model_load_timeout(name, "load")
     logger.error(
         "Adapter startup timeout: model=%s elapsed_s=%.1f msg=%s",
         name,

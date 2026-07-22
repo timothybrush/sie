@@ -15,12 +15,16 @@ inputs:
 tasks:
   generate:
     # Native context length is 262,144 tokens (YaRN extends to ~1M).
-    # Keep the base model contract at the measured 4K window. The managed
+    # Keep the base model contract at the 8K launch window. The managed
     # tester rollout exposes the 32K surface only through the
     # ``:rtx-pro-6000`` variant below, whose profile-level ``max_seq_length``
     # is promoted into the generated variant config by the loader.
-    context_length: 4096
+    context_length: 8192
     max_output_tokens: 4096
+    # NEXTN cannot safely run Outlines grammar decoding. The gateway rewrites
+    # grammar-constrained requests to this non-speculative sibling, which is
+    # deployed on the same H100 machine class as the default lane.
+    grammar_profile: no-spec
     capabilities:
       # Same constraint as Qwen3.5-4B: SGLang's outlines_backend does
       # not implement ebnf. xgrammar smoke would pass all three; flip
@@ -63,7 +67,7 @@ tasks:
             answer:
               type: string
           required: [answer]
-max_sequence_length: 4096
+max_sequence_length: 8192
 # ── KV-cache math ──
 #
 # Qwen3.6-27B layer breakdown (per model card / config.json):
@@ -77,7 +81,7 @@ max_sequence_length: 4096
 # enough host RAM to read the BF16 checkpoint before quantization.
 #   * L4 (24 GB)         → infeasible
 #   * A100-40GB (40 GB)  → infeasible BF16; FP8/TP2 only
-#   * H100-80GB          → BF16 speculative profiles at the measured 4K window
+#   * H100-80GB          → BF16 speculative profiles at the 8K launch window
 #   * RTX PRO 6000 96GB  → FP8 + NEXTN profile with a 32K variant surface
 profiles:
   # L4 / A100-40GB BF16 profiles intentionally omitted — Qwen3.6-27B's BF16
@@ -86,7 +90,7 @@ profiles:
     max_batch_tokens: 16384
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
-    # H100-80GB speculative launch shape carried forward at the measured 4K
+    # H100-80GB speculative launch shape carried forward at the 8K launch
     # base-model context. The managed cluster routes 32K 27B generation to
     # ``rtx-pro-6000``.
     kv_budget_tokens: 8192
@@ -132,7 +136,7 @@ profiles:
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
     # Same H100-80GB target as ``default`` with the model-card 3/4 NEXTN draft
-    # preserved from main. Keep the public H100 context at the measured 4K
+    # preserved from main. Keep the public H100 context at the 8K
     # base-model window until a separate 32K H100 smoke lands.
     kv_budget_tokens: 32768
     adapter_options:

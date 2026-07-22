@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 from sie_server.adapters._flash_pack import build_position_ids
-from sie_server.adapters.splade_flash import SPLADEFlashAdapter
+from sie_server.adapters.splade_flash.adapter import SPLADEFlashAdapter
 
 
 def _cu_seqlens(seq_lengths: list[int]) -> torch.Tensor:

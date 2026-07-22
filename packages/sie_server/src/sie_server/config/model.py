@@ -8,6 +8,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from sie_server.config.engine import ComputePrecision
+from sie_server.config.package_artifacts import (
+    PackageArtifactDeclaration,
+    has_package_artifact_declaration,
+    parse_package_artifact_declaration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +156,8 @@ class GenerateTask(BaseModel):
     Outlines compile cost. See :class:`PrewarmGrammar` for the entry
     shape; the worker iterates the list once on boot and silently
     continues past individual compile failures (which are surfaced via
-    the ``sie_worker_grammar_prewarm_total{outcome="failed"}`` counter).
+    ``sie.worker.generation.grammar.compile.duration`` with
+    ``phase="prewarm", outcome="error"``).
 
     ``kv_budget_tokens`` for admission control lives on
     :class:`ProfileConfig` rather than here, because the
@@ -569,6 +575,30 @@ class ModelConfig(BaseModel):
                     parent=self.profiles[profile.extends] if profile.extends is not None else None,
                 )
         return self
+
+    @model_validator(mode="after")
+    def validate_package_artifacts(self) -> "ModelConfig":
+        declarations: set[PackageArtifactDeclaration] = set()
+        for name in self.profiles:
+            loadtime = self._effective_package_artifact_loadtime(name)
+            if not self.package_backed and has_package_artifact_declaration(loadtime):
+                raise ValueError("package artifact declarations require 'package_backed: true'")
+            declarations.add(parse_package_artifact_declaration(loadtime))
+        if self.package_backed and len(declarations) != 1:
+            raise ValueError("all profiles of a package-backed model must declare identical package artifacts")
+        return self
+
+    def _effective_package_artifact_loadtime(self, name: str) -> dict[str, Any]:
+        # Keep artifact validation on the exact same inheritance/replacement
+        # path as adapter construction.  Do not duplicate profile resolution
+        # semantics here: that would let future resolution changes silently
+        # validate a different declaration than the worker consumes.
+        return dict(self._resolve_profile_uncached(name).loadtime)
+
+    @property
+    def package_artifact_declaration(self) -> PackageArtifactDeclaration:
+        first_profile = next(iter(self.profiles))
+        return parse_package_artifact_declaration(self._effective_package_artifact_loadtime(first_profile))
 
     def resolve_profile(self, name: str) -> ResolvedProfile:
         if name in self._resolved_cache:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 from sie_server.config.model import ModelConfig
-from sie_server.core.runtime_options import merge_runtime_options
+from sie_server.core.runtime_options import apply_generation_runtime_options, merge_runtime_options
 
 
 def _embedder_config() -> ModelConfig:
@@ -93,3 +93,95 @@ def test_unknown_profile_raises_value_error() -> None:
     config = _embedder_config()
     with pytest.raises(ValueError, match="nope"):
         merge_runtime_options(config, {"profile": "nope"})
+
+
+def _generation_config() -> ModelConfig:
+    return ModelConfig.model_validate(
+        {
+            "sie_id": "test/generator",
+            "hf_id": "test/generator",
+            "inputs": {"text": True},
+            "tasks": {"generate": {"context_length": 4096, "max_output_tokens": 512}},
+            "max_sequence_length": 4096,
+            "profiles": {
+                "default": {
+                    "max_batch_tokens": 4096,
+                    "kv_budget_tokens": 2048,
+                    "adapter_path": "sie_server.adapters.fake.adapter:FakeAdapter",
+                    "adapter_options": {
+                        "runtime": {
+                            "default_sampling": {"temperature": 0.7, "top_p": 0.8},
+                            "stop_tokens": ["</s>"],
+                            "overall_timeout_s": 60,
+                        }
+                    },
+                }
+            },
+        }
+    )
+
+
+def test_generation_runtime_defaults_apply_below_typed_fields() -> None:
+    resolved = apply_generation_runtime_options(
+        _generation_config(),
+        {"profile": "default"},
+        {"prompt": "hi", "temperature": 1.0, "stop": ["DONE"]},
+    )
+
+    assert resolved["temperature"] == 1.0
+    assert resolved["top_p"] == 0.8
+    assert resolved["stop"] == ["DONE", "</s>"]
+    assert "profile" not in resolved
+
+
+def test_generation_request_runtime_overrides_profile_defaults() -> None:
+    resolved = apply_generation_runtime_options(
+        _generation_config(),
+        {"default_sampling": {"temperature": 0.2}},
+        {"prompt": "hi"},
+    )
+
+    assert resolved["temperature"] == 0.2
+    assert resolved["top_p"] == 0.8
+
+
+def test_generation_non_default_profile_requires_model_variant_identity() -> None:
+    with pytest.raises(ValueError, match="model:profile"):
+        apply_generation_runtime_options(
+            _generation_config(),
+            {"profile": "fast"},
+            {"prompt": "hi"},
+        )
+
+
+def test_generation_unknown_option_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported generation option"):
+        apply_generation_runtime_options(
+            _generation_config(),
+            {"not_executable": True},
+            {"prompt": "hi"},
+        )
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"temperature": "0.7"},
+        {"top_p": None},
+        {"presence_penalty": float("inf")},
+        {"top_k": True},
+        {"min_new_tokens": -1},
+    ],
+)
+def test_generation_invalid_sampling_option_fails_closed(sampling: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="invalid value"):
+        apply_generation_runtime_options(
+            _generation_config(),
+            {"default_sampling": sampling},
+            {"prompt": "hi"},
+        )
+
+
+def test_generation_non_finite_timeout_fails_closed() -> None:
+    with pytest.raises(ValueError, match="positive number"):
+        apply_generation_runtime_options(_generation_config(), {"overall_timeout_s": float("inf")}, {"prompt": "hi"})

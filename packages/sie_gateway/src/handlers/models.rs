@@ -55,6 +55,7 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 Some(entry) => entry.to_model_info_value(loaded),
                 None => worker_only_model_info(name, loaded),
             };
+            attach_model_revision(&mut body, state.as_ref(), name);
             attach_pending_generation(&mut body, state.as_ref(), name);
             body
         })
@@ -141,9 +142,19 @@ pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppSta
             }
         }
     }
+    attach_model_revision(&mut body, state.as_ref(), &canonical_model);
     attach_pending_generation(&mut body, state.as_ref(), &canonical_model);
 
     (StatusCode::OK, Json(body)).into_response()
+}
+
+fn attach_model_revision(body: &mut Value, state: &AppState, model: &str) {
+    let Some(revision) = state.model_registry.get_model_revision(model) else {
+        return;
+    };
+    if let Some(map) = body.as_object_mut() {
+        map.insert("revision".to_string(), json!(revision));
+    }
 }
 
 fn attach_pending_generation(body: &mut Value, state: &AppState, model: &str) {
@@ -187,6 +198,7 @@ fn worker_only_model_info(name: &str, loaded: bool) -> Value {
             outputs: Vec::new(),
             dims: HashMap::new(),
             max_sequence_length: None,
+            revision: None,
             max_output_tokens: None,
             grammar_capabilities: None,
             grammar_profile: None,
@@ -340,7 +352,6 @@ mod route_tests {
         Config {
             host: "127.0.0.1".to_string(),
             port: 0,
-            metrics_port: None,
             worker_urls: Vec::new(),
             use_kubernetes: false,
             k8s_namespace: "default".to_string(),
@@ -364,11 +375,13 @@ mod route_tests {
             stream_max_age_s: 1_800,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
+            configured_physical_lanes: Default::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
+            public_base_url: None,
             config_service_url: None,
             config_service_token: None,
             config_modal_proxy_token: None,
@@ -406,7 +419,8 @@ mod route_tests {
             model_registry,
             pool_manager: Arc::new(PoolManager::new(Vec::new())),
             work_publisher: None,
-            demand_tracker: Arc::new(DemandTracker::new()),
+            lane_backlog_source: None,
+            demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
         });
         let router = create_router(Arc::clone(&state), config);
@@ -429,6 +443,7 @@ mod route_tests {
             .model_registry
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
+                hf_revision: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -468,6 +483,7 @@ mod route_tests {
             .model_registry
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
+                hf_revision: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -497,6 +513,7 @@ mod route_tests {
             .model_registry
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
+                hf_revision: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -549,7 +566,8 @@ mod route_tests {
             model_registry,
             pool_manager: Arc::new(PoolManager::new(Vec::new())),
             work_publisher: None,
-            demand_tracker: Arc::new(DemandTracker::new()),
+            lane_backlog_source: None,
+            demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
         };
         seed_model(&state, "test/model");
@@ -619,6 +637,7 @@ mod route_tests {
             .model_registry
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
+                hf_revision: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,

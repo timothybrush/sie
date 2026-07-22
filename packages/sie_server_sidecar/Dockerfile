@@ -31,6 +31,7 @@ WORKDIR /build
 
 FROM chef AS planner
 COPY packages/sie_server_sidecar/Cargo.toml packages/sie_server_sidecar/Cargo.lock ./
+COPY packages/sie_audio_prep/ /sie_audio_prep/
 COPY packages/sie_server_sidecar/src/ src/
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -44,8 +45,8 @@ ARG FEATURES
 #   * `pkg-config + libssl-dev` - in case any transitive dep uses OpenSSL
 #     (async-nats itself uses rustls, but staying safe for feature toggles).
 #   * `ca-certificates` - cargo needs these when the network cache misses.
-#   * `build-essential` - gcc/cmake/make for `onig_sys` (tokenizers) and
-#     `safetensors`. These crates ship C sources and STATICALLY link them
+#   * `build-essential + cmake` - native builds for bundled Opus, `onig_sys`
+#     (tokenizers), and `safetensors`. These crates STATICALLY link C sources
 #     so the distroless runtime image can stay minimal.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -53,6 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libssl-dev \
         ca-certificates \
         build-essential \
+        cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Force `onig_sys` to statically link the bundled Oniguruma instead of
@@ -61,6 +63,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 ENV RUSTONIG_STATIC_LIBONIG=1
 
 COPY --from=planner /build/recipe.json recipe.json
+# The path dependency resolves from /build/../sie_audio_prep. cargo-chef
+# reconstructs the root crate from recipe.json, but not a sibling directory.
+COPY packages/sie_audio_prep/ /sie_audio_prep/
 
 # Warm cargo's target cache with JUST the dependency graph. This keeps
 # iteration fast when only worker source changes (deps hash unchanged).
@@ -76,6 +81,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # the real manifest and source before `cargo build` so the final image gets
 # `sie-server-sidecar`, not a cache-warming placeholder binary.
 COPY packages/sie_server_sidecar/Cargo.toml packages/sie_server_sidecar/Cargo.lock ./
+COPY packages/sie_audio_prep/ /sie_audio_prep/
 COPY packages/sie_server_sidecar/src/ src/
 
 # Real build.
@@ -101,14 +107,13 @@ COPY --from=builder /usr/local/bin/sie-server-sidecar /sie-server-sidecar
 
 # Opinionated defaults; override via env in the Pod spec / Helm chart.
 #
-# * SIE_WORKER_METRICS_PORT - Prometheus scrape port (matches the clap arg
-#                             name; default 9095).
+# * SIE_WORKER_PROBE_PORT   - liveness/readiness probe port (default 9095).
 # * SIE_IPC_SOCKET_PATH     - Unix socket to the Python sie-server process. The Helm
 #                             chart mounts a shared emptyDir at /var/run/sie.
 # * RUST_LOG                - structured log level; OTel set at deploy time.
 # * SIE_NATS_URL            - required, no default; must be set by the
 #                             Pod / Helm chart.
-ENV SIE_WORKER_METRICS_PORT=9095 \
+ENV SIE_WORKER_PROBE_PORT=9095 \
     SIE_IPC_SOCKET_PATH=/var/run/sie/ipc.sock \
     RUST_LOG=info
 

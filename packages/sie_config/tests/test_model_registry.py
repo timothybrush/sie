@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import yaml
 from sie_config import model_registry
 from sie_config.model_registry import (
     DEFAULT_ENGINE,
@@ -152,6 +153,49 @@ class TestModelRegistry:
         assert "intfloat/e5-small-v2" in models
         assert "cross-encoder/ms-marco-MiniLM-L-6-v2" in models
         assert "Qwen/Qwen3-Embedding-8B" in models
+
+    def test_remove_model_config_drops_routes_variants_and_hash_input(self, temp_config_dirs) -> None:
+        bundles_dir, models_dir = temp_config_dirs
+        registry = ModelRegistry(bundles_dir, models_dir)
+        registry.replace_model_config(
+            {
+                "sie_id": "api/model",
+                "profiles": {
+                    "default": {"adapter_path": "sie_server.adapters.bge_m3:Adapter"},
+                    "fast": {"adapter_path": "sie_server.adapters.bge_m3:Adapter"},
+                },
+            }
+        )
+        before = registry.compute_bundle_config_hash("default")
+
+        affected = registry.remove_model_config("api/model")
+
+        assert affected == ["default", "sglang"]
+        assert registry.get_model_info("api/model") is None
+        assert registry.get_model_info("api/model:fast") is None
+        assert registry.compute_bundle_config_hash("default") != before
+        assert registry.remove_model_config("api/model") == []
+
+    def test_remove_model_config_restores_matching_filesystem_fallback(self, temp_config_dirs) -> None:
+        bundles_dir, models_dir = temp_config_dirs
+        registry = ModelRegistry(bundles_dir, models_dir)
+        registry.replace_model_config(
+            {
+                "sie_id": "BAAI/bge-m3",
+                "pool": "customer",
+                "profiles": {
+                    "default": {"adapter_path": "sie_server.adapters.bge_m3:Override"},
+                },
+            }
+        )
+        fallback = yaml.safe_load((models_dir / "baai-bge-m3.yaml").read_text())
+
+        registry.remove_model_config("BAAI/bge-m3", fallback_config=fallback)
+
+        restored = registry.get_full_config("BAAI/bge-m3")
+        assert restored is not None
+        assert "pool" not in restored
+        assert restored["profiles"]["default"]["adapter_path"].endswith(":BGEM3Adapter")
 
     def test_model_bundle_mapping(self, temp_config_dirs) -> None:
         bundles_dir, models_dir = temp_config_dirs
