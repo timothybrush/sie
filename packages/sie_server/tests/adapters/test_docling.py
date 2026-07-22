@@ -487,40 +487,6 @@ class TestDoclingSpec:
         assert ocr_converter.convert.call_count == 1
         assert not adapter._loaded
 
-    def test_local_model_source_is_used_as_artifact_root(self, tmp_path: Path) -> None:
-        adapter = DoclingAdapter(model_name_or_path=tmp_path)
-
-        assert adapter._resolve_artifacts_path() == tmp_path.resolve()
-
-    def test_hub_model_source_resolves_exact_revision(self, tmp_path: Path) -> None:
-        adapter = DoclingAdapter(
-            model_name_or_path="superlinked/docling-artifacts",
-            revision="a" * 40,
-        )
-
-        with patch("huggingface_hub.snapshot_download", return_value=str(tmp_path)) as download:
-            assert adapter._resolve_artifacts_path() == tmp_path.resolve()
-
-        download.assert_called_once_with(
-            repo_id="superlinked/docling-artifacts",
-            revision="a" * 40,
-        )
-
-    def test_ordinary_model_source_prewarm_fails_closed(self, tmp_path: Path) -> None:
-        adapter = DoclingAdapter(model_name_or_path=tmp_path)
-        adapter._make_converter = MagicMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("missing immutable model asset")
-        )
-
-        with pytest.raises(RuntimeError, match="staged artifact initialization failed"):
-            adapter.load("cpu")
-
-        assert not adapter._loaded
-
-    def test_ordinary_and_package_artifact_sources_are_mutually_exclusive(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="exactly one"):
-            DoclingAdapter(model_name_or_path=tmp_path, package_artifact_root=tmp_path)
-
 
 class TestDoclingMakeConverter:
     def test_make_converter_no_ocr_passes_do_ocr_false(self) -> None:
@@ -571,20 +537,6 @@ class TestDoclingMakeConverter:
             adapter._make_converter(ocr_enabled=False)
 
         assert mock_opts.call_args.kwargs["artifacts_path"] == tmp_path
-
-    def test_make_converter_passes_resolved_ordinary_artifact_root(self, tmp_path: Path) -> None:
-        adapter = DoclingAdapter(model_name_or_path=tmp_path)
-        adapter._artifacts_path = adapter._resolve_artifacts_path()
-
-        with (
-            patch("docling.document_converter.DocumentConverter"),
-            patch("docling.datamodel.pipeline_options.PdfPipelineOptions") as mock_opts,
-            patch("docling.document_converter.PdfFormatOption"),
-            patch("docling.document_converter.ImageFormatOption"),
-        ):
-            adapter._make_converter(ocr_enabled=True)
-
-        assert mock_opts.call_args.kwargs["artifacts_path"] == tmp_path.resolve()
 
     def test_make_converter_no_ocr_uses_accelerator_options_when_device_set(self) -> None:
         adapter = DoclingAdapter()

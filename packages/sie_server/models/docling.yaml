@@ -1,6 +1,5 @@
 sie_id: docling
-hf_id: superlinked/docling-artifacts
-hf_revision: 6281da328c88328d2b36af759ff19d470b4f7411
+package_backed: true
 inputs:
   text: false
   image: true
@@ -18,6 +17,7 @@ profiles:
     adapter_path: sie_server.adapters.docling.adapter:DoclingAdapter
     adapter_options:
       loadtime:
+        package_artifact_mode: live
         max_num_pages: 100
         max_file_size_bytes: 16777216
         document_timeout_s: 90
@@ -28,6 +28,7 @@ profiles:
     adapter_path: sie_server.adapters.docling.adapter:DoclingAdapter
     adapter_options:
       loadtime:
+        package_artifact_mode: live
         max_num_pages: 100
         max_file_size_bytes: 16777216
         document_timeout_s: 90

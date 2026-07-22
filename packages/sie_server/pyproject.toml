@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.22"
+version = "0.6.21"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -86,7 +86,7 @@ flash-attn = ["flash-attn>=2.7,<3 ; sys_platform == 'linux'"]
 xformers = ["xformers>=0.0.30,<0.1 ; sys_platform == 'linux'"]
 gpu-metrics = ["nvidia-ml-py>=13.5,<14"]
 # Shared Rust decoder/resampler for direct (non-sidecar) audio extract.
-audio = ["sie-audio-prep==0.6.22"]  # x-release-please-version
+audio = ["sie-audio-prep==0.6.21"]  # x-release-please-version
 # TUI dependencies
 top = ["textual>=3.0,<4"]
 # Local embeddings + reranking on Apple Silicon / CPU (no Docker/mise). The torch /

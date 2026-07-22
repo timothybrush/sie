@@ -1,5 +1,122 @@
 # Changelog
 
+## v0.6.21
+
+- chore(main): release 0.6.21
+- test(colpali): cover all three forward paths in #2144 regression tests (review feedback)
+- test(colpali,worker): regression tests for #2144 fixes (review feedback)
+- fix(colpali): serialize model forwards — transformers output-recorder race (#2144)
+- fix(worker): release OOM tracebacks in the no-recovery branch too (CodeRabbit)
+- fix(colpali): stop GPU memory accumulation on Vidore evals (#2144)
+- test(server): make artifact symlink check deterministic
+- feat(server): bind package artifact identity
+- fix(evidence): harden worker identity boundaries
+- fix(evidence): close worker identity contract gaps
+- feat(evidence): propagate worker execution identity
+- fix: keep audio prep release pin in sync
+- fix(models): restore SPLADE 512-token capacity
+- feat(sdk): preserve terminal request metadata on errors
+- refactor(server): fold visual-SPLADE serving into the transformers5 bundle
+- feat(models): raise qwen36 launch context to 8k
+- test(server): resolve OCR model fixtures by file
+- fix(models): pin hf_revision for gte-Qwen2-7B remote-code load
+- fix(models): serve gte-Qwen2-7B via its own bidirectional forward (#2097)
+- test: harden model-filter, feasibility, and dispatch-order coverage
+- fix(vision): address review edge cases
+- perf(vision): bulk-convert detection outputs
+- feat(vision): harden OSS runtime contracts
+- fix(extract): close review validation gaps
+- fix(extract): filter unconstrained relation endpoints
+- feat(extract): add pinned PII quality gate
+- test(billing): pin vision reranker token contract
+- refactor(billing): scope pair image metering hook
+- feat(billing): meter multimodal catalog units
+- fix(worker): propagate effective sequence caps
+- fix(eval): add faithful Qwen3-VL reference
+- fix(reranking): address exact-head review
+- fix(server): empty bundle model_filter must advertise zero models, not all
+- feat(server): transformers514 bundle + SparseEncoder vision sparse adapter
+- fix(keda): keep gateway coordination under autoscaling
+- fix(keda): verify lean forward upgrade
+- fix(keda): simplify forward OTLP upgrade
+- fix(model): restore SPLADE quality sequence cap
+- fix(cloud): clarify idempotent deletion tests
+- feat(cloud): enforce exact managed catalog authority
+- fix(keda): support forward-only OTLP upgrade
+- fix(bench): capture generation timeout evidence
+- fix(server): remove unused fake adapter import
+- fix(metering): reject invalid score counts
+- fix(cloud): address billing review findings
+- fix(reranking): emit authoritative fake usage
+- refactor(reranking): keep fake adapter outside scope
+- style(core): format compatibility assertions
+- fix(core): preserve unit count wire order
+- feat(sdk): expose terminal billing metadata
+- feat(core): report authoritative score pair usage
+- feat(core): expose authoritative request usage
+- fix(reranking): address exact-head review
+- fix(reranking): reject blank compatibility inputs
+- fix(reranking): emit fake score usage
+- feat(gateway): add strict Cohere rerank compatibility
+- feat(reranking): harden Qwen score runtime
+- feat(candle): add native SPLADE sparse encoding
+- fix(audio): sandbox image builds the audio wheel opportunistically
+- feat(models): onboard Snowflake/snowflake-arctic-embed-s (scaffolded)
+- fix(cloud): pin governed catalog weights
+- fix(inference): harden abandonment cancellation
+- fix(inference): cancel abandoned non-generation work
+- fix(audio): address exact-head review findings
+- fix(audio): harden release integration
+- test(audio): isolate optional compatibility deps
+- fix(audio): harden Whisper compatibility
+- feat(audio): add native Whisper transcription
+- fix(transport): address chunk protocol review
+- test(telemetry): assert canonical worker profile identity
+- refactor(telemetry): expose one gateway metrics facade
+- fix(telemetry): stage safe KEDA rollback migration
+- fix(models): bound Qwen grammar admission
+- fix(models): address Qwen profile review
+- fix(models): promote Qwen3.5 A100 default
+- test(server): tighten queued option assertions
+- feat(transport): harden local binary ingress
+- fix(telemetry): close rollback and audit gaps
+- fix(ocr): distinguish missing document inputs
+- feat(ocr): add document-aware extraction contracts
+- fix(generate): preserve governed streaming overrides
+- feat(generate): govern runtime options and streaming
+- fix(telemetry): preserve delta metrics across backends
+- fix(dashboards): cover result chunk telemetry
+- refactor(transport): harden generic chunk delivery
+- fix(serving): reject unsigned generation seeds
+- fix(api): align seed validation across local clients
+- fix(serving): correct generation seed contract
+- fix(cloud): avoid serving sync for pin checks
+- fix(inference): honor native profile selection
+- fix(serving): normalize direct-route seeds
+- fix(serving): preserve seeded SGLang streams
+- feat(inference): add bounded 8k ColBERT scoring
+- fix(serving): isolate SGLang vision extraction workers
+- feat(retrieval): complete sparse and multivector launch support
+- feat(extract): add GLiNER2 structured and relation support
+- fix(gateway): preserve encode output dtype
+- fix(sidecar): preserve raw encode ids and cap results
+- fix(candle): make multivector profile contract explicit
+- refactor(telemetry): enforce single-emission routing
+- test(gateway): configure fake stack KEDA lane
+- data(bench): re-floor Splade_PP_en_v2 at the vanilla numbers (#1919)
+- feat(telemetry): centralize observability on OTLP
+- perf(candle): enable Arctic XLM-R fp16 fast path
+- perf(sidecar): coalesce saturated scheduler tails
+- feat(sidecar): expose scheduler request latency
+- perf(server): reduce BGE packing synchronization
+- perf(server): batch BGE-M3 tokenization
+- fix(sidecar): avoid double-counting adaptive latency
+- feat(telemetry): cover managed service signals
+- feat(telemetry): codify dashboards and edge signals
+- feat(telemetry): add safe request logs and latency
+- feat(telemetry): add Better Stack OTLP pipeline
+- fix(cloud): close i6pn lifecycle review gaps
+
 ## v0.6.22
 
 - chore(main): release 0.6.22
