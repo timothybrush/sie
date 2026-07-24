@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -38,6 +40,14 @@ def _mock_response_200() -> MagicMock:
     return resp
 
 
+def _mock_response_model_loading() -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 503
+    resp.headers = {"Retry-After": "0.01", "content-type": "application/json"}
+    resp.json.return_value = {"detail": {"code": "MODEL_LOADING", "message": "loading"}}
+    return resp
+
+
 def _async_response_200() -> object:
     from sie_sdk.client.async_ import _AioResponse
 
@@ -55,6 +65,53 @@ def _async_response_200() -> object:
 
 
 class TestSyncTransportErrorRetry:
+    def test_shared_client_recovers_from_read_error_during_concurrent_model_loading(self) -> None:
+        """One transient socket failure must not abort concurrent cold-load requests."""
+        from sie_sdk import SIEClient
+
+        worker_count = 4
+        first_attempts = threading.Barrier(worker_count)
+        attempts: dict[int, int] = {}
+        attempts_lock = threading.Lock()
+        error_thread: list[int] = []
+
+        def _post(*_args: object, **_kwargs: object) -> MagicMock:
+            thread_id = threading.get_ident()
+            with attempts_lock:
+                attempt = attempts.get(thread_id, 0) + 1
+                attempts[thread_id] = attempt
+                if not error_thread:
+                    error_thread.append(thread_id)
+
+            if attempt == 1:
+                first_attempts.wait(timeout=2.0)
+                return _mock_response_model_loading()
+            if thread_id == error_thread[0] and attempt == 2:
+                raise httpx.ReadError("[Errno 9] Bad file descriptor")
+            return _mock_response_200()
+
+        with patch("sie_sdk.client.sync.httpx.Client") as mock_client:
+            mock_client.return_value.post.side_effect = _post
+            client = SIEClient("http://localhost:8080")
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        client.encode,
+                        "bge-m3",
+                        {"text": f"item-{index}"},
+                        wait_for_capacity=True,
+                        provision_timeout_s=10.0,
+                    )
+                    for index in range(worker_count)
+                ]
+                results = [future.result() for future in futures]
+
+            assert all(result["dense"].shape == (4,) for result in results)
+            assert sorted(attempts.values()) == [2, 2, 2, 3]
+            assert mock_client.return_value.post.call_count == 9
+            client.close()
+
     @pytest.mark.parametrize(
         "exc",
         [

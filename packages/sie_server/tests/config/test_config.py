@@ -714,6 +714,27 @@ class TestModelConfigProfiles:
         resolved = config.resolve_profile("child")
         assert resolved.runtime == {"instruction": "child"}
 
+    def test_resolve_child_profile_inherits_empty_runtime(self) -> None:
+        """An explicit empty runtime preserves the parent's runtime."""
+        config = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/model",
+            tasks=Tasks(encode=EncodeTask(dense=EmbeddingDim(dim=768))),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="mod:Cls",
+                    max_batch_tokens=8192,
+                    adapter_options=AdapterOptions(runtime={"output_similarity": {"dense": "dot"}}),
+                ),
+                "child": ProfileConfig(
+                    extends="default",
+                    adapter_options=AdapterOptions(runtime={}),
+                ),
+            },
+        )
+
+        assert config.resolve_profile("child").runtime == {"output_similarity": {"dense": "dot"}}
+
     def test_resolve_missing_profile_raises(self) -> None:
         """resolve_profile raises for unknown profile."""
         config = _make_config()

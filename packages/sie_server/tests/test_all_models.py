@@ -741,21 +741,6 @@ def test_mixedbread_ai_mxbai_edge_colbert_v0_32m_muvera_multivector() -> None:
     )
 
 
-@pytest.mark.xfail(reason="3B model too large for CPU unit tests", strict=False)
-def test_nvidia_llama_nemoretriever_colembed_3b_v1_muvera_multivector() -> None:
-    _assert_multivector("nvidia/llama-nemoretriever-colembed-3b-v1:muvera", 128, None)
-
-
-@pytest.mark.xfail(reason="3B model too large for CPU unit tests", strict=False)
-def test_vidore_colpali_v1_3_hf_muvera_multivector() -> None:
-    _assert_multivector("vidore/colpali-v1.3-hf:muvera", 128, None)
-
-
-@pytest.mark.xfail(reason="2B+ model too large for CPU unit tests", strict=False)
-def test_vidore_colqwen2_5_v0_2_muvera_multivector() -> None:
-    _assert_multivector("vidore/colqwen2.5-v0.2:muvera", 128, None)
-
-
 # =============================================================================
 # Score (reranker) models
 # =============================================================================
@@ -904,7 +889,6 @@ def test_fastino_gliguard_llmguardrails_300m_extract() -> None:
     adapter = _get_adapter("fastino/gliguard-LLMGuardrails-300M")
     output = adapter.extract(
         [Item(text="Explain how to steal passwords from a login form.")],
-        labels=["safe", "unsafe"],
     )
 
     assert output.entities == [[]]

@@ -17,7 +17,7 @@ from sie_server.api.options import resolve_runtime_options
 from sie_server.api.serialization import MsgPackResponse
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.config.model import ModelConfig
-from sie_server.core.encode_pipeline import EncodePipeline
+from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_output_types
 from sie_server.core.worker import QueueFullError
 from sie_server.observability.tracing import tracer
 from sie_server.observability.worker_telemetry import worker_telemetry, worker_telemetry_enabled
@@ -307,9 +307,6 @@ async def encode(
             # Worker batcher routes on options["lora"]; profile uses "lora_id".
             options["lora"] = lora
 
-        # Get output_types: profile > request param > default
-        output_types: list[str] = options.get("output_types") or (params.output_types if params else None) or ["dense"]
-
         # Get output_dtype: request param > profile > default
         # Request param takes precedence to allow per-request overrides
         output_dtype: OutputDType = cast(
@@ -320,38 +317,25 @@ async def encode(
         # Add resolved output_dtype to options for postprocessor registry
         options["output_dtype"] = output_dtype
 
-        # Validate output types against model capabilities + profile-enabled outputs
-        supported_outputs = set(config.outputs)
-        # Profiles can enable additional output types via postprocessors (e.g., muvera enables dense)
-        if profile_name and profile_name in config.profiles:
-            profile_output_types = options.get("output_types")
-            if profile_output_types:
-                supported_outputs = supported_outputs | set(profile_output_types)
-        requested_outputs = set(output_types)
-        unsupported = requested_outputs - supported_outputs
-        if unsupported:
+        # Shared with the managed queue ingress: validate capabilities from the
+        # selected catalog profile, then translate postprocessed response types
+        # (MuVERA dense) to the adapter's native type (multivector).
+        try:
+            adapter_output_types, output_types = resolve_encode_output_types(
+                config,
+                params.output_types if params else None,
+                request_options,
+                options,
+            )
+        except ValueError as e:
             span.set_attribute("error", "unsupported_output_types")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "code": ErrorCode.INVALID_INPUT.value,
-                    "message": f"Model '{model}' does not support output types: {unsupported}. "
-                    f"Supported: {supported_outputs}",
+                    "message": str(e),
                 },
-            )
-
-        # Translate output types for postprocessor-enabled outputs
-        # MUVERA produces 'dense' by postprocessing 'multivector', so we request
-        # 'multivector' from adapter and let postprocessor add 'dense'
-        muvera_enabled = options.get("muvera") is not None
-        needs_translation = muvera_enabled and "dense" in output_types
-        if needs_translation:
-            # Build adapter types: remove 'dense', ensure 'multivector'
-            adapter_output_types = [t for t in output_types if t != "dense"]
-            if "multivector" not in adapter_output_types:
-                adapter_output_types.append("multivector")
-        else:
-            adapter_output_types = output_types  # No copy needed - not mutating
+            ) from e
 
         items = request.items
 

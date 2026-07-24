@@ -46,7 +46,7 @@ import msgpack_numpy as m
 from sie_sdk.audio import convert_item_audio
 from sie_sdk.documents import convert_item_document
 from sie_sdk.files import resolve_upload
-from sie_sdk.images import convert_item_images
+from sie_sdk.images import ImageLike, convert_images_for_json, convert_item_images
 from sie_sdk.jobs import TERMINAL_JOB_STATES, build_job_body, decode_chunk_bytes, job_chunks
 from sie_sdk.types import (
     Batch,
@@ -62,6 +62,8 @@ from sie_sdk.types import (
     File,
     FileDeleted,
     GenerateChunk,
+    GenerateGrammar,
+    GenerateImage,
     GenerateResult,
     Item,
     JobResults,
@@ -72,6 +74,8 @@ from sie_sdk.types import (
     PoolInfo,
     PoolSpec,
     RequestMetadata,
+    ResponseInputMessage,
+    ResponseResult,
     ScoreResult,
     StatusMessage,
     WorkerInfo,
@@ -98,6 +102,7 @@ from ._shared import (
     attach_request_metadata,
     base_url_accepts_origin_credentials,
     build_chat_body,
+    build_responses_body,
     check_version_skew,
     compute_oom_backoff,
     compute_retry_delay,
@@ -123,6 +128,8 @@ from ._shared import (
     sse_chunk_error,
     sse_headers,
     validate_encode_result_count,
+    validate_generate_grammar,
+    validate_generate_request_body,
     websocket_matches_base_url_origin,
 )
 from ._sse import aiter_sse_payloads
@@ -1848,12 +1855,13 @@ class SIEAsyncClient:
         prompt: str,
         *,
         max_new_tokens: int,
+        images: Sequence[ImageLike | GenerateImage | dict[str, Any]] | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         stop: list[str] | None = None,
         frequency_penalty: float | None = None,
         presence_penalty: float | None = None,
-        grammar: dict[str, Any] | None = None,
+        grammar: GenerateGrammar | Mapping[str, Any] | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
         routing_key: str | None = None,
@@ -1872,6 +1880,7 @@ class SIEAsyncClient:
         awaits the aggregated outcome; use :meth:`stream_generate` for
         SIE-native chunk streaming.
         """
+        resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = await self._resolve_pool_and_gpu(gpu)
 
         safe_model = model.replace("/", "__")
@@ -1881,6 +1890,8 @@ class SIEAsyncClient:
             "prompt": prompt,
             "max_new_tokens": max_new_tokens,
         }
+        if images is not None:
+            request_body["images"] = convert_images_for_json(images)
         if stop is not None:
             request_body["stop"] = stop
         optional_fields = {
@@ -1889,7 +1900,7 @@ class SIEAsyncClient:
             "options": resolved_options,
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
-            "grammar": grammar,
+            "grammar": resolved_grammar,
             "seed": seed,
             "logit_bias": logit_bias,
             "routing_key": routing_key,
@@ -1898,6 +1909,7 @@ class SIEAsyncClient:
             "lora_adapter": lora_adapter,
         }
         request_body.update({key: value for key, value in optional_fields.items() if value is not None})
+        validate_generate_request_body(request_body)
 
         body = json.dumps(request_body).encode("utf-8")
         headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
@@ -2034,6 +2046,102 @@ class SIEAsyncClient:
         result = _parse_generate_result_async(data, request=parse_request_metadata(response.headers))
         attach_request_metadata([result], response.headers)
         return result
+
+    async def responses(
+        self,
+        model: str,
+        input: str | Sequence[ResponseInputMessage],
+        *,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        gpu: str | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> ResponseResult:
+        """Async counterpart of :meth:`SIEClient.responses`.
+
+        The gateway's Responses MVP is stateless, text-only, and
+        non-streaming. Retry behavior matches the sync method: only explicit
+        pre-execution capacity signals and connect-before-send failures are
+        retried; mid-flight failures and post-publish 504 responses are
+        terminal because generation is non-idempotent.
+        """
+        pool_name, resolved_gpu = await self._resolve_pool_and_gpu(gpu)
+        body = json.dumps(
+            build_responses_body(
+                model,
+                input,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+            )
+        ).encode("utf-8")
+        headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
+        if resolved_gpu:
+            headers["X-SIE-MACHINE-PROFILE"] = resolved_gpu
+        if pool_name:
+            headers["X-SIE-Pool"] = pool_name
+
+        timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
+        start_time = time.monotonic()
+        oom_retries = 0
+        while True:
+            remaining = timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                msg = f"Provision timeout ({timeout:.1f}s) exceeded before request could be sent"
+                raise ProvisioningError(msg, gpu=resolved_gpu)
+            try:
+                async with (
+                    self._throttle(),
+                    self._ensure_session().post(
+                        "/v1/responses",
+                        data=body,
+                        headers=self._headers_for_request("/v1/responses", headers),
+                        timeout=aiohttp.ClientTimeout(total=min(self._timeout, remaining)),
+                        allow_redirects=False,
+                    ) as raw,
+                ):
+                    content = await raw.read()
+                    response = _AioResponse(raw.status, content, raw.headers)
+            except aiohttp.ClientConnectorError as e:
+                if wait_for_capacity and is_transient_connect_error(e):
+                    delay_s = compute_retry_delay(
+                        start_time=start_time,
+                        timeout=timeout,
+                        error_label="Connect error",
+                        error=e,
+                    )
+                    if delay_s is not None:
+                        await asyncio.sleep(delay_s)
+                        continue
+                msg = f"Failed to connect to {self._base_url}: {e}"
+                raise SIEConnectionError(msg) from e
+            except (aiohttp.ClientError, OSError) as e:
+                msg = f"Request failed: {e}"
+                raise SIEConnectionError(msg) from e
+
+            if response.status_code == 200:
+                break
+            delay, oom_retries = next_stream_retry_delay(
+                response,
+                model=model,
+                gpu=resolved_gpu,
+                wait_for_capacity=wait_for_capacity,
+                start_time=start_time,
+                timeout=timeout,
+                oom_retries=oom_retries,
+                max_oom_retries=max_oom_retries,
+            )
+            await asyncio.sleep(delay)
+
+        self._check_server_version(response)
+        data = parse_terminal_json_object(response, owner="Responses")
+        attach_request_metadata([data], response.headers)
+        return cast("ResponseResult", data)
 
     async def chat_completions(
         self,
@@ -2266,12 +2374,13 @@ class SIEAsyncClient:
         prompt: str,
         *,
         max_new_tokens: int,
+        images: Sequence[ImageLike | GenerateImage | dict[str, Any]] | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         stop: list[str] | None = None,
         frequency_penalty: float | None = None,
         presence_penalty: float | None = None,
-        grammar: dict[str, Any] | None = None,
+        grammar: GenerateGrammar | Mapping[str, Any] | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
         logprobs: bool = False,
@@ -2291,6 +2400,7 @@ class SIEAsyncClient:
 
         Async counterpart of :meth:`SIEClient.stream_generate`.
         """
+        resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = await self._resolve_pool_and_gpu(gpu)
         safe_model = model.replace("/", "__")
         resolved_options = self._resolve_options(options)
@@ -2299,6 +2409,8 @@ class SIEAsyncClient:
             "max_new_tokens": max_new_tokens,
             "stream": True,
         }
+        if images is not None:
+            req["images"] = convert_images_for_json(images)
         if stop is not None:
             req["stop"] = stop
         optional_fields = {
@@ -2307,7 +2419,7 @@ class SIEAsyncClient:
             "top_p": top_p,
             "options": resolved_options,
             "presence_penalty": presence_penalty,
-            "grammar": grammar,
+            "grammar": resolved_grammar,
             "seed": seed,
             "logit_bias": logit_bias,
             "routing_key": routing_key,
@@ -2322,6 +2434,7 @@ class SIEAsyncClient:
                 req["top_logprobs"] = top_logprobs
         if extra_body:
             req.update(extra_body)
+        validate_generate_request_body(req)
         if not req.get("logprobs"):
             req.pop("top_logprobs", None)
         req.update(prompt=prompt, max_new_tokens=max_new_tokens, stream=True)

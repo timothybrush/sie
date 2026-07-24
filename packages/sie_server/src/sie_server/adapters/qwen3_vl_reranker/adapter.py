@@ -381,20 +381,21 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
                 instruction=instruction,
                 include_document_placeholder=False,
             )
-            prompts.append(
-                self._processor.apply_chat_template(  # ty: ignore[unresolved-attribute]
-                    conversation,
-                    tokenize=False,
-                    add_generation_prompt=True,
+            with self._tokenizer_guard():
+                prompts.append(
+                    self._processor.apply_chat_template(  # ty: ignore[unresolved-attribute]
+                        conversation,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
                 )
-            )
-            sentinel_prompts.append(
-                self._processor.apply_chat_template(  # ty: ignore[unresolved-attribute]
-                    sentinel_conversation,
-                    tokenize=False,
-                    add_generation_prompt=True,
+                sentinel_prompts.append(
+                    self._processor.apply_chat_template(  # ty: ignore[unresolved-attribute]
+                        sentinel_conversation,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
                 )
-            )
             sentinels.append(sentinel)
             document_texts.append(doc.text or "")
             if query_image is not None:
@@ -414,7 +415,8 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         if images:
             proc_kwargs["images"] = images
         try:
-            processor_inputs = self._processor(**proc_kwargs)  # ty: ignore[call-non-callable]
+            with self._tokenizer_guard():
+                processor_inputs = self._processor(**proc_kwargs)  # ty: ignore[call-non-callable]
         except (IndexError, ValueError) as exc:
             raise InvalidInputError("Qwen3-VL processor rejected the supplied text/image layout") from exc
 
@@ -513,12 +515,13 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
                 )
 
         tokenizer = self._processor.tokenizer  # ty: ignore[unresolved-attribute]
-        padded = tokenizer.pad(
-            {"input_ids": trimmed_ids},
-            padding=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
+        with self._tokenizer_guard():
+            padded = tokenizer.pad(
+                {"input_ids": trimmed_ids},
+                padding=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
         inputs = dict(padded)
         for key, value in processor_inputs.items():
             if key in {"input_ids", "attention_mask", "offset_mapping"}:

@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Literal, cast
 
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters.base import ModelAdapter, ModelCapabilities, ModelDims
+from sie_server.types.grammar import GrammarSpec
 from sie_server.types.inputs import ImageInput
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,7 @@ class GenerationAdapter(ModelAdapter):
         top_k: int | None = None,
         repetition_penalty: float | None = None,
         min_new_tokens: int | None = None,
+        grammar: GrammarSpec | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
         logprobs: bool = False,
@@ -278,6 +280,7 @@ class GenerationAdapter(ModelAdapter):
             repetition_penalty: Optional non-OpenAI multiplicative
                 penalty in ``(0.0, 2.0]`` (``1.0`` = no penalty).
                 ``None`` → sampler default.
+            grammar: Optional structured-output grammar.
             seed: Optional per-request sampling seed. Reproducibility
                 semantics are backend-specific.
             logit_bias: Optional ``{token_id_str: bias_float}`` map.

@@ -252,7 +252,7 @@ def test_direct_preprocessor_uses_rust_and_strips_encoded_audio(monkeypatch: pyt
     assert batch.items[0].payload.duration_ms == 2
 
 
-def test_direct_preprocessor_reports_missing_audio_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_direct_preprocessor_reports_missing_audio_extension(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing_extension(name: str) -> None:
         raise ModuleNotFoundError(name=name)
 
@@ -261,7 +261,7 @@ def test_direct_preprocessor_reports_missing_audio_extra(monkeypatch: pytest.Mon
         missing_extension,
     )
 
-    with pytest.raises(RuntimeError, match=r"sie-server\[audio\]"):
+    with pytest.raises(RuntimeError, match="SIE image or workspace build"):
         AudioPreprocessor().prepare(
             [Item(audio={"data": b"encoded", "format": "wav"})],
             config=MagicMock(),

@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.6.21"
+version = "0.6.23"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -85,8 +85,6 @@ flash-attn = ["flash-attn>=2.7,<3 ; sys_platform == 'linux'"]
 # xformers for memory-efficient attention (required by Stella models)
 xformers = ["xformers>=0.0.30,<0.1 ; sys_platform == 'linux'"]
 gpu-metrics = ["nvidia-ml-py>=13.5,<14"]
-# Shared Rust decoder/resampler for direct (non-sidecar) audio extract.
-audio = ["sie-audio-prep==0.6.21"]  # x-release-please-version
 # TUI dependencies
 top = ["textual>=3.0,<4"]
 # Local embeddings + reranking on Apple Silicon / CPU (no Docker/mise). The torch /
@@ -120,7 +118,6 @@ packages = ["src/sie_server"]
 "bundles" = "sie_server/bundles"
 
 [tool.uv.sources]
-sie-audio-prep = { workspace = true }
 # Prebuilt flash-attn wheel for torch 2.9 + cu129 (official wheels only go up to torch 2.8).
 # Platform-specific: Linux x86_64 only. Non-Linux users should not install the flash-attn extra.
 # Source: mjun0812/flash-attention-prebuild-wheels v0.7.11 (first release with cu129torch2.9 cp312 manylinux).

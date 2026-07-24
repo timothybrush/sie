@@ -8,12 +8,12 @@ import re
 import socket
 import ssl
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urljoin, urlsplit
 
 import msgpack
@@ -147,6 +147,7 @@ from sie_sdk.types import (
     EntityResult,
     ExtractItemErrorDetail,
     ExtractResult,
+    GenerateGrammar,
     Relation,
     RequestMetadata,
     RequestUsage,
@@ -174,6 +175,62 @@ HTTP_CLIENT_ERROR = 400
 HTTP_SERVER_ERROR = 500
 HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_GATEWAY_TIMEOUT = 504
+
+
+_GENERATE_GRAMMAR_VARIANTS = frozenset({"json_schema", "regex", "ebnf"})
+_GENERATE_GRAMMAR_FIELDS = _GENERATE_GRAMMAR_VARIANTS | {"label", "strict"}
+
+
+def validate_generate_grammar(grammar: GenerateGrammar | Mapping[str, Any]) -> GenerateGrammar:
+    """Validate and detach the native structured-output grammar envelope.
+
+    ``generate`` historically accepted a broad dictionary here. Keep that
+    source-compatible input type while validating the exact native three-arm
+    shape before issuing a request.
+    """
+    if not isinstance(grammar, Mapping):
+        msg = "grammar must be a mapping"
+        raise TypeError(msg)
+
+    unknown = set(grammar) - _GENERATE_GRAMMAR_FIELDS
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        msg = f"grammar contains unsupported field(s): {names}"
+        raise ValueError(msg)
+
+    grammar_dict = dict(grammar)
+    variants = _GENERATE_GRAMMAR_VARIANTS.intersection(grammar_dict)
+    if len(variants) != 1:
+        msg = "grammar must contain exactly one of json_schema, regex, or ebnf"
+        raise ValueError(msg)
+
+    variant = next(iter(variants))
+    value = grammar_dict[variant]
+    if variant == "json_schema":
+        if not isinstance(value, Mapping):
+            msg = "grammar.json_schema must be a mapping"
+            raise TypeError(msg)
+        grammar_dict["json_schema"] = dict(value)
+    elif not isinstance(value, str):
+        msg = f"grammar.{variant} must be a string"
+        raise TypeError(msg)
+
+    if "label" in grammar and grammar["label"] is not None and not isinstance(grammar["label"], str):
+        msg = "grammar.label must be a string"
+        raise TypeError(msg)
+    if "strict" in grammar and grammar["strict"] is not None and not isinstance(grammar["strict"], bool):
+        msg = "grammar.strict must be a boolean"
+        raise TypeError(msg)
+
+    return cast("GenerateGrammar", grammar_dict)
+
+
+def validate_generate_request_body(request_body: MutableMapping[str, Any]) -> None:
+    """Validate and detach any grammar in a fully merged generate request."""
+    grammar = request_body.get("grammar")
+    if grammar is not None:
+        request_body["grammar"] = validate_generate_grammar(grammar)
+
 
 # Default provisioning settings
 DEFAULT_PROVISION_TIMEOUT_S = 900.0  # 15 minutes
@@ -1011,6 +1068,36 @@ def build_chat_body(
     body.update({key: value for key, value in optional.items() if value is not None})
     if extra_body:
         body.update(extra_body)
+    return body
+
+
+def build_responses_body(
+    model: str,
+    input: str | Sequence[Mapping[str, Any]],
+    *,
+    max_output_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Assemble the strict, non-streaming ``/v1/responses`` request body.
+
+    The gateway's Responses MVP is stateless, text-only, and non-streaming.
+    Keeping this builder typed to the complete public OpenAPI allow-list
+    prevents SDK callers from accidentally relying on wider parser behavior or
+    OpenAI fields that the gateway contract does not expose.
+    """
+    body: dict[str, Any] = {
+        "model": model,
+        "input": input if isinstance(input, str) else list(input),
+    }
+    optional: dict[str, Any] = {
+        "max_output_tokens": max_output_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "seed": seed,
+    }
+    body.update({key: value for key, value in optional.items() if value is not None})
     return body
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -164,6 +165,12 @@ class ColSmolAdapter(BaseAdapter):
 
         self._model: Any = None
         self._processor: Any = None
+        # HF fast tokenizers are NOT thread-safe: applying per-call padding/truncation
+        # reconfigures the underlying Rust tokenizer (a mutable borrow). The direct
+        # adapter path (encode_pipeline.py: asyncio.to_thread, no per-model lock) lets
+        # concurrent requests race with RuntimeError: Already borrowed (#2098). Serialise
+        # the processor call — microseconds vs the GPU forward. Matches CLIP/SigLIP.
+        self._tokenizer_lock = threading.Lock()
         self._device: str | None = None
         self._multivector_dim: int = token_dim
 
@@ -331,12 +338,13 @@ class ColSmolAdapter(BaseAdapter):
         assert self._processor is not None
 
         # One text prompt per image; nested image lists pair image i with prompt i.
-        batch = self._processor(
-            text=[_VISUAL_PROMPT_PREFIX] * len(images),
-            images=[[img] for img in images],
-            padding="longest",
-            return_tensors="pt",
-        )
+        with self._tokenizer_lock:
+            batch = self._processor(
+                text=[_VISUAL_PROMPT_PREFIX] * len(images),
+                images=[[img] for img in images],
+                padding="longest",
+                return_tensors="pt",
+            )
         batch = {k: v.to(self._device) for k, v in batch.items() if hasattr(v, "to")}
 
         with torch.inference_mode():
@@ -364,11 +372,12 @@ class ColSmolAdapter(BaseAdapter):
         assert self._processor is not None
 
         augmented = text + _QUERY_AUGMENTATION_TOKEN * _QUERY_AUGMENTATION_COUNT
-        batch = self._processor(
-            text=[augmented],
-            return_tensors="pt",
-            padding="longest",
-        )
+        with self._tokenizer_lock:
+            batch = self._processor(
+                text=[augmented],
+                return_tensors="pt",
+                padding="longest",
+            )
         batch = {k: v.to(self._device) for k, v in batch.items() if hasattr(v, "to")}
 
         with torch.inference_mode():

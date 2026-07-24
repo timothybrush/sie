@@ -41,6 +41,7 @@ from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.core.preprocessor import DetectionPreprocessor
+from sie_server.core.preprocessor.vision import collect_detection_prepared_items
 from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import DetectedObject
 
@@ -208,15 +209,10 @@ class Owlv2Adapter(BaseAdapter):
 
         if prepared_items:
             # Use preprocessed tensors from DetectionPreprocessor
-            valid_items = [p for p in prepared_items if hasattr(p, "payload") and p.payload is not None]
-
-            if not valid_items:
+            prepared_batch = collect_detection_prepared_items(prepared_items)
+            if prepared_batch is None:
                 return ExtractOutput(entities=[[] for _ in range(n_items)], objects=[[] for _ in range(n_items)])
-
-            # Stack pixel values and collect metadata
-            pixel_values = torch.stack([p.payload.pixel_values for p in valid_items])
-            original_sizes = [p.payload.original_size for p in valid_items]
-            image_indices = [p.original_index for p in valid_items]
+            pixel_values, _pixel_mask, original_sizes, image_indices = prepared_batch
 
             # Batched inference with preprocessed tensors
             batch_results = self._detect_batch(

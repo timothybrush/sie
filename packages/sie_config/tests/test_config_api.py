@@ -448,6 +448,50 @@ class TestConfigAPIModels:
         api_model = next(m for m in models if m["model_id"] == "api/model")
         assert api_model["source"] == "api"
 
+    @pytest.mark.parametrize("sie_id", ["org-42/foo:v2", "org-42/bar@3", "org-42/baz:v2@3"])
+    def test_variant_and_version_ids_round_trip_add_get_delete(self, sie_id: str) -> None:
+        """#1841: a ':variant'/'@N' served id must round-trip add -> get -> DELETE.
+
+        A custom-model NAME may carry a ':variant' and/or '@N' version suffix
+        (control_plane advertises exactly this in its MODEL_EXISTS 409), so the
+        served id `<slug>/<name>` reaches this write-path validator on both the
+        register append AND the DPA erase tombstone. When `_MODEL_ID_PATTERN`
+        rejected ':' and '@', the tombstone 400'd and the erase wedged forever.
+        """
+        yaml_body = (
+            f"sie_id: {sie_id}\n"
+            "profiles:\n"
+            "  default:\n"
+            "    adapter_path: sie_server.adapters.bert_flash:BertFlashAdapter\n"
+            "    max_batch_tokens: 8192\n"
+        )
+        add = self.client.post("/v1/configs/models", content=yaml_body, headers={"Content-Type": "application/x-yaml"})
+        assert add.status_code == 201, add.text
+        assert add.json()["model_id"] == sie_id
+
+        got = self.client.get(f"/v1/configs/models/{sie_id}")
+        assert got.status_code == 200, got.text
+
+        # The ':'/'@' chars are ordinary POSIX filename chars — '/' still maps to
+        # '__' and they stay inside the models dir (no traversal, no separator).
+        expected = self._store / "models" / (sie_id.replace("/", "__") + ".yaml")
+        assert expected.exists(), f"expected on-disk artifact {expected} missing"
+        assert expected.parent == (self._store / "models")
+
+        deleted = self.client.delete(f"/v1/configs/models/{sie_id}")
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted"] is True
+
+    def test_variant_id_still_rejects_traversal_and_status_suffix(self) -> None:
+        """Widening the id grammar for ':'/'@' must not defeat the safety guards."""
+        for bad in ("org-42/foo:../secret", "org-42/foo:v2/status", "org-42/..@3"):
+            resp = self.client.post(
+                "/v1/configs/models",
+                content=f"sie_id: {bad}\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:A\n    max_batch_tokens: 1\n",
+                headers={"Content-Type": "application/x-yaml"},
+            )
+            assert resp.status_code == 400, f"{bad!r} should be rejected, got {resp.status_code}"
+
 
 class TestConfigAPIBundles:
     def setup_method(self) -> None:

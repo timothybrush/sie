@@ -6,6 +6,7 @@
 //!
 //! * Payload size cap (64 KiB)
 //! * JSON Schema nesting-depth cap (16)
+//! * Raw traversal-depth cap (128)
 //! * Regex length cap (4 KiB)
 //! * Internal JSON Schema ``$ref`` dereferencing (``#/...`` only)
 //! * JSON Schema reject-list (``$dynamicRef``, ``if/then/else``,
@@ -88,6 +89,13 @@ pub const MAX_GRAMMAR_BYTES: usize = 64 * 1024;
 /// ``{"items":{"items":{"items":...}}}``) trigger this before Outlines
 /// gets a chance to OOM on compile.
 pub const MAX_SCHEMA_DEPTH: usize = 16;
+
+/// Maximum raw tree / reference-expansion depth visited by either schema
+/// pass. This is deliberately independent of :const:`MAX_SCHEMA_DEPTH`:
+/// unknown annotation keys do not increase semantic schema depth, but they
+/// still consume a Rust recursion frame when a programmatically constructed
+/// or alternate-ingress :class:`Value` reaches this validator.
+pub const MAX_SCHEMA_TRAVERSAL_DEPTH: usize = 128;
 
 /// Maximum total node count visited during the schema walk. Depth alone
 /// doesn't stop a *wide* schema (one shallow object with hundreds of
@@ -319,12 +327,13 @@ fn dereference_schema_refs(schema: &Value, path: &str) -> Result<Value, Response
         path,
         &mut visited,
         &mut stack,
-        SchemaResolveContext::Schema,
+        SchemaContext::Schema,
+        0,
     )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SchemaResolveContext {
+enum SchemaContext {
     Schema,
     SchemaMap,
     SchemaArray,
@@ -338,7 +347,8 @@ fn dereference_schema_refs_inner(
     path: &str,
     visited: &mut usize,
     stack: &mut Vec<String>,
-    context: SchemaResolveContext,
+    context: SchemaContext,
+    traversal_depth: usize,
 ) -> Result<Value, Response> {
     *visited = visited.saturating_add(1);
     if *visited > MAX_SCHEMA_NODES {
@@ -348,10 +358,17 @@ fn dereference_schema_refs_inner(
             oai_code::INVALID_REQUEST,
         ));
     }
+    if traversal_depth > MAX_SCHEMA_TRAVERSAL_DEPTH {
+        return Err(bad_request(
+            format!("JSON Schema traversal depth exceeds limit ({MAX_SCHEMA_TRAVERSAL_DEPTH})"),
+            path,
+            oai_code::INVALID_REQUEST,
+        ));
+    }
 
     match v {
         Value::Object(map) => {
-            if context == SchemaResolveContext::Schema && map.contains_key("$ref") {
+            if context == SchemaContext::Schema && map.contains_key("$ref") {
                 let ref_value = map.get("$ref").expect("checked above");
                 let ref_param = format!("{path}.$ref");
                 let Some(ref_str) = ref_value.as_str() else {
@@ -397,7 +414,8 @@ fn dereference_schema_refs_inner(
                     path,
                     visited,
                     stack,
-                    SchemaResolveContext::Schema,
+                    SchemaContext::Schema,
+                    traversal_depth + 1,
                 )?;
                 stack.pop();
 
@@ -407,7 +425,7 @@ fn dereference_schema_refs_inner(
                         continue;
                     }
                     let child_path = format!("{path}.{k}");
-                    let child_context = schema_child_resolve_context(context, k);
+                    let child_context = schema_child_context(context, k);
                     siblings.insert(
                         k.clone(),
                         dereference_schema_refs_inner(
@@ -417,6 +435,7 @@ fn dereference_schema_refs_inner(
                             visited,
                             stack,
                             child_context,
+                            traversal_depth + 1,
                         )?,
                     );
                 }
@@ -433,13 +452,11 @@ fn dereference_schema_refs_inner(
             } else {
                 let mut out = serde_json::Map::new();
                 for (k, child) in map {
-                    if context == SchemaResolveContext::Schema
-                        && (k == "$defs" || k == "definitions")
-                    {
+                    if context == SchemaContext::Schema && (k == "$defs" || k == "definitions") {
                         continue;
                     }
                     let child_path = format!("{path}.{k}");
-                    let child_context = schema_child_resolve_context(context, k);
+                    let child_context = schema_child_context(context, k);
                     out.insert(
                         k.clone(),
                         dereference_schema_refs_inner(
@@ -449,6 +466,7 @@ fn dereference_schema_refs_inner(
                             visited,
                             stack,
                             child_context,
+                            traversal_depth + 1,
                         )?,
                     );
                 }
@@ -459,14 +477,12 @@ fn dereference_schema_refs_inner(
             let mut out = Vec::with_capacity(arr.len());
             for (i, child) in arr.iter().enumerate() {
                 let child_path = format!("{path}[{i}]");
-                let child_context = if matches!(
-                    context,
-                    SchemaResolveContext::Schema | SchemaResolveContext::SchemaArray
-                ) {
-                    SchemaResolveContext::Schema
-                } else {
-                    SchemaResolveContext::Other
-                };
+                let child_context =
+                    if matches!(context, SchemaContext::Schema | SchemaContext::SchemaArray) {
+                        SchemaContext::Schema
+                    } else {
+                        SchemaContext::Other
+                    };
                 out.push(dereference_schema_refs_inner(
                     root,
                     child,
@@ -474,6 +490,7 @@ fn dereference_schema_refs_inner(
                     visited,
                     stack,
                     child_context,
+                    traversal_depth + 1,
                 )?);
             }
             Ok(Value::Array(out))
@@ -482,13 +499,13 @@ fn dereference_schema_refs_inner(
     }
 }
 
-fn schema_child_resolve_context(parent: SchemaResolveContext, key: &str) -> SchemaResolveContext {
+fn schema_child_context(parent: SchemaContext, key: &str) -> SchemaContext {
     match parent {
-        SchemaResolveContext::Schema => match key {
+        SchemaContext::Schema => match key {
             "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
-                SchemaResolveContext::SchemaMap
+                SchemaContext::SchemaMap
             }
-            "oneOf" | "anyOf" | "allOf" | "prefixItems" => SchemaResolveContext::SchemaArray,
+            "oneOf" | "anyOf" | "allOf" | "prefixItems" => SchemaContext::SchemaArray,
             "items"
             | "additionalProperties"
             | "contains"
@@ -496,13 +513,11 @@ fn schema_child_resolve_context(parent: SchemaResolveContext, key: &str) -> Sche
             | "not"
             | "if"
             | "then"
-            | "else" => SchemaResolveContext::Schema,
-            _ => SchemaResolveContext::Other,
+            | "else" => SchemaContext::Schema,
+            _ => SchemaContext::Other,
         },
-        SchemaResolveContext::SchemaMap => SchemaResolveContext::Schema,
-        SchemaResolveContext::SchemaArray | SchemaResolveContext::Other => {
-            SchemaResolveContext::Other
-        }
+        SchemaContext::SchemaMap => SchemaContext::Schema,
+        SchemaContext::SchemaArray | SchemaContext::Other => SchemaContext::Other,
     }
 }
 
@@ -516,7 +531,7 @@ fn schema_child_resolve_context(parent: SchemaResolveContext, key: &str) -> Sche
 #[allow(clippy::result_large_err)]
 fn walk_schema(v: &Value, path: &str, depth: usize) -> Result<(), Response> {
     let mut visited: usize = 0;
-    walk_schema_inner(v, path, depth, &mut visited)
+    walk_schema_inner(v, path, depth, &mut visited, SchemaContext::Schema, 0)
 }
 
 #[allow(clippy::result_large_err)]
@@ -525,11 +540,20 @@ fn walk_schema_inner(
     path: &str,
     depth: usize,
     visited: &mut usize,
+    context: SchemaContext,
+    traversal_depth: usize,
 ) -> Result<(), Response> {
     *visited = visited.saturating_add(1);
     if *visited > MAX_SCHEMA_NODES {
         return Err(bad_request(
             format!("JSON Schema node count exceeds limit ({MAX_SCHEMA_NODES})"),
+            path,
+            oai_code::INVALID_REQUEST,
+        ));
+    }
+    if traversal_depth > MAX_SCHEMA_TRAVERSAL_DEPTH {
+        return Err(bad_request(
+            format!("JSON Schema traversal depth exceeds limit ({MAX_SCHEMA_TRAVERSAL_DEPTH})"),
             path,
             oai_code::INVALID_REQUEST,
         ));
@@ -544,29 +568,54 @@ fn walk_schema_inner(
 
     match v {
         Value::Object(map) => {
-            // Reject before descending so the message names the keyword
-            // at the shallowest occurrence.
-            for &kw in UNSUPPORTED_KEYWORDS {
-                if map.contains_key(kw) {
-                    let param = format!("{path}.{kw}");
-                    let message = format!("JSON Schema keyword '{kw}' is not supported");
-                    return Err(bad_request(message, &param, oai_code::UNSUPPORTED_FIELD));
+            // Only schema objects own JSON Schema keywords. Keys below
+            // ``properties`` / ``patternProperties`` / definitions are user
+            // names, and annotation/custom-keyword payloads are arbitrary
+            // JSON; neither may be mistaken for unsupported keywords.
+            if context == SchemaContext::Schema {
+                for &kw in UNSUPPORTED_KEYWORDS {
+                    if map.contains_key(kw) {
+                        let param = format!("{path}.{kw}");
+                        let message = format!("JSON Schema keyword '{kw}' is not supported");
+                        return Err(bad_request(message, &param, oai_code::UNSUPPORTED_FIELD));
+                    }
                 }
             }
             for (k, child) in map {
                 let child_path = format!("{path}.{k}");
-                let child_depth = if is_schema_nesting_key(k) {
+                let child_depth = if context == SchemaContext::Schema && is_schema_nesting_key(k) {
                     depth + 1
                 } else {
                     depth
                 };
-                walk_schema_inner(child, &child_path, child_depth, visited)?;
+                let child_context = schema_child_context(context, k);
+                walk_schema_inner(
+                    child,
+                    &child_path,
+                    child_depth,
+                    visited,
+                    child_context,
+                    traversal_depth + 1,
+                )?;
             }
         }
         Value::Array(arr) => {
+            let child_context =
+                if matches!(context, SchemaContext::Schema | SchemaContext::SchemaArray) {
+                    SchemaContext::Schema
+                } else {
+                    SchemaContext::Other
+                };
             for (i, child) in arr.iter().enumerate() {
                 let child_path = format!("{path}[{i}]");
-                walk_schema_inner(child, &child_path, depth, visited)?;
+                walk_schema_inner(
+                    child,
+                    &child_path,
+                    depth,
+                    visited,
+                    child_context,
+                    traversal_depth + 1,
+                )?;
             }
         }
         // Scalars (string / number / bool / null) cannot host
@@ -643,6 +692,78 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_grammar_accepts_unsupported_keyword_names_as_properties() {
+        let v = json!({
+            "json_schema": {
+                "type": "object",
+                "properties": {
+                    "$dynamicRef": {"type": "string"},
+                    "if": {"type": "string"},
+                    "then": {"type": "integer"},
+                    "else": {"type": "boolean"},
+                    "unevaluatedProperties": {"type": "number"},
+                    "dependentSchemas": {"type": "array", "items": {"type": "string"}},
+                },
+                "patternProperties": {
+                    "^if$": {"type": "string"},
+                },
+            }
+        });
+
+        let spec = ok_or_panic(parse_grammar(&v));
+        let GrammarSpec::JsonSchema { value, .. } = spec else {
+            panic!("expected JsonSchema");
+        };
+        assert_eq!(value["properties"]["if"]["type"], "string");
+        assert_eq!(
+            value["properties"]["dependentSchemas"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(value["patternProperties"]["^if$"]["type"], "string");
+    }
+
+    #[test]
+    fn test_parse_grammar_accepts_unsupported_keyword_names_as_definition_keys() {
+        let v = json!({
+            "json_schema": {
+                "$defs": {
+                    "if": {"type": "string"},
+                    "then": {"type": "integer"},
+                },
+                "definitions": {
+                    "else": {"type": "boolean"},
+                },
+                "type": "object",
+                "properties": {
+                    "condition": {"$ref": "#/$defs/if"},
+                    "fallback": {"$ref": "#/definitions/else"},
+                },
+            }
+        });
+
+        let spec = ok_or_panic(parse_grammar(&v));
+        let GrammarSpec::JsonSchema { value, .. } = spec else {
+            panic!("expected JsonSchema");
+        };
+        assert_eq!(value["properties"]["condition"]["type"], "string");
+        assert_eq!(value["properties"]["fallback"]["type"], "boolean");
+    }
+
+    #[test]
+    fn test_parse_grammar_accepts_keyword_names_in_annotation_payloads() {
+        let v = json!({
+            "json_schema": {
+                "type": "string",
+                "default": {"if": "annotation data"},
+                "examples": [{"then": "annotation data"}],
+                "x-metadata": {"else": {"dependentSchemas": true}},
+            }
+        });
+
+        let _ = ok_or_panic(parse_grammar(&v));
+    }
+
+    #[test]
     fn test_parse_grammar_accepts_small_regex() {
         let v = json!({"regex": r"[A-Z]{3}-\d{4}"});
         let spec = ok_or_panic(parse_grammar(&v));
@@ -687,6 +808,40 @@ mod tests {
             param.starts_with("grammar.json_schema"),
             "expected depth error path under grammar.json_schema, got {param}"
         );
+    }
+
+    fn deeply_nested_unknown_value(depth: usize) -> Value {
+        let mut value = json!("leaf");
+        for _ in 0..depth {
+            value = json!({"x-annotation": value});
+        }
+        value
+    }
+
+    #[tokio::test]
+    async fn test_dereference_schema_refs_rejects_raw_traversal_depth() {
+        let schema = deeply_nested_unknown_value(MAX_SCHEMA_TRAVERSAL_DEPTH + 1);
+        let response = dereference_schema_refs(&schema, "grammar.json_schema")
+            .expect_err("raw traversal depth should reject during dereference");
+        let body = err_body(response).await;
+
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("traversal depth exceeds limit")));
+    }
+
+    #[tokio::test]
+    async fn test_walk_schema_rejects_raw_traversal_depth() {
+        let schema = deeply_nested_unknown_value(MAX_SCHEMA_TRAVERSAL_DEPTH + 1);
+        let response = walk_schema(&schema, "grammar.json_schema", 0)
+            .expect_err("raw traversal depth should reject during validation");
+        let body = err_body(response).await;
+
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("traversal depth exceeds limit")));
     }
 
     #[test]
@@ -890,6 +1045,32 @@ mod tests {
                 "param path for {kw}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_grammar_rejects_unsupported_keyword_in_nested_schema_context() {
+        let v = json!({
+            "json_schema": {
+                "type": "object",
+                "properties": {
+                    "result": {
+                        "allOf": [
+                            {
+                                "type": "object",
+                                "if": {"properties": {"enabled": {"const": true}}},
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let body = err_or_panic(parse_grammar(&v)).await;
+        assert_eq!(body["error"]["code"], "unsupported_field");
+        assert_eq!(
+            body["error"]["param"],
+            "grammar.json_schema.properties.result.allOf[0].if"
+        );
     }
 
     #[tokio::test]

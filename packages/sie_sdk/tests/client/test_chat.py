@@ -167,9 +167,10 @@ def test_stream_generate_yields_chunks_and_normalizes_model_path() -> None:
                 "Qwen/Qwen3-4B-Instruct",
                 "hi",
                 max_new_tokens=8,
+                images=[{"data": b"\x89PNG\r\n\x1a\npayload", "format": "png"}],
                 frequency_penalty=0.25,
                 presence_penalty=-0.5,
-                grammar={"regex": "[a-z]+"},
+                grammar={"regex": "[a-z]+", "label": None, "strict": None},
                 seed=-2,
                 logit_bias={"123": 1.5},
                 logprobs=True,
@@ -190,10 +191,11 @@ def test_stream_generate_yields_chunks_and_normalizes_model_path() -> None:
         assert sent == {
             "prompt": "hi",
             "max_new_tokens": 8,
+            "images": [{"data": "iVBORw0KGgpwYXlsb2Fk", "format": "png"}],
             "stream": True,
             "frequency_penalty": 0.25,
             "presence_penalty": -0.5,
-            "grammar": {"regex": "[a-z]+"},
+            "grammar": {"regex": "[a-z]+", "label": None, "strict": None},
             "seed": -2,
             "logit_bias": {"123": 1.5},
             "top_logprobs": 3,
@@ -203,6 +205,22 @@ def test_stream_generate_yields_chunks_and_normalizes_model_path() -> None:
             "lora_adapter": "sql-adapter",
             "logprobs": True,
         }
+        client.close()
+
+
+def test_stream_generate_validates_extra_body_grammar_before_request() -> None:
+    with patch("sie_sdk.client.sync.httpx.Client") as mc:
+        client = SIEClient("http://localhost:8080")
+        with pytest.raises(ValueError, match="exactly one"):
+            list(
+                client.stream_generate(
+                    "m",
+                    "hi",
+                    max_new_tokens=8,
+                    extra_body={"grammar": {"regex": "x", "ebnf": 'root ::= "x"'}},
+                )
+            )
+        mc.return_value.stream.assert_not_called()
         client.close()
 
 

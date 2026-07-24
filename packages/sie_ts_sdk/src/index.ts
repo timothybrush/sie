@@ -109,6 +109,10 @@ export type {
   // Generation
   FinishReason,
   GenerationUsage,
+  JsonSchemaGrammar,
+  RegexGrammar,
+  EbnfGrammar,
+  GenerateGrammar,
   GenerateOptions,
   StreamGenerateOptions,
   GenerateResult,

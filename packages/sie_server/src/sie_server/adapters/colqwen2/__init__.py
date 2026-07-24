@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -176,6 +177,20 @@ class ColQwen2Adapter(BaseAdapter):
 
         self._model: Any = None
         self._processor: Any = None
+        # HF fast tokenizers are NOT thread-safe: applying per-call padding/truncation
+        # reconfigures the underlying Rust tokenizer (a mutable borrow). The direct
+        # adapter path (encode_pipeline.py: asyncio.to_thread, no per-model lock) lets
+        # concurrent requests race with RuntimeError: Already borrowed (#2098). Serialise
+        # the processor call — microseconds vs the GPU forward. Matches CLIP/SigLIP.
+        self._tokenizer_lock = threading.Lock()
+        # ColQwen2_5.forward requests output_hidden_states=True, which makes
+        # transformers' check_model_inputs monkey-patch every recordable layer's
+        # forward for the call and restore it after — with no locking. This
+        # adapter has no preprocessor, so every request runs on the unserialized
+        # asyncio.to_thread path; two concurrent forwards interleave the
+        # patch/restore and leave a capture wrapper installed permanently,
+        # leaking layer outputs on GPU until OOM. Serialize forwards (#2144/#2204).
+        self._forward_lock = threading.Lock()
         self._device: str | None = None
         self._multivector_dim: int = token_dim
 
@@ -342,12 +357,13 @@ class ColQwen2Adapter(BaseAdapter):
         assert self._processor is not None
 
         # Process images with visual prompt prefix (replicates ColQwen2_5_Processor.process_images)
-        batch = self._processor(
-            text=[_VISUAL_PROMPT_PREFIX] * len(images),
-            images=images,
-            padding="longest",
-            return_tensors="pt",
-        )
+        with self._tokenizer_lock:
+            batch = self._processor(
+                text=[_VISUAL_PROMPT_PREFIX] * len(images),
+                images=images,
+                padding="longest",
+                return_tensors="pt",
+            )
 
         # Pad pixel_values per-image for batched inference
         # (handles variable number of patches per image)
@@ -360,7 +376,7 @@ class ColQwen2Adapter(BaseAdapter):
 
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             embeddings = self._model(**batch)  # (batch, seq, 128)
 
         if len(images) == 1:
@@ -385,12 +401,13 @@ class ColQwen2Adapter(BaseAdapter):
         assert self._processor is not None
 
         # Process all images with visual prompt prefix
-        batch = self._processor(
-            text=[_VISUAL_PROMPT_PREFIX] * len(images),
-            images=images,
-            padding="longest",
-            return_tensors="pt",
-        )
+        with self._tokenizer_lock:
+            batch = self._processor(
+                text=[_VISUAL_PROMPT_PREFIX] * len(images),
+                images=images,
+                padding="longest",
+                return_tensors="pt",
+            )
 
         # Pad pixel_values per-image for batched inference
         offsets = batch["image_grid_thw"][:, 1] * batch["image_grid_thw"][:, 2]
@@ -402,7 +419,7 @@ class ColQwen2Adapter(BaseAdapter):
 
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             embeddings = self._model(**batch)  # (batch, seq, 128)
 
         results = [embeddings[i].float().cpu().numpy() for i in range(len(images))]
@@ -427,14 +444,15 @@ class ColQwen2Adapter(BaseAdapter):
         # Add query augmentation tokens (replicates ColQwen2_5_Processor.process_queries)
         augmented = text + _QUERY_AUGMENTATION_TOKEN * _QUERY_AUGMENTATION_COUNT
 
-        batch = self._processor(
-            text=[augmented],
-            return_tensors="pt",
-            padding="longest",
-        )
+        with self._tokenizer_lock:
+            batch = self._processor(
+                text=[augmented],
+                return_tensors="pt",
+                padding="longest",
+            )
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             embeddings = self._model(**batch)  # (1, seq, 128)
 
         return embeddings[0].float().cpu().numpy()

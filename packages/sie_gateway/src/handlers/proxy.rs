@@ -35,7 +35,13 @@ use super::models::{extract_bearer_token, mask_token};
 
 const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PROXY_BODY: usize = 16 * 1024 * 1024;
-const MAX_GENERATE_BODY: usize = 4 * 1024 * 1024;
+// Native generate accepts bounded inline images. A 16 MiB decoded image grows
+// to ~21.4 MiB in base64; leave room for the prompt and JSON envelope while
+// still bounding aggregate request memory at ingress.
+const MAX_GENERATE_BODY: usize = 24 * 1024 * 1024;
+const MAX_GENERATE_IMAGES: usize = 16;
+const MAX_GENERATE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GENERATE_IMAGE_BASE64_CHARS: usize = 4 * MAX_GENERATE_IMAGE_BYTES.div_ceil(3);
 // The audio preprocessor accepts 24 MiB of encoded media. Base64 expands that
 // to exactly 32 MiB; leave bounded room for the surrounding native JSON item.
 const MAX_EXTRACT_BODY: usize = 34 * 1024 * 1024;
@@ -1275,6 +1281,7 @@ struct RoutingResult {
 async fn resolve_routing(
     state: &AppState,
     headers: &HeaderMap,
+    ext: &axum::http::Extensions,
     path: &str,
     endpoint: &str,
 ) -> Result<RoutingResult, Box<Response>> {
@@ -1315,6 +1322,50 @@ async fn resolve_routing(
         resolve_model_spec_with_aliases(&state.config.model_aliases, &model, |m| {
             state.model_registry.resolve_canonical_model_name(m)
         });
+    // #1841 org-scoped visibility: a custom model hidden from this caller is
+    // treated as ABSENT — the identical MODEL_NOT_FOUND 404 the dispatcher emits
+    // for an unknown model — so there is no cross-org existence oracle. Decided on
+    // the RESOLVED id (alias/`__`/case already folded), so the gate can never
+    // diverge from the dispatcher. No-op in OSS self-host (policy is None).
+    if state
+        .model_access_policy
+        .as_ref()
+        .is_some_and(|p| !p.visible(&model_name, ext))
+    {
+        return Err(Box::new(endpoint_error_response(
+            endpoint,
+            StatusCode::NOT_FOUND,
+            err_code::MODEL_NOT_FOUND,
+            oai_type::MODEL_NOT_FOUND,
+            oai_code::MODEL_NOT_FOUND,
+            Some("model"),
+            format!("Model not found: {model_name}"),
+        )));
+    }
+    // #1841 bundle-less sealed dispatch: an org-registered custom model is served
+    // from its own sealed sandbox, not a catalog bundle, so there is no bundle to
+    // resolve — the normal path below would dead-end at MODEL_NOT_FOUND. The
+    // visibility gate above already proved this caller OWNS the id, so the policy's
+    // `sealed_route` decides purely on id shape; we return the synthetic sealed lane
+    // tuple and SKIP bundle + profile resolution. `engine == "sealed"` is the sole
+    // discriminator the dispatcher co-process routes on. A client can never reach
+    // this via the `X-SIE-Engine` pin below — `"sealed"` is server-derived only and
+    // is not in `KNOWN_ENGINES`. No-op in OSS self-host (policy is None).
+    if let Some(route) = state
+        .model_access_policy
+        .as_ref()
+        .and_then(|p| p.sealed_route(&model_name, ext))
+    {
+        debug_assert_eq!(route.engine, "sealed");
+        return Ok(RoutingResult {
+            model_name,
+            bundle: route.bundle,
+            engine: route.engine,
+            gpu: route.machine_profile,
+            pool_name: route.pool,
+            gpu_configured: true,
+        });
+    }
     // Hidden operator/debug header: normal clients should select explicit
     // model profile variants (for example ``model:candle``) or compatible
     // bundle overrides. Lowercase normalisation + UTF-8 validation lives in
@@ -1472,7 +1523,15 @@ pub(crate) async fn proxy_request(
         gpu,
         pool_name,
         gpu_configured,
-    } = match resolve_routing(&state, req.headers(), req.uri().path(), endpoint).await {
+    } = match resolve_routing(
+        &state,
+        req.headers(),
+        req.extensions(),
+        req.uri().path(),
+        endpoint,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
@@ -1666,10 +1725,10 @@ pub(crate) async fn proxy_request(
         .unwrap_or(false);
     let use_msgpack_out = publisher::wants_msgpack(req.headers());
 
-    // Per-endpoint body cap. `generate` is pure text — Qwen3.5's 32k
-    // context is ~128 KiB of UTF-8, so 4 MiB gives ~30× headroom and
-    // closes the trivial-OOM-under-concurrency vector that the legacy
-    // 256 MiB cap left open. The remaining endpoints routed here
+    // Per-endpoint body cap. `generate` allows one 16 MiB decoded inline
+    // image after JSON base64 expansion, so its 24 MiB cap closes the
+    // trivial-OOM-under-concurrency vector while admitting the maximum
+    // legal image. The remaining endpoints routed here
     // (encode / score) get the same text-appropriate 16 MiB cap as the
     // chat / embeddings paths. Extract accepts bounded binary media, so
     // its cap covers the maximum legal audio after JSON base64 expansion.
@@ -1969,6 +2028,28 @@ async fn queue_mode_proxy(
                             .into_response();
                     }
                 }
+            }
+        }
+        let has_images = params
+            .generate
+            .as_ref()
+            .is_some_and(generate_params_have_images);
+        if has_images {
+            let image_supported = state
+                .model_registry
+                .get_model_info(model)
+                .is_some_and(|info| info.info_extras.supports_vision_generation());
+            if !native_generate_image_input_allowed(params.generate.as_ref(), image_supported) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_openai_error(
+                        format!("Model '{display_model}' does not support image input"),
+                        oai_type::INVALID_REQUEST,
+                        Some("images"),
+                        oai_code::UNSUPPORTED_FIELD,
+                    )),
+                )
+                    .into_response();
             }
         }
     }
@@ -5428,6 +5509,7 @@ fn map_chat_finish_reason(sie: &str) -> &'static str {
 pub(crate) fn resolve_model_and_bundle(
     state: &AppState,
     model_spec: &str,
+    ext: &axum::http::Extensions,
 ) -> Result<(String, String), Response> {
     let (bundle_override, model_name) =
         resolve_model_spec_with_aliases(&state.config.model_aliases, model_spec, |m| {
@@ -5438,6 +5520,38 @@ pub(crate) fn resolve_model_and_bundle(
     } else {
         Some(bundle_override.as_str())
     };
+    // #1841 org-scoped visibility (mirrors resolve_routing for the OpenAI body
+    // routes): a custom model hidden from this caller is treated as absent — the
+    // identical MODEL_NOT_FOUND 404 the block below emits — so there is no
+    // cross-org existence oracle. Gates the RESOLVED id. No-op in OSS (policy None).
+    if state
+        .model_access_policy
+        .as_ref()
+        .is_some_and(|p| !p.visible(&model_name, ext))
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json_openai_error(
+                format!("Model not found: {model_name}"),
+                oai_type::MODEL_NOT_FOUND,
+                Some("model"),
+                oai_code::MODEL_NOT_FOUND,
+            )),
+        )
+            .into_response());
+    }
+    // #1841 sealed dispatch (OpenAI body routes): an org-registered custom model
+    // has no catalog bundle, so short-circuit with the synthetic sealed bundle
+    // rather than dead-ending at MODEL_NOT_FOUND below. The engine/pool override
+    // happens in `resolve_generation_route`, which re-consults the same policy on
+    // the same id. Ownership is already proven by `visible()` above.
+    if let Some(route) = state
+        .model_access_policy
+        .as_ref()
+        .and_then(|p| p.sealed_route(&model_name, ext))
+    {
+        return Ok((model_name, route.bundle));
+    }
     let bundle = if state.model_registry.model_exists(&model_name) {
         match state
             .model_registry
@@ -5515,40 +5629,62 @@ async fn resolve_generation_route(
     hdr: &HeaderMap,
     bundle: &str,
     model_name: &str,
+    ext: &axum::http::Extensions,
     metric_labels_slot: Option<&telemetry::MetricLabelsSlot>,
 ) -> Result<ResolvedRoute, Response> {
+    // #1841 sealed dispatch: an org-registered custom model routes to its own
+    // sealed sandbox, not a catalog bundle. Force the synthetic (gpu, pool) =
+    // ("sealed", "sealed") so `resolve_effective_pool` below matches the registered
+    // sealed worker lane (header-based profile/pool resolution would pick a catalog
+    // pool), and pin `engine = "sealed"` (the dispatcher's sole routing
+    // discriminator) instead of the bundle-derived engine — a bundle-less "sealed"
+    // would otherwise fall back to DEFAULT_ENGINE and mis-route to the shared
+    // catalog lane, a silent isolation failure. Ownership is already proven by the
+    // visibility gate in `resolve_model_and_bundle`; re-consulting the same policy
+    // on the same id is a pure, cheap id-shape check.
+    let sealed = state
+        .model_access_policy
+        .as_ref()
+        .and_then(|p| p.sealed_route(model_name, ext));
     // Machine-profile + pool resolution, shared with the primitive path via
     // `resolve_profile_and_pool`. Errors are rendered here in the OpenAI
     // envelope (`json_openai_error`), preserving the compat surface.
-    let ProfilePoolRoute {
-        gpu,
-        pool_name,
-        gpu_configured,
-    } = match resolve_profile_and_pool(state, hdr, model_name).await {
-        Ok(route) => route,
-        Err(ProfilePoolError::InvalidPool) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json_openai_error(
-                    "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)".to_string(),
-                    oai_type::INVALID_REQUEST,
-                    Some("X-SIE-Pool"),
-                    oai_code::INVALID_REQUEST,
-                )),
-            )
-                .into_response());
-        }
-        Err(ProfilePoolError::PoolMismatch { message }) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json_openai_error(
-                    message,
-                    oai_type::INVALID_REQUEST,
-                    Some("X-SIE-Pool"),
-                    oai_code::INVALID_REQUEST,
-                )),
-            )
-                .into_response());
+    // #1841: a sealed custom-model route carries its own machine profile + pool,
+    // so it short-circuits catalog profile/pool resolution entirely.
+    let (gpu, pool_name, gpu_configured) = if let Some(route) = &sealed {
+        (route.machine_profile.clone(), route.pool.clone(), true)
+    } else {
+        match resolve_profile_and_pool(state, hdr, model_name).await {
+            Ok(ProfilePoolRoute {
+                gpu,
+                pool_name,
+                gpu_configured,
+            }) => (gpu, pool_name, gpu_configured),
+            Err(ProfilePoolError::InvalidPool) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json_openai_error(
+                        "Invalid pool name: only [A-Za-z0-9_-] are allowed (max 128 chars)"
+                            .to_string(),
+                        oai_type::INVALID_REQUEST,
+                        Some("X-SIE-Pool"),
+                        oai_code::INVALID_REQUEST,
+                    )),
+                )
+                    .into_response());
+            }
+            Err(ProfilePoolError::PoolMismatch { message }) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json_openai_error(
+                        message,
+                        oai_type::INVALID_REQUEST,
+                        Some("X-SIE-Pool"),
+                        oai_code::INVALID_REQUEST,
+                    )),
+                )
+                    .into_response());
+            }
         }
     };
 
@@ -5589,11 +5725,16 @@ async fn resolve_generation_route(
     let (bundle_config_hash, model_revision) = state
         .model_registry
         .bundle_execution_evidence(bundle, &hash_pool, model_name);
-    let engine = state
-        .model_registry
-        .get_bundle_info(bundle)
-        .map(|info| info.engine)
-        .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string());
+    // #1841: pin the sealed engine marker (see the top-of-fn note); a bundle-less
+    // "sealed" bundle has no BundleInfo, so the else-branch would yield DEFAULT_ENGINE.
+    let engine = match &sealed {
+        Some(route) => route.engine.clone(),
+        None => state
+            .model_registry
+            .get_bundle_info(bundle)
+            .map(|info| info.engine)
+            .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string()),
+    };
     let lookup = resolve_effective_pool(
         &state.registry,
         Some(&state.pool_manager),
@@ -5813,7 +5954,8 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     // the trivial OOM-under-concurrency vector.
     const MAX_CHAT_BODY: usize = 16 * 1024 * 1024;
     let hdr = req.headers().clone();
-    let body_bytes = match to_bytes(req.into_body(), MAX_CHAT_BODY).await {
+    let (parts, body) = req.into_parts(); // keep extensions (caller identity) for the #1841 gate
+    let body_bytes = match to_bytes(body, MAX_CHAT_BODY).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -5855,10 +5997,11 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
     // -- model registry resolution (mirrors proxy_request, but the
     //    model comes from the body rather than the path). Shared with
     //    /v1/completions via resolve_model_and_bundle.
-    let (model_name, bundle) = match resolve_model_and_bundle(&state, &params.model) {
-        Ok(mb) => mb,
-        Err(resp) => return resp,
-    };
+    let (model_name, bundle) =
+        match resolve_model_and_bundle(&state, &params.model, &parts.extensions) {
+            Ok(mb) => mb,
+            Err(resp) => return resp,
+        };
 
     // Grammar routing (follow-up: chat-path gate ordering). Resolve the model's
     // declared ``grammar_profile`` variant and compute the DISPATCH id BEFORE the
@@ -6051,6 +6194,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, req: Request) -> Res
         &hdr,
         &bundle,
         &model_name,
+        &parts.extensions,
         metric_labels_slot.as_ref(),
     )
     .await
@@ -6584,7 +6728,8 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
 
     const MAX_COMPLETIONS_BODY: usize = 16 * 1024 * 1024;
     let hdr = req.headers().clone();
-    let body_bytes = match to_bytes(req.into_body(), MAX_COMPLETIONS_BODY).await {
+    let (parts, body) = req.into_parts(); // keep extensions (caller identity) for the #1841 gate
+    let body_bytes = match to_bytes(body, MAX_COMPLETIONS_BODY).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -6620,10 +6765,11 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         CompletionsParamsResult::Err(resp) => return resp,
     };
 
-    let (model_name, bundle) = match resolve_model_and_bundle(&state, &params.model) {
-        Ok(mb) => mb,
-        Err(resp) => return resp,
-    };
+    let (model_name, bundle) =
+        match resolve_model_and_bundle(&state, &params.model, &parts.extensions) {
+            Ok(mb) => mb,
+            Err(resp) => return resp,
+        };
 
     let ResolvedRoute {
         physical_lane,
@@ -6642,6 +6788,7 @@ pub async fn proxy_completions(State(state): State<Arc<AppState>>, req: Request)
         &hdr,
         &bundle,
         &model_name,
+        &parts.extensions,
         metric_labels_slot.as_ref(),
     )
     .await
@@ -7158,7 +7305,8 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
 
     const MAX_RESPONSES_BODY: usize = 16 * 1024 * 1024;
     let hdr = req.headers().clone();
-    let body_bytes = match to_bytes(req.into_body(), MAX_RESPONSES_BODY).await {
+    let (parts, body) = req.into_parts(); // keep extensions (caller identity) for the #1841 gate
+    let body_bytes = match to_bytes(body, MAX_RESPONSES_BODY).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -7194,10 +7342,11 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         ResponsesParamsResult::Err(resp) => return resp,
     };
 
-    let (model_name, bundle) = match resolve_model_and_bundle(&state, &params.model) {
-        Ok(mb) => mb,
-        Err(resp) => return resp,
-    };
+    let (model_name, bundle) =
+        match resolve_model_and_bundle(&state, &params.model, &parts.extensions) {
+            Ok(mb) => mb,
+            Err(resp) => return resp,
+        };
     let ResolvedRoute {
         physical_lane,
         gpu,
@@ -7215,6 +7364,7 @@ pub async fn proxy_responses(State(state): State<Arc<AppState>>, req: Request) -
         &hdr,
         &bundle,
         &model_name,
+        &parts.extensions,
         metric_labels_slot.as_ref(),
     )
     .await
@@ -9659,6 +9809,7 @@ fn parse_lora_adapter_field(value: Option<&serde_json::Value>) -> Result<Option<
 /// (``n`` / ``best_of`` / ``stream_options``) stay on the OpenAI adapters.
 const GENERATE_ACCEPTED_FIELDS: &[&str] = &[
     "prompt",
+    "images",
     "max_new_tokens",
     "temperature",
     "top_p",
@@ -9678,6 +9829,141 @@ const GENERATE_ACCEPTED_FIELDS: &[&str] = &[
     "stream",
 ];
 
+/// Parse the SIE-native JSON image envelope used by ``/v1/generate``.
+///
+/// The gateway never fetches URLs. Each entry is an exact
+/// ``{data: <standard-base64>, format?: <short token>}`` object and remains
+/// base64 on the generate work wire so it can round-trip through the
+/// sidecar's ``serde_json::Value`` representation.
+#[allow(clippy::result_large_err)]
+fn parse_native_generate_images(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<Vec<publisher::ChatImage>>, Response> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(entries) = value.as_array() else {
+        return Err(sampler_bad_request(
+            "'images' must be a non-empty array".to_string(),
+            "images",
+            oai_code::INVALID_REQUEST,
+        ));
+    };
+    if entries.is_empty() || entries.len() > MAX_GENERATE_IMAGES {
+        return Err(sampler_bad_request(
+            format!("'images' must contain between 1 and {MAX_GENERATE_IMAGES} entries"),
+            "images",
+            oai_code::INVALID_REQUEST,
+        ));
+    }
+    let mut images = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let param = format!("images[{index}]");
+        let Some(object) = entry.as_object() else {
+            return Err(sampler_bad_request(
+                format!("'{param}' must be an object"),
+                &param,
+                oai_code::INVALID_REQUEST,
+            ));
+        };
+        if let Some(unknown) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "data" | "format"))
+        {
+            let unknown_param = format!("{param}.{unknown}");
+            return Err(sampler_bad_request(
+                format!("'{unknown_param}' is not supported"),
+                &unknown_param,
+                oai_code::UNSUPPORTED_FIELD,
+            ));
+        }
+        let data_param = format!("{param}.data");
+        let Some(data) = object.get("data").and_then(serde_json::Value::as_str) else {
+            return Err(sampler_bad_request(
+                format!("'{data_param}' must be a non-empty base64 string"),
+                &data_param,
+                oai_code::INVALID_REQUEST,
+            ));
+        };
+        if !native_generate_image_encoded_size_allowed(data.len()) {
+            return Err(sampler_bad_request(
+                format!(
+                    "'{data_param}' must decode to between 1 byte and {MAX_GENERATE_IMAGE_BYTES} bytes"
+                ),
+                &data_param,
+                oai_code::INVALID_REQUEST,
+            ));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| {
+                sampler_bad_request(
+                    format!("'{data_param}' must be valid standard base64"),
+                    &data_param,
+                    oai_code::INVALID_REQUEST,
+                )
+            })?;
+        if decoded.is_empty() || decoded.len() > MAX_GENERATE_IMAGE_BYTES {
+            return Err(sampler_bad_request(
+                format!(
+                    "'{data_param}' must decode to between 1 byte and {MAX_GENERATE_IMAGE_BYTES} bytes"
+                ),
+                &data_param,
+                oai_code::INVALID_REQUEST,
+            ));
+        }
+        let format = match object.get("format") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(format))
+                if !format.is_empty()
+                    && format.len() <= 32
+                    && format.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')
+                    }) =>
+            {
+                Some(format.to_ascii_lowercase())
+            }
+            Some(_) => {
+                let format_param = format!("{param}.format");
+                return Err(sampler_bad_request(
+                    format!("'{format_param}' must be a short media-format token"),
+                    &format_param,
+                    oai_code::INVALID_REQUEST,
+                ));
+            }
+        };
+        images.push(publisher::ChatImage {
+            data: data.to_string(),
+            format,
+        });
+    }
+    Ok(Some(images))
+}
+
+fn native_generate_image_encoded_size_allowed(length: usize) -> bool {
+    (1..=MAX_GENERATE_IMAGE_BASE64_CHARS).contains(&length)
+}
+
+fn generate_params_have_images(params: &publisher::GenerateParams) -> bool {
+    matches!(
+        &params.input,
+        publisher::GenerateInput::Messages { messages }
+            if messages.iter().any(|message| {
+                message.images.as_ref().is_some_and(|images| !images.is_empty())
+            })
+    )
+}
+
+fn native_generate_image_input_allowed(
+    params: Option<&publisher::GenerateParams>,
+    model_supports_vision_generation: bool,
+) -> bool {
+    !params.is_some_and(generate_params_have_images) || model_supports_vision_generation
+}
+
 /// Parse the walking-skeleton ``/v1/generate/{model}`` JSON body shape into a
 /// :class:`GenerateParams`. Returns ``Ok(None)`` when required fields are
 /// missing or malformed — the caller surfaces a generic 400 in that case.
@@ -9685,9 +9971,9 @@ const GENERATE_ACCEPTED_FIELDS: &[&str] = &[
 /// that response is the precise OpenAI envelope and is returned
 /// verbatim.
 ///
-/// Only the ``Prompt`` arm is exposed via this entrypoint; chat requests
-/// flow through :func:`chat_params_from_json` and assemble
-/// the ``Messages`` arm there.
+/// Text-only requests preserve the ``Prompt`` arm. Native image requests and
+/// chat requests assemble the existing ``Messages`` arm so both reach the
+/// worker's model-native template renderer.
 #[allow(clippy::result_large_err)]
 fn generate_params_from_json(
     parsed: &serde_json::Value,
@@ -9704,6 +9990,7 @@ fn generate_params_from_json(
             ))
         }
     };
+    let images = parse_native_generate_images(parsed.get("images"))?;
     // Granular `max_new_tokens` rejection so OpenAI-shaped error
     // envelopes carry the correct `param` field. Previously every
     // failure mode collapsed to `Ok(None)` and the caller emitted
@@ -9911,8 +10198,21 @@ fn generate_params_from_json(
     let top_logprobs = parse_top_logprobs_field(parsed.get("top_logprobs"))?;
     check_logprobs_consistency(logprobs, top_logprobs)?;
 
+    let input = match images {
+        Some(images) => publisher::GenerateInput::Messages {
+            messages: vec![publisher::ChatMessage {
+                role: "user".to_string(),
+                content: prompt,
+                tool_calls: None,
+                tool_call_id: None,
+                images: Some(images),
+                content_parts: None,
+            }],
+        },
+        None => publisher::GenerateInput::Prompt { prompt },
+    };
     Ok(Some(publisher::GenerateParams {
-        input: publisher::GenerateInput::Prompt { prompt },
+        input,
         max_new_tokens,
         temperature,
         top_p,
@@ -10060,6 +10360,11 @@ fn generate_params_from_rmpv(
             ))
         }
     };
+    let images = parse_native_generate_images(
+        rmpv_map_get(parsed, "images")
+            .map(rmpv_to_json_owned)
+            .as_ref(),
+    )?;
     // Mirror the JSON path's granular error attribution so SDKs that
     // branch on `error.param` see the same field name whether the
     // wire format is JSON or msgpack.
@@ -10311,8 +10616,21 @@ fn generate_params_from_rmpv(
     let top_logprobs = parse_top_logprobs_field(bridge("top_logprobs").as_ref())?;
     check_logprobs_consistency(logprobs, top_logprobs)?;
 
+    let input = match images {
+        Some(images) => publisher::GenerateInput::Messages {
+            messages: vec![publisher::ChatMessage {
+                role: "user".to_string(),
+                content: prompt,
+                tool_calls: None,
+                tool_call_id: None,
+                images: Some(images),
+                content_parts: None,
+            }],
+        },
+        None => publisher::GenerateInput::Prompt { prompt },
+    };
     Ok(Some(publisher::GenerateParams {
-        input: publisher::GenerateInput::Prompt { prompt },
+        input,
         max_new_tokens,
         temperature,
         top_p,
@@ -12562,6 +12880,79 @@ mod tests {
                 configured_physical_lanes,
             )),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
+        }
+    }
+
+    /// A #1841 test policy: reports `visible` per the flag and marks any
+    /// `org-`-prefixed id as sealed. Lets the native resolve path's sealed branch be
+    /// exercised (and its ordering behind the visibility gate be locked) without the
+    /// managed crate.
+    struct SealedTestPolicy {
+        visible: bool,
+    }
+    impl crate::server::ModelAccessPolicy for SealedTestPolicy {
+        fn visible(&self, _resolved_model: &str, _ext: &axum::http::Extensions) -> bool {
+            self.visible
+        }
+        fn sealed_route(
+            &self,
+            resolved_model: &str,
+            _ext: &axum::http::Extensions,
+        ) -> Option<crate::server::SealedRoute> {
+            resolved_model
+                .starts_with("org-")
+                .then(|| crate::server::SealedRoute {
+                    engine: "sealed".to_string(),
+                    bundle: "sealed".to_string(),
+                    pool: "sealed".to_string(),
+                    machine_profile: "sealed".to_string(),
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_sends_owned_custom_model_to_the_sealed_lane() {
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut state = admission_test_state(pm);
+        state.model_access_policy = Some(Arc::new(SealedTestPolicy { visible: true }));
+        let routing = resolve_routing(
+            &state,
+            &HeaderMap::new(),
+            &axum::http::Extensions::new(),
+            "/v1/encode/org-7/support-embedder",
+            "encode",
+        )
+        .await
+        .expect("a visible sealed model must route, not error");
+        // Bundle-less sealed dispatch: `engine` is the sealed marker and the lane
+        // tuple is synthetic. bundle/profile resolution was SKIPPED — the model is
+        // not in the registry, so the normal path would have returned MODEL_NOT_FOUND.
+        assert_eq!(routing.engine, "sealed");
+        assert_eq!(routing.bundle, "sealed");
+        assert_eq!(routing.pool_name, "sealed");
+        assert_eq!(routing.gpu, "sealed");
+        assert_eq!(routing.model_name, "org-7/support-embedder");
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_runs_visibility_gate_before_the_sealed_branch() {
+        // Ordering lock: a non-visible caller is 404'd BEFORE the sealed branch, so a
+        // cross-org / anonymous caller can never coerce engine="sealed".
+        let pm = Arc::new(PoolManager::new(vec!["l4".to_string()]));
+        let mut state = admission_test_state(pm);
+        state.model_access_policy = Some(Arc::new(SealedTestPolicy { visible: false }));
+        let result = resolve_routing(
+            &state,
+            &HeaderMap::new(),
+            &axum::http::Extensions::new(),
+            "/v1/encode/org-7/support-embedder",
+            "encode",
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("a hidden model must 404, never reach the sealed branch"),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::NOT_FOUND),
         }
     }
 
@@ -13161,6 +13552,131 @@ mod tests {
         assert_eq!(params.top_p, Some(0.9_f32));
         assert_eq!(params.stop.as_deref(), Some(&["</s>".to_string()][..]));
         assert!(params.grammar.is_none());
+    }
+
+    #[test]
+    fn test_generate_params_from_json_maps_native_images_to_worker_messages() {
+        for stream in [false, true] {
+            let body = serde_json::json!({
+                "prompt": "Read the image",
+                "images": [{"data": "aGVsbG8=", "format": "PNG"}],
+                "max_new_tokens": 8,
+                "stream": stream,
+            });
+            let params = _expect_generate_ok(&body);
+            assert_eq!(params.stream, stream);
+            assert!(generate_params_have_images(&params));
+            let publisher::GenerateInput::Messages { messages } = params.input else {
+                panic!("image-native generate must use the worker message path")
+            };
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "Read the image");
+            let images = messages[0].images.as_ref().expect("one image");
+            assert_eq!(images[0].data, "aGVsbG8=");
+            assert_eq!(images[0].format.as_deref(), Some("png"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_params_from_json_rejects_malformed_native_images() {
+        let too_many = serde_json::Value::Array(vec![
+            serde_json::json!({"data": "aGk="});
+            MAX_GENERATE_IMAGES + 1
+        ]);
+        let cases = [
+            (serde_json::json!([]), "images"),
+            (serde_json::json!([{"data": "!!!"}]), "images[0].data"),
+            (serde_json::json!([{"data": "aGk"}]), "images[0].data"),
+            (serde_json::json!([{"data": "__8="}]), "images[0].data"),
+            (serde_json::json!([{"data": "AB=="}]), "images[0].data"),
+            (
+                serde_json::json!([{"data": "aGVsbG8=", "url": "https://example.com/image.png"}]),
+                "images[0].url",
+            ),
+            (
+                serde_json::json!([{"data": "aGVsbG8=", "format": "png;bad"}]),
+                "images[0].format",
+            ),
+            (too_many, "images"),
+        ];
+        for (images, expected_param) in cases {
+            let body = serde_json::json!({
+                "prompt": "Read",
+                "images": images,
+                "max_new_tokens": 8,
+            });
+            let error = _expect_generate_err(&body).await;
+            assert_eq!(error["error"]["param"], expected_param);
+        }
+    }
+
+    #[test]
+    fn test_generate_params_from_rmpv_maps_native_images_to_worker_messages() {
+        let body = serde_json::json!({
+            "prompt": "Read",
+            "images": [{"data": "aGVsbG8=", "format": "png"}],
+            "max_new_tokens": 8,
+        });
+        let rmpv::Value::Map(map) = json_to_rmpv(body) else {
+            panic!("object must map")
+        };
+        let params = generate_params_from_rmpv(&map)
+            .expect("valid request")
+            .expect("generate params");
+        assert!(generate_params_have_images(&params));
+    }
+
+    #[test]
+    fn test_generate_native_image_validation_has_json_msgpack_parity() {
+        let body = serde_json::json!({
+            "prompt": "Read",
+            "images": [{"data": "aGk"}],
+            "max_new_tokens": 8,
+        });
+        assert!(generate_params_from_json(&body).is_err());
+        let rmpv::Value::Map(map) = json_to_rmpv(body) else {
+            panic!("object must map")
+        };
+        assert!(generate_params_from_rmpv(&map).is_err());
+    }
+
+    #[test]
+    fn test_generate_native_images_fail_closed_on_model_capability() {
+        let image_body = serde_json::json!({
+            "prompt": "Read",
+            "images": [{"data": "aGk="}],
+            "max_new_tokens": 8,
+        });
+        let image_params = _expect_generate_ok(&image_body);
+        assert!(!native_generate_image_input_allowed(
+            Some(&image_params),
+            false
+        ));
+        assert!(native_generate_image_input_allowed(
+            Some(&image_params),
+            true
+        ));
+
+        let text_params = _expect_generate_ok(&serde_json::json!({
+            "prompt": "Read",
+            "max_new_tokens": 8,
+        }));
+        assert!(native_generate_image_input_allowed(
+            Some(&text_params),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_generate_native_image_caps_fit_bounded_aggregate_body() {
+        assert!(native_generate_image_encoded_size_allowed(
+            MAX_GENERATE_IMAGE_BASE64_CHARS
+        ));
+        assert!(!native_generate_image_encoded_size_allowed(0));
+        assert!(!native_generate_image_encoded_size_allowed(
+            MAX_GENERATE_IMAGE_BASE64_CHARS + 1
+        ));
     }
 
     #[test]

@@ -12,8 +12,53 @@ from sie_server.core.worker.handlers.encode import EncodeHandler
 from sie_server.types.inputs import Item
 
 if TYPE_CHECKING:
+    from sie_server.config.model import ModelConfig
     from sie_server.core.preprocessor_registry import PreprocessorRegistry
     from sie_server.ipc_types import PreparedTokens
+
+
+def resolve_encode_output_types(
+    config: ModelConfig,
+    request_output_types: list[str] | None,
+    request_options: dict[str, Any] | None,
+    effective_options: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Resolve adapter and response output types for every encode ingress.
+
+    Profiles may expose a postprocessed output that the adapter does not emit
+    directly. MuVERA is the canonical example: the public response is dense,
+    while the adapter must first produce multivectors. Keeping capability
+    validation and that translation here prevents the HTTP and managed queue
+    paths from drifting apart.
+
+    Returns:
+        ``(adapter_output_types, response_output_types)``.
+
+    Raises:
+        ValueError: If the requested response includes an output not declared
+            by the model or the selected profile.
+    """
+    response_output_types = list(effective_options.get("output_types") or request_output_types or ["dense"])
+
+    profile_name = request_options.get("profile") if request_options else None
+    selected_profile = config.resolve_profile(profile_name or "default")
+    supported_outputs = set(config.outputs)
+    profile_output_types = selected_profile.runtime.get("output_types")
+    if profile_output_types:
+        supported_outputs.update(profile_output_types)
+
+    unsupported = set(response_output_types) - supported_outputs
+    if unsupported:
+        msg = f"Model '{config.sie_id}' does not support output types: {unsupported}. Supported: {supported_outputs}"
+        raise ValueError(msg)
+
+    adapter_output_types = response_output_types
+    if effective_options.get("muvera") is not None and "dense" in response_output_types:
+        adapter_output_types = [output_type for output_type in response_output_types if output_type != "dense"]
+        if "multivector" not in adapter_output_types:
+            adapter_output_types.append("multivector")
+
+    return adapter_output_types, response_output_types
 
 
 class EncodePipeline:

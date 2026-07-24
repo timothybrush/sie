@@ -39,7 +39,7 @@ class AudioPreprocessor:
         except ModuleNotFoundError as exc:
             if exc.name != "sie_audio_prep":
                 raise
-            msg = 'Audio preprocessing requires the "sie-server[audio]" extra'
+            msg = "Audio preprocessing requires a SIE image or workspace build containing sie-audio-prep"
             raise RuntimeError(msg) from exc
         prepared_items: list[PreparedItem[AudioPayload]] = []
         total_cost = 0

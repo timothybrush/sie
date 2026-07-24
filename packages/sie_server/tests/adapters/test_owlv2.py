@@ -177,3 +177,30 @@ def test_extract_normalizes_label_whitespace() -> None:
         )
 
     assert detect_batch.call_args.kwargs["text_queries"] == ["a photo of car"]
+
+
+def test_fused_requests_map_prepared_results_positionally() -> None:
+    adapter = Owlv2Adapter("google/owlv2-base-patch16-ensemble")
+    adapter._model = MagicMock()
+    adapter._processor = MagicMock()
+    first = [{"label": "first", "score": 1.0, "bbox": [0, 0, 1, 1]}]
+    second = [{"label": "second", "score": 1.0, "bbox": [1, 1, 1, 1]}]
+    prepared = [
+        SimpleNamespace(
+            original_index=0,
+            payload=SimpleNamespace(
+                pixel_values=torch.full((3, 2, 2), value),
+                original_size=(2, 2),
+            ),
+        )
+        for value in (1.0, 2.0)
+    ]
+
+    with patch.object(adapter, "_detect_batch", return_value=[first, second]) as detect_batch:
+        result = adapter.extract([Item(), Item()], labels=["object"], prepared_items=prepared)
+
+    assert result.objects == [first, second]
+    assert torch.equal(
+        detect_batch.call_args.kwargs["pixel_values"],
+        torch.stack([prepared[0].payload.pixel_values, prepared[1].payload.pixel_values]),
+    )

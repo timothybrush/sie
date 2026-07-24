@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from sie_server.adapters._generation_base import GenerationChunk
 from sie_server.adapters.sglang_vision_extract.adapter import SGLangVisionExtractAdapter
+from sie_server.config.model import ModelConfig
 from sie_server.types.inputs import ImageInput, InvalidMediaError, Item
 
 
@@ -71,6 +76,23 @@ def test_device_factory_does_not_apply_text_only_mlx_fallback() -> None:
         model_name_or_path="lightonai/LightOnOCR-2-1B",
     )
     assert isinstance(instance, SGLangVisionExtractAdapter)
+
+
+def test_compat_path_is_prepended_to_inherited_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
+    inherited = os.pathsep.join(("/inherited/one", "/inherited/two"))
+    monkeypatch.setenv("PYTHONPATH", inherited)
+
+    instance = SGLangVisionExtractAdapter("lightonai/LightOnOCR-2-1B")
+
+    compat_dir = Path(__file__).resolve().parents[2] / "src/sie_server/adapters/sglang_vision_extract/_compat"
+    assert instance._extra_env["PYTHONPATH"] == os.pathsep.join((str(compat_dir), inherited))
+
+
+def test_lighton_default_profile_enables_compat_hook() -> None:
+    model_path = Path(__file__).resolve().parents[2] / "models" / "lightonai__LightOnOCR-2-1B.yaml"
+    config = ModelConfig.model_validate(yaml.safe_load(model_path.read_text()))
+
+    assert config.resolve_profile("default").loadtime["extra_env"] == {"SIE_SGLANG_LIGHTON_OCR_COMPAT": "1"}
 
 
 def test_build_prompt_preserves_instruction(adapter: SGLangVisionExtractAdapter) -> None:
@@ -274,6 +296,78 @@ def test_load_resolves_processor_to_pinned_snapshot() -> None:
     engine_load.assert_called_once_with("cuda:0")
     start_loop.assert_called_once_with()
     assert instance._processor is processor
+
+
+def test_lighton_compat_is_deferred_until_native_sglang_registration(tmp_path: Path) -> None:
+    package_root = tmp_path / "fake-package"
+    models = package_root / "sglang" / "srt" / "models"
+    models.mkdir(parents=True)
+    for package in (package_root / "sglang", package_root / "sglang" / "srt", models):
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    (models / "state.py").write_text("ready = False\n", encoding="utf-8")
+    (models / "lightonocr.py").write_text(
+        """from . import state
+assert state.ready, "native SGLang registry is not ready"
+
+class LightOnOCRForConditionalGeneration:
+    def __init__(self, *, config, prefix="", **kwargs):
+        self.rope_theta = config.vision_config.rope_theta
+
+EntryClass = LightOnOCRForConditionalGeneration
+""",
+        encoding="utf-8",
+    )
+    (models / "registry.py").write_text(
+        """import importlib
+from . import state
+
+state.ready = True
+MODEL = importlib.import_module("sglang.srt.models.lightonocr").EntryClass
+""",
+        encoding="utf-8",
+    )
+
+    compat_dir = Path(__file__).resolve().parents[2] / "src/sie_server/adapters/sglang_vision_extract/_compat"
+    script = """import sys
+import sitecustomize
+
+sitecustomize._install_lightonocr_compat()
+sitecustomize._install_lightonocr_compat()
+
+from sglang.srt.models import registry
+
+sitecustomize._patch_lightonocr_module(sys.modules["sglang.srt.models.lightonocr"])
+sitecustomize._patch_lightonocr_module(sys.modules["sglang.srt.models.lightonocr"])
+assert not hasattr(registry.MODEL.__init__.__wrapped__, "__wrapped__")
+
+class VisionConfig:
+    rope_parameters = {"rope_theta": 10000.0}
+
+    def to_dict(self):
+        return {"rope_parameters": self.rope_parameters}
+
+class Config:
+    vision_config = VisionConfig()
+
+assert registry.MODEL(config=Config()).rope_theta == 10000.0
+print("native-lighton-ready")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join((str(compat_dir), str(package_root)))
+    env["SIE_SGLANG_LIGHTON_OCR_COMPAT"] = "1"
+
+    completed = subprocess.run(  # noqa: S603 - executes the fixed local interpreter
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Error in sitecustomize" not in completed.stderr
+    assert completed.stdout.strip() == "native-lighton-ready"
 
 
 def test_resolve_processor_dir_preserves_local_path(tmp_path: Path) -> None:

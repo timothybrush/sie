@@ -23,8 +23,6 @@ flash-attn = ["sie-server[flash-attn]"]
 gpu-metrics = ["sie-server[gpu-metrics]"]
 # xformers for memory-efficient attention (required by Stella models)
 xformers = ["sie-server[xformers]"]
-# Native audio decoding/resampling for direct extract execution.
-audio = ["sie-server[audio]"]
 
 [dependency-groups]
 dev = [
@@ -54,7 +52,7 @@ dev = [
     "statsmodels>=0.14",
     "marimo>=0.23.9",
     # Keep host-side benchmark wire accounting aligned with the deploy CLI/image.
-    "modal==1.4.2",
+    "modal==1.5.2",
     "kaleido>=1.3.0",
 ]
 benchview = [

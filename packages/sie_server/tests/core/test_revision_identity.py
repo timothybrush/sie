@@ -147,3 +147,42 @@ class TestRequirePinnedRevisionsAtLoad:
         configs = load_model_configs(tmp_path, require_pinned_revision=True)
         assert {"org/a", "org/b"} <= set(configs)
         require_pinned_revisions(configs)  # idempotent, no raise
+
+
+_MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+
+
+def _serves_trust_remote_code(config: ModelConfig) -> bool:
+    """True when ANY profile resolves to ``trust_remote_code`` — i.e. loading the
+    model executes Python fetched from the HF Hub. ``trust_remote_code`` is a
+    ``loadtime`` adapter option, so it may be inherited via ``extends``; use the
+    same resolution the server serves with rather than a raw per-profile scan.
+    """
+    return any(config.resolve_profile(name).loadtime.get("trust_remote_code") for name in config.profiles)
+
+
+class TestTrustRemoteCodeModelsArePinned:
+    """Repo invariant (#2109): a ``trust_remote_code`` model is a remote-code-execution
+    surface — without an immutable ``hf_revision`` the executed Python comes from the
+    mutable Hub ``main`` and an upstream compromise silently changes what we run. This
+    guards the security-critical subset so the class cannot regrow, without demanding a
+    pin from the (harmless) unpinned dense long tail.
+    """
+
+    def test_every_trust_remote_code_model_pins_immutable_revision(self) -> None:
+        """Fail if any served trust_remote_code model in the real catalog lacks an
+        immutable ``hf_revision``, naming each offender.
+        """
+        configs = load_model_configs(_MODELS_DIR)
+        trc = {sie_id: c for sie_id, c in configs.items() if _serves_trust_remote_code(c)}
+        # Guard the guard: if resolution ever stops surfacing loadtime, an empty set
+        # would make this test vacuously green.
+        assert trc, "expected the catalog to contain trust_remote_code models"
+        unpinned = sorted(
+            f"{sie_id} (hf_id={c.hf_id})" for sie_id, c in trc.items() if not is_immutable_revision(c.hf_revision)
+        )
+        assert not unpinned, (
+            "trust_remote_code executes Hub-fetched Python at model load; each such model MUST pin an "
+            "immutable hf_revision (40-hex commit SHA) so the executed code cannot drift on the Hub. "
+            f"Unpinned: {unpinned}"
+        )

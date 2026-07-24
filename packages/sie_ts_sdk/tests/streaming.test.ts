@@ -15,6 +15,7 @@ import {
   SIEStreamError,
 } from "../src/errors.js";
 import type { ChatCompletionChunk, GenerateChunk } from "../src/types.js";
+import { MINIMAL_JPEG_BASE64, MINIMAL_JPEG_BYTES } from "./fixtures.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
@@ -498,12 +499,13 @@ describe("SIEClient.streamGenerate", () => {
     const client = new SIEClient("http://localhost:8080");
     for await (const _ of client.streamGenerate("Qwen/Qwen3-4B-Instruct-2507", "hi", {
       maxNewTokens: 4,
+      images: [MINIMAL_JPEG_BYTES],
       temperature: 0.5,
       topP: 0.9,
       stop: ["</s>"],
       frequencyPenalty: 0.25,
       presencePenalty: -0.5,
-      grammar: { regex: "[a-z]+" },
+      grammar: { regex: "[a-z]+", label: null, strict: null },
       seed: -2,
       logitBias: { "123": 1.5 },
       topLogprobs: 3,
@@ -521,12 +523,13 @@ describe("SIEClient.streamGenerate", () => {
     expect(body).toEqual({
       prompt: "hi",
       max_new_tokens: 4,
+      images: [{ data: MINIMAL_JPEG_BASE64, format: "jpeg" }],
       temperature: 0.5,
       top_p: 0.9,
       stop: ["</s>"],
       frequency_penalty: 0.25,
       presence_penalty: -0.5,
-      grammar: { regex: "[a-z]+" },
+      grammar: { regex: "[a-z]+", label: null, strict: null },
       seed: -2,
       logit_bias: { "123": 1.5 },
       logprobs: true,

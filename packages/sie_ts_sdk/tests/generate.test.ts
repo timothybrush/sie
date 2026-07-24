@@ -15,6 +15,7 @@ import {
   SIEConnectionError,
   ServerError,
 } from "../src/errors.js";
+import { MINIMAL_JPEG_BASE64, MINIMAL_JPEG_BYTES } from "./fixtures.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
@@ -86,7 +87,7 @@ describe("SIEClient.generate", () => {
       stop: ["</s>"],
       frequencyPenalty: 0.25,
       presencePenalty: -0.5,
-      grammar: { regex: "[a-z]+" },
+      grammar: { regex: "[a-z]+", label: null, strict: null },
       seed: -1,
       logitBias: { "123": 1.5 },
       routingKey: "tenant-7",
@@ -111,7 +112,7 @@ describe("SIEClient.generate", () => {
       stop: ["</s>"],
       frequency_penalty: 0.25,
       presence_penalty: -0.5,
-      grammar: { regex: "[a-z]+" },
+      grammar: { regex: "[a-z]+", label: null, strict: null },
       seed: -1,
       logit_bias: { "123": 1.5 },
       routing_key: "tenant-7",
@@ -120,6 +121,63 @@ describe("SIEClient.generate", () => {
       lora_adapter: "sql-adapter",
       options: { overall_timeout_s: 30 },
     });
+  });
+
+  it("serializes native images as canonical base64 JSON envelopes", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        model: "vision-model",
+        text: "caption",
+        finish_reason: "stop",
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    );
+
+    const client = new SIEClient("http://localhost:8080");
+    await client.generate("vision-model", "Describe this image", {
+      maxNewTokens: 8,
+      images: [MINIMAL_JPEG_BYTES],
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.images).toEqual([{ data: MINIMAL_JPEG_BASE64, format: "jpeg" }]);
+    expect(body.images[0].data).not.toBeInstanceOf(Uint8Array);
+  });
+
+  it("accepts a valid grammar held in the legacy broad record type", async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        model: "m",
+        text: "123",
+        finish_reason: "stop",
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    );
+    const grammar: Record<string, unknown> = { regex: "\\d+" };
+
+    const client = new SIEClient("http://localhost:8080");
+    await client.generate("m", "Return digits", { maxNewTokens: 8, grammar });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.grammar).toEqual(grammar);
+  });
+
+  it.each([
+    {},
+    { json_schema: {}, regex: "x" },
+    { regex: 123 },
+    { ebnf: "root", unknown: true },
+    { regex: "x", label: 123 },
+    { ebnf: "root", strict: "yes" },
+  ])("rejects an invalid grammar before request: %j", async (grammar) => {
+    const client = new SIEClient("http://localhost:8080");
+    await expect(
+      client.generate("m", "Hi", {
+        maxNewTokens: 8,
+        grammar: grammar as never,
+      }),
+    ).rejects.toThrow();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it.each([Number.MAX_SAFE_INTEGER + 1, Number.MIN_SAFE_INTEGER - 1, 1.5, Number.NaN])(

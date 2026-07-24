@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,12 @@ class ColQwen3Adapter(BaseAdapter):
 
         self._model: Any = None
         self._processor: Any = None
+        # HF fast tokenizers are NOT thread-safe: applying per-call padding/truncation
+        # reconfigures the underlying Rust tokenizer (a mutable borrow). The direct
+        # adapter path (encode_pipeline.py: asyncio.to_thread, no per-model lock) lets
+        # concurrent requests race with RuntimeError: Already borrowed (#2098). Serialise
+        # the processor call — microseconds vs the GPU forward. Matches CLIP/SigLIP.
+        self._tokenizer_lock = threading.Lock()
         self._device: str | None = None
         self._multivector_dim: int = token_dim
 
@@ -277,11 +284,12 @@ class ColQwen3Adapter(BaseAdapter):
         assert self._model is not None
         assert self._processor is not None
 
-        inputs = self._processor(
-            images=images,
-            return_tensors="pt",
-            padding="longest",
-        )
+        with self._tokenizer_lock:
+            inputs = self._processor(
+                images=images,
+                return_tensors="pt",
+                padding="longest",
+            )
         inputs = {k: v.to(self._device) for k, v in inputs.items() if hasattr(v, "to")}
 
         with torch.inference_mode():
@@ -314,11 +322,12 @@ class ColQwen3Adapter(BaseAdapter):
         assert self._model is not None
         assert self._processor is not None
 
-        inputs = self._processor(
-            text=[text],
-            return_tensors="pt",
-            padding="longest",
-        )
+        with self._tokenizer_lock:
+            inputs = self._processor(
+                text=[text],
+                return_tensors="pt",
+                padding="longest",
+            )
         inputs = {k: v.to(self._device) for k, v in inputs.items() if hasattr(v, "to")}
 
         with torch.inference_mode():

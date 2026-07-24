@@ -101,6 +101,15 @@ class ColPaliAdapter(BaseAdapter):
 
         self._model: ColPaliForRetrieval | None = None
         self._processor: ColPaliProcessor | None = None
+        # from_pretrained kwargs captured at load() so the preprocessor factory
+        # can rebuild an identical processor per pool thread (#2098).
+        self._processor_load_kwargs: dict[str, Any] = {}
+        # HF fast tokenizers are NOT thread-safe: applying per-call padding/truncation
+        # reconfigures the underlying Rust tokenizer (a mutable borrow). The direct
+        # adapter path (encode_pipeline.py: asyncio.to_thread, no per-model lock) lets
+        # concurrent requests race with RuntimeError: Already borrowed (#2098). Serialise
+        # the processor call — microseconds vs the GPU forward. Matches CLIP/SigLIP.
+        self._tokenizer_lock = threading.Lock()
         self._device: str | None = None
         self._multivector_dim: int = token_dim or 128  # ColPali uses 128-dim per patch
         # ColPaliForRetrieval.forward hardcodes output_hidden_states=True into
@@ -138,6 +147,10 @@ class ColPaliAdapter(BaseAdapter):
         shared_kwargs: dict[str, Any] = {"trust_remote_code": self._trust_remote_code}
         if self._revision is not None:
             shared_kwargs["revision"] = self._revision
+
+        # Capture the exact processor-load kwargs so get_preprocessor() can build
+        # an identical per-thread processor for each pool worker (#2098).
+        self._processor_load_kwargs = dict(shared_kwargs)
 
         # Load processor
         self._processor = ColPaliProcessor.from_pretrained(
@@ -383,7 +396,8 @@ class ColPaliAdapter(BaseAdapter):
         from torch.nn import functional
 
         # Process images
-        batch = self._processor(images=images, return_tensors="pt")
+        with self._tokenizer_lock:
+            batch = self._processor(images=images, return_tensors="pt")
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
         with self._forward_lock, torch.inference_mode():
@@ -430,7 +444,8 @@ class ColPaliAdapter(BaseAdapter):
         from torch.nn import functional
 
         # Process text
-        batch = self._processor(text=[text], return_tensors="pt")
+        with self._tokenizer_lock:
+            batch = self._processor(text=[text], return_tensors="pt")
         batch = {k: v.to(self._device) for k, v in batch.items()}
 
         with self._forward_lock, torch.inference_mode():
@@ -614,6 +629,23 @@ class ColPaliAdapter(BaseAdapter):
         if self._processor is None:
             return None
 
+        from transformers import ColPaliProcessor
+
         from sie_server.core.preprocessor import ImagePreprocessor
 
-        return ImagePreprocessor(self._processor, self._model_name_or_path)
+        model_name_or_path = self._model_name_or_path
+        load_kwargs = self._processor_load_kwargs
+
+        def _make_processor() -> ColPaliProcessor:
+            # Built once per pool thread (HF-cache hit). The ColPali processor
+            # invokes its Rust fast tokenizer even for image-only calls, so the
+            # 8-worker preprocessor executor cannot share one instance without
+            # racing on "Already borrowed" (#2098). A per-thread instance removes
+            # the race without a pool-wide lock (which collapsed eval throughput).
+            return ColPaliProcessor.from_pretrained(model_name_or_path, **load_kwargs)
+
+        return ImagePreprocessor(
+            self._processor,
+            self._model_name_or_path,
+            processor_factory=_make_processor,
+        )

@@ -40,6 +40,7 @@ from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.core.preprocessor import DetectionPreprocessor
+from sie_server.core.preprocessor.vision import collect_detection_prepared_items
 from sie_server.types.inputs import media_bytes
 from sie_server.types.responses import DetectedObject
 
@@ -211,15 +212,10 @@ class GroundingDINOAdapter(BaseAdapter):
 
         if prepared_items:
             # Use preprocessed tensors from DetectionPreprocessor
-            valid_items = [p for p in prepared_items if hasattr(p, "payload") and p.payload is not None]
-
-            if not valid_items:
+            prepared_batch = collect_detection_prepared_items(prepared_items)
+            if prepared_batch is None:
                 return ExtractOutput(entities=[[] for _ in range(n_items)], objects=[[] for _ in range(n_items)])
-
-            # Stack pixel values and collect metadata
-            pixel_values = torch.stack([p.payload.pixel_values for p in valid_items])
-            original_sizes = [p.payload.original_size for p in valid_items]
-            image_indices = [p.original_index for p in valid_items]
+            pixel_values, pixel_mask, original_sizes, image_indices = prepared_batch
 
             # Batched inference with preprocessed tensors
             batch_results = self._detect_batch(
@@ -227,6 +223,7 @@ class GroundingDINOAdapter(BaseAdapter):
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
                 pixel_values=pixel_values,
+                pixel_mask=pixel_mask,
                 original_sizes=original_sizes,
             )
         else:
@@ -265,6 +262,7 @@ class GroundingDINOAdapter(BaseAdapter):
         text_threshold: float,
         *,
         pixel_values: torch.Tensor | None = None,
+        pixel_mask: torch.Tensor | None = None,
         original_sizes: list[tuple[int, int]] | None = None,
         images: list[Image] | None = None,
     ) -> list[list[DetectedObject]]:
@@ -306,6 +304,8 @@ class GroundingDINOAdapter(BaseAdapter):
                 "input_ids": text_inputs["input_ids"].to(device),
                 "attention_mask": text_inputs["attention_mask"].to(device),
             }
+            if pixel_mask is not None:
+                inputs["pixel_mask"] = pixel_mask.to(device)
 
             # Target sizes for post-processing (height, width)
             target_sizes = [(h, w) for w, h in original_sizes]

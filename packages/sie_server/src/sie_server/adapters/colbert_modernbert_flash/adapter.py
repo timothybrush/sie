@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import string
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -43,14 +44,12 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     fallback_adapter_path: ClassVar[str | None] = "colbert:ColBERTAdapter"
     # Align the fallback with this adapter's faithful serving of the ModernBERT
     # ColBERT trio: no query expansion (their checkpoints set
-    # do_query_expansion: false), no document punctuation skiplist (this flash
-    # path applies none), and the flash default max_seq_length (ColBERTAdapter
-    # defaults to 512). Applies ONLY to fallback instances created for models
+    # do_query_expansion: false) and the flash default max_seq_length
+    # (ColBERTAdapter defaults to 512). Applies ONLY to fallback instances created for models
     # configured with this adapter, never to models whose YAML names
     # colbert:ColBERTAdapter directly.
     fallback_kwargs_overrides: ClassVar[dict[str, Any]] = {
         "query_expansion": False,
-        "doc_punctuation_skiplist": False,
         "max_seq_length": 8192,
     }
 
@@ -70,6 +69,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         query_max_length: int = 32,
         compute_precision: ComputePrecision = "bfloat16",
         skip_special_tokens: bool = True,
+        doc_punctuation_skiplist: bool = False,
         query_prefix: str = "",
         doc_prefix: str = "",
         muvera_config: dict[str, Any] | None = None,
@@ -86,6 +86,8 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             query_max_length: Maximum sequence length for queries.
             compute_precision: Compute precision (bfloat16 recommended).
             skip_special_tokens: Whether to exclude special tokens from output.
+            doc_punctuation_skiplist: Whether to remove punctuation token
+                embeddings from documents before MaxSim scoring.
             query_prefix: Prefix to prepend to queries.
             doc_prefix: Prefix to prepend to documents.
             muvera_config: MUVERA configuration dict with keys like num_repetitions,
@@ -105,6 +107,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_max_length = query_max_length
         self._compute_precision = compute_precision
         self._skip_special_tokens = skip_special_tokens
+        self._doc_punctuation_skiplist = doc_punctuation_skiplist
         self._query_prefix = query_prefix
         self._doc_prefix = doc_prefix
         self._muvera_config = muvera_config
@@ -113,6 +116,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._tokenizer: PreTrainedTokenizerFast | None = None
         self._device: str | None = None
         self._dense_chain: list[torch.Tensor] | None = None
+        self._doc_skiplist_ids: set[int] = set()
 
     def load(self, device: str) -> None:
         """Load the model onto the specified device.
@@ -139,6 +143,12 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         )
 
         self._tokenizer = self._load_tokenizer()
+
+        if self._doc_punctuation_skiplist:
+            skiplist_ids: set[int] = set()
+            for character in string.punctuation:
+                skiplist_ids.update(self._tokenizer.encode(character, add_special_tokens=False))
+            self._doc_skiplist_ids = skiplist_ids
 
         # Load model with eager attention - we handle flash attention manually
         self._model = AutoModel.from_pretrained(
@@ -258,18 +268,19 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 extra={"input_token_counts": []},
             )
 
-        max_length = self._query_max_length if is_query else self._max_seq_length
-
-        # Tokenize each sequence individually (no padding)
-        encodings = [
-            self._tokenizer(
-                text,
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
+        opts = options or {}
+        if is_query:
+            max_length = self._coerce_runtime_max_length(
+                opts.get("query_max_length"),
+                self._query_max_length,
             )
-            for text in texts
-        ]
+        else:
+            max_length = self._coerce_runtime_max_length(
+                opts.get("max_seq_length"),
+                self._max_seq_length,
+            )
+
+        encodings = self._tokenize_inputs(texts, max_length)
 
         # Build packed representation
         seq_lengths = [enc["input_ids"].shape[1] for enc in encodings]
@@ -321,7 +332,13 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 hidden = functional.normalize(hidden, p=2, dim=-1)
 
             # Split back into per-item results
-            multivectors = self._split_embeddings(hidden, cu_seqlens, seq_lengths, input_ids_packed)
+            multivectors = self._split_embeddings(
+                hidden,
+                cu_seqlens,
+                seq_lengths,
+                input_ids_packed,
+                is_query=is_query,
+            )
 
         return EncodeOutput(
             multivector=multivectors,
@@ -331,12 +348,28 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             extra={"input_token_counts": [int(length) for length in seq_lengths]},
         )
 
+    def _tokenize_inputs(self, texts: list[str], max_length: int) -> list[Any]:
+        """Tokenize packed inputs without racing metering tokenization."""
+        if self._tokenizer is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+        with self._tokenizer_guard():
+            return [
+                self._tokenizer(
+                    text,
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                for text in texts
+            ]
+
     def score(
         self,
         query: Item,
         items: list[Item],
         *,
         instruction: str | None = None,
+        options: dict[str, Any] | None = None,
     ) -> list[float]:
         """Score items against a query using MaxSim.
 
@@ -356,6 +389,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             output_types=["multivector"],
             instruction=instruction,
             is_query=True,
+            options=options,
         )
         query_vecs = query_output.multivector[0]
 
@@ -364,6 +398,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             items,
             output_types=["multivector"],
             is_query=False,
+            options=options,
         )
 
         # MaxSim over all documents in one padded, masked batched matmul.
@@ -381,14 +416,19 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     ) -> ScoreOutput:
         """Score parallel (query, doc) pairs via per-query MaxSim grouping.
 
-        Encode-time runtime ``options`` (e.g. ``muvera``/``output_types``) are
-        irrelevant to ColBERT MaxSim and are accepted and ignored. ``score()`` on
-        this adapter does not take ``options``; ``grouped_score_pairs`` never threads
-        options into the score callable, so delegation is unaffected.
+        Sequence-length runtime options are forwarded to query/document encode.
         """
-        _ = options  # Encode-time options are irrelevant to MaxSim scoring.
-        output = grouped_score_pairs(self.score, queries, docs, instruction=instruction)
-        output.input_token_counts = self._pair_input_token_counts(queries, docs, instruction)
+
+        def score_with_options(
+            query: Item,
+            items: list[Item],
+            *,
+            instruction: str | None = None,
+        ) -> list[float]:
+            return self.score(query, items, instruction=instruction, options=options)
+
+        output = grouped_score_pairs(score_with_options, queries, docs, instruction=instruction)
+        output.input_token_counts = self._pair_input_token_counts(queries, docs, instruction, options)
         return output
 
     def _pair_input_token_counts(
@@ -396,6 +436,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         queries: list[Item],
         docs: list[Item],
         instruction: str | None,
+        options: dict[str, Any] | None = None,
     ) -> list[int] | None:
         """Return faithful logical token counts for bi-encoder pair scoring.
 
@@ -410,13 +451,23 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         if not queries:
             return []
 
+        opts = options or {}
+        query_max_length = self._coerce_runtime_max_length(
+            opts.get("query_max_length"),
+            self._query_max_length,
+        )
+        doc_max_length = self._coerce_runtime_max_length(
+            opts.get("max_seq_length"),
+            self._max_seq_length,
+        )
+
         try:
             query_texts = self._extract_texts(queries, instruction, is_query=True)
             doc_texts = self._extract_texts(docs, None, is_query=False)
             with self._tokenizer_guard():
                 query_encodings = self._tokenizer(
                     query_texts,
-                    max_length=self._query_max_length,
+                    max_length=query_max_length,
                     truncation=True,
                     padding=False,
                     return_attention_mask=False,
@@ -424,7 +475,7 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
                 )
                 doc_encodings = self._tokenizer(
                     doc_texts,
-                    max_length=self._max_seq_length,
+                    max_length=doc_max_length,
                     truncation=True,
                     padding=False,
                     return_attention_mask=False,
@@ -580,6 +631,8 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         cu_seqlens: torch.Tensor,
         seq_lengths: list[int],
         input_ids: torch.Tensor,
+        *,
+        is_query: bool = True,
     ) -> list[np.ndarray]:
         """Split packed embeddings back into per-item arrays."""
         results = []
@@ -599,8 +652,11 @@ class ColBERTModernBERTFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             if self._tokenizer.eos_token_id is not None:
                 special_ids.add(self._tokenizer.eos_token_id)
 
+        if not is_query:
+            special_ids |= self._doc_skiplist_ids
+
         # Build a batched filter mask on GPU
-        if self._skip_special_tokens and special_ids:
+        if special_ids:
             filter_tensor = torch.tensor(sorted(special_ids), device=self._device)
             keep_mask_all = ~torch.isin(input_ids, filter_tensor)
         else:

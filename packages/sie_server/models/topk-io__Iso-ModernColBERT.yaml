@@ -26,6 +26,7 @@ profiles:
         normalize: true
         query_max_length: 32
         skip_special_tokens: false
+        doc_punctuation_skiplist: false
       runtime: {}
   candle:
     extends: default

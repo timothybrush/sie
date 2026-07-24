@@ -102,6 +102,96 @@ class TestGroundingDINOAdapter:
         assert result.objects == [[]]
         assert adapter._detect_batch.call_args.kwargs["text_prompt"] == expected_prompt
 
+    def test_fused_requests_map_prepared_results_positionally(self) -> None:
+        adapter = GroundingDINOAdapter("IDEA-Research/grounding-dino-tiny")
+        adapter._model = MagicMock()
+        adapter._processor = MagicMock()
+        first = [{"label": "first", "score": 1.0, "bbox": [0, 0, 1, 1]}]
+        second = [{"label": "second", "score": 1.0, "bbox": [1, 1, 1, 1]}]
+        adapter._detect_batch = MagicMock(return_value=[first, second])  # type: ignore[method-assign]
+        prepared = [
+            SimpleNamespace(
+                original_index=0,
+                payload=SimpleNamespace(
+                    pixel_values=torch.full((3, 2, 2), value),
+                    original_size=(2, 2),
+                ),
+            )
+            for value in (1.0, 2.0)
+        ]
+
+        result = adapter.extract([Item(), Item()], labels=["object"], prepared_items=prepared)
+
+        assert result.objects == [first, second]
+        assert torch.equal(
+            adapter._detect_batch.call_args.kwargs["pixel_values"],
+            torch.stack([prepared[0].payload.pixel_values, prepared[1].payload.pixel_values]),
+        )
+
+    def test_fused_requests_pad_variable_image_shapes_with_pixel_mask(self) -> None:
+        adapter = GroundingDINOAdapter("IDEA-Research/grounding-dino-tiny")
+        adapter._model = MagicMock()
+        adapter._processor = MagicMock()
+        adapter._detect_batch = MagicMock(return_value=[[], []])  # type: ignore[method-assign]
+        prepared = [
+            SimpleNamespace(
+                original_index=0,
+                payload=SimpleNamespace(
+                    pixel_values=torch.full((3, 2, 3), 1.0),
+                    original_size=(3, 2),
+                ),
+            ),
+            SimpleNamespace(
+                original_index=0,
+                payload=SimpleNamespace(
+                    pixel_values=torch.full((3, 4, 2), 2.0),
+                    original_size=(2, 4),
+                ),
+            ),
+        ]
+
+        adapter.extract([Item(), Item()], labels=["object"], prepared_items=prepared)
+
+        pixel_values = adapter._detect_batch.call_args.kwargs["pixel_values"]
+        pixel_mask = adapter._detect_batch.call_args.kwargs["pixel_mask"]
+        assert pixel_values.shape == (2, 3, 4, 3)
+        assert torch.equal(pixel_values[0, :, :2, :3], prepared[0].payload.pixel_values)
+        assert torch.equal(pixel_values[1, :, :4, :2], prepared[1].payload.pixel_values)
+        assert torch.equal(pixel_mask[0], torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 0], [0, 0, 0]]))
+        assert torch.equal(pixel_mask[1], torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0]]))
+
+    def test_prepared_detection_forwards_pixel_mask(self) -> None:
+        adapter = GroundingDINOAdapter("IDEA-Research/grounding-dino-tiny")
+        adapter._model = MagicMock(return_value=MagicMock())
+        adapter._processor = MagicMock()
+        adapter._processor.tokenizer.return_value = {
+            "input_ids": torch.zeros((2, 4), dtype=torch.long),
+            "attention_mask": torch.ones((2, 4), dtype=torch.long),
+        }
+        adapter._processor.post_process_grounded_object_detection.return_value = [{}, {}]
+        adapter._device = "cpu"
+        adapter._device_type = "cpu"
+        adapter._model_dtype = torch.float32
+        pixel_values = torch.zeros((2, 3, 4, 5))
+        pixel_mask = torch.tensor(
+            [
+                [[1, 1, 1, 1, 1]] * 4,
+                [[1, 1, 1, 0, 0]] * 4,
+            ]
+        )
+
+        with patch.object(adapter, "_results_to_objects", return_value=[]):
+            adapter._detect_batch(
+                "object.",
+                0.25,
+                0.25,
+                pixel_values=pixel_values,
+                pixel_mask=pixel_mask,
+                original_sizes=[(5, 4), (3, 4)],
+            )
+
+        assert torch.equal(adapter._model.call_args.kwargs["pixel_mask"], pixel_mask)
+
     def test_text_prompt_format(self) -> None:
         """Test that labels are formatted correctly for GroundingDINO.
 

@@ -214,6 +214,9 @@ def test_splade_pp_exposes_checkpoint_sequence_capacity() -> None:
     data = yaml.safe_load(model_yaml.read_text()) or {}
 
     assert data["max_sequence_length"] == 512
+    assert data["profiles"]["default"]["adapter_options"]["runtime"]["max_seq_length"] == 128
+    assert data["profiles"]["candle"]["adapter_options"]["loadtime"]["max_seq_length"] == 128
+    assert data["profiles"]["candle"]["adapter_options"]["runtime"]["max_seq_length"] == 128
 
 
 @pytest.mark.parametrize("bundle_yaml", sorted(BUNDLES_DIR.glob("*.yaml")))

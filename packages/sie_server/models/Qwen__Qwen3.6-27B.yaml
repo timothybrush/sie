@@ -4,10 +4,10 @@ hf_revision: 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
 inputs:
   # Qwen3.6-27B is a unified vision-language model (Gated DeltaNet + Gated
   # Attention with an integrated vision encoder; same hybrid family as
-  # Qwen3.5-4B but scaled to 64 layers / hidden_size=5120). The wire
-  # surface accepts text+image via the OpenAI chat-completions schema
-  # (``image_url`` content parts); video is documented by Qwen but not
-  # yet wired through the SIE gateway.
+  # Qwen3.5-4B but scaled to 64 layers / hidden_size=5120). The wire surface
+  # accepts text+image via SIE-native generate (inline ``images``) and the
+  # OpenAI chat-completions schema (``image_url`` content parts); video is
+  # documented by Qwen but not yet wired through the SIE gateway.
   text: true
   image: true
   audio: false
@@ -90,9 +90,10 @@ profiles:
     max_batch_tokens: 16384
     compute_precision: bfloat16
     adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
-    # H100-80GB speculative launch shape carried forward at the 8K launch
-    # base-model context. The managed cluster routes 32K 27B generation to
-    # ``rtx-pro-6000``.
+    # H100-80GB launch shape at the 8K base-model context. NEXTN is
+    # correctness-gated off on the pinned SGLang engine; retain the measured
+    # load-time shape while the generic newer-engine lane is validated. The
+    # managed cluster routes 32K 27B generation to ``rtx-pro-6000``.
     kv_budget_tokens: 8192
     adapter_options:
       loadtime:
@@ -103,11 +104,10 @@ profiles:
         grammar_backend: outlines
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
-        # MTP/NEXTN per the Qwen3.x model-card recipe. Keep the smaller 2/2
-        # H100 draft shape from main; the larger 3/4 draft remains on the
-        # RTX-PRO-6000 FP8 profile.
+        # Preserve the smaller 2/2 H100 draft shape for a future validated
+        # engine, but keep it disabled on the pinned SGLang release.
         speculative:
-          enabled: true
+          enabled: false
           algorithm: nextn
           num_steps: 2
           eagle_topk: 1
@@ -127,6 +127,7 @@ profiles:
         default_sampling:
           temperature: 0.7
           top_p: 0.8
+          top_k: 20
           presence_penalty: 1.5
           min_new_tokens: 10
         stop_tokens:
@@ -168,6 +169,7 @@ profiles:
         default_sampling:
           temperature: 0.7
           top_p: 0.8
+          top_k: 20
           presence_penalty: 1.5
           min_new_tokens: 10
         stop_tokens:
@@ -262,6 +264,7 @@ profiles:
         default_sampling:
           temperature: 0.7
           top_p: 0.8
+          top_k: 20
           presence_penalty: 1.5
           min_new_tokens: 10
         stop_tokens:
@@ -317,6 +320,7 @@ profiles:
         default_sampling:
           temperature: 0.7
           top_p: 0.8
+          top_k: 20
           presence_penalty: 1.5
           min_new_tokens: 10
         stop_tokens:
@@ -353,6 +357,7 @@ profiles:
         default_sampling:
           temperature: 0.7
           top_p: 0.8
+          top_k: 20
           presence_penalty: 1.5
           min_new_tokens: 10
         stop_tokens:

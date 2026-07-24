@@ -4,7 +4,7 @@ Serves sentence-transformers ``SparseEncoder`` models that accept image
 documents in addition to text (visual-SPLADE family, e.g.
 naver/v-splade-quality): text or page-image in, sparse vocab-sized vector out.
 
-Requires the ``transformers514`` bundle (sentence-transformers >=5.6 /
+Requires the ``transformers5`` bundle (sentence-transformers >=5.6 /
 transformers >=5.14); the multimodal ``SparseEncoder`` routing does not exist
 on the sentence-transformers 5.0 line the default bundle pins.
 """
@@ -12,11 +12,13 @@ on the sentence-transformers 5.0 line the default bundle pins.
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
 from PIL import Image
 from sentence_transformers import SparseEncoder
 
@@ -104,6 +106,8 @@ class SparseEncoderVisionAdapter(BaseAdapter):
         # Omit revision unless pinned so the library default (main) is unchanged.
         if self._revision is not None:
             load_kwargs["revision"] = self._revision
+        if self._trust_remote_code:
+            self._register_remote_code_dir()
         self._model = SparseEncoder(self._model_name_or_path, **load_kwargs)
 
         if self._max_seq_length is not None:
@@ -111,6 +115,45 @@ class SparseEncoderVisionAdapter(BaseAdapter):
 
         # Sparse dim is vocabulary size
         self._sparse_dim = self._model.get_embedding_dimension()
+
+    def _register_remote_code_dir(self) -> None:
+        """Put the checkpoint's snapshot directory on ``sys.path``.
+
+        sentence-transformers' ``Router`` resolves its sub-module classes with a
+        bare ``importlib.import_module(<module>)`` (``router.load`` ->
+        ``util.import_from_string``) that has no ``trust_remote_code`` snapshot
+        fallback, unlike the top-level module loader. So a custom module such as
+        ``modeling_st_vsplade`` only resolves when its directory is already
+        importable; serving environments that don't pre-import it otherwise fail
+        with ``ModuleNotFoundError`` (#2209). Registering the snapshot dir here
+        makes the load deterministic across serve, smoke, and release images.
+
+        The directory is prepended so this checkpoint's copy of the custom module
+        wins, and any same-named module already cached from a *different*
+        snapshot is evicted first — otherwise a sibling checkpoint that ships a
+        module of the same name (e.g. two visual-SPLADE variants co-served in one
+        process) would silently reuse the first one's code. Already-loaded models
+        keep working: sentence-transformers holds the resolved class objects, so
+        eviction only affects subsequent imports.
+        """
+        local = Path(self._model_name_or_path)
+        if local.exists():
+            base = local if local.is_dir() else local.parent
+            snapshot_root = base.resolve()
+        else:
+            downloaded = snapshot_download(self._model_name_or_path, revision=self._revision)
+            snapshot_root = Path(downloaded).resolve()
+
+        for module_file in snapshot_root.glob("*.py"):
+            cached = sys.modules.get(module_file.stem)
+            cached_file = getattr(cached, "__file__", None)
+            if cached_file and Path(cached_file).resolve() != module_file.resolve():
+                del sys.modules[module_file.stem]
+
+        snapshot_dir = str(snapshot_root)
+        if snapshot_dir in sys.path:
+            sys.path.remove(snapshot_dir)
+        sys.path.insert(0, snapshot_dir)
 
     def encode(
         self,

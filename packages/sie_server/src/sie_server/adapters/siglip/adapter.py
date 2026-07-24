@@ -83,6 +83,35 @@ def _open_clip_token_counts(input_ids: Any) -> list[int] | None:
         return None
 
 
+def _attention_mask_token_counts(
+    input_ids: Any,
+    attention_mask: Any,
+    *,
+    expected_len: int,
+) -> list[int] | None:
+    """Count the exact tokens selected by a shape-valid binary attention mask.
+
+    SigLIP tokenizers commonly use the same id for ``pad_token`` and
+    ``eos_token``. Counting ids unequal to the pad id would therefore omit the
+    real EOS token from every non-truncated input. The processor's attention
+    mask is the unambiguous record of which positions the text tower encoded.
+
+    Best-effort: malformed/custom processor output returns ``None`` so the
+    caller can use the existing padding-free tokenizer recount. Metering must
+    never fail inference or accept a malformed count as settlement evidence.
+    """
+    try:
+        input_shape = tuple(input_ids.shape)
+        mask_shape = tuple(attention_mask.shape)
+        if len(input_shape) != 2 or mask_shape != input_shape or input_shape[0] != expected_len:
+            return None
+        if not bool(torch.logical_or(attention_mask == 0, attention_mask == 1).all().item()):
+            return None
+        return [int(row.sum().item()) for row in attention_mask]
+    except Exception:  # noqa: BLE001 — metering must never fail inference
+        return None
+
+
 # Cross-item preprocessing is CPU-bound (PIL decode + resize). Fan the flat
 # image set across a small bounded thread pool so decode/resize overlaps.
 _MAX_PREPROCESS_THREADS = 8
@@ -483,10 +512,9 @@ class SiglipAdapter(BaseAdapter):
             is_query: Whether items are queries.
             prepared_items: Optional list of ``PreparedItem[ImagePayload]``
                 from the framework's image preprocessor. When supplied, the
-                ``open_clip`` backend reuses the preprocessed pixel tensors
-                (which were computed in parallel on a CPU executor thread)
-                instead of re-running ``val_preproc`` here. The transformers
-                backend currently ignores this hint.
+                adapter reuses the preprocessed pixel tensors (which were
+                computed in parallel on a CPU executor thread) instead of
+                repeating processor work on the inference thread.
 
         Returns:
             EncodeOutput with dense embeddings.
@@ -499,22 +527,21 @@ class SiglipAdapter(BaseAdapter):
 
         self._validate_output_types(output_types)
 
-        # Index prepared image tensors by the original item index so the
-        # batched image path can reuse them. Only the open_clip backend
-        # currently consumes these; the transformers ImagePreprocessor produces
-        # tensors in a layout matching SiglipProcessor, but the transformers
-        # code path re-runs the processor inline — left untouched here to avoid
-        # behavioral drift on the google/siglip* regression tests.
+        # The worker supplies ``prepared_items`` positionally aligned with its
+        # fused ``items`` list. ``PreparedItem.original_index`` is only local to
+        # the originating request and therefore repeats when dynamic batching
+        # fuses concurrent requests; keying on it would overwrite tensors and
+        # attach another request's image to an item.
         prepared_by_index: dict[int, Any] = {}
-        if self._backend == "open_clip" and prepared_items:
-            for prepared in prepared_items:
+        if prepared_items:
+            for fused_index, prepared in enumerate(prepared_items):
                 payload = getattr(prepared, "payload", None)
                 if payload is None:
                     continue
                 pixel_values = getattr(payload, "pixel_values", None)
                 if pixel_values is None:
                     continue
-                prepared_by_index[prepared.original_index] = pixel_values
+                prepared_by_index[fused_index] = pixel_values
 
         # Partition items by modality (image takes precedence over text),
         # preserving original positions so the stacked output stays in order.
@@ -623,7 +650,7 @@ class SiglipAdapter(BaseAdapter):
             counts.append(len(item_images))
             orig_index = image_indices[slot]
             prepared = prepared_by_index.get(orig_index)
-            if self._backend == "open_clip" and prepared is not None and len(item_images) == 1:
+            if prepared is not None and len(item_images) == 1:
                 jobs.append(("ready", prepared))
             else:
                 jobs.extend(("decode", img_input) for img_input in item_images)
@@ -717,14 +744,20 @@ class SiglipAdapter(BaseAdapter):
                     truncation=True,
                     max_length=self._max_seq_length,
                 )
-                # Unit-meter seam (§7.3): SigLIP pads every text to a fixed
-                # length (and its tokenizer omits an attention mask), so count
-                # the exact content tokens via a padding-free recount over the
-                # processor tokenizer (capped at the model-specific context, rather than
-                # a fixed 64 tokens) — the real billable length, excluding padding.
-                token_counts = self._token_counts_or_none(
-                    self._processor.tokenizer, list(texts), expected_len=len(texts)
+                # Unit-meter seam (§7.3): the exact attention mask includes the
+                # real EOS token even when it shares an id with padding (the
+                # stock SigLIP tokenizer does this). Older/custom processors
+                # without a shape-valid binary mask retain the conservative
+                # padding-free recount fallback.
+                token_counts = _attention_mask_token_counts(
+                    inputs.get("input_ids"),
+                    inputs.get("attention_mask"),
+                    expected_len=len(texts),
                 )
+                if token_counts is None:
+                    token_counts = self._token_counts_or_none(
+                        self._processor.tokenizer, list(texts), expected_len=len(texts)
+                    )
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
             with torch.inference_mode():
                 text_features = _feature_tensor(self._model.get_text_features(**inputs))

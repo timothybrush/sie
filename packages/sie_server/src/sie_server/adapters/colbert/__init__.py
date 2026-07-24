@@ -34,6 +34,7 @@ import torch
 from torch.nn import functional
 
 from sie_server.adapters._base_adapter import BaseAdapter
+from sie_server.adapters._colbert_projection import load_standalone_colbert_projection
 from sie_server.adapters._flash_pack import build_position_ids
 from sie_server.adapters._multivector import maxsim_scores_batched
 from sie_server.adapters._pylate_dense import apply_dense_chain, load_pylate_dense_chain
@@ -81,6 +82,22 @@ class ColBERTAdapter(BaseAdapter):
         unload_fields=("_model", "_tokenizer", "_linear", "_actual_token_dim", "_dense_chain"),
     )
 
+    @staticmethod
+    def _coerce_runtime_max_length(raw: Any, ceiling: int) -> int:
+        """Return a positive runtime sequence length clamped to ``ceiling``."""
+        if raw is None or isinstance(raw, bool):
+            return ceiling
+        if isinstance(raw, int):
+            candidate = raw
+        else:
+            try:
+                candidate = int(raw)
+            except (TypeError, ValueError):
+                return ceiling
+        if candidate <= 0:
+            return ceiling
+        return min(candidate, ceiling)
+
     def __init__(
         self,
         model_name_or_path: str | Path,
@@ -99,6 +116,7 @@ class ColBERTAdapter(BaseAdapter):
         doc_punctuation_skiplist: bool = True,
         muvera_config: dict[str, Any] | None = None,
         revision: str | None = None,
+        code_revision: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -131,11 +149,15 @@ class ColBERTAdapter(BaseAdapter):
             revision: Optional HuggingFace revision/branch/commit SHA to pin when
                 loading the tokenizer, config, model, and Dense-chain/projection
                 artifacts. Forwarded to ``from_pretrained(..., revision=...)``.
+            code_revision: Optional independent commit SHA for trusted remote
+                code. Forwarded to every ``from_pretrained`` call that may load
+                repository code, including device fallbacks.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
         self._revision = revision
+        self._code_revision = code_revision
         self._token_dim = token_dim
         self._normalize = normalize
         self._max_seq_length = max_seq_length
@@ -186,6 +208,8 @@ class ColBERTAdapter(BaseAdapter):
         shared_kwargs: dict[str, Any] = {"trust_remote_code": True}
         if self._revision is not None:
             shared_kwargs["revision"] = self._revision
+        if self._code_revision is not None:
+            shared_kwargs["code_revision"] = self._code_revision
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_name_or_path,
@@ -406,48 +430,12 @@ class ColBERTAdapter(BaseAdapter):
         Some ColBERT models store the projection layer as 'linear.weight' in the
         safetensors file without registering it as a model attribute.
         """
-        try:
-            from huggingface_hub import hf_hub_download
-            from safetensors import safe_open
-
-            # Try to get safetensors file
-            try:
-                file_path = hf_hub_download(self._model_name_or_path, "model.safetensors", revision=self._revision)
-            except (OSError, ValueError):
-                return None
-
-            with safe_open(file_path, framework="pt") as f:
-                keys = list(f.keys())
-
-                # Look for standalone linear projection layer
-                if "linear.weight" in keys:
-                    weight = f.get_tensor("linear.weight")
-                    out_features, in_features = weight.shape
-
-                    # Create Linear layer and load weights
-                    # Check for bias
-                    has_bias = "linear.bias" in keys
-                    linear = torch.nn.Linear(in_features, out_features, bias=has_bias)
-                    linear.weight.data = weight
-
-                    if has_bias:
-                        linear.bias.data = f.get_tensor("linear.bias")
-
-                    # Move to device and set dtype
-                    dtype = self._resolve_dtype()
-                    linear = linear.to(self._device, dtype=dtype)
-
-                    logger.info(
-                        "Loaded projection layer from safetensors: %d -> %d",
-                        in_features,
-                        out_features,
-                    )
-                    return linear
-
-        except (ImportError, OSError, RuntimeError, KeyError) as e:
-            logger.debug("Failed to load projection from weights: %s", e)
-
-        return None
+        return load_standalone_colbert_projection(
+            self._model_name_or_path,
+            revision=self._revision,
+            device=self._device,
+            dtype=self._resolve_dtype(),
+        )
 
     def _resolve_dtype(self) -> torch.dtype:
         """Resolve compute dtype.
@@ -575,7 +563,17 @@ class ColBERTAdapter(BaseAdapter):
         self._validate_output_types(output_types)
         texts = self._extract_texts(items, instruction, is_query=is_query)
 
-        max_length = self._query_max_length if is_query else self._doc_max_length
+        opts = options or {}
+        if is_query:
+            max_length = self._coerce_runtime_max_length(
+                opts.get("query_max_length"),
+                self._query_max_length,
+            )
+        else:
+            max_length = self._coerce_runtime_max_length(
+                opts.get("max_seq_length"),
+                self._doc_max_length,
+            )
 
         # Determine if query expansion should be applied
         # Query expansion pads queries with MASK tokens to exactly max_length
@@ -621,7 +619,7 @@ class ColBERTAdapter(BaseAdapter):
         assert self._tokenizer is not None
 
         # Adjust max_length if we need to insert a prefix token
-        effective_max_length = max_length - 1 if prefix_id is not None else max_length
+        effective_max_length = max(1, max_length - 1) if prefix_id is not None else max_length
 
         # Serialise all tokenizer access (including the transient
         # ``pad_token_id`` swap) against the §7.3 metering tokenization that
@@ -750,7 +748,7 @@ class ColBERTAdapter(BaseAdapter):
         assert self._tokenizer is not None
 
         # Adjust max_length if we need to insert a prefix token
-        effective_max_length = max_length - 1 if prefix_id is not None else max_length
+        effective_max_length = max(1, max_length - 1) if prefix_id is not None else max_length
 
         # Serialise all tokenizer access (including the transient
         # ``pad_token_id`` swap) against the §7.3 metering tokenization that
@@ -804,6 +802,23 @@ class ColBERTAdapter(BaseAdapter):
         # Pack input_ids
         input_ids_packed = torch.cat([enc["input_ids"].squeeze(0) for enc in encodings]).to(self._device)
 
+        # Expanded MASK rows remain query positions so their output vectors are
+        # available to MaxSim, but PyLate/ColBERTv2's default attention contract
+        # excludes them from K/V. Build that smaller K/V layout from the CPU
+        # tokenizer masks before transferring it to the GPU. Non-expanded
+        # inputs are already unpadded and retain the original shared Q/K layout.
+        key_mask_packed: torch.Tensor | None = None
+        cu_seqlens_k: torch.Tensor | None = None
+        max_seqlen_k: int | None = None
+        if use_expansion:
+            attention_masks = [enc["attention_mask"].squeeze(0) for enc in encodings]
+            key_mask_packed = torch.cat(attention_masks).to(self._device, dtype=torch.bool)
+            key_seq_lengths = [int(mask.sum().item()) for mask in attention_masks]
+            cu_seqlens_k = torch.zeros(len(texts) + 1, dtype=torch.int32, device=self._device)
+            for i, length in enumerate(key_seq_lengths):
+                cu_seqlens_k[i + 1] = cu_seqlens_k[i] + length
+            max_seqlen_k = max(key_seq_lengths)
+
         # Build cu_seqlens (cumulative sequence lengths)
         cu_seqlens = torch.zeros(len(texts) + 1, dtype=torch.int32, device=self._device)
         for i, length in enumerate(seq_lengths):
@@ -817,7 +832,15 @@ class ColBERTAdapter(BaseAdapter):
             hidden = self._run_embeddings(input_ids_packed, position_ids_packed)
 
             # Run transformer layers with flash attention
-            hidden = self._run_transformer_flash(hidden, cu_seqlens, max_seqlen, total_tokens)
+            hidden = self._run_transformer_flash(
+                hidden,
+                cu_seqlens,
+                max_seqlen,
+                total_tokens,
+                key_mask_packed=key_mask_packed,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k,
+            )
 
             # Apply the trained pylate Dense chain if present, else the single
             # projection layer
@@ -913,6 +936,7 @@ class ColBERTAdapter(BaseAdapter):
             output_types=["multivector"],
             instruction=instruction,
             is_query=True,
+            options=options,
         )
         if query_output.multivector is None:
             raise RuntimeError("Failed to encode query: no multivector output")
@@ -923,6 +947,7 @@ class ColBERTAdapter(BaseAdapter):
             items,
             output_types=["multivector"],
             is_query=False,
+            options=options,
         )
 
         # MaxSim over all documents in one padded, masked batched matmul.
@@ -941,14 +966,19 @@ class ColBERTAdapter(BaseAdapter):
     ) -> ScoreOutput:
         """Score parallel (query, doc) pairs via per-query MaxSim grouping.
 
-        ColBERT scoring always uses ``output_types=["multivector"]`` and computes
-        MaxSim directly. Encode-time runtime ``options`` resolved from the profile
-        (e.g. ``muvera``/``output_types``/``output_similarity``) are irrelevant to
-        MaxSim, so they are accepted and ignored here rather than routed into
-        ``score()``.
+        ColBERT scoring always uses multivectors, while sequence-length runtime
+        options still apply to the query and documents.
         """
-        _ = options  # Encode-time options are irrelevant to MaxSim scoring.
-        return grouped_score_pairs(self.score, queries, docs, instruction=instruction)
+
+        def score_with_options(
+            query: Item,
+            items: list[Item],
+            *,
+            instruction: str | None = None,
+        ) -> list[float]:
+            return self.score(query, items, instruction=instruction, options=options)
+
+        return grouped_score_pairs(score_with_options, queries, docs, instruction=instruction)
 
     def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
         """Build position IDs for packed sequences."""
@@ -1005,6 +1035,10 @@ class ColBERTAdapter(BaseAdapter):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         total_tokens: int,
+        *,
+        key_mask_packed: torch.Tensor | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         """Run transformer layers using flash_attn_varlen_func.
 
@@ -1021,14 +1055,28 @@ class ColBERTAdapter(BaseAdapter):
         head_dim = hidden_size // num_heads
         softmax_scale = 1.0 / (head_dim**0.5)
 
+        if key_mask_packed is None:
+            effective_cu_seqlens_k = cu_seqlens
+            effective_max_seqlen_k = max_seqlen
+        else:
+            if cu_seqlens_k is None or max_seqlen_k is None:
+                raise ValueError("Masked ColBERT K/V requires cumulative and maximum key lengths")
+            if key_mask_packed.ndim != 1 or key_mask_packed.shape[0] != total_tokens:
+                raise ValueError("Packed ColBERT key mask must contain one entry per query token")
+            effective_cu_seqlens_k = cu_seqlens_k
+            effective_max_seqlen_k = max_seqlen_k
+
         for layer_untyped in self._model.encoder.layer:  # type: ignore
             layer = cast("Any", layer_untyped)
             attention = layer.attention.self
 
-            # QKV projections (standard BERT-style)
+            # Every expansion position remains a query, while only unmasked
+            # positions become keys/values. This matches BERT's padding-mask
+            # semantics without giving up the packed FlashAttention path.
+            key_hidden = hidden if key_mask_packed is None else hidden[key_mask_packed]
             query = attention.query(hidden).view(total_tokens, num_heads, head_dim)
-            key = attention.key(hidden).view(total_tokens, num_heads, head_dim)
-            value = attention.value(hidden).view(total_tokens, num_heads, head_dim)
+            key = attention.key(key_hidden).view(key_hidden.shape[0], num_heads, head_dim)
+            value = attention.value(key_hidden).view(key_hidden.shape[0], num_heads, head_dim)
 
             # Flash attention with variable-length sequences
             attn_out = flash_attn_varlen_func(
@@ -1036,9 +1084,9 @@ class ColBERTAdapter(BaseAdapter):
                 key,
                 value,
                 cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
+                cu_seqlens_k=effective_cu_seqlens_k,
                 max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
+                max_seqlen_k=effective_max_seqlen_k,
                 causal=False,
                 softmax_scale=softmax_scale,
             )

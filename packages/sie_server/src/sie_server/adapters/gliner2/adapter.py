@@ -53,6 +53,7 @@ class GLiNER2Adapter(BaseAdapter):
         *,
         threshold: float = 0.5,
         classification_task: str | None = None,
+        default_labels: list[str] | None = None,
         multi_label: bool = False,
         max_seq_length: int | None = None,
         compute_precision: ComputePrecision = "float16",
@@ -67,6 +68,8 @@ class GLiNER2Adapter(BaseAdapter):
             classification_task: Optional schema task name. When set, ``extract``
                 returns classifications instead of entities. The task may be
                 overridden per request through runtime options.
+            default_labels: Optional labels used when a request omits ``labels``.
+                Request-provided labels take precedence.
             multi_label: Whether the configured classification task may return
                 multiple labels.
             max_seq_length: Maximum document and schema input length.
@@ -79,6 +82,7 @@ class GLiNER2Adapter(BaseAdapter):
         self._model_name_or_path = str(model_name_or_path)
         self._threshold = threshold
         self._classification_task = classification_task
+        self._default_labels = self._validate_labels(default_labels) if default_labels is not None else None
         self._multi_label = multi_label
         self._max_seq_length = max_seq_length
         self._compute_precision = compute_precision
@@ -154,7 +158,8 @@ class GLiNER2Adapter(BaseAdapter):
                 input_token_counts=input_token_counts,
             )
 
-        normalized_labels = self._validate_labels(labels)
+        effective_labels = labels if labels is not None else self._default_labels
+        normalized_labels = self._validate_labels(effective_labels)
         relation_entities = [self._extract_relation_entities(item) for item in items]
         if any(entities is not None for entities in relation_entities):
             if not all(entities for entities in relation_entities):
@@ -380,6 +385,10 @@ class GLiNER2Adapter(BaseAdapter):
 
     @staticmethod
     def _validate_labels(labels: list[str] | None) -> list[str]:
+        if labels is None:
+            raise ValueError(_ERR_REQUIRES_LABELS)
+        if not isinstance(labels, list):
+            raise ValueError("GLiNER2 labels must be a list")
         if not labels:
             raise ValueError(_ERR_REQUIRES_LABELS)
         if any(not isinstance(label, str) or not label.strip() for label in labels):

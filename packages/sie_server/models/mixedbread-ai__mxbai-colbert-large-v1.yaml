@@ -44,4 +44,4 @@ profiles:
         output_types:
         - dense
         output_similarity:
-          dense: dot
+          dense: cosine

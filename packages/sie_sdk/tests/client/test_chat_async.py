@@ -161,9 +161,10 @@ async def test_async_stream_generate_yields_and_normalizes_path() -> None:
             "Qwen/Qwen3-4B-Instruct",
             "hi",
             max_new_tokens=8,
+            images=[{"data": b"\x89PNG\r\n\x1a\npayload", "format": "png"}],
             frequency_penalty=0.25,
             presence_penalty=-0.5,
-            grammar={"regex": "[a-z]+"},
+            grammar={"regex": "[a-z]+", "label": None, "strict": None},
             seed=-3,
             logit_bias={"123": 1.5},
             logprobs=True,
@@ -183,10 +184,11 @@ async def test_async_stream_generate_yields_and_normalizes_path() -> None:
     assert sent == {
         "prompt": "hi",
         "max_new_tokens": 8,
+        "images": [{"data": "iVBORw0KGgpwYXlsb2Fk", "format": "png"}],
         "stream": True,
         "frequency_penalty": 0.25,
         "presence_penalty": -0.5,
-        "grammar": {"regex": "[a-z]+"},
+        "grammar": {"regex": "[a-z]+", "label": None, "strict": None},
         "seed": -3,
         "logit_bias": {"123": 1.5},
         "top_logprobs": 3,
@@ -196,6 +198,24 @@ async def test_async_stream_generate_yields_and_normalizes_path() -> None:
         "lora_adapter": "sql-adapter",
         "logprobs": True,
     }
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_stream_generate_validates_extra_body_grammar_before_request() -> None:
+    client = SIEAsyncClient("http://localhost:8080")
+    session = _patch_session(client, post_returns=_FakeRaw())
+    with pytest.raises(ValueError, match="exactly one"):
+        _ = [
+            chunk
+            async for chunk in client.stream_generate(
+                "m",
+                "hi",
+                max_new_tokens=8,
+                extra_body={"grammar": {"regex": "x", "ebnf": 'root ::= "x"'}},
+            )
+        ]
+    session.post.assert_not_called()
     await client.close()
 
 

@@ -54,7 +54,7 @@ import msgpack_numpy as m
 from sie_sdk.audio import convert_item_audio
 from sie_sdk.documents import convert_item_document
 from sie_sdk.files import resolve_upload
-from sie_sdk.images import convert_item_images
+from sie_sdk.images import ImageLike, convert_images_for_json, convert_item_images
 from sie_sdk.jobs import TERMINAL_JOB_STATES, build_job_body, decode_chunk_bytes, job_chunks
 from sie_sdk.types import (
     Batch,
@@ -70,6 +70,8 @@ from sie_sdk.types import (
     File,
     FileDeleted,
     GenerateChunk,
+    GenerateGrammar,
+    GenerateImage,
     GenerateResult,
     Item,
     JobResults,
@@ -80,6 +82,8 @@ from sie_sdk.types import (
     PoolInfo,
     PoolSpec,
     RequestMetadata,
+    ResponseInputMessage,
+    ResponseResult,
     ScoreResult,
     StatusMessage,
     WorkerInfo,
@@ -107,6 +111,7 @@ from ._shared import (
     attach_request_metadata,
     base_url_accepts_origin_credentials,
     build_chat_body,
+    build_responses_body,
     check_version_skew,
     compute_oom_backoff,
     compute_retry_delay,
@@ -132,6 +137,8 @@ from ._shared import (
     sse_chunk_error,
     sse_headers,
     validate_encode_result_count,
+    validate_generate_grammar,
+    validate_generate_request_body,
     websocket_matches_base_url_origin,
 )
 from ._sse import iter_sse_payloads
@@ -2030,12 +2037,13 @@ class SIEClient:
         prompt: str,
         *,
         max_new_tokens: int,
+        images: Sequence[ImageLike | GenerateImage | dict[str, Any]] | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         stop: list[str] | None = None,
         frequency_penalty: float | None = None,
         presence_penalty: float | None = None,
-        grammar: dict[str, Any] | None = None,
+        grammar: GenerateGrammar | Mapping[str, Any] | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
         routing_key: str | None = None,
@@ -2065,6 +2073,9 @@ class SIEClient:
                 helpers in the SDK (use the OpenAI SDK against
                 ``/v1/chat/completions`` for chat-shaped requests).
             max_new_tokens: Hard cap on output tokens.
+            images: Optional native image inputs. When present, the worker
+                renders one user turn containing the images and ``prompt``
+                through the model's own chat template before generation.
             temperature: Sampling temperature override. Omit to use the
                 selected model profile's default.
             top_p: Nucleus sampling cutoff override. Omit to use the selected
@@ -2072,7 +2083,8 @@ class SIEClient:
             stop: Optional list of stop strings.
             frequency_penalty: OpenAI-compatible frequency penalty in ``[-2, 2]``.
             presence_penalty: OpenAI-compatible presence penalty in ``[-2, 2]``.
-            grammar: Optional native structured-output grammar.
+            grammar: Optional native structured-output grammar. Set exactly
+                one of ``json_schema``, ``regex``, or ``ebnf``.
             seed: Optional signed 64-bit per-request sampling seed. Exact
                 reproducibility depends on the active generation backend and
                 deployment configuration.
@@ -2104,6 +2116,7 @@ class SIEClient:
                 retried) or other 5xx responses.
         """
         self._reset_retry_count()
+        resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
 
         safe_model = model.replace("/", "__")
@@ -2113,6 +2126,8 @@ class SIEClient:
             "prompt": prompt,
             "max_new_tokens": max_new_tokens,
         }
+        if images is not None:
+            request_body["images"] = convert_images_for_json(images)
         if stop is not None:
             request_body["stop"] = stop
         optional_fields = {
@@ -2121,7 +2136,7 @@ class SIEClient:
             "options": resolved_options,
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
-            "grammar": grammar,
+            "grammar": resolved_grammar,
             "seed": seed,
             "logit_bias": logit_bias,
             "routing_key": routing_key,
@@ -2130,6 +2145,7 @@ class SIEClient:
             "lora_adapter": lora_adapter,
         }
         request_body.update({key: value for key, value in optional_fields.items() if value is not None})
+        validate_generate_request_body(request_body)
 
         body = json.dumps(request_body).encode("utf-8")
         headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
@@ -2263,6 +2279,132 @@ class SIEClient:
         result = _parse_generate_result(data, request=parse_request_metadata(response.headers))
         attach_request_metadata([result], response.headers)
         return result
+
+    def responses(
+        self,
+        model: str,
+        input: str | Sequence[ResponseInputMessage],
+        *,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
+        gpu: str | None = None,
+        wait_for_capacity: bool = True,
+        provision_timeout_s: float | None = None,
+        max_oom_retries: int = RESOURCE_EXHAUSTED_MAX_RETRIES,
+    ) -> ResponseResult:
+        """Create one non-streaming OpenAI-compatible Responses result.
+
+        The gateway's Responses MVP is stateless and text-only. ``input`` may
+        be a raw prompt or a sequence of role/content messages; content-part
+        arrays accept text parts only. Streaming, tools, stateful threading,
+        reasoning, metadata, instructions, and multimodal parts are not
+        supported by this surface.
+
+        Generation is non-idempotent. Only explicit pre-execution 503
+        PROVISIONING / MODEL_LOADING / RESOURCE_EXHAUSTED responses and
+        connect-before-send failures are retried. Mid-flight transport errors
+        and post-publish 504 responses are terminal so a retry cannot
+        double-bill or create a second completion.
+
+        Args:
+            model: Model name to use for generation.
+            input: Raw prompt string or typed role/content messages.
+            max_output_tokens: Optional hard cap on output tokens.
+            temperature: Optional sampling temperature override.
+            top_p: Optional nucleus sampling cutoff override.
+            seed: Optional signed 64-bit per-request sampling seed.
+            gpu: Target GPU type or pool spec; see :meth:`encode`.
+            wait_for_capacity: Auto-retry ``503 PROVISIONING`` responses
+                under ``provision_timeout_s``. Worker-side model loading and
+                resource-exhaustion retries follow their own bounded policies.
+            provision_timeout_s: Maximum time to wait for capacity.
+            max_oom_retries: Maximum number of worker-side
+                ``503 RESOURCE_EXHAUSTED`` retries.
+
+        Returns:
+            A typed :class:`ResponseResult`.
+
+        Raises:
+            ProvisioningError: If capacity is unavailable and waiting is
+                disabled, or the provisioning timeout is exceeded.
+            ModelLoadingError: If worker-side model-loading retries time out.
+            ResourceExhaustedError: If worker-side OOM retries are exhausted.
+            ServerError: On post-publish ``504`` or other server errors.
+            SIEConnectionError: If the request cannot be sent safely or the
+                connection fails after sending.
+        """
+        self._reset_retry_count()
+        pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
+        body = json.dumps(
+            build_responses_body(
+                model,
+                input,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+            )
+        ).encode("utf-8")
+        headers: dict[str, str] = {"content-type": JSON_CONTENT_TYPE, "accept": JSON_CONTENT_TYPE}
+        if resolved_gpu:
+            headers["X-SIE-MACHINE-PROFILE"] = resolved_gpu
+        if pool_name:
+            headers["X-SIE-Pool"] = pool_name
+
+        timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
+        start_time = time.monotonic()
+        oom_retries = 0
+        while True:
+            remaining = timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                msg = f"Provision timeout ({timeout:.1f}s) exceeded before request could be sent"
+                raise ProvisioningError(msg, gpu=resolved_gpu)
+            try:
+                response = self._client.post(
+                    "/v1/responses",
+                    content=body,
+                    headers=headers,
+                    timeout=min(self._timeout, remaining),
+                )
+            except httpx.ConnectError as e:
+                if wait_for_capacity and is_transient_connect_error(e):
+                    delay_s = compute_retry_delay(
+                        start_time=start_time,
+                        timeout=timeout,
+                        error_label="Connect error",
+                        error=e,
+                    )
+                    if delay_s is not None:
+                        self._record_retry()
+                        time.sleep(delay_s)
+                        continue
+                msg = f"Failed to connect to {self._base_url}: {e}"
+                raise SIEConnectionError(msg) from e
+            except _RETRYABLE_TRANSPORT_ERRORS as e:
+                msg = f"Connection lost mid-request ({type(e).__name__}): {e}"
+                raise SIEConnectionError(msg) from e
+
+            if response.status_code == 200:
+                break
+            delay, oom_retries = next_stream_retry_delay(
+                response,
+                model=model,
+                gpu=resolved_gpu,
+                wait_for_capacity=wait_for_capacity,
+                start_time=start_time,
+                timeout=timeout,
+                oom_retries=oom_retries,
+                max_oom_retries=max_oom_retries,
+            )
+            self._record_retry()
+            time.sleep(delay)
+
+        self._check_server_version(response)
+        data = parse_terminal_json_object(response, owner="Responses")
+        attach_request_metadata([data], response.headers)
+        return cast("ResponseResult", data)
 
     def chat_completions(
         self,
@@ -2494,12 +2636,13 @@ class SIEClient:
         prompt: str,
         *,
         max_new_tokens: int,
+        images: Sequence[ImageLike | GenerateImage | dict[str, Any]] | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         stop: list[str] | None = None,
         frequency_penalty: float | None = None,
         presence_penalty: float | None = None,
-        grammar: dict[str, Any] | None = None,
+        grammar: GenerateGrammar | Mapping[str, Any] | None = None,
         seed: int | None = None,
         logit_bias: dict[str, float] | None = None,
         logprobs: bool = False,
@@ -2521,6 +2664,7 @@ class SIEClient:
         ``done: true`` plus ``usage`` / ``ttft_ms``. Error semantics match
         :meth:`stream_chat_completions`.
         """
+        resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
         safe_model = model.replace("/", "__")
         resolved_options = self._resolve_options(options)
@@ -2529,6 +2673,8 @@ class SIEClient:
             "max_new_tokens": max_new_tokens,
             "stream": True,
         }
+        if images is not None:
+            req["images"] = convert_images_for_json(images)
         if stop is not None:
             req["stop"] = stop
         optional_fields = {
@@ -2537,7 +2683,7 @@ class SIEClient:
             "top_p": top_p,
             "options": resolved_options,
             "presence_penalty": presence_penalty,
-            "grammar": grammar,
+            "grammar": resolved_grammar,
             "seed": seed,
             "logit_bias": logit_bias,
             "routing_key": routing_key,
@@ -2552,6 +2698,7 @@ class SIEClient:
                 req["top_logprobs"] = top_logprobs
         if extra_body:
             req.update(extra_body)
+        validate_generate_request_body(req)
         if not req.get("logprobs"):
             req.pop("top_logprobs", None)
         req.update(prompt=prompt, max_new_tokens=max_new_tokens, stream=True)

@@ -13,6 +13,7 @@ import yaml
 
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
+from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_output_types
 from sie_server.core.oom import is_oom_error
 from sie_server.core.prepared import AudioPayload, AudioPreparedItem, ExtractPreparedItem
 from sie_server.core.registry import ModelRegistry
@@ -868,8 +869,6 @@ class QueueExecutor:
         ``instruction``, ``is_query``, or ``options`` — these cannot share a
         single ``EncodePipeline.run_encode()`` call.
         """
-        from sie_server.core.encode_pipeline import EncodePipeline  # noqa: PLC0415
-
         model_id = req.model_id
         items = req.items
 
@@ -957,31 +956,25 @@ class QueueExecutor:
                 # embedders silently lose their query template on the cluster
                 # path (#1489). An unknown profile name raises ValueError, which
                 # the surrounding except turns into per-item failures.
-                options = merge_runtime_options(config, options)
-                # Profile-default ``output_types`` parity with the OSS HTTP path
-                # (api.encode resolves ``profile > request > default``). The
-                # gateway forwards only the request-level output_types, so a
-                # profile whose runtime declares an output_types default (e.g.
-                # the ``bge-m3:sparse`` variant, whose promoted "default" profile
-                # carries ``output_types: [sparse]``) would otherwise be served
-                # dense-only here — the managed path silently dropped it. Reuse
-                # the merged profile runtime (same resolver, no duplicated
-                # precedence) and apply it exactly as api.encode does. The group
-                # key already folded request→``["dense"]``, so this is precisely
-                # ``profile or request or default``, keeping managed == OSS (P6.6).
-                profile_output_types = options.get("output_types")
-                if profile_output_types:
-                    output_types = list(profile_output_types)
+                request_options = options
+                options = merge_runtime_options(config, request_options)
+                adapter_output_types, output_types = resolve_encode_output_types(
+                    config,
+                    output_types,
+                    request_options,
+                    options,
+                )
                 formatted_outputs, timing = await EncodePipeline.run_encode(
                     registry=self._registry,
                     model=model_id,
                     items=server_items,
-                    output_types=output_types,
+                    output_types=adapter_output_types,
                     instruction=instruction,
                     config=config,
                     is_query=is_query,
                     options=options,
                     prepared_tokens_per_item=prepared_tokens_per_item,
+                    response_output_types=output_types,
                     preformed_batch=True,
                 )
 

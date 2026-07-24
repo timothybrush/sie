@@ -85,10 +85,12 @@ class DoclingAdapter(BaseAdapter):
     """Composite-document parser backed by Docling's `DocumentConverter`.
 
     Supports PDF, DOCX, HTML, and other formats Docling auto-detects from bytes.
-    The adapter is package-backed (no single HF/local weight source). Development
-    may use Docling's live artifact downloads. Promoted offline serving instead
-    supplies a loader-verified staged artifact root, which is passed to every
-    Docling pipeline so missing files fail rather than silently changing weights.
+    Docling expects one artifact root containing its layout, table, and OCR
+    assets. The adapter accepts that root through the same ``model_name_or_path``
+    contract as other adapters: a local ``weights_path`` is used directly and an
+    ``hf_id`` is resolved at its pinned revision. The legacy package-artifact
+    root remains supported while existing configs migrate to the ordinary model
+    source contract.
 
     Result shape (per item, in ``ExtractOutput.data``):
 
@@ -122,8 +124,9 @@ class DoclingAdapter(BaseAdapter):
 
     def __init__(
         self,
-        model_name_or_path: str | None = None,  # unused; Docling is package-backed
+        model_name_or_path: str | Path | None = None,
         *,
+        revision: str | None = None,
         compute_precision: str | None = None,  # unused; device is threaded via load()
         max_num_pages: int = 100,
         max_file_size_bytes: int = 16 * 1024 * 1024,
@@ -132,18 +135,24 @@ class DoclingAdapter(BaseAdapter):
         package_artifact_manifest_sha256: str | None = None,
         **kwargs: Any,
     ) -> None:
-        _ = (model_name_or_path, compute_precision, kwargs)
+        _ = (compute_precision, kwargs)
+        if model_name_or_path is not None and package_artifact_root is not None:
+            raise ValueError("Docling requires exactly one ordinary or package artifact source")
         self._max_num_pages = _positive_int("max_num_pages", max_num_pages)
         self._max_file_size_bytes = _positive_int("max_file_size_bytes", max_file_size_bytes)
         self._document_timeout_s = _positive_finite_float("document_timeout_s", document_timeout_s)
         self._loaded = False
         self._device: str | None = None
         self._converters: dict[bool, Any] = {}
+        self._model_name_or_path = model_name_or_path
+        self._revision = revision
         self._package_artifact_root = Path(package_artifact_root) if package_artifact_root is not None else None
         self._package_artifact_manifest_sha256 = package_artifact_manifest_sha256
+        self._artifacts_path: Path | None = None
 
     def load(self, device: str) -> None:
         self._device = device
+        self._artifacts_path = self._resolve_artifacts_path()
         # Pre-warm: triggers Docling's lazy download of layout/table models so
         # the first real request doesn't block on a multi-hundred-MB pull.
         # Models cache globally, so subsequent per-task converters are cheap.
@@ -168,13 +177,35 @@ class DoclingAdapter(BaseAdapter):
             if ocr_warm_error is not None:
                 raise RuntimeError(ocr_warm_error.message)
         except Exception as exc:
-            if self._package_artifact_root is not None:
+            if self._artifacts_path is not None:
                 raise RuntimeError("Docling staged artifact initialization failed") from exc
             logger.exception("Docling pre-warm failed; first real request may be slow")
         self._loaded = True
 
+    def _resolve_artifacts_path(self) -> Path | None:
+        """Resolve an ordinary local or immutable Hub model source for Docling."""
+        if self._package_artifact_root is not None:
+            return self._package_artifact_root
+        if self._model_name_or_path is None:
+            return None
+        if isinstance(self._model_name_or_path, Path):
+            path = self._model_name_or_path.resolve()
+            if not path.is_dir():
+                raise ValueError("Docling local artifact source must be an existing directory")
+            return path
+
+        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(
+                repo_id=self._model_name_or_path,
+                revision=self._revision,
+            )
+        ).resolve()
+
     def unload(self) -> None:
         self._converters.clear()
+        self._artifacts_path = None
         self._loaded = False
         super().unload()
 
@@ -355,8 +386,9 @@ class DoclingAdapter(BaseAdapter):
             "do_ocr": ocr_enabled,
             "document_timeout": self._document_timeout_s,
         }
-        if self._package_artifact_root is not None:
-            pdf_kwargs["artifacts_path"] = self._package_artifact_root
+        artifacts_path = self._artifacts_path or self._package_artifact_root
+        if artifacts_path is not None:
+            pdf_kwargs["artifacts_path"] = artifacts_path
         if accelerator_options is not None:
             pdf_kwargs["accelerator_options"] = accelerator_options
         pdf_opts = PdfPipelineOptions(**pdf_kwargs)

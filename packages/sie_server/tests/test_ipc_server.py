@@ -149,7 +149,11 @@ def _make_executor() -> tuple[QueueExecutor, MagicMock]:
     reg.loaded_model_names = ["test/model"]
     reg.is_loaded.return_value = True
     reg.is_loading.return_value = False
-    reg.get_config.return_value = MagicMock()
+    config = MagicMock()
+    config.sie_id = "test/model"
+    config.outputs = ["dense"]
+    config.resolve_profile.return_value.runtime = {}
+    reg.get_config.return_value = config
     reg.get_configs_snapshot.return_value = {}
     return QueueExecutor(reg), reg
 

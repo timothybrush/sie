@@ -36,7 +36,11 @@ fn openai_model_object(name: &str) -> Value {
     tag = "models",
     responses((status = 200, description = "Models visible to this gateway replica", body = crate::openapi::ModelsResponse))
 )]
-pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let ext = req.extensions();
     let model_workers =
         canonical_worker_models(state.registry.get_models().await, &state.model_registry);
 
@@ -45,6 +49,15 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .list_models()
         .into_iter()
         .chain(model_workers.keys().cloned())
+        // #1841 org-scoped visibility: drop models this caller cannot see (other
+        // orgs' custom models), so the listing carries no cross-org existence
+        // oracle. No-op in OSS self-host (policy is None).
+        .filter(|name| {
+            state
+                .model_access_policy
+                .as_ref()
+                .is_none_or(|p| p.visible(name, ext))
+        })
         .collect();
     let models: Vec<serde_json::Value> = model_names
         .iter()
@@ -93,7 +106,11 @@ pub async fn get_models(State(state): State<Arc<AppState>>) -> impl IntoResponse
         (status = 404, description = "Model not found", body = crate::openapi::ModelNotFoundResponse)
     )
 )]
-pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppState>>) -> Response {
+pub async fn get_model(
+    Path(model): Path<String>,
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
     let model_entry = state.model_registry.get_model_info(&model);
     let known_in_registry = model_entry.is_some();
     // Own the canonical name so it stays valid after `model_entry` is
@@ -102,6 +119,24 @@ pub async fn get_model(Path(model): Path<String>, State(state): State<Arc<AppSta
         .as_ref()
         .map(|entry| entry.name.clone())
         .unwrap_or_else(|| model.clone());
+    // #1841 org-scoped visibility: a model this caller cannot see 404s exactly
+    // like an unknown one (no cross-org existence oracle). No-op in OSS.
+    if state
+        .model_access_policy
+        .as_ref()
+        .is_some_and(|p| !p.visible(&canonical_model, req.extensions()))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "detail": {
+                    "code": "MODEL_NOT_FOUND",
+                    "message": format!("Model '{}' not found", model),
+                }
+            })),
+        )
+            .into_response();
+    }
     let bundles = state.model_registry.get_model_bundles(&model);
     let model_workers =
         canonical_worker_models(state.registry.get_models().await, &state.model_registry);
@@ -422,6 +457,7 @@ mod route_tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         });
         let router = create_router(Arc::clone(&state), config);
         (router, state, bundles_dir, models_dir)
@@ -569,26 +605,30 @@ mod route_tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         };
         seed_model(&state, "test/model");
 
         use crate::handlers::proxy::resolve_model_and_bundle;
         // sql -> BF16 bundle; code -> FP8 bundle (same base model, different precision).
         assert_eq!(
-            resolve_model_and_bundle(&state, "sql").unwrap(),
+            resolve_model_and_bundle(&state, "sql", &axum::http::Extensions::new()).unwrap(),
             ("test/model".to_string(), "bf16-pytorch".to_string()),
         );
         assert_eq!(
-            resolve_model_and_bundle(&state, "code").unwrap(),
+            resolve_model_and_bundle(&state, "code", &axum::http::Extensions::new()).unwrap(),
             ("test/model".to_string(), "fp8-pytorch".to_string()),
         );
         // An explicit caller bundle overrides the alias's bundle.
         assert_eq!(
-            resolve_model_and_bundle(&state, "fp8-pytorch:/sql").unwrap(),
+            resolve_model_and_bundle(&state, "fp8-pytorch:/sql", &axum::http::Extensions::new())
+                .unwrap(),
             ("test/model".to_string(), "fp8-pytorch".to_string()),
         );
         // Alias -> a bundle the model isn't registered under: hard 409, no fallback.
-        assert!(resolve_model_and_bundle(&state, "broken").is_err());
+        assert!(
+            resolve_model_and_bundle(&state, "broken", &axum::http::Extensions::new()).is_err()
+        );
     }
 
     /// Seed a multi-profile model whose profiles declare disjoint LoRA

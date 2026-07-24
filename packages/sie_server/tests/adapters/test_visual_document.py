@@ -4,18 +4,57 @@ These adapters encode document images into multi-vector representations
 for late interaction retrieval using MaxSim scoring.
 """
 
+import io
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import torch
+from PIL import Image as PILImage
 from sie_server.adapters.colpali import ColPaliAdapter
 from sie_server.adapters.colqwen2 import ColQwen2Adapter
 from sie_server.adapters.colqwen3 import ColQwen3Adapter
 from sie_server.adapters.colsmol import ColSmolAdapter
 from sie_server.adapters.nemo_colembed import NemoColEmbedAdapter
+from sie_server.core.preprocessor import ImagePreprocessor
 from sie_server.types.inputs import Item
+
+
+class _BorrowGuard:
+    """Fake HF processor that flags any overlapping (concurrent) entry.
+
+    Stands in for the non-thread-safe Rust fast tokenizer: a second call while
+    one is still in flight is the ``RuntimeError: Already borrowed`` that #2098
+    serialises away. Returns both ``input_ids`` (text-encode paths) and
+    ``pixel_values`` (the ImagePreprocessor path) so it fits either call site.
+    """
+
+    def __init__(self, sleep_s: float = 0.02) -> None:
+        self._guard = threading.Lock()
+        self._sleep_s = sleep_s
+        self.active = 0
+        self.max_concurrent = 0
+        self.borrow_error = False
+
+    def __call__(self, *args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+        with self._guard:
+            if self.active > 0:
+                self.borrow_error = True
+                raise RuntimeError("Already borrowed")
+            self.active += 1
+            self.max_concurrent = max(self.max_concurrent, self.active)
+        time.sleep(self._sleep_s)
+        with self._guard:
+            self.active -= 1
+        return {
+            "input_ids": torch.zeros((1, 3), dtype=torch.long),
+            "pixel_values": torch.zeros((1, 3, 4, 4)),
+        }
 
 
 class TestColPaliAdapter:
@@ -206,6 +245,38 @@ class TestColQwen2Adapter:
         with pytest.raises(ValueError, match="Unsupported output types"):
             adapter.encode(items, output_types=["sparse"])
 
+    def test_concurrent_forwards_serialize(self, adapter: ColQwen2Adapter) -> None:
+        """The forward lock serializes model forwards across threads (#2144/#2204).
+
+        ColQwen2_5.forward requests output_hidden_states=True and this adapter
+        has no preprocessor, so every request runs on the unserialized
+        to_thread path; overlapping forwards race transformers' recorder
+        patch/restore and leak layer outputs on GPU. The tokenizer lock is
+        released before the forward, so only ``_forward_lock`` covers it.
+        """
+        counter_guard = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def forward(**kwargs: Any) -> Any:
+            nonlocal active, max_active
+            with counter_guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with counter_guard:
+                active -= 1
+            return torch.zeros(1, 3, 128)
+
+        adapter._model = MagicMock(side_effect=forward)
+        adapter._processor = MagicMock(return_value={"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+        adapter._device = "cpu"
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: adapter._encode_text("q"), range(6)))
+
+        assert max_active == 1
+
 
 class TestColQwen3Adapter:
     """Tests for ColQwen3Adapter with mocked model."""
@@ -322,6 +393,56 @@ class TestColQwen3Adapter:
         assert mv[0, 0] == 1.0
         assert mv[3, 0] == 2.0
         assert mv[8, 0] == 3.0
+
+    def test_colqwen3_processor_call_holds_tokenizer_lock(self, adapter: ColQwen3Adapter) -> None:
+        """The processor call runs under ``_tokenizer_lock`` (#2098).
+
+        HF fast tokenizers are not thread-safe under per-call padding, so the
+        adapter must hold the lock across the ``self._processor(...)`` call.
+        The fake processor samples ``_tokenizer_lock.locked()`` at call time.
+        """
+        held: dict[str, bool] = {}
+
+        def fake_processor(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+            held["value"] = adapter._tokenizer_lock.locked()
+            return {"input_ids": torch.zeros((1, 3), dtype=torch.long)}
+
+        adapter._processor = fake_processor
+        adapter._model = lambda **kwargs: SimpleNamespace(embeddings=torch.zeros((1, 3, 4)))
+        adapter._device = "cpu"
+
+        adapter._encode_text("q")
+
+        assert held.get("value") is True
+
+    def test_colqwen3_concurrent_encode_text_serialized(self, adapter: ColQwen3Adapter) -> None:
+        """Concurrent text encodes are serialized, so the shared processor is
+        never entered re-entrantly (proxy for the Rust ``Already borrowed``).
+        """
+        guard = _BorrowGuard()
+        adapter._processor = guard
+        adapter._model = lambda **kwargs: SimpleNamespace(embeddings=torch.zeros((1, 3, 4)))
+        adapter._device = "cpu"
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                adapter._encode_text("q")
+            except BaseException as exc:  # noqa: BLE001 - record for assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert guard.borrow_error is False
+        assert guard.max_concurrent == 1
 
 
 class TestColSmolAdapter:
@@ -475,6 +596,56 @@ class TestNemoColEmbedAdapter:
         with pytest.raises(ValueError, match="Unsupported output types"):
             adapter.encode(items, output_types=["sparse"])
 
+    def test_concurrent_forwards_serialize(self, adapter: NemoColEmbedAdapter) -> None:
+        """The v1 document forward (output_hidden_states=True) is serialized by
+        _forward_lock, so concurrent forwards cannot race the recorder
+        patch/restore (#2144/#2204). Defensive: v1 uses a remote model class.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        class _StopAfterForwardError(RuntimeError):
+            pass
+
+        counter_guard = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def forward(**kwargs: Any) -> Any:
+            nonlocal active, max_active
+            with counter_guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with counter_guard:
+                active -= 1
+            raise _StopAfterForwardError  # skip the reshape/EncodeOutput tail
+
+        processor = MagicMock()
+        processor.collate = MagicMock(
+            return_value={
+                "pixel_values": torch.zeros(1, 3, 2, 2),
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            }
+        )
+        adapter._processor = processor
+        adapter._model = MagicMock(side_effect=forward)
+        adapter._device = "cpu"
+        adapter._batch_size = 1
+
+        def call(_: int) -> None:
+            try:
+                adapter._encode_images_preprocessed([Item(text="d")], [object()], is_query=False)
+            except _StopAfterForwardError:
+                # Forward ran (overlap recorded); the downstream reshape/EncodeOutput
+                # tail is intentionally skipped — only forward serialization is under test.
+                pass
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(call, range(6)))
+
+        assert max_active == 1
+
 
 class TestNemoColEmbedPreprocessor:
     """Tests for NemoColEmbedPreprocessor infrastructure."""
@@ -593,3 +764,198 @@ class TestVLMCudaCacheClearing:
         assert "torch.cuda.empty_cache()" in source, (
             "NemoColEmbed._encode_images_preprocessed must call torch.cuda.empty_cache() to prevent OOM"
         )
+
+
+class TestColFamilyTokenizerLock:
+    """#2098: every Col-family adapter must hold a per-call tokenizer lock around
+    the shared HF processor on the direct (get_preprocessor -> None) encode path,
+    so concurrent text queries cannot race the Rust fast tokenizer.
+    """
+
+    @staticmethod
+    def _obj_model(**kwargs: Any) -> Any:
+        """Fake model returning a ModelOutput-like object (colqwen3/colpali)."""
+        return SimpleNamespace(embeddings=torch.zeros((1, 3, 4)))
+
+    @staticmethod
+    def _tensor_model(**kwargs: Any) -> torch.Tensor:
+        """Fake model returning the embeddings tensor directly (colqwen2/colsmol)."""
+        return torch.zeros((1, 3, 4))
+
+    @pytest.mark.parametrize(
+        ("adapter_factory", "model_kind"),
+        [
+            (lambda: ColQwen3Adapter("stub/colqwen3"), "obj"),
+            (lambda: ColQwen2Adapter("stub/colqwen2"), "tensor"),
+            (lambda: ColSmolAdapter("stub/colsmol"), "tensor"),
+            (lambda: ColPaliAdapter("stub/colpali"), "obj"),
+        ],
+    )
+    def test_encode_text_holds_tokenizer_lock(self, adapter_factory: Any, model_kind: str) -> None:
+        adapter = adapter_factory()
+        held: dict[str, bool] = {}
+
+        def fake_processor(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+            held["value"] = adapter._tokenizer_lock.locked()
+            return {"input_ids": torch.zeros((1, 3), dtype=torch.long)}
+
+        adapter._processor = fake_processor
+        adapter._model = self._obj_model if model_kind == "obj" else self._tensor_model
+        adapter._device = "cpu"
+
+        adapter._encode_text("q")
+
+        assert held.get("value") is True
+
+
+class _PoolProbeState:
+    """Shared state behind a per-thread processor factory (#2098).
+
+    Each ``ImagePreprocessor.prepare`` thread gets its own ``_PoolProbeProcessor``
+    (one factory call), but they all report into this single state object. It
+    counts how many processors the factory built and — via a shared atomic
+    counter — the peak number of threads simultaneously inside *any* processor
+    call. With per-thread instances and a real sleep in each call, two concurrent
+    prepares overlap, so ``max_cross_instance`` reaches 2: proof the pool is NOT
+    serialised. A pool-wide lock would cap it at 1.
+    """
+
+    def __init__(self, sleep_s: float = 0.02) -> None:
+        self.lock = threading.Lock()
+        self._sleep_s = sleep_s
+        self.instances = 0  # processors the factory built (== threads that touched it)
+        self.active = 0  # threads currently inside some processor call
+        self.max_cross_instance = 0  # peak of `active`
+        self.reentered = False  # a single instance was entered concurrently (must not happen)
+
+    def make_processor(self) -> "_PoolProbeProcessor":
+        with self.lock:
+            self.instances += 1
+        return _PoolProbeProcessor(self, self._sleep_s)
+
+
+class _PoolProbeProcessor:
+    """A single per-thread fake processor tied to a shared ``_PoolProbeState``."""
+
+    def __init__(self, state: _PoolProbeState, sleep_s: float) -> None:
+        self._state = state
+        self._sleep_s = sleep_s
+        self._own = threading.Lock()
+        self._inside = 0
+
+    def __call__(self, *args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+        state = self._state
+        with self._own:
+            if self._inside > 0:  # per-thread instance entered re-entrantly: a bug
+                state.reentered = True
+            self._inside += 1
+        with state.lock:
+            state.active += 1
+            state.max_cross_instance = max(state.max_cross_instance, state.active)
+        time.sleep(self._sleep_s)
+        with state.lock:
+            state.active -= 1
+        with self._own:
+            self._inside -= 1
+        return {
+            "input_ids": torch.zeros((1, 3), dtype=torch.long),
+            "pixel_values": torch.zeros((1, 3, 4, 4)),
+        }
+
+
+class TestImagePreprocessorThreadLocalProcessor:
+    """#2098 image path: per-thread processors instead of a pool-wide lock.
+
+    ColPali hands its raw shared processor to ``ImagePreprocessor``, which runs
+    on the 8-worker preprocessor executor. The ColPali processor invokes its Rust
+    fast tokenizer even for image-only calls, so one shared instance races with
+    "Already borrowed". The fix is a per-thread processor (``processor_factory``):
+    no shared mutable state, no lock, full pool parallelism. (A pool-wide lock
+    removed the race but serialised image transforms and collapsed colpali eval
+    throughput → server 503s.)
+    """
+
+    @staticmethod
+    def _png_item() -> Item:
+        """An Item carrying real PNG bytes (ImagePreprocessor decodes them)."""
+        buf = io.BytesIO()
+        PILImage.new("RGB", (8, 8), color="white").save(buf, format="PNG")
+        return Item(images=[{"data": buf.getvalue(), "format": "png"}])
+
+    @staticmethod
+    def _run_two_prepares(pre: ImagePreprocessor, item: Item) -> list[BaseException]:
+        """Drive two concurrent ``prepare`` calls through ``pre``, gated on a barrier."""
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                pre.prepare([item], config=MagicMock())
+            except BaseException as exc:  # noqa: BLE001 - record for assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return errors
+
+    def test_prepare_uses_thread_local_processor(self) -> None:
+        """Two concurrent prepares each get their own processor and run in
+        parallel — no "Already borrowed", one factory call per thread, and the
+        shared processor is never touched.
+
+        Anti-serialisation proof: ``max_cross_instance`` reaches 2. Under the old
+        pool-wide lock this would cap at 1, so this assertion is the regression
+        guard for the throughput collapse.
+        """
+        state = _PoolProbeState()
+
+        def _shared_must_not_be_called(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+            raise AssertionError("shared processor must not be used when a factory is set")
+
+        pre = ImagePreprocessor(
+            _shared_must_not_be_called,
+            "stub/colpali",
+            processor_factory=state.make_processor,
+        )
+
+        errors = self._run_two_prepares(pre, self._png_item())
+
+        assert errors == []  # no RuntimeError: Already borrowed
+        assert state.reentered is False  # each per-thread instance stayed single-entry
+        assert state.instances == 2  # one factory call per pool thread → distinct instances
+        assert state.max_cross_instance >= 2  # calls overlapped: the pool is NOT serialised
+
+    def test_prepare_without_factory_shares_processor(self) -> None:
+        """Default path (no factory): the shared processor is used directly,
+        byte-identical to the pre-#2098 behaviour (CLIP/SigLIP/registry).
+        """
+        calls: list[Any] = []
+
+        def shared_processor(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+            calls.append(kwargs.get("images"))
+            return {"pixel_values": torch.zeros((1, 3, 4, 4))}
+
+        pre = ImagePreprocessor(shared_processor, "stub/clip")
+        assert pre._tls is None  # no thread-local state when no factory
+
+        batch = pre.prepare([self._png_item()], config=MagicMock())
+
+        assert len(calls) == 1  # the shared processor did the work
+        assert len(batch.items) == 1
+
+    def test_shared_processor_without_factory_can_race(self) -> None:
+        """Control: a single shared instance with no factory CAN be entered
+        concurrently — this is exactly the "Already borrowed" hazard the
+        per-thread factory exists to remove. Not wired to any production path;
+        colpali always supplies a factory now.
+        """
+        guard = _BorrowGuard()
+        pre = ImagePreprocessor(guard, "stub/colpali")  # no factory: shared instance
+
+        self._run_two_prepares(pre, self._png_item())
+
+        assert guard.borrow_error is True

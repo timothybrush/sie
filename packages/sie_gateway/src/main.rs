@@ -707,6 +707,8 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         lane_backlog_source,
         demand_tracker,
         config_epoch: config_epoch.clone(),
+        // OSS self-host: no org-scoping; every model is global.
+        model_access_policy: None,
     });
 
     // KEDA consumes the collector's Prometheus translation. The shared helper

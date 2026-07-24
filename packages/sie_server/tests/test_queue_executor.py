@@ -113,7 +113,23 @@ def _make_registry(*, loaded: bool = True, loading: bool = False) -> MagicMock:
     reg.has_model.return_value = True
     reg.is_loaded.return_value = loaded
     reg.is_loading.return_value = loading
-    reg.get_config.return_value = MagicMock()
+    reg.get_config.return_value = ModelConfig(
+        sie_id="test/model",
+        package_backed=True,
+        tasks=Tasks(
+            encode=EncodeTask(
+                dense=EmbeddingDim(dim=768),
+                sparse=EmbeddingDim(dim=768),
+                multivector=EmbeddingDim(dim=128),
+            )
+        ),
+        profiles={
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.sentence_transformer:SentenceTransformerDenseAdapter",
+                max_batch_tokens=8192,
+            )
+        },
+    )
     # No recorded load failure by default — a bare MagicMock would otherwise
     # return a truthy stub for ``get_failure(...)`` and its ``.is_permanent``,
     # which ``ensure_model_ready`` now reads to gate the terminal ``failed``
@@ -681,6 +697,47 @@ class TestProcessEncodeBatch:
         assert outcome.outcomes[0].disposition == "publish_and_ack"
         assert outcome.outcomes[0].raw_output is not None
         assert outcome.outcomes[0].raw_output.sparse is not None
+
+    @pytest.mark.asyncio
+    async def test_muvera_profile_translates_managed_adapter_output(self) -> None:
+        """Managed queue requests must use the same MuVERA contract as HTTP."""
+        config = ModelConfig.model_validate(
+            {
+                "sie_id": "test/colbert:muvera",
+                "hf_id": "test/colbert",
+                "inputs": {"text": True},
+                "tasks": {"encode": {"multivector": {"dim": 8}}},
+                "profiles": {
+                    "default": {
+                        "max_batch_tokens": 8192,
+                        "adapter_path": "sie_server.adapters.colbert:ColBERTAdapter",
+                        "adapter_options": {
+                            "runtime": {"muvera": {}, "output_types": ["dense"]},
+                        },
+                    },
+                },
+            }
+        )
+        reg = _make_registry()
+        reg.get_config.return_value = config
+        ex = QueueExecutor(reg)
+
+        fake_timing = RequestTiming()
+        with patch(
+            "sie_server.core.encode_pipeline.EncodePipeline.run_encode",
+            new_callable=AsyncMock,
+            return_value=([{"dense": [0.1, 0.2]}], fake_timing),
+        ) as mock_encode:
+            outcome = await ex.process_encode_batch(
+                ProcessEncodeBatchRequest(model_id="test/colbert:muvera", items=[_encode_item()])
+            )
+
+        call = mock_encode.await_args.kwargs
+        assert call["output_types"] == ["multivector"]
+        assert call["response_output_types"] == ["dense"]
+        assert outcome.outcomes[0].disposition == "publish_and_ack"
+        assert outcome.outcomes[0].result_msgpack is not None
+        assert msgpack.unpackb(outcome.outcomes[0].result_msgpack, raw=False) == {"dense": [0.1, 0.2]}
 
     @pytest.mark.asyncio
     async def test_request_output_types_and_base_default_unchanged(self) -> None:

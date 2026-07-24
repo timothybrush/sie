@@ -282,6 +282,5 @@ tmp/
 
 .requirements-modal.txt
 b6_results.json
-packages/sie_cloud/deploy/manifests/archive/
 # Raw dev-cloud load-test reports are local artifacts, not source-controlled baselines.
 packages/sie_cloud/bench/results/dev-us-*/

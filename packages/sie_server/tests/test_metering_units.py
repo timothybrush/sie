@@ -755,7 +755,11 @@ class TestSGLangEmbeddingMetering:
 def _encode_registry(adapter: BaseAdapter) -> MagicMock:
     reg = MagicMock()
     reg.device = "cpu"
-    reg.get_config.return_value = MagicMock()
+    config = MagicMock()
+    config.sie_id = "test/model"
+    config.outputs = ["dense"]
+    config.resolve_profile.return_value.runtime = {}
+    reg.get_config.return_value = config
     reg.get.return_value = adapter
     return reg
 

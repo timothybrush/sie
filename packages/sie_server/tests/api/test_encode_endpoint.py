@@ -326,6 +326,64 @@ class TestEncodeEndpoint:
         assert data["detail"]["code"] == "INVALID_INPUT"
         assert "sparse" in data["detail"]["message"]
 
+    def test_routed_profile_enables_postprocessed_output(
+        self, client: TestClient, mock_registry: MagicMock, mock_adapter: MagicMock
+    ) -> None:
+        """A first-class route uses its promoted default profile capabilities."""
+        mock_registry.get_config.return_value = ModelConfig(
+            sie_id="test-model:muvera",
+            hf_id="org/test",
+            tasks=Tasks(encode=EncodeTask(multivector=EmbeddingDim(dim=128))),
+            profiles={
+                "default": ProfileConfig(
+                    adapter_path="test:TestAdapter",
+                    max_batch_tokens=8192,
+                    adapter_options=AdapterOptions(runtime={"muvera": {}, "output_types": ["dense"]}),
+                )
+            },
+        )
+        muvera = MagicMock()
+
+        def _postprocess(output: Any, *, is_query: bool) -> None:
+            del is_query
+            output.dense = np.array([[0.4, 0.5, 0.6]], dtype=np.float32)
+
+        muvera.transform.side_effect = _postprocess
+        mock_registry.postprocessor_registry.register("test-model:muvera", {"muvera": muvera})
+
+        response = client.post(
+            "/v1/encode/test-model:muvera",
+            json={"items": [{"text": "Hello"}], "params": {"output_types": ["dense"]}},
+            headers=JSON_HEADERS,
+        )
+
+        assert response.status_code == 200
+        assert mock_adapter.encode.call_args.args[1] == ["multivector"]
+        item = response.json()["items"][0]
+        assert item["dense"] is not None
+        assert "multivector" not in item
+        muvera.transform.assert_called_once()
+
+    def test_request_option_cannot_self_authorize_unsupported_output(
+        self, client: TestClient, mock_registry: MagicMock
+    ) -> None:
+        """Only profile declarations can extend the model output allowlist."""
+        mock_registry.get_config.return_value = ModelConfig(
+            sie_id="test-model",
+            hf_id="org/test",
+            tasks=Tasks(encode=EncodeTask(multivector=EmbeddingDim(dim=128))),
+            profiles={"default": ProfileConfig(adapter_path="test:TestAdapter", max_batch_tokens=8192)},
+        )
+
+        response = client.post(
+            "/v1/encode/test-model",
+            json={"items": [{"text": "Hello"}], "params": {"options": {"output_types": ["dense"]}}},
+            headers=JSON_HEADERS,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "INVALID_INPUT"
+
     def test_encode_with_instruction(self, client: TestClient, mock_adapter: MagicMock) -> None:
         """Instruction parameter is passed to adapter."""
         response = client.post(

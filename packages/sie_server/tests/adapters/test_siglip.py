@@ -14,6 +14,7 @@ import torch
 import yaml
 from PIL import Image
 from sie_server.adapters.siglip.adapter import SiglipAdapter
+from sie_server.core.prepared import ImagePayload, PreparedItem
 from sie_server.types.inputs import Item
 
 
@@ -421,6 +422,105 @@ class TestSiglipAdapter:
             }
         ]
 
+    def test_encode_text_counts_from_primary_attention_mask_when_pad_equals_eos(self) -> None:
+        adapter = SiglipAdapter("google/siglip2-base-patch16-224", normalize=False)
+        model = MagicMock()
+        model.get_text_features.return_value = torch.zeros((2, 8))
+        tokenizer = MagicMock()
+        tokenizer.pad_token_id = 1
+        tokenizer.eos_token_id = 1
+        tokenizer.side_effect = AssertionError("padding-free recount must not run")
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.return_value = {
+            "input_ids": torch.tensor(
+                [
+                    [12, 13, 1, 1],
+                    [42, 1, 1, 1],
+                ]
+            ),
+            "attention_mask": torch.tensor(
+                [
+                    [1, 1, 1, 0],
+                    [1, 1, 0, 0],
+                ]
+            ),
+        }
+        adapter._model = model
+        adapter._processor = processor
+        adapter._device = "cpu"
+
+        _embeddings, counts = adapter._encode_texts(["first", "second"])
+
+        assert counts == [3, 2]
+        tokenizer.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            torch.tensor([[1, 1, 1], [1, 1, 0]]),
+            torch.tensor([[1, 1, 2, 0], [1, 1, 0, 0]]),
+        ],
+        ids=["wrong-shape", "non-binary"],
+    )
+    def test_encode_text_recounts_when_primary_attention_mask_is_malformed(self, attention_mask: torch.Tensor) -> None:
+        adapter = SiglipAdapter("google/siglip2-base-patch16-224", normalize=False)
+        model = MagicMock()
+        model.get_text_features.return_value = torch.zeros((2, 8))
+        tokenizer = MagicMock()
+        tokenizer.pad_token_id = 1
+        tokenizer.eos_token_id = 1
+        tokenizer.return_value = {"input_ids": [[12, 13, 1], [42, 1]]}
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.return_value = {
+            "input_ids": torch.tensor(
+                [
+                    [12, 13, 1, 1],
+                    [42, 1, 1, 1],
+                ]
+            ),
+            "attention_mask": attention_mask,
+        }
+        adapter._model = model
+        adapter._processor = processor
+        adapter._device = "cpu"
+
+        _embeddings, counts = adapter._encode_texts(["first", "second"])
+
+        assert counts == [3, 2]
+        tokenizer.assert_called_once_with(
+            ["first", "second"],
+            truncation=True,
+            max_length=64,
+        )
+
+    def test_transformers_backend_reuses_positionally_aligned_prepared_images(self) -> None:
+        adapter = SiglipAdapter("google/siglip2-base-patch16-224", normalize=False)
+        model = MagicMock()
+        model.get_image_features.side_effect = lambda pixel_values: pixel_values[:, :, 0, 0]
+        adapter._model = model
+        adapter._processor = MagicMock(side_effect=AssertionError("prepared fast path expected"))
+        adapter._device = "cpu"
+        adapter._dense_dim = 3
+        prepared = [
+            PreparedItem(
+                payload=ImagePayload(pixel_values=torch.full((3, 1, 1), value), original_size=(1, 1)),
+                cost=1,
+                original_index=0,
+            )
+            for value in (1.0, 2.0)
+        ]
+
+        output = adapter.encode(
+            [_img_item("first", [(1, 1, 1)]), _img_item("second", [(2, 2, 2)])],
+            ["dense"],
+            prepared_items=prepared,
+        )
+
+        assert output.dense is not None
+        np.testing.assert_array_equal(output.dense, np.array([[1.0] * 3, [2.0] * 3]))
+
     @pytest.mark.parametrize("invalid", [0, -1])
     def test_rejects_non_positive_max_length(self, invalid: int) -> None:
         with pytest.raises(ValueError, match="max_seq_length must be positive"):
@@ -511,3 +611,40 @@ class TestSiglipAdapter:
             cos = float(np.dot(got, expected) / denom)
             assert cos >= 0.9999, f"item {i} cosine {cos}"
             assert np.allclose(got, expected, atol=1e-5), f"item {i} value mismatch"
+
+    def test_fused_requests_use_positionally_aligned_prepared_images(self) -> None:
+        """Duplicate request-local indices must not cross-wire fused images."""
+        adapter = SiglipAdapter(
+            "Marqo/marqo-ecommerce-embeddings-B",
+            backend="open_clip",
+            open_clip_model_id="local-model",
+            dense_dim=3,
+            normalize=False,
+        )
+        model = MagicMock()
+        model.parameters.return_value = iter([torch.nn.Parameter(torch.zeros(1))])
+        model.encode_image.side_effect = lambda pixel_values, normalize: pixel_values[:, :, 0, 0]
+        adapter._model = model
+        adapter._open_clip_preprocess = MagicMock(side_effect=AssertionError("prepared fast path expected"))
+        adapter._device = "cpu"
+        adapter._dense_dim = 3
+
+        # Two two-item requests fused into one inference call. Each request's
+        # preprocessor numbers its items 0, 1, so original_index repeats.
+        prepared = [
+            PreparedItem(
+                payload=ImagePayload(pixel_values=torch.full((3, 1, 1), value), original_size=(1, 1)),
+                cost=1,
+                original_index=request_index,
+            )
+            for value, request_index in [(1.0, 0), (2.0, 1), (3.0, 0), (4.0, 1)]
+        ]
+        items = [_img_item(str(index), [(index, index, index)]) for index in range(4)]
+
+        output = adapter.encode(items, ["dense"], prepared_items=prepared)
+
+        assert output.dense is not None
+        np.testing.assert_array_equal(
+            output.dense,
+            np.array([[1.0] * 3, [2.0] * 3, [3.0] * 3, [4.0] * 3]),
+        )

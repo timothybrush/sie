@@ -22,6 +22,55 @@ use crate::state::worker_registry::WorkerRegistry;
 use crate::types::PoolState;
 use tracing::warn;
 
+/// A model served from a dedicated sandbox rather than a catalog bundle (#1841).
+///
+/// The managed service returns one of these from [`ModelAccessPolicy::sealed_route`]
+/// for an org-registered custom model: it carries the routing tuple the dispatch
+/// path would otherwise derive from a resolved bundle, so the proxy skips bundle /
+/// profile resolution (a custom model has no bundle) and dispatches straight to the
+/// sealed lane. Every value is supplied by the managed policy — the OSS proxy only
+/// learns the generic rule "if a route is returned, use it verbatim." The
+/// load-bearing field is `engine`: it is the SOLE discriminator the dispatcher
+/// co-process uses to route a request to the per-org sealed sandbox.
+pub struct SealedRoute {
+    /// The wire engine marker (`"sealed"`) — the dispatcher co-process routes on it.
+    pub engine: String,
+    /// Synthetic bundle label; matches the registered sealed worker lane.
+    pub bundle: String,
+    /// Synthetic admission pool; matches the registered sealed worker lane.
+    pub pool: String,
+    /// Synthetic machine profile; the middle segment of the dispatch lane string.
+    pub machine_profile: String,
+}
+
+/// A deployment hook to keep certain models visible/servable only to authorized
+/// callers, decided on the RESOLVED model id and the request extensions (which
+/// carry the caller identity). The OSS self-host build installs no policy (every
+/// model is global); the managed service supplies one that scopes org-registered
+/// custom models to their owning org (#1841). It is consulted at model
+/// resolution (the serve gate) AND at the `/v1/models` listing (the enumeration
+/// filter), so a model hidden from a caller is indistinguishable from an absent
+/// one — no cross-org existence oracle.
+pub trait ModelAccessPolicy: Send + Sync {
+    /// Whether `resolved_model` (the canonical, alias/`__`/case-resolved id) is
+    /// visible to the caller identified in `ext`. `false` ⇒ treat as not found.
+    fn visible(&self, resolved_model: &str, ext: &axum::http::Extensions) -> bool;
+
+    /// If `resolved_model` is served from a dedicated sandbox (a #1841 org custom
+    /// model) rather than a catalog bundle, return its [`SealedRoute`]. Consulted
+    /// ONLY after [`Self::visible`] has passed, so the caller already owns any
+    /// org-scoped model — implementations MUST NOT re-derive ownership here. The
+    /// default (catalog-only OSS build) returns `None`, so with no policy installed
+    /// there are no sealed models by construction.
+    fn sealed_route(
+        &self,
+        _resolved_model: &str,
+        _ext: &axum::http::Extensions,
+    ) -> Option<SealedRoute> {
+        None
+    }
+}
+
 pub struct AppState {
     pub registry: Arc<WorkerRegistry>,
     pub config: Arc<Config>,
@@ -30,6 +79,9 @@ pub struct AppState {
     pub work_publisher: Option<Arc<dyn WorkDispatcher>>,
     pub lane_backlog_source: Option<Arc<dyn LaneBacklogSource>>,
     pub demand_tracker: Arc<DemandTracker>,
+    /// Optional model-visibility policy (managed service; `None` = OSS, all
+    /// models global). See [`ModelAccessPolicy`].
+    pub model_access_policy: Option<Arc<dyn ModelAccessPolicy>>,
     /// Monotonic view of the furthest-known control-plane epoch. Written by
     /// bootstrap, the NATS delta handler, and the epoch poller; read by
     /// `GET /v1/configs/models/{id}/status`.
@@ -852,6 +904,7 @@ mod flat_404_tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         });
         let router = create_router(Arc::clone(&state), config);
         (router, bundles_dir, models_dir)

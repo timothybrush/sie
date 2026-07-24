@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.6.23
+
+- chore(main): release 0.6.23
+- fix(grammar): bound pointer index parsing
+- fix(grammar): harden schema normalization
+- fix(gateway): validate schema keywords by context
+- fix(sdk): accept nullable grammar metadata
+- fix(cloud): attest LightOnOCR image compatibility
+- fix(catalog): disable unsafe qwen speculative default
+- test(sdk): assert grammar validation failures precisely
+- fix(sdk): keep grammar types on supported module path
+- fix(generation): close structured grammar review gaps
+- feat(generation): type structured output contracts
+- test(server): assert visual muvera config removal
+- fix(server): hide unsupported visual muvera profiles
+- fix(server): pin launch guardrail policies
+- test(adapters): stdlib imports to file top + comment the skip-tail except (CodeRabbit/Copilot)
+- fix(server): defer LightOn OCR compatibility patch
+- fix(adapters): serialize output_hidden_states forwards to close the #2144 recorder-race class
+- fix(server): meter SigLIP tokens from attention masks
+- perf(vision): reuse siglip preprocessing
+- fix(vision): pad fused detection batches
+- test(sdk): harden Responses capacity contract
+- feat(sdk): add typed Responses client
+- test(api): harden multimodal contract fixtures
+- fix(api): close multimodal parity gaps
+- fix(api): address multimodal contract review
+- fix(server): preserve stream helper compatibility
+- feat(api): accept native multimodal generation
+- fix(cloud): align launch evidence contracts
+- fix(catalog): raise GTE Muvera repetitions
+- fix(catalog): route mxbai edge through native attention
+- fix(catalog): use pinned GTE query length
+- fix(server): serialize remaining tokenizer access
+- fix(server): preserve trusted code revision on fallback
+- fix(server): restore ColBERTv2 retrieval recipe
+- fix(server): apply trained Rotary ColBERT projection
+- fix(server): mask ColBERT expansion keys in flash attention
+- fix(server): restore Jina ColBERT retrieval recipe
+- style(test): D209 docstring closing quotes on own line + re-lock manifests
+- fix(eval): restore colbert recipe and cache integrity
+- docs(test): docstring the trust_remote_code pin invariant (CodeRabbit coverage)
+- fix(security): pin hf_revision on the 10 unpinned trust_remote_code models (#2109)
+- fix(catalog): preserve muvera quality similarity
+- test(ci): strengthen profile and install contracts
+- fix(eval): align governed benchmark identities
+- fix(vision): consolidate detection batch alignment
+- fix(ci): harden scoped quality and rust jobs
+- fix(vision): serialize Qwen processor tokenization
+- fix(sie_server): harden remote-code snapshot registration (review)
+- fix(vision): preserve fused request image alignment
+- fix(eval): preserve profile floor identity
+- fix(eval): scope quality floors to model profiles
+- fix(splade): enforce candle sequence cap
+- test(splade): cover inherited runtime caps
+- fix(retrieval): align GTE ColBERT serving recipe
+- fix(splade): preserve default retrieval recipe
+- test(encode): declare mocked output capabilities
+- style(encode): keep required imports global
+- fix(encode): align profile output contracts
+- fix(profiles): honor routed output capabilities
+- fix(vidore): per-thread processors in ImagePreprocessor instead of a pool-wide lock (#2098)
+- fix(vidore): close the image-path and qwen3_vl gaps in the tokenizer serialization (#2098 review)
+- fix(vidore): serialize Col-family processors and retry eval transport loss under load
+- fix(sie_server): register remote-code snapshot dir on sys.path for ST-Router models
+- fix(release): keep audio prep internal to builds
+- fix(cloud): make wallet balance own admission
+- feat(models): onboard naver/v-splade-quality (#2035)
+- fix(gateway): make sealed-standby schema drift a compile error, not a 5s log line
+- feat(1841): declare the sealed-lane metrics through the closed telemetry contract
+- fix(1841): close the post-merge gaps the real Postgres run found
+- fix(custom-models): a variant-named model's DPA erase no longer wedges forever
+- feat(custom-models): withdraw erased models from the catalog; quote only a real rate
+- feat(custom-models): gateway bundle-less sealed dispatch for org custom models (#1841 W4)
+- feat(gateway): resolve-seam org gate for the OpenAI body routes (#1895)
+- refactor(gateway): gate + list custom models on the RESOLVED id (#1895)
+
 ## v0.6.21
 
 - chore(main): release 0.6.21

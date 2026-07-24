@@ -10,7 +10,7 @@ These types support flexible Python inputs
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Required, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Never, NotRequired, Required, TypedDict
 
 import numpy as np
 
@@ -386,6 +386,47 @@ class ExtractResult(TypedDict, total=False):
 FinishReason = Literal["stop", "length", "cancelled", "content_filter", "error"]
 
 
+class GenerateImage(TypedDict):
+    """One image paired with a native generation prompt."""
+
+    data: Image.Image | NDArray[Any] | bytes | str | Path
+    format: NotRequired[str]
+
+
+class JsonSchemaGrammar(TypedDict):
+    """Constrain generation to a JSON Schema."""
+
+    json_schema: dict[str, Any]
+    regex: NotRequired[Never]
+    ebnf: NotRequired[Never]
+    label: NotRequired[str | None]
+    strict: NotRequired[bool | None]
+
+
+class RegexGrammar(TypedDict):
+    """Constrain generation to a regular expression."""
+
+    json_schema: NotRequired[Never]
+    regex: str
+    ebnf: NotRequired[Never]
+    label: NotRequired[str | None]
+    strict: NotRequired[bool | None]
+
+
+class EbnfGrammar(TypedDict):
+    """Constrain generation to an EBNF grammar."""
+
+    json_schema: NotRequired[Never]
+    regex: NotRequired[Never]
+    ebnf: str
+    label: NotRequired[str | None]
+    strict: NotRequired[bool | None]
+
+
+GenerateGrammar = JsonSchemaGrammar | RegexGrammar | EbnfGrammar
+"""Native structured-output grammar. Exactly one grammar variant is set."""
+
+
 class GenerationUsage(TypedDict):
     """Token usage for a single generation call."""
 
@@ -562,6 +603,65 @@ class ChatCompletionChunk(TypedDict, total=False):
     system_fingerprint: str | None
     choices: list[ChatChunkChoice]
     usage: ChatUsage
+
+
+# --- Responses (OpenAI-compatible) — /v1/responses -------------------------
+
+
+class ResponseInputContentPart(TypedDict):
+    """One text-only content part accepted by the Responses MVP."""
+
+    type: Literal["text", "input_text"]
+    text: str
+
+
+ResponseInputRole = Literal["system", "user", "assistant", "developer"]
+
+
+class ResponseInputMessage(TypedDict):
+    """One stateless text message accepted by the Responses MVP."""
+
+    role: ResponseInputRole
+    content: str | list[ResponseInputContentPart]
+
+
+class ResponseOutputText(TypedDict):
+    """One text content part returned by the Responses MVP."""
+
+    type: Literal["output_text"]
+    text: str
+    annotations: list[dict[str, Any]]
+
+
+class ResponseOutputMessage(TypedDict):
+    """One completed assistant message returned by the Responses MVP."""
+
+    type: Literal["message"]
+    id: str
+    role: Literal["assistant"]
+    status: Literal["completed"]
+    content: list[ResponseOutputText]
+
+
+class ResponseUsage(TypedDict):
+    """Token usage returned by the Responses MVP."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+class ResponseResult(TypedDict, total=False):
+    """Non-streaming result from :meth:`SIEClient.responses`."""
+
+    id: str
+    object: Literal["response"]
+    created_at: int
+    model: str
+    status: Literal["completed"]
+    output: list[ResponseOutputMessage]
+    usage: ResponseUsage
+    request: RequestMetadata
 
 
 class WorkerInfo(TypedDict, total=False):

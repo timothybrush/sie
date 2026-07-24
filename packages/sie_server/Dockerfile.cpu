@@ -7,8 +7,8 @@
 
 ARG BUNDLE=default
 
-# Build the checked-in Rust extension once so standalone images do not depend
-# on the matching sie-audio-prep release already existing on PyPI.
+# Build the internal Rust extension from checked-in source; it is not published
+# to PyPI.
 FROM ghcr.io/pyo3/maturin:v1.13.3 AS audio-prep-builder
 WORKDIR /io
 COPY packages/sie_audio_prep .
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --extra-index-url https://pypi.org/simple \
         /tmp/audio-prep-dist/*.whl \
         -e "/tmp/sie_sdk[storage]" \
-        -e ".[gpu-metrics,audio]"
+        -e ".[gpu-metrics]"
 
 # =============================================================================
 # Shared runtime base: source install and venv finalization

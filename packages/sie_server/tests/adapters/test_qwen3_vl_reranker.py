@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -224,6 +227,59 @@ class _FakeProcessor:
         return output
 
 
+class _RaceDetectingProcessor(_FakeProcessor):
+    """Emulate shared fast-tokenizer mutation across processor methods."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active = 0
+        self._guard = threading.Lock()
+        self.peak_concurrency = 0
+        tokenizer = self.tokenizer
+        processor = self
+
+        class RaceDetectingTokenizer:
+            all_special_tokens = tokenizer.all_special_tokens
+
+            def pad(self, *args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+                processor._enter()
+                try:
+                    return tokenizer.pad(*args, **kwargs)
+                finally:
+                    processor._exit()
+
+        self.tokenizer = RaceDetectingTokenizer()
+
+    def _enter(self) -> None:
+        with self._guard:
+            self._active += 1
+            self.peak_concurrency = max(self.peak_concurrency, self._active)
+            concurrent = self._active > 1
+        if concurrent:
+            with self._guard:
+                self._active -= 1
+            raise RuntimeError("Already borrowed")
+        time.sleep(0.002)
+
+    def _exit(self) -> None:
+        with self._guard:
+            self._active -= 1
+
+    def apply_chat_template(self, conversation: list[dict[str, Any]], **kwargs: Any) -> str:
+        self._enter()
+        try:
+            return super().apply_chat_template(conversation, **kwargs)
+        finally:
+            self._exit()
+
+    def __call__(self, **kwargs: Any) -> dict[str, Any]:
+        self._enter()
+        try:
+            return super().__call__(**kwargs)
+        finally:
+            self._exit()
+
+
 class _FakeModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -277,6 +333,26 @@ def test_vl_score_pairs_batches_forward_and_surfaces_measured_units(monkeypatch:
     assert output.scores.tolist() == pytest.approx([0.880797, 0.119203])
     assert output.input_token_counts == [len(prompt) for prompt in processed_prompts]
     assert output.input_image_counts == [0, 1]
+
+
+def test_vl_processor_tokenization_is_thread_safe() -> None:
+    adapter = Qwen3VLRerankerAdapter("unused")
+    model = _FakeModel()
+    processor = _RaceDetectingProcessor()
+    adapter._model = model  # ty: ignore[invalid-assignment]
+    adapter._processor = processor  # ty: ignore[invalid-assignment]
+    adapter._device = "cpu"
+    adapter._yes_token_id = 1
+    adapter._no_token_id = 2
+
+    def score(_: int) -> float:
+        return adapter.score_pairs([Item(text="query")], [Item(text="document")]).scores[0]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        scores = list(executor.map(score, range(32)))
+
+    assert len(scores) == 32
+    assert processor.peak_concurrency == 1
 
 
 def test_vl_score_pairs_keeps_cuda_allocator_cache(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -33,7 +33,16 @@ audit_logger = logging.getLogger("sie.audit")
 router = APIRouter(prefix="/v1/configs", tags=["config"])
 
 _MAX_CONFIG_BODY_BYTES = 1_048_576  # 1 MiB
-_MODEL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
+# ':' and '@' are admitted because a custom-model NAME may carry a ':variant'
+# and/or '@N' version suffix (control_plane `_MODEL_NAME_RE`, dispatcher
+# `_MODEL_ID_RE`), and the served id `<slug>/<name>` reaches this write-path
+# validator on both add (append) and DELETE (DPA erase tombstone). Rejecting
+# them here 400s the tombstone, which wedges an erase forever (§6.9). They are
+# path-safe: `..`, '\\', and the '/status' route-ambiguity guard in
+# `_validate_model_id` still fire regardless of the class, and ConfigStore maps
+# '/' -> '__' on disk while ':'/'@' are ordinary POSIX filename chars that
+# introduce no separator and cannot escape the models dir.
+_MODEL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$")
 
 # In-memory idempotency cache: maps Idempotency-Key -> (status_code, response_body, payload_hash).
 # The cache, its guarding lock, and the in-flight event map are all held
@@ -700,7 +709,6 @@ async def add_model(request: Request) -> Response:
                         existing_config = {}
                     if not isinstance(existing_config, dict):
                         existing_config = {}
-
                     merged_config: dict[str, Any] = dict(existing_config)
 
                     conflicting_fields: list[str] = []

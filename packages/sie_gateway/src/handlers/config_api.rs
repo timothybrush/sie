@@ -516,6 +516,7 @@ mod tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         });
 
         create_router(state, config)
@@ -553,6 +554,7 @@ mod tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         });
         let router = create_router(Arc::clone(&state), config);
         (router, state)
@@ -1102,6 +1104,7 @@ mod tests {
             lane_backlog_source: None,
             demand_tracker: Arc::new(DemandTracker::new(Default::default())),
             config_epoch: crate::state::config_epoch::ConfigEpoch::new(),
+            model_access_policy: None,
         });
         seed_model(&state, "BAAI/bge-m3");
         let app = create_router(Arc::clone(&state), config);

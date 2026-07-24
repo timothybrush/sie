@@ -3305,7 +3305,7 @@ wheels = [
 
 [[package]]
 name = "modal"
-version = "1.4.2"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -3317,15 +3317,14 @@ dependencies = [
     { name = "rich" },
     { name = "synchronicity" },
     { name = "toml" },
-    { name = "typer" },
     { name = "types-certifi" },
     { name = "types-toml" },
     { name = "typing-extensions" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/67/c84029cf5a0eaa366400d2cae3901c757a313349e7e1ccf4fc4644bf3cf8/modal-1.4.2.tar.gz", hash = "sha256:ab4e76a2c28fc0e0aebb616f11a2658051518d38cd241825af27fb34e2688b46", size = 699847 }
+sdist = { url = "https://files.pythonhosted.org/packages/b8/e6/44f609084472d16a3acf7748c184e23d3009944eed5860e855aaafc61065/modal-1.5.2.tar.gz", hash = "sha256:ac0d2983ecccacb80c54385906404d75f37a3751f1374c750974cd7853c0008a", size = 818040 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/65/fa87a72b7bf150dbf9949e503b8a45e278789201ac3691b8af1cd861a7d6/modal-1.4.2-py3-none-any.whl", hash = "sha256:6993874476dfd51057e36c778dbd7aae58811802515532447336eced00c81e28", size = 802775 },
+    { url = "https://files.pythonhosted.org/packages/e3/fe/7e284d889eb3ea2c307e48828eccdd9a984beb2e096bce5577ef796592e9/modal-1.5.2-py3-none-any.whl", hash = "sha256:7508a44f8742c6f26be4d28da71f46092ef3bcc07d0f27cbd0ea8c9d6d9fc873", size = 932258 },
 ]
 
 [[package]]
@@ -3442,7 +3441,7 @@ wheels = [
 [[package]]
 name = "mteb"
 version = "2.7.5"
-source = { git = "https://github.com/superlinked/mteb.git?rev=main#0667a6b974fc4a0c15ebfdb0e1eba029698dff00" }
+source = { git = "https://github.com/superlinked/mteb.git?rev=main#f8075d1bae97a232edec786f4e664cecd54e8767" }
 dependencies = [
     { name = "datasets" },
     { name = "numpy" },
@@ -5655,9 +5654,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-audio = [
-    { name = "sie-server", extra = ["audio"] },
-]
 flash-attn = [
     { name = "sie-server", extra = ["flash-attn"] },
 ]
@@ -5712,7 +5708,6 @@ requires-dist = [
     { name = "sie-config", editable = "packages/sie_config" },
     { name = "sie-sdk", editable = "packages/sie_sdk" },
     { name = "sie-server", editable = "packages/sie_server" },
-    { name = "sie-server", extras = ["audio"], marker = "extra == 'audio'", editable = "packages/sie_server" },
     { name = "sie-server", extras = ["flash-attn"], marker = "extra == 'flash-attn'", editable = "packages/sie_server" },
     { name = "sie-server", extras = ["gpu-metrics"], marker = "extra == 'gpu-metrics'", editable = "packages/sie_server" },
     { name = "sie-server", extras = ["xformers"], marker = "extra == 'xformers'", editable = "packages/sie_server" },
@@ -5731,7 +5726,7 @@ dev = [
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "kaleido", specifier = ">=1.3.0" },
     { name = "marimo", specifier = ">=0.23.9" },
-    { name = "modal", specifier = "==1.4.2" },
+    { name = "modal", specifier = "==1.5.2" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "plotly", specifier = ">=6.1.1" },
     { name = "pre-commit", specifier = "~=4.0" },
@@ -5751,7 +5746,7 @@ dev = [
 
 [[package]]
 name = "sie-admin"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "packages/sie_admin" }
 dependencies = [
     { name = "httpx" },
@@ -5784,12 +5779,12 @@ requires-dist = [
 
 [[package]]
 name = "sie-audio-prep"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "packages/sie_audio_prep" }
 
 [[package]]
 name = "sie-bench"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "packages/sie_bench" }
 dependencies = [
     { name = "aiohttp" },
@@ -5800,6 +5795,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "mteb" },
     { name = "nvidia-ml-py" },
+    { name = "packaging" },
     { name = "psutil" },
     { name = "pyarrow" },
     { name = "pylate" },
@@ -5860,6 +5856,7 @@ requires-dist = [
     { name = "nvidia-ml-py", specifier = ">=13.5,<14" },
     { name = "olmocr", extras = ["bench"], marker = "extra == 'all'", specifier = ">=0.4.27,<1" },
     { name = "olmocr", extras = ["bench"], marker = "extra == 'quality-ocr'", specifier = ">=0.4.27,<1" },
+    { name = "packaging", specifier = ">=24,<25" },
     { name = "psutil", specifier = ">=5" },
     { name = "pyarrow", specifier = ">=14,<24" },
     { name = "pycocotools", marker = "extra == 'all'", specifier = ">=2.0" },
@@ -5880,7 +5877,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-chroma"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_chroma" }
 dependencies = [
     { name = "chromadb" },
@@ -5960,7 +5957,7 @@ dev = [
 
 [[package]]
 name = "sie-crewai"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_crewai" }
 dependencies = [
     { name = "crewai" },
@@ -5985,7 +5982,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-dspy"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_dspy" }
 dependencies = [
     { name = "dspy" },
@@ -6010,7 +6007,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-haystack"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_haystack" }
 dependencies = [
     { name = "haystack-ai" },
@@ -6037,7 +6034,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-lancedb"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_lancedb" }
 dependencies = [
     { name = "lancedb" },
@@ -6064,7 +6061,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-langchain"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_langchain" }
 dependencies = [
     { name = "langchain-core" },
@@ -6091,7 +6088,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-llamaindex"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_llamaindex" }
 dependencies = [
     { name = "llama-index-core" },
@@ -6157,7 +6154,7 @@ dev = [
 
 [[package]]
 name = "sie-qdrant"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_qdrant" }
 dependencies = [
     { name = "qdrant-client" },
@@ -6180,7 +6177,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-sdk"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "packages/sie_sdk" }
 dependencies = [
     { name = "aiohttp" },
@@ -6233,7 +6230,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-server"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "packages/sie_server" }
 dependencies = [
     { name = "blake3" },
@@ -6283,9 +6280,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-audio = [
-    { name = "sie-audio-prep" },
-]
 flash-attn = [
     { name = "flash-attn", marker = "sys_platform == 'linux'" },
 ]
@@ -6337,7 +6331,6 @@ requires-dist = [
     { name = "rich", specifier = ">=13,<14" },
     { name = "safetensors", specifier = ">=0.4,<1" },
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
-    { name = "sie-audio-prep", marker = "extra == 'audio'", editable = "packages/sie_audio_prep" },
     { name = "sie-sdk", extras = ["storage"], editable = "packages/sie_sdk" },
     { name = "textual", marker = "extra == 'top'", specifier = ">=3.0,<4" },
     { name = "timm", specifier = ">=0.9.0,<1.0" },
@@ -6375,7 +6368,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-weaviate"
-version = "0.6.21"
+version = "0.6.23"
 source = { editable = "integrations/sie_weaviate" }
 dependencies = [
     { name = "sie-sdk" },
@@ -6615,14 +6608,14 @@ wheels = [
 
 [[package]]
 name = "synchronicity"
-version = "0.12.2"
+version = "0.12.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f9/5e/50ea27817003665c7cc4f5bdad309f13d6329037f657848ee87fe06c3740/synchronicity-0.12.2.tar.gz", hash = "sha256:6fd605a5035d1ec74ce48fffaca80ea00345c84ca34223914e2436fb4f162ff9", size = 60018 }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/1c/f51dc54bbd302991026a53f9790735540e0e9e1184e9d5939f02446aa5bc/synchronicity-0.12.5.tar.gz", hash = "sha256:94d96b1d85698e3056b96a793b8c0949af6584e4a7d877fabdeb5385efe230aa", size = 60745 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/41/44/4f6ba4e2c171847e6f9a460213b196bbf26edea43d0e66889c7ccc55d368/synchronicity-0.12.2-py3-none-any.whl", hash = "sha256:9dbaca81fb7f2b57c6dea326e514e1c80e9ccfd9c9618515e84fa6091026273b", size = 41312 },
+    { url = "https://files.pythonhosted.org/packages/06/74/ad9b99520f70c0bc3318e582e359d360cfc0f7afd7bf368a7f24013cece7/synchronicity-0.12.5-py3-none-any.whl", hash = "sha256:fdbbb10d437bc08a6b0f814fc66fddd1b58ffed314533d42f1ab555801e781af", size = 41107 },
 ]
 
 [[package]]

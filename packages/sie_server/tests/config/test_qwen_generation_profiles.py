@@ -123,8 +123,28 @@ def test_qwen36_grammar_requests_route_to_no_spec() -> None:
     assert config.tasks.generate.grammar_profile == "no-spec"
     assert default.adapter_path == no_spec.adapter_path == _ADAPTER
     assert default.loadtime["grammar_backend"] == no_spec.loadtime["grammar_backend"] == "outlines"
-    assert default.loadtime["speculative"]["enabled"] is True
+    assert default.loadtime["speculative"] == {
+        "enabled": False,
+        "algorithm": "nextn",
+        "num_steps": 2,
+        "eagle_topk": 1,
+        "num_draft_tokens": 2,
+    }
     assert no_spec.loadtime["speculative"] == {"enabled": False}
+
+
+def test_qwen36_profiles_use_official_non_thinking_sampling_defaults() -> None:
+    config = ModelConfig.model_validate(yaml.safe_load(_QWEN36_MODEL_PATH.read_text()))
+    expected = {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "presence_penalty": 1.5,
+        "min_new_tokens": 10,
+    }
+
+    for profile_name in ("default", "h100", "rtx-pro-6000", "batch", "no-spec"):
+        assert config.resolve_profile(profile_name).runtime["default_sampling"] == expected
 
 
 def test_qwen36_base_profiles_expose_8k_context() -> None:

@@ -2554,7 +2554,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sie-audio-prep"
-version = "0.6.21"
+version = "0.6.23"
 dependencies = [
  "audioadapter-buffers",
  "opusic-sys",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "sie-server-sidecar"
-version = "0.6.21"
+version = "0.6.23"
 dependencies = [
  "anyhow",
  "async-nats",

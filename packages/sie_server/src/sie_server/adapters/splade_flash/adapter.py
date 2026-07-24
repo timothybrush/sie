@@ -226,6 +226,7 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         opts = options or {}
         query_template = opts.get("query_template", self._query_template)
         doc_template = opts.get("doc_template", self._doc_template)
+        max_length = self._coerce_runtime_max_length(opts.get("max_seq_length"), self._max_seq_length)
 
         texts = extract_texts(
             items,
@@ -241,12 +242,12 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         # Inference-free query encoding via IDF lookup (doc-* checkpoint pattern)
         if is_query and self._idf is not None:
-            return self._encode_query_idf(texts, is_query)
+            return self._encode_query_idf(texts, is_query, max_length=max_length)
 
         if self._use_flash:
-            sparse_list, input_token_counts = self._encode_flash(texts)
+            sparse_list, input_token_counts = self._encode_flash(texts, max_length=max_length)
         else:
-            sparse_list, input_token_counts = self._encode_native(texts)
+            sparse_list, input_token_counts = self._encode_native(texts, max_length=max_length)
 
         return EncodeOutput(
             sparse=sparse_list,
@@ -259,15 +260,24 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     # Native path — standard model forward (CPU / MPS / CUDA-without-flash)
     # ------------------------------------------------------------------
 
-    def _encode_native(self, texts: list[str]) -> tuple[list[SparseVector], list[int]]:
+    def _encode_native(
+        self,
+        texts: list[str],
+        *,
+        max_length: int | None = None,
+    ) -> tuple[list[SparseVector], list[int]]:
         """Encode using the model's standard forward pass.
 
         Uses padded batches with the model's own attention implementation for
         bit-exact parity with the reference sentence-transformers pipeline.
         """
-        inputs = self._tokenizer(
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+        effective_max_length = max_length if max_length is not None else self._max_seq_length
+        inputs = tokenizer(
             texts,
-            max_length=self._max_seq_length,
+            max_length=effective_max_length,
             truncation=True,
             padding=True,
             return_tensors="pt",
@@ -293,11 +303,20 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
     # Flash path — packed sequences with flash_attn_varlen_func (CUDA)
     # ------------------------------------------------------------------
 
-    def _encode_flash(self, texts: list[str]) -> tuple[list[SparseVector], list[int]]:
+    def _encode_flash(
+        self,
+        texts: list[str],
+        *,
+        max_length: int | None = None,
+    ) -> tuple[list[SparseVector], list[int]]:
         """Encode using packed sequences with flash attention."""
-        batch_encoding = self._tokenizer(
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            raise RuntimeError(ERR_NOT_LOADED)
+        effective_max_length = max_length if max_length is not None else self._max_seq_length
+        batch_encoding = tokenizer(
             texts,
-            max_length=self._max_seq_length,
+            max_length=effective_max_length,
             truncation=True,
             padding=False,
             return_attention_mask=False,
@@ -595,14 +614,21 @@ class SPLADEFlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
-    def _encode_query_idf(self, texts: list[str], is_query: bool) -> EncodeOutput:
+    def _encode_query_idf(
+        self,
+        texts: list[str],
+        is_query: bool,
+        *,
+        max_length: int | None = None,
+    ) -> EncodeOutput:
         self._check_loaded()
         if self._tokenizer is None or self._idf is None:
             raise RuntimeError(ERR_NOT_LOADED)
 
+        effective_max_length = max_length if max_length is not None else self._max_seq_length
         batch_encoding = self._tokenizer(
             texts,
-            max_length=self._max_seq_length,
+            max_length=effective_max_length,
             truncation=True,
             padding=False,
             return_attention_mask=False,

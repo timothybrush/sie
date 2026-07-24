@@ -19,5 +19,8 @@ profiles:
     adapter_options:
       loadtime:
         classification_task: prompt_safety
+        default_labels:
+          - safe
+          - unsafe
         multi_label: false
       runtime: {}

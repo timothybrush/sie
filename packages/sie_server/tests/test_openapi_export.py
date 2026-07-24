@@ -1,4 +1,6 @@
 import json
+import tomllib
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 from sie_server.cli import app
@@ -51,6 +53,19 @@ def test_openapi_documents_generate_contract() -> None:
     assert request_schema == {"$ref": "#/components/schemas/GenerateRequestModel"}
 
     schema = spec["components"]["schemas"]["GenerateRequestModel"]
+    images = schema["properties"]["images"]
+    assert images["anyOf"][0]["items"]["$ref"] == "#/components/schemas/NativeGenerateImageModel"
+    assert images["anyOf"][0]["minItems"] == 1
+    assert images["anyOf"][0]["maxItems"] == 16
+    image_schema = spec["components"]["schemas"]["NativeGenerateImageModel"]
+    assert image_schema["properties"]["data"]["maxLength"] == 22_369_624
+    grammar = schema["properties"]["grammar"]
+    grammar_refs = {variant["$ref"] for variant in grammar["anyOf"] if "$ref" in variant}
+    assert grammar_refs == {
+        "#/components/schemas/NativeJsonSchemaGrammarModel",
+        "#/components/schemas/NativeRegexGrammarModel",
+        "#/components/schemas/NativeEbnfGrammarModel",
+    }
     assert set(schema["required"]) == {"prompt", "max_new_tokens"}
     assert schema["properties"]["stream"]["anyOf"][0] == {"type": "boolean"}
     seed_schema = schema["properties"]["seed"]
@@ -61,7 +76,7 @@ def test_openapi_documents_generate_contract() -> None:
     assert schema["properties"]["logprobs"]["anyOf"][0] == {"type": "boolean"}
     assert schema["properties"]["top_logprobs"]["anyOf"][0]["minimum"] == 0
     assert schema["properties"]["top_logprobs"]["anyOf"][0]["maximum"] == 20
-    for unsupported in ("grammar", "lora_adapter", "n", "best_of", "stream_options"):
+    for unsupported in ("lora_adapter", "n", "best_of", "stream_options"):
         assert unsupported not in schema["properties"]
 
     response_content = operation["responses"]["200"]["content"]
@@ -122,9 +137,15 @@ def test_openapi_output_file(tmp_path: Path) -> None:
 
 
 def test_openapi_version_from_package() -> None:
-    """Spec version matches the installed sie-server package version."""
-    from importlib.metadata import version as pkg_version
-
+    """Generated and committed specs match the repo-managed package version."""
     result = runner.invoke(app, ["openapi"])
+    assert result.exit_code == 0, result.output
     spec = json.loads(result.output)
-    assert spec["info"]["version"] == pkg_version("sie-server")
+    package_dir = Path(__file__).parents[1]
+    project = tomllib.loads((package_dir / "pyproject.toml").read_text())
+    project_version = project["project"]["version"]
+    committed_spec = json.loads((package_dir / "openapi.json").read_text())
+
+    assert pkg_version("sie-server") == project_version
+    assert spec["info"]["version"] == project_version
+    assert committed_spec["info"]["version"] == project_version

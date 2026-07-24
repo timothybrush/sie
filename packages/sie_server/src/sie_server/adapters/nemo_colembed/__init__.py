@@ -110,6 +110,11 @@ class NemoColEmbedAdapter(BaseAdapter):
         self._batch_size = batch_size
 
         self._model: Any = None
+        # The v1 document forward requests output_hidden_states=True; if its
+        # (remote) model class uses transformers' recorder mechanism, unlocked
+        # patch/restore of layer forwards leaks GPU memory to OOM under
+        # interleaved forwards. Serialize forwards defensively (#2144/#2204).
+        self._forward_lock = threading.Lock()
         self._device: str | None = None
         self._multivector_dim: int = token_dim  # ColEmbed uses 128-dim per patch
         self._processor: Any = None  # NemoColEmbedPreprocessor, created on load()
@@ -602,7 +607,11 @@ class NemoColEmbedAdapter(BaseAdapter):
                 batch = self._processor.collate(sub_batch_items, device=self._device)
 
                 # Forward pass - call model directly
-                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with (
+                    self._forward_lock,
+                    torch.inference_mode(),
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+                ):
                     outputs = self._model(
                         pixel_values=batch["pixel_values"],
                         input_ids=batch["input_ids"],

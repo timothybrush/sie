@@ -545,6 +545,14 @@ class ModelLoader:
         Returns:
             LoadedModel containing the loaded state.
         """
+        resolved = config.resolve_profile("default")
+        postprocessors = adapter.get_postprocessors() or {}
+        if resolved.runtime.get("muvera") is not None and "muvera" not in postprocessors:
+            raise ValueError(
+                f"model profile {name!r} requests MUVERA but adapter "
+                f"{type(adapter).__name__!r} did not register a 'muvera' postprocessor"
+            )
+
         # Get preprocessor(s) from adapter - all adapters implement get_preprocessor().
         # Most return a single preprocessor; multi-modal adapters (e.g. NemoColEmbed v1,
         # which needs a text preprocessor for queries AND an image preprocessor for
@@ -567,22 +575,18 @@ class ModelLoader:
                 logger.info("Registered audio preprocessor for model '%s'", name)
 
         # Register postprocessors if adapter provides them.
-        if hasattr(adapter, "get_postprocessors"):
-            postprocessors = adapter.get_postprocessors()
-            if postprocessors:
-                self._postprocessor_registry.register(name, postprocessors)
-                logger.info(
-                    "Registered postprocessors for model '%s': %s",
-                    name,
-                    list(postprocessors.keys()),
-                )
+        if postprocessors:
+            self._postprocessor_registry.register(name, postprocessors)
+            logger.info(
+                "Registered postprocessors for model '%s': %s",
+                name,
+                list(postprocessors.keys()),
+            )
 
         # Get actual memory footprint from the adapter
         memory_bytes = adapter.memory_footprint()
 
         # Create worker for the adapter with postprocessor support
-        resolved = config.resolve_profile("default")
-
         # Merge per-model adaptive batching overrides onto engine defaults
         adaptive_params = _merge_adaptive_params(self._adaptive_batching, resolved.adaptive_batching)
 

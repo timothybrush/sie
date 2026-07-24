@@ -64,6 +64,7 @@ async def _drain(adapter: Any) -> list[str]:
             presence_penalty=-0.5,
             top_k=12,
             min_new_tokens=2,
+            grammar=None,
             seed=None,
             logit_bias=None,
             logprobs=True,

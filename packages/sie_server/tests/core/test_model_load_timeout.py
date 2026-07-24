@@ -19,10 +19,10 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from sie_server.config.model import EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
+from sie_server.config.model import AdapterOptions, EmbeddingDim, EncodeTask, ModelConfig, ProfileConfig, Tasks
 from sie_server.core.hf_env import set_hf_default_timeouts
 from sie_server.core.load_errors import (
     LoadErrorClass,
@@ -61,6 +61,32 @@ def _make_embedding_config(name: str = "t") -> ModelConfig:
             )
         },
     )
+
+
+def test_muvera_runtime_requires_registered_postprocessor() -> None:
+    loader = _make_loader()
+    config = ModelConfig(
+        sie_id="test/visual:muvera",
+        hf_id="test/visual",
+        tasks=Tasks(encode=EncodeTask(multivector=EmbeddingDim(dim=8))),
+        profiles={
+            "default": ProfileConfig(
+                adapter_path="sie_server.adapters.base:ModelAdapter",
+                max_batch_tokens=8,
+                adapter_options=AdapterOptions(
+                    runtime={
+                        "muvera": {},
+                        "output_types": ["dense"],
+                    }
+                ),
+            )
+        },
+    )
+    adapter = MagicMock()
+    adapter.get_postprocessors.return_value = None
+
+    with pytest.raises(ValueError, match=r"requests MUVERA.*did not register a 'muvera' postprocessor"):
+        loader._finish_load("test/visual:muvera", "cpu", adapter, config)
 
 
 class TestResolveLoadTimeout:
@@ -263,8 +289,6 @@ class TestRegistryIntegration:
         so even if the orphan finishes ``adapter.load`` later, no
         registry mutation occurs from the leaked thread.
         """
-        from unittest.mock import MagicMock
-
         from sie_server.config.model import EmbeddingDim, EncodeTask, ProfileConfig, Tasks
 
         loader = _make_loader(timeout_s=0.05)

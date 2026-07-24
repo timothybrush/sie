@@ -63,6 +63,9 @@ def _make_registry() -> MagicMock:
     reg.is_loaded.return_value = True
     reg.is_loading.return_value = False
     config = MagicMock()
+    config.sie_id = MODEL_ID
+    config.outputs = ["dense", "sparse"]
+    config.resolve_profile.return_value.runtime = {}
     config.tasks.encode.dense.dim = 4
     reg.get_config.return_value = config
     return reg
@@ -358,6 +361,9 @@ class TestProcessEncodeBatchSparseMV:
         reg.is_loaded.return_value = True
         reg.is_loading.return_value = False
         config = MagicMock()
+        config.sie_id = MODEL_ID
+        config.outputs = ["sparse"]
+        config.resolve_profile.return_value.runtime = {}
         config.tasks.encode.sparse.dim = sparse_dim
         reg.get_config.return_value = config
         return reg
@@ -369,6 +375,9 @@ class TestProcessEncodeBatchSparseMV:
         reg.is_loaded.return_value = True
         reg.is_loading.return_value = False
         config = MagicMock()
+        config.sie_id = MODEL_ID
+        config.outputs = ["multivector"]
+        config.resolve_profile.return_value.runtime = {}
         config.tasks.encode.multivector.dim = mv_dim
         reg.get_config.return_value = config
         return reg
